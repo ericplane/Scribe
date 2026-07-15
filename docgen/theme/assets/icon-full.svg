@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" xmlns="http://www.w3.org/2000/svg" version="1.1" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 128 128">
+  <!-- Generator: Adobe Illustrator 30.6.0, SVG Export Plug-In . SVG Version: 2.1.4 Build 109)  -->
+  <defs>
+    <style>
+      .st0 {
+        stroke: url(#linear-gradient);
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 13px;
+      }
+
+      .st0, .st1 {
+        fill: none;
+      }
+
+      .st2 {
+        fill: #6ee7b7;
+      }
+
+      .st1 {
+        stroke: #1e2a3a;
+      }
+
+      .st3 {
+        fill: #101823;
+      }
+    </style>
+    <linearGradient id="linear-gradient" x1="64" y1="100" x2="64" y2="32" gradientTransform="translate(0 130) scale(1 -1)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2ea87a"/>
+      <stop offset=".55" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#57e3a3"/>
+    </linearGradient>
+  </defs>
+  <rect class="st3" width="128" height="128" rx="24" ry="24"/>
+  <rect class="st1" x="2" y="2" width="124" height="124" rx="22" ry="22"/>
+  <path class="st0" d="M84,38h-40v26h40v26h-40"/>
+  <circle class="st2" cx="84" cy="38" r="7"/>
+  <circle class="st2" cx="44" cy="90" r="7"/>
+</svg>

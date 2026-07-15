@@ -1,0 +1,245 @@
+/* ============================================================================
+   Scribe docs — navy + mint, layered surfaces, gold-class polish
+   ============================================================================ */
+:root {
+  --scribe-green: #34d399;
+  --scribe-green-light: #6ee7b7;
+  --scribe-green-dark: #2ea87a;
+
+  --md-primary-fg-color: #101823;
+  --md-primary-fg-color--light: #1a2635;
+  --md-primary-fg-color--dark: #0b111a;
+  --md-accent-fg-color: #34d399;
+}
+
+/* Use the space on large monitors */
+.md-grid { max-width: 78rem; }
+
+/* ---- Dark scheme: layered navy surfaces so things read against the page ---- */
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: #101823;            /* page — matches the icon      */
+  --md-default-bg-color--light: #18232f;
+  --md-default-bg-color--lighter: #212e3d;
+  --md-default-bg-color--lightest: #2b3a4c;
+  --md-code-bg-color: #0b1119;               /* code, recessed               */
+  --md-typeset-a-color: var(--scribe-green-light);
+  --md-accent-fg-color: var(--scribe-green-light);
+
+  --scribe-surface: #18232f;                 /* cards, admonitions, tables   */
+  --scribe-surface-2: #212e3d;               /* headers, hovers, elevated    */
+  --scribe-border: #2b3a4c;
+
+  --scribe-nav-active-bg: #183a2d;           /* sidebar active pill (dark)   */
+  --scribe-nav-active-fg: var(--scribe-green-light);
+}
+
+/* ---- Light scheme ---- */
+[data-md-color-scheme="default"] {
+  --md-typeset-a-color: var(--scribe-green-dark);
+  --md-accent-fg-color: var(--scribe-green-dark);
+  --scribe-surface: #f5f8fb;
+  --scribe-surface-2: #eaf0f6;
+  --scribe-border: #dbe3ec;
+
+  --scribe-nav-active-bg: #d1fae5;           /* soft emerald pill (light)    */
+  --scribe-nav-active-fg: #067a4e;           /* dark emerald text, readable  */
+}
+
+/* ===================== Header / navbar — modern & separated ===================== */
+.md-header {
+  background-color: #141e2c;                 /* lifted off the page bg */
+  border-bottom: 1px solid var(--scribe-border);
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.35);
+}
+.md-tabs {
+  background-color: #141e2c;
+  border-bottom: 1px solid var(--scribe-border);
+}
+.md-header__title { font-weight: 650; }
+/* active top tab: green + underline */
+.md-tabs__link { opacity: 0.72; transition: opacity 120ms, color 120ms; }
+.md-tabs__link:hover { opacity: 1; }
+.md-tabs__item--active .md-tabs__link {
+  opacity: 1;
+  color: var(--scribe-green-light);
+  font-weight: 600;
+}
+
+/* Search — rounded pill on a subtle surface */
+.md-search__form {
+  border-radius: 999px;
+  background-color: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--scribe-border);
+  box-shadow: none;
+  transition: background-color 120ms, border-color 120ms;
+}
+.md-search__form:hover,
+[data-md-toggle="search"]:checked ~ .md-header .md-search__form {
+  background-color: rgba(255, 255, 255, 0.09);
+  border-color: var(--scribe-green-dark);
+}
+.md-search__input::placeholder { color: rgba(255, 255, 255, 0.55); }
+
+/* Left nav — EVERY link shares one box so the active pill never shifts the
+   text up/down; the fill is a flat solid (no gradient) shown only when active */
+.md-nav--primary .md-nav__link {
+  border-radius: 6px;
+  padding: 0.32rem 0.55rem;
+  margin-left: -0.55rem;
+  margin-right: -0.55rem;
+  transition: background-color 100ms ease, color 100ms ease;
+}
+.md-nav--primary .md-nav__link--active,
+.md-nav--primary .md-nav__link--active:hover {
+  color: var(--scribe-nav-active-fg);
+  background: var(--scribe-nav-active-bg);   /* flat, scheme-aware, no gradient */
+  font-weight: 600;
+}
+/* Material scatters page-navy box-shadows across the sticky nav chrome — the
+   section titles (a .4rem glow) AND the list's inset top line (0 .05rem 0
+   inset). On this dark theme each bleeds a gradient/line onto the adjacent
+   pill, most visibly over the TOP of the first item (its rounded corners
+   expose the line). Strip them all; the solid backgrounds still mask scroll. */
+.md-nav--primary .md-nav__title,
+.md-nav--secondary .md-nav__title,
+.md-nav--primary .md-nav__title ~ .md-nav__list {
+  box-shadow: none;
+}
+/* Lifted nav paints BOTH the active page link AND the active *section* label
+   ("API", the section that holds your page) with a navy .4rem glow. Strip the
+   glow from both, but green ONLY the actual active page — its link carries
+   --active, whereas the section label is just .md-nav__link, so it keeps the
+   plain page background and shows no pill. */
+.md-nav--lifted > .md-nav__list > .md-nav__item--active > .md-nav__link {
+  box-shadow: none;
+}
+.md-nav--lifted > .md-nav__list > .md-nav__item--active > .md-nav__link--active {
+  background-color: var(--scribe-nav-active-bg);
+}
+
+/* ===================== Typography ===================== */
+.md-typeset { line-height: 1.72; }
+.md-typeset code { border-radius: 4px; }
+.md-typeset h2 {
+  font-weight: 650;
+  margin-top: 2.8rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--scribe-border);
+}
+.md-typeset h3 { font-weight: 600; }
+
+/* ===================== API members ===================== */
+/* divider BETWEEN members … */
+.md-typeset h3[id] {
+  margin-top: 2.4rem;
+  padding-top: 1.3rem;
+  border-top: 1px solid var(--scribe-border);
+}
+/* … but NOT a second line right after a category heading */
+.md-typeset h2 + h3[id] {
+  border-top: none;
+  padding-top: 0.2rem;
+  margin-top: 1.2rem;
+}
+
+/* ===================== Code blocks — defined surface ===================== */
+.md-typeset pre > code {
+  border: 1px solid var(--scribe-border);
+  border-radius: 8px;
+}
+
+/* ===================== Admonitions (notices) — elevated & legible ========= */
+.md-typeset .admonition,
+.md-typeset details {
+  background: var(--scribe-surface);
+  border: 1px solid var(--scribe-border);
+  border-left-width: 3px;
+  border-radius: 8px;
+  overflow: hidden;                 /* clip the title bar to the rounded corners */
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+/* Title bar left to Material: its `margin: 0 -.6rem` bleeds the bar to the box
+   edges, and its per-type tint (blue = note, teal = tip, amber = warning …)
+   stays; the container's overflow:hidden rounds the bar's top corners. */
+
+/* ===================== Tables — readable, no shattered tokens ============== */
+.md-typeset table:not([class]) {
+  background: var(--scribe-surface);
+  border: 1px solid var(--scribe-border);
+  border-radius: 10px;
+  overflow: hidden;
+  font-size: 0.76rem;
+}
+.md-typeset table:not([class]) th {
+  background: var(--scribe-surface-2);
+  color: var(--md-default-fg-color);
+  font-weight: 650;
+  border: none;
+  border-bottom: 2px solid var(--scribe-green-dark);
+  white-space: nowrap;
+  padding: 0.7em 1em;
+}
+.md-typeset table:not([class]) td {
+  border: none;
+  border-top: 1px solid var(--scribe-border);
+  vertical-align: top;
+  padding: 0.7em 1em;
+  line-height: 1.6;
+}
+.md-typeset table:not([class]) tr:hover td {
+  background: rgba(52, 211, 153, 0.045);
+}
+/* wrap code only at spaces — never split a token like `Migrations` mid-word */
+.md-typeset table:not([class]) code {
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: normal;
+  background: var(--md-code-bg-color);
+}
+/* the first (name/option) column stays on one line */
+.md-typeset table:not([class]) td:first-child,
+.md-typeset table:not([class]) td:first-child code {
+  white-space: nowrap;
+}
+
+/* ===================== Back-to-top — visible against navy ================== */
+.md-top {
+  background: var(--scribe-surface-2);
+  color: var(--md-default-fg-color);
+  border: 1px solid var(--scribe-border);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.4);
+}
+.md-top:hover {
+  background: var(--scribe-green);
+  color: #06281c;
+  border-color: var(--scribe-green);
+}
+
+/* ===================== Nav / ToC accents ===================== */
+/* scheme-aware: --md-typeset-a-color is green-light on dark, green-dark on light
+   (the sidebar pill overrides this with its own high-contrast pair) */
+.md-nav__link--active,
+.md-nav--secondary .md-nav__link--active {
+  color: var(--md-typeset-a-color);
+  font-weight: 600;
+}
+.md-nav__item .md-nav__link:hover { color: var(--md-typeset-a-color); }
+/* ToC section labels a touch quieter, members a touch tighter */
+.md-nav--secondary .md-nav__item { font-size: 0.68rem; }
+
+/* ===================== API badges ===================== */
+.badges { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.1rem 0 0.75rem; }
+.badge {
+  font-size: 0.6rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 0.18rem 0.55rem; border-radius: 999px; line-height: 1.4; border: 1px solid transparent;
+}
+.badge--server   { color: var(--scribe-green-light); background: rgba(52, 211, 153, 0.12); border-color: rgba(52, 211, 153, 0.35); }
+.badge--client   { color: #93c5fd; background: rgba(96, 165, 250, 0.12); border-color: rgba(96, 165, 250, 0.35); }
+.badge--yields   { color: #fcd34d; background: rgba(252, 211, 77, 0.12); border-color: rgba(252, 211, 77, 0.35); }
+.badge--signal   { color: #c4b5fd; background: rgba(167, 139, 250, 0.12); border-color: rgba(167, 139, 250, 0.35); }
+.badge--property { color: var(--md-default-fg-color--light); background: var(--scribe-surface-2); border-color: var(--scribe-border); }
+/* light mode: the pale badge text above is illegible on white, so darken it */
+[data-md-color-scheme="default"] .badge--server { color: #067a4e; }
+[data-md-color-scheme="default"] .badge--client { color: #1d4ed8; }
+[data-md-color-scheme="default"] .badge--yields { color: #b45309; }
+[data-md-color-scheme="default"] .badge--signal { color: #6d28d9; }

@@ -1,0 +1,4 @@
+std = "roblox+testez"
+
+# The Lune runner uses Lune globals/requires, not Roblox's.
+exclude = ["lune/**", "Packages/**", "ServerPackages/**", "DevPackages/**"]

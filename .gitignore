@@ -1,0 +1,24 @@
+# Project place file
+/Scribe.rbxlx
+
+# Roblox Studio lock files
+/*.rbxlx.lock
+/*.rbxl.lock
+
+sourcemap*.json
+Packages/
+ServerPackages/
+DevPackages/
+wally.lock
+*.rbxlx
+*.rbxl
+node_modules/
+package-lock.json
+
+# MkDocs docs build
+/docs_gen/*
+!/docs_gen/.gitkeep
+/site/
+__pycache__/
+.venv/
+.cache/

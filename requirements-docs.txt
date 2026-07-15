@@ -1,0 +1,4 @@
+# Scribe documentation toolchain.
+# mkdocs-material pulls in mkdocs + pymdown-extensions transitively.
+# The generator (docgen/gen.py) uses only the Python standard library.
+mkdocs-material>=9.7,<10
