@@ -232,7 +232,7 @@ def convert_guide(text):
     text = re.sub(r"\]\(\./([\w-]+)(#[\w-]+)?\)", lambda m: f"]({m.group(1)}.md{m.group(2) or ''})", text)
     text = re.sub(r"\]\(/api/(\w+)(#[\w-]+)?\)",
                   lambda m: f"](api/{m.group(1).lower()}.md{(m.group(2) or '').lower()})", text)
-    text = text.replace("](intro.md", "](index.md")  # intro is the home page
+    text = text.replace("](intro.md", "](getting-started.md")  # intro is now the Getting Started guide
     text = text.replace("{{version}}", VERSION)       # stamp the wally.toml version
     text = unescape_code_pipes(text)                  # `\|` in table cells -> `|`
     return text
@@ -264,9 +264,15 @@ def main():
 
     guides = sorted(DOCS.glob("*.md"))
     for path in guides:
-        name = "index.md" if path.stem == "intro" else path.name
+        name = "getting-started.md" if path.stem == "intro" else path.name
         (OUT / name).write_text(convert_guide(path.read_text(encoding="utf-8")), encoding="utf-8")
     print(f"[docgen] guides: {len(guides)} converted")
+
+    # the landing page keeps its Material syntax and frontmatter; it is the home page
+    home = HERE / "home.md"
+    if home.exists():
+        (OUT / "index.md").write_text(home.read_text(encoding="utf-8").replace("{{version}}", VERSION), encoding="utf-8")
+        print("[docgen] home: home.md -> index.md")
 
     copy_theme()
     print(f"[docgen] wrote {OUT.relative_to(ROOT)}")

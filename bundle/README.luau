@@ -18,6 +18,10 @@
 	           local Scribe = require(game:GetService("ReplicatedStorage").Packages.Scribe)
 
 	Notes
+	    For the typed API and autocomplete, enable the new Luau type solver:
+	    select Workspace in the Explorer and set UseNewLuauTypeSolver (under
+	    Scripting) to Enabled. Scribe still runs correctly without it.
+
 	    Signal is bundled for convenience. Scribe has a built in fallback with the
 	    same surface, so it also works if you remove Signal.
 

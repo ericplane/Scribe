@@ -243,3 +243,37 @@
 [data-md-color-scheme="default"] .badge--client { color: #1d4ed8; }
 [data-md-color-scheme="default"] .badge--yields { color: #b45309; }
 [data-md-color-scheme="default"] .badge--signal { color: #6d28d9; }
+
+/* ===================== Landing page: buttons + feature grid ===================== */
+.md-typeset .md-button {
+  border-radius: 8px;
+  border-color: var(--scribe-border);
+  color: var(--md-default-fg-color);   /* Material defaults this to navy (invisible); make it readable */
+}
+.md-typeset .md-button:hover {
+  background-color: var(--scribe-surface-2);
+  border-color: var(--scribe-green);
+  color: var(--md-typeset-a-color);
+}
+.md-typeset .md-button--primary {
+  background-color: var(--scribe-green);
+  border-color: var(--scribe-green);
+  color: #06281c;
+}
+.md-typeset .md-button--primary:hover {
+  background-color: var(--scribe-green-light);
+  border-color: var(--scribe-green-light);
+  color: #06281c;
+}
+/* six highlight cards, 3 across on wide screens (a 3x2 grid) */
+@media screen and (min-width: 60em) {
+  .md-typeset .grid.cards { grid-template-columns: repeat(3, 1fr); }
+}
+.md-typeset .grid.cards > ul > li {
+  background: var(--scribe-surface);
+  border-color: var(--scribe-border);
+  border-radius: 10px;
+}
+.md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--scribe-green-dark);
+}

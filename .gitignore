@@ -27,3 +27,5 @@ package-lock.json
 __pycache__/
 .venv/
 .cache/
+# Edge render temp for devforum-post assets
+/devforum-post
