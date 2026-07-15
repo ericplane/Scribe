@@ -8,7 +8,7 @@
 ```toml
 # wally.toml
 [dependencies]
-Scribe = "ericplane/scribe@1.0.1"
+Scribe = "ericplane/scribe@1.0.2"
 ```
 
 - **Fully typed.** A type-solver-generated accessor tree types your data end to end (`data.Coins.Increment(50)`, nested containers, arrays, and datatype fields), checked at compile time.
