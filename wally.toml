@@ -1,12 +1,12 @@
 [package]
 name = "ericplane/scribe"
-description = ""
-version = "1.0.0"
+description = "Persistent, fully-typed, automatically-replicated player data for Roblox Luau, built on ProfileStore."
+version = "1.0.1"
 license = "MIT"
 authors = ["ericplane"]
 registry = "https://github.com/UpliftGames/wally-index"
-homepage = "https://"
-repositoy = "https://github.com/ericplane/Scribe"
+homepage = "https://ericplane.github.io/Scribe/"
+repository = "https://github.com/ericplane/Scribe"
 realm = "shared"
 
 include = ["src", "default.project.json", "wally.toml", "LICENSE", "README.md"]

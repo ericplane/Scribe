@@ -12,8 +12,13 @@ DevPackages/
 wally.lock
 *.rbxlx
 *.rbxl
+*.rbxm
+*.rbxmx
 node_modules/
 package-lock.json
+
+# rbxm bundle build staging (deps copied out of Wally _Index in CI)
+/bundle/deps/
 
 # MkDocs docs build
 /docs_gen/*

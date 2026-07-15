@@ -1,0 +1,63 @@
+name: Bundle rbxm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload the asset to the release
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the exact tools pinned in rokit.toml (wally + rojo).
+      - uses: CompeyDev/setup-rokit@v0.1.2
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VER="${{ github.event.release.tag_name }}"
+            VER="${VER#v}"                 # strip a leading v (v1.0.1 -> 1.0.1)
+          else
+            VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
+          fi
+          echo "value=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Wally dependencies
+        run: wally install
+
+      - name: Assemble the bundle
+        env:
+          VER: ${{ steps.ver.outputs.value }}
+        run: |
+          # Copy the real dependency modules out of Wally's _Index (not the link
+          # files), excluding tests/manifests. ProfileStore is mapped as a single
+          # file so it is named "ProfileStore" (Scribe looks it up by that exact
+          # name), not "profilestore" from its own project file.
+          mkdir -p bundle/deps/Signal
+          cp Packages/_Index/sleitnick_signal@*/signal/init.luau bundle/deps/Signal/init.luau
+          cp ServerPackages/_Index/lm-loleris_profilestore@*/profilestore/ProfileStore.luau bundle/deps/ProfileStore.luau
+
+          # Name the root folder after the release and stamp the version into the README.
+          sed -i "s|\"name\": \"Scribe\"|\"name\": \"Scribe v${VER}\"|" bundle/rbxm.project.json
+          sed -i "s|__VERSION__|${VER}|g" bundle/README.luau
+
+      - name: Build Scribe.rbxm
+        run: rojo build bundle/rbxm.project.json -o Scribe.rbxm
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        run: gh release upload "${{ github.event.release.tag_name }}" Scribe.rbxm --clobber
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Upload as a workflow artifact
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scribe-rbxm
+          path: Scribe.rbxm

@@ -22,6 +22,16 @@ THEME = HERE / "theme"        # static css + assets copied into OUT
 BLOCK = re.compile(r"--\[=\[(.*?)\]=\]", re.S)
 
 DATATYPES = []                # datatype-declarator family; filled by main()
+VERSION = "0.0.0"             # wally.toml package version; filled by main()
+
+
+def read_version():
+    # single source of truth for the version shown in the docs: wally.toml.
+    # guides use a {{version}} placeholder that gets substituted at build time,
+    # so the deployed site always matches the current package version.
+    text = (ROOT / "wally.toml").read_text(encoding="utf-8")
+    m = re.search(r'^\s*version\s*=\s*"([^"]+)"', text, re.M)
+    return m.group(1) if m else "0.0.0"
 
 
 def parse_block(body, next_code):
@@ -223,6 +233,7 @@ def convert_guide(text):
     text = re.sub(r"\]\(/api/(\w+)(#[\w-]+)?\)",
                   lambda m: f"](api/{m.group(1).lower()}.md{(m.group(2) or '').lower()})", text)
     text = text.replace("](intro.md", "](index.md")  # intro is the home page
+    text = text.replace("{{version}}", VERSION)       # stamp the wally.toml version
     text = unescape_code_pipes(text)                  # `\|` in table cells -> `|`
     return text
 
@@ -237,8 +248,9 @@ def copy_theme():
 
 
 def main():
-    global DATATYPES
+    global DATATYPES, VERSION
     DATATYPES = find_datatypes()
+    VERSION = read_version()
 
     # OUT is fully generated; wipe it clean so deleted sources don't leave stragglers
     shutil.rmtree(OUT, ignore_errors=True)

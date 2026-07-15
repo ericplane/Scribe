@@ -1,0 +1,27 @@
+name: Sync README version
+
+on:
+  push:
+    branches: [main]
+    paths: [wally.toml]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync README.md to the wally.toml version
+        run: |
+          VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
+          sed -i -E "s#(ericplane/scribe@)[^\"]+#\1${VER}#g" README.md
+          if git diff --quiet README.md; then
+            echo "README.md already at ${VER}, nothing to do."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "docs: sync README to scribe@${VER}"
+            git push
+          fi

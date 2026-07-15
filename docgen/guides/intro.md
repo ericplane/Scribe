@@ -12,7 +12,7 @@ With [Wally](https://wally.run):
 
 ```toml
 [dependencies]
-Scribe = "ericplane/scribe@1.0.0"
+Scribe = "ericplane/scribe@{{version}}"
 ```
 
 ProfileStore is a dependency of Scribe, so `wally install` pulls it into `ServerPackages/` automatically. You don't declare it yourself.
