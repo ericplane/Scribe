@@ -26,6 +26,7 @@ export type SchemaNode = {
 	Members: { string }?,
 	MemberIndex: { [string]: number }?, -- 0-based, for u8 packing
 	Default: any,
+	Factory: (() -> any)?, -- Scribe.Dynamic: seeds this field on a brand-new profile
 	Children: { [string]: SchemaNode }?,
 	ChildOrder: { string }?, -- sorted; ordinal i encodes child ChildOrder[i]
 	ChildOrdinal: { [string]: number }?,
@@ -39,6 +40,7 @@ export type Compiled = {
 	NodeCount: number,
 	Hash: number,
 	RootOrder: { string },
+	DynamicNodes: { SchemaNode }, -- fields with a Scribe.Dynamic factory, in id order
 	Config: CompileConfig,
 }
 
@@ -124,6 +126,23 @@ local function buildNode(
 		elseif kind == "Datatype" then
 			valueType = "datatype"
 			meta = markerMeta
+		elseif kind == "Dynamic" then
+			-- `default` is the sample (the factory ran once at declaration). Infer
+			-- the field type from it and carry the factory forward; it seeds the
+			-- field per brand-new profile.
+			if default == nil then
+				compileError(path, "Scribe.Dynamic factory must return a non-nil value")
+			end
+			local factory = if markerMeta then markerMeta.Factory else nil
+			local sampleType = typeof(default)
+			if Datatypes.IsSupported(sampleType) then
+				valueType = "datatype"
+				meta = { Datatype = sampleType, Factory = factory } :: Marker.Meta
+			elseif type(default) == "table" then
+				compileError(path, "Scribe.Dynamic only wraps leaf values (numbers, strings, datatypes, ...)")
+			else
+				meta = { Factory = factory } :: Marker.Meta
+			end
 		end
 		value = default
 	end
@@ -179,6 +198,21 @@ local function buildNode(
 			end
 			node.Members = members
 			node.MemberIndex = index
+		end
+	end
+
+	-- Scribe.Dynamic: record a factory that seeds this field on brand-new
+	-- profiles. Datatype results are packed (profile.Data holds the packed form);
+	-- other leaves pass through unchanged.
+	if meta and meta.Factory then
+		local rawFactory = meta.Factory
+		if datatypeName then
+			local dtName = datatypeName :: string
+			node.Factory = function()
+				return Datatypes.Pack(dtName, rawFactory())
+			end
+		else
+			node.Factory = rawFactory
 		end
 	end
 
@@ -363,12 +397,23 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		end
 	end
 
+	-- Flatten the fields carrying a Scribe.Dynamic factory (in id order), so the
+	-- load path can seed them on a new profile without walking the whole tree.
+	local dynamicNodes: { SchemaNode } = {}
+	for id = 0, state.NextId - 1 do
+		local node = state.ById[id]
+		if node and node.Factory then
+			table.insert(dynamicNodes, node)
+		end
+	end
+
 	return {
 		Root = root,
 		ById = state.ById,
 		NodeCount = state.NextId,
 		Hash = hash,
 		RootOrder = order,
+		DynamicNodes = dynamicNodes,
 		Config = cfg,
 	}
 end

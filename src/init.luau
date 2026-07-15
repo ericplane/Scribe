@@ -151,12 +151,15 @@ export type function ValueType(T)
 			add("Update", fn({ fn({ valueType }, { valueType }), optBool }, { valueType }))
 		end
 		add("Clone", fn({}, { valueType }))
+		add("Default", fn({}, { valueType }))
 		add("Changed", fn({ fn({ valueType, valueType, optional(ts.unionof(ts.string, ts.number)) }, {}) }, { disconnectType }))
 		add("Observe", fn({ fn({ valueType }, {}) }, { disconnectType }))
 
 		if t:is("number") then
 			add("Increment", fn({ ts.number, anyType }, { ts.number }))
 			add("Decrement", fn({ ts.number, anyType }, { ts.number }))
+			add("Min", fn({}, { optNumber }))
+			add("Max", fn({}, { optNumber }))
 		elseif t:is("boolean") then
 			add("Toggle", fn({ optBool }, { ts.boolean }))
 		end
@@ -896,6 +899,32 @@ end
 ]=]
 function Scribe.Timed<T>(default: T): Timed<T>
 	return Marker.make("Timed", default) :: any
+end
+
+--[=[
+	@within Scribe
+	@tag Field Types
+	@function Dynamic
+	@param factory () -> T
+	@return T
+	Declares a field whose default is produced by `factory` **the first time a
+	profile is created**, instead of once at module load. Use it for values that
+	must be evaluated per profile rather than frozen at server start, like a
+	creation timestamp:
+
+	```lua
+	CREATION_UNIX = Scribe.Dynamic(os.time),
+	JOINED_AT     = Scribe.Dynamic(function() return DateTime.now() end), -- datatype, packed for you
+	```
+
+	Returning players keep their stored value; only brand-new profiles run the
+	factory. The field types as the factory's return type. Player-specific
+	defaults (e.g. based on `player.Name`) still belong in `OnPlayerInit`.
+]=]
+-- `(...any) -> T` (not `() -> T`) so standard-library functions with optional
+-- params typecheck when passed directly, e.g. `Scribe.Dynamic(os.time)`.
+function Scribe.Dynamic<T>(factory: (...any) -> T): T
+	return Marker.make("Dynamic", factory(), { Factory = factory :: any }) :: any
 end
 
 -- Roblox datatype fields (opt-in serialization): stored and replicated as a

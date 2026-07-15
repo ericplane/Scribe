@@ -517,6 +517,30 @@ function Persistence.new(ctx: any)
 		local profile = entry.Profile :: any
 		local player = entry.Player
 
+		-- Decide which Scribe.Dynamic fields to seed, BEFORE Reconcile backfills
+		-- their baseline: all of them on a brand-new profile, plus any the STORED
+		-- data is missing (a field added to the template after this profile was
+		-- created). Reading the stored data first is the safety guarantee -- a
+		-- saved value IS present, so it is never flagged and never overwritten.
+		local dynamicToSeed: { any } = {}
+		if #compiled.DynamicNodes > 0 then
+			local isNew = profile.SessionLoadCount == 1
+			for _, node in compiled.DynamicNodes do
+				local present = true
+				local at: any = profile.Data
+				for _, seg in node.Path do
+					if type(at) ~= "table" or at[seg] == nil then
+						present = false
+						break
+					end
+					at = at[seg]
+				end
+				if isNew or not present then
+					table.insert(dynamicToSeed, node)
+				end
+			end
+		end
+
 		profile:AddUserId(entry.UserId)
 		profile:Reconcile()
 
@@ -539,6 +563,33 @@ function Persistence.new(ctx: any)
 			end
 			teardown(entry, "migration-failed")
 			return
+		end
+
+		-- Seed the flagged Scribe.Dynamic fields now that Reconcile has created any
+		-- parent containers, before OnPlayerInit so it can still override. Written
+		-- raw into profile.Data (the factory already packs datatypes); the tree
+		-- wraps this same table, so the values are live and will save.
+		if #dynamicToSeed > 0 then
+			for _, node in dynamicToSeed do
+				local ok, value = pcall(node.Factory :: () -> any)
+				if not ok then
+					Log.Error(
+						"Lifecycle",
+						"DYNAMIC_DEFAULT_FAILED",
+						`Scribe.Dynamic factory for "{Util.pathString(node.Path)}" threw: {value}`,
+						{ Player = player, Path = Util.pathString(node.Path) }
+					)
+				else
+					local container: any = profile.Data
+					for i = 1, #node.Path - 1 do
+						container = if type(container) == "table" then container[node.Path[i]] else nil
+					end
+					if type(container) == "table" then
+						container[node.Path[#node.Path]] = value
+					end
+				end
+			end
+			entry.SaveInfo.Dirty = true
 		end
 
 		if ctx.DevMode then

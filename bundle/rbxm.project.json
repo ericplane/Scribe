@@ -5,8 +5,7 @@
     "README": { "$path": "README.luau" },
     "Packages": {
       "$className": "Folder",
-      "Scribe": { "$path": "../src" },
-      "Signal": { "$path": "deps/Signal" }
+      "Scribe": { "$path": "../src" }
     },
     "ServerPackages": {
       "$className": "Folder",

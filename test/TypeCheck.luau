@@ -8,6 +8,7 @@ type ItemData = { Health: number, Dmg: number }
 
 local template = {
 	Coins = Scribe.Int(0, { Min = 0 }),
+	CreatedAt = Scribe.Dynamic(os.time), -- number; seeded per new profile
 	Gems = 0,
 	Wins = 0,
 	Stats = { Kills = 0, Deaths = 0 },
@@ -81,6 +82,13 @@ local Data = bundle.Server
 local function serverUsage(player: Player)
 	local data = Data[player]
 	local coins: number = data.Coins.Increment(50)
+	-- Read-only declared bounds (number?), on both server and client.
+	local coinMin: number? = data.Coins.Min()
+	local coinMax: number? = data.Coins.Max()
+	-- Declared default, typed as the field's value type.
+	local coinDefault: number = data.Coins.Default()
+	local spawnDefault: Vector3 = data.SpawnPoint.Default()
+	local createdAt: number = data.CreatedAt.Get() -- Scribe.Dynamic field types as its factory's return
 	-- Economy-tagged mutation: the meta table annotates against Scribe.EconomyMeta.
 	local meta: Scribe.EconomyMeta = {
 		TransactionType = Enum.AnalyticsEconomyTransactionType.Shop,
@@ -127,7 +135,7 @@ local function serverUsage(player: Player)
 		end,
 	})
 
-	return coins, dmg, has, active, remaining, equipped, flagged, inCombat, reason, owns, ok, err, onCooldown, cooldownRemaining, blob, spawnPoint, door, tint, bought
+	return coins, dmg, has, active, remaining, equipped, flagged, inCombat, reason, owns, ok, err, onCooldown, cooldownRemaining, blob, spawnPoint, door, tint, bought, coinMin, coinMax, coinDefault, spawnDefault, createdAt
 end
 
 local ClientData = bundle.Client

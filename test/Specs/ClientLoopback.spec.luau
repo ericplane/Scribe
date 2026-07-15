@@ -68,6 +68,150 @@ return function()
 		harness.Cleanup()
 	end)
 
+	itRunning("fires Observe/Changed for snapshot values at every depth when registered before Init", function()
+		-- Regression: a whole-container snapshot Set used to fire Changed only on
+		-- the container, so a nested Observe/Changed registered before Init missed
+		-- its value (top-level leaves were unaffected).
+		local harness = TestCtx.make({ AutoPump = false })
+		local player, entry, serverData = harness.Join()
+		harness.Transport.LocalPlayer = player
+
+		-- Server state set BEFORE the client handshake.
+		serverData.Coins.Set(5) -- top-level leaf
+		serverData.Inventory.Test.Set(7) -- dynamic dict key
+		serverData.Settings.Music.Set(false) -- nested static field
+
+		local clientData = Client.new(harness.Options, harness.Compiled) -- Hello queued
+
+		local coins, dictVal, music = {}, {}, {}
+		local invChanged, keyAdded = 0, {}
+		clientData.Coins.Observe(function(v)
+			table.insert(coins, v)
+		end)
+		clientData.Inventory.Test.Observe(function(v)
+			table.insert(dictVal, if v == nil then "NIL" else v)
+		end)
+		clientData.Settings.Music.Observe(function(v)
+			table.insert(music, v)
+		end)
+		clientData.Inventory.Changed(function()
+			invChanged += 1
+		end)
+		clientData.Inventory.OnKeyAdded(function(key)
+			table.insert(keyAdded, key)
+		end)
+
+		harness.Transport:PumpToServer() -- Hello -> Init(snapshot)
+		harness.Transport:PumpToClient()
+
+		-- Every observer sees its snapshot value (dict/nested were missed before).
+		expect(coins[#coins]).to.equal(5)
+		expect(dictVal[#dictVal]).to.equal(7)
+		expect(music[#music]).to.equal(false)
+		-- Container observer fires exactly once (no double-fire from the replay).
+		expect(invChanged).to.equal(1)
+		-- OnKeyAdded intentionally does NOT replay snapshot keys (matches the
+		-- top-level behavior; avoids a flood of "added" events on join).
+		expect(#keyAdded).to.equal(0)
+
+		-- A post-Init per-key update still fires the child observer.
+		serverData.Inventory.Test.Set(9)
+		harness.Ctx.Replication.FlushEntry(entry)
+		harness.Transport:PumpToClient()
+		expect(dictVal[#dictVal]).to.equal(9)
+
+		harness.Cleanup()
+	end)
+
+	itRunning("Mock fires nested observers registered before the Mock call (edit mode)", function()
+		-- Same whole-root-Set root cause as Init, on the edit-mode path.
+		local harness = TestCtx.make()
+		local RunService = game:GetService("RunService")
+		local origIsRunning = RunService.IsRunning
+		RunService.IsRunning = function() -- edit mode at construction
+			return false
+		end
+		local clientData = Client.new({}, harness.Compiled)
+		RunService.IsRunning = origIsRunning
+
+		local dictVal, music = {}, {}
+		clientData.Inventory.Test.Observe(function(v) -- nested dict key, BEFORE Mock
+			table.insert(dictVal, if v == nil then "NIL" else v)
+		end)
+		clientData.Settings.Music.Observe(function(v) -- nested static, BEFORE Mock
+			table.insert(music, v)
+		end)
+
+		clientData.Mock({ Inventory = { Test = 5 }, Settings = { Music = false } })
+
+		expect(dictVal[#dictVal]).to.equal(5) -- was missed before the fix
+		expect(music[#music]).to.equal(false) -- was missed before the fix
+
+		harness.Cleanup()
+	end)
+
+	itRunning("exposes declared Min/Max on numeric fields (client and server, even before load)", function()
+		local harness, _player, _entry, serverData, clientData = makeLoopback()
+		-- Server reads the declared bounds.
+		expect(serverData.Coins.Min()).to.equal(0)
+		expect(serverData.Coins.Max()).to.equal(1000000)
+		expect(serverData.Health.Max()).to.equal(100)
+		expect(serverData.Gems.Max()).to.equal(nil) -- Max unbounded
+		expect(serverData.Delta.Min()).to.equal(nil) -- both unbounded
+		-- Client reads the same shared schema.
+		expect(clientData.Coins.Min()).to.equal(0)
+		expect(clientData.Coins.Max()).to.equal(1000000)
+		harness.Cleanup()
+
+		-- Bounds are static metadata, so they resolve before Init even lands.
+		local harness2 = TestCtx.make({ AutoPump = false })
+		local player2 = harness2.Join()
+		harness2.Transport.LocalPlayer = player2
+		local unloaded = Client.new(harness2.Options, harness2.Compiled)
+		expect(unloaded.IsReady()).to.equal(false)
+		expect(unloaded.Coins.Min()).to.equal(0)
+		harness2.Cleanup()
+	end)
+
+	itRunning("exposes the declared Default of a field (client and server, incl. datatypes)", function()
+		local Scribe = require(ScribeRoot) :: any
+		local harness = TestCtx.make({
+			Template = {
+				Coins = Scribe.Int(0, { Min = 0 }),
+				Nick = Scribe.String("Guest", { MaxLength = 16 }),
+				Team = Scribe.Enum("Red", { "Red", "Blue" }),
+				Settings = { Music = true, Sfx = false },
+				Home = Scribe.Vector3(Vector3.new(1, 2, 3)), -- packed datatype
+			},
+		})
+		local player, _entry, serverData = harness.Join()
+		harness.Transport.LocalPlayer = player
+		local clientData = Client.new(harness.Options, harness.Compiled) -- unloaded is fine
+
+		expect(serverData.Coins.Default()).to.equal(0)
+		expect(serverData.Nick.Default()).to.equal("Guest")
+		expect(serverData.Team.Default()).to.equal("Red")
+		-- Real datatype (not the packed buffer); compared by component since the
+		-- headless Vector3 stub has no value equality.
+		local home = serverData.Home.Default()
+		expect(home.X).to.equal(1)
+		expect(home.Y).to.equal(2)
+		expect(home.Z).to.equal(3)
+
+		-- Container default is a deep copy: mutating it can't affect the schema.
+		local settings = serverData.Settings.Default()
+		expect(settings.Music).to.equal(true)
+		settings.Music = false
+		expect(serverData.Settings.Default().Music).to.equal(true)
+
+		-- Client reads the same shared schema (even before Init).
+		expect(clientData.IsReady()).to.equal(false)
+		expect(clientData.Coins.Default()).to.equal(0)
+		expect(clientData.Home.Default().X).to.equal(1)
+
+		harness.Cleanup()
+	end)
+
 	itRunning("returns a root accessor before Init without yielding in the metamethod", function()
 		-- No AutoPump: Hello is never delivered, so Init never arrives and the
 		-- client stays unloaded. Accessing a root field goes through the Data

@@ -56,6 +56,12 @@ export type Tree = typeof(setmetatable(
 		Accessor: any,
 		Dead: boolean,
 		_listeners: { [string]: { [string]: { [any]: (...any) -> () } } },
+		-- path array for each listener'd pathKey, so the Init replay can read a
+		-- node's value without reversing the (lossy) pathKey string.
+		_paths: { [string]: { string | number } },
+		-- true only while replaying the initial snapshot: suppresses per-op fires
+		-- so descendants can be fired once, together, afterwards.
+		_replaying: boolean,
 		_accessors: { [string]: any },
 		_batchDepth: number,
 		_txn: { Snapshots: { [string]: { Path: { string | number }, Value: any } }, Ops: { { Op: Op, Schema: SchemaNode? } }, Created: { { string | number } } }?,
@@ -80,6 +86,8 @@ function Node.NewTree(params: TreeParams): Tree
 		Accessor = nil :: any,
 		Dead = false,
 		_listeners = {},
+		_paths = {},
+		_replaying = false,
 		_accessors = {},
 		_batchDepth = 0,
 		_txn = nil,
@@ -169,9 +177,11 @@ local function listenersFor(tree: Tree, pathKey: string, event: string, create: 
 	return list
 end
 
-local function connect(tree: Tree, pathKey: string, event: string, fn: (...any) -> ()): () -> ()
+local function connect(tree: Tree, path: { string | number }, event: string, fn: (...any) -> ()): () -> ()
 	assertAlive(tree)
+	local pathKey = Util.pathKey(path)
 	local list = listenersFor(tree, pathKey, event, true) :: { [any]: (...any) -> () }
+	tree._paths[pathKey] = path
 	local token = {}
 	list[token] = fn
 	return function()
@@ -185,6 +195,7 @@ local function connect(tree: Tree, pathKey: string, event: string, fn: (...any) 
 				byEvent[event] = nil
 				if next(byEvent) == nil then
 					tree._listeners[pathKey] = nil
+					tree._paths[pathKey] = nil
 				end
 			end
 		end
@@ -192,6 +203,9 @@ local function connect(tree: Tree, pathKey: string, event: string, fn: (...any) 
 end
 
 local function fire(tree: Tree, pathKey: string, event: string, ...: any)
+	if tree._replaying then
+		return -- suppressed during the Init replay; fired together afterwards
+	end
 	local list = listenersFor(tree, pathKey, event, false)
 	if list == nil then
 		return
@@ -615,6 +629,60 @@ function Tree.ApplyOp(self: Tree, op: Op)
 	end
 end
 
+-- Runs `apply` with per-op fires suppressed, then fires Changed once per
+-- observed path the mutation actually changed. A whole-container Set fires
+-- Changed only on the container and its ancestors, never its descendants, so a
+-- nested Observe/Changed registered BEFORE the mutation would miss its value.
+-- Used by the initial snapshot (ReplayInit) and edit-mode Mock, both of which
+-- write whole roots. Cost is O(listeners) -- independent of player-data size.
+function Tree.ReplayFire(self: Tree, apply: () -> ())
+	if self.Dead then
+		apply()
+		return
+	end
+	-- Snapshot the pre-apply value of every observed path.
+	local olds: { [string]: any } = {}
+	for pathKey, path in self._paths do
+		local byEvent = self._listeners[pathKey]
+		if byEvent and byEvent.Changed then
+			olds[pathKey] = readValue(self, path)
+		end
+	end
+	self._replaying = true
+	local ok, err = pcall(apply)
+	self._replaying = false -- always cleared, even if `apply` threw
+	if not ok then
+		error(err, 0)
+	end
+	-- Collect the changed observed paths first (a fired listener may add or
+	-- remove listeners), then fire. leafEquals is false for tables/buffers, so
+	-- container observers always fire (matching a live whole-container Set);
+	-- scalar leaves fire only on a real change.
+	local pending: { { Key: string, New: any, Old: any } } = {}
+	for pathKey, path in self._paths do
+		local byEvent = self._listeners[pathKey]
+		if byEvent and byEvent.Changed then
+			local current = readValue(self, path)
+			if not Util.leafEquals(current, olds[pathKey]) then
+				table.insert(pending, { Key = pathKey, New = current, Old = olds[pathKey] })
+			end
+		end
+	end
+	for _, entry in pending do
+		fire(self, entry.Key, "Changed", entry.New, entry.Old)
+	end
+end
+
+-- Applies the initial snapshot (the caller has already reset the mirror to
+-- defaults), firing nested observers registered before Init.
+function Tree.ReplayInit(self: Tree, ops: { Op })
+	self:ReplayFire(function()
+		for _, op in ops do
+			self:ApplyOp(op)
+		end
+	end)
+end
+
 -- Batch / Transaction ------------------------------------------------
 
 function Tree.RunBatch(self: Tree, fn: () -> ())
@@ -775,6 +843,17 @@ end
 ]=]
 
 --[=[
+	@function Default
+	@within Value
+	@tag Core
+	@return T
+	The field's declared default (a deep copy for tables/buffers, the real
+	datatype for datatype fields). Read-only schema metadata, so it works on the
+	client and server and before data loads. Handy for "reset to default" flows
+	and diffing against the current value.
+]=]
+
+--[=[
 	@function Observe
 	@within Value
 	@tag Core
@@ -829,6 +908,26 @@ end
 	Number fields only. Subtracts `amount` and returns the new value. Like
 	[Value.Increment] but the economy flow defaults to `Sink`. See the
 	[Economy Analytics](../economy.md) guide.
+]=]
+
+--[=[
+	@function Min
+	@within Value
+	@tag Numbers
+	@return number?
+	Number fields only. The declared minimum (`Scribe.Int(0, { Min = 0 })`), or
+	`nil` if unbounded. Read-only metadata from the shared schema, so it works on
+	both the client and the server, and even before data has loaded. Handy for
+	driving slider ranges or validation off the single source of truth.
+]=]
+
+--[=[
+	@function Max
+	@within Value
+	@tag Numbers
+	@return number?
+	Number fields only. The declared maximum, or `nil` if unbounded. See
+	[Value.Min].
 ]=]
 
 --[=[
@@ -1096,6 +1195,38 @@ METHOD_FACTORIES.Decrement = function(accessor)
 	end
 end
 
+-- Min/Max read the declarator's bounds off the (static) schema, so they work on
+-- the server and client alike, and even before data has loaded.
+METHOD_FACTORIES.Min = function(accessor)
+	return function(): number?
+		local schema = accessorSchema(accessor)
+		return if schema then schema.Min else nil
+	end
+end
+
+METHOD_FACTORIES.Max = function(accessor)
+	return function(): number?
+		local schema = accessorSchema(accessor)
+		return if schema then schema.Max else nil
+	end
+end
+
+-- The declarator's default, straight off the (static) schema: a fresh datatype
+-- for packed datatype fields, a deep copy for tables/buffers, the value itself
+-- for scalars. Works on server and client and before data has loaded.
+METHOD_FACTORIES.Default = function(accessor)
+	return function(): any
+		local schema = accessorSchema(accessor)
+		if schema == nil then
+			return nil
+		end
+		if schema.ValueType == "datatype" then
+			return unpackIfDatatype(schema, schema.Default)
+		end
+		return Util.deepClone(schema.Default)
+	end
+end
+
 METHOD_FACTORIES.Toggle = function(accessor)
 	return function(replicate: boolean?)
 		local tree = accessorTree(accessor)
@@ -1119,7 +1250,7 @@ METHOD_FACTORIES.Changed = function(accessor)
 				inner(unpackIfDatatype(schema, newValue), unpackIfDatatype(schema, oldValue), key)
 			end
 		end
-		return connect(tree, accessorKey(accessor), "Changed", fn)
+		return connect(tree, accessorPath(accessor), "Changed", fn)
 	end
 end
 
@@ -1128,7 +1259,7 @@ METHOD_FACTORIES.Observe = function(accessor)
 		local tree = accessorTree(accessor)
 		assertAlive(tree)
 		local schema = accessorSchema(accessor)
-		local disconnect = connect(tree, accessorKey(accessor), "Changed", function(newValue)
+		local disconnect = connect(tree, accessorPath(accessor), "Changed", function(newValue)
 			fn(unpackIfDatatype(schema, newValue))
 		end)
 		local ok, err = xpcall(function()
@@ -1234,7 +1365,7 @@ for _, event in { "OnInsert", "OnRemove", "OnKeyAdded", "OnKeyRemoved" } do
 	METHOD_FACTORIES[event] = function(accessor)
 		return function(fn: (...any) -> ())
 			local tree = accessorTree(accessor)
-			return connect(tree, accessorKey(accessor), event, fn)
+			return connect(tree, accessorPath(accessor), event, fn)
 		end
 	end
 end

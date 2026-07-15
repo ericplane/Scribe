@@ -12,6 +12,7 @@ export type MarkerKind =
 	| "Enum"
 	| "Timed"
 	| "Datatype"
+	| "Dynamic"
 	| "ServerOnly"
 	| "Shared"
 	| "Session"
@@ -22,6 +23,7 @@ export type Meta = {
 	MaxLength: number?,
 	Members: { string }?,
 	Datatype: string?, -- typeof() name for Datatype markers (e.g. "Vector3")
+	Factory: (() -> any)?, -- Dynamic markers: produces the per-new-profile default
 }
 
 local Marker = {}

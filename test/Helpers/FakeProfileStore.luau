@@ -93,7 +93,9 @@ function FakeProfileStore.new()
 			profile.Data = if persisted then Util.deepClone(persisted) else Util.deepClone(template or {})
 			profile.LastSavedData = Util.deepClone(profile.Data)
 			profile.FirstSessionTime = os.time()
-			profile.SessionLoadCount = 1
+			-- Mirror ProfileStore: a brand-new key's first session is 1; a returning
+			-- (already-persisted) profile is >1.
+			profile.SessionLoadCount = if persisted then 2 else 1
 			profile.RobloxMetaData = {}
 			profile.UserIds = {}
 			profile.KeyInfo = { Version = "live", CreatedTime = os.time() * 1000 }

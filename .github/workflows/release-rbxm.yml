@@ -34,12 +34,10 @@ jobs:
         env:
           VER: ${{ steps.ver.outputs.value }}
         run: |
-          # Copy the real dependency modules out of Wally's _Index (not the link
-          # files), excluding tests/manifests. ProfileStore is mapped as a single
-          # file so it is named "ProfileStore" (Scribe looks it up by that exact
-          # name), not "profilestore" from its own project file.
-          mkdir -p bundle/deps/Signal
-          cp Packages/_Index/sleitnick_signal@*/signal/init.luau bundle/deps/Signal/init.luau
+          # Copy the real ProfileStore module out of Wally's _Index (not the link
+          # file). It is mapped as a single file named "ProfileStore" (Scribe looks
+          # it up by that exact name), not "profilestore" from its own project file.
+          mkdir -p bundle/deps
           cp ServerPackages/_Index/lm-loleris_profilestore@*/profilestore/ProfileStore.luau bundle/deps/ProfileStore.luau
 
           # Name the root folder after the release and stamp the version into the README.

@@ -141,9 +141,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		for key, value in defaults do
 			mirror[key] = value
 		end
-		for _, op in ops do
-			tree:ApplyOp(op)
-		end
+		tree:ReplayInit(ops)
 		if not loaded then
 			loaded = true
 			loadedSignal:Fire()
@@ -687,37 +685,42 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	]=]
 	function Data.Mock(values: { [string]: any }?, scribeState: { [string]: any }?)
 		assertEditMode("Data.Mock")
-		if values then
-			for key, value in values do
-				local current = mirror[key]
-				tree.Accessor[key].Set(deepMerge(current, value))
-			end
-		end
-		if scribeState then
-			local reservedAccessor = tree.Accessor[Template.RESERVED_ROOT]
-			if scribeState.Perks then
-				for _, perk in scribeState.Perks :: { string } do
-					reservedAccessor.Perks[perk].Set(true)
+		-- Batch the whole-root Sets through ReplayFire so a nested observer
+		-- registered before Mock still fires (a plain whole-root Set fires only
+		-- the container's Changed, never its descendants').
+		tree:ReplayFire(function()
+			if values then
+				for key, value in values do
+					local current = mirror[key]
+					tree.Accessor[key].Set(deepMerge(current, value))
 				end
 			end
-			if scribeState.GiftCredits then
-				reservedAccessor.GiftCredits.Set(scribeState.GiftCredits)
-			end
-			if scribeState.PurchaseLogs then
-				local logs = scribeState.PurchaseLogs :: { [string]: any }
-				if logs.Robux then
-					reservedAccessor.PurchaseLogs.Robux.Set(logs.Robux)
+			if scribeState then
+				local reservedAccessor = tree.Accessor[Template.RESERVED_ROOT]
+				if scribeState.Perks then
+					for _, perk in scribeState.Perks :: { string } do
+						reservedAccessor.Perks[perk].Set(true)
+					end
 				end
-				if logs.InGame then
-					reservedAccessor.PurchaseLogs.InGame.Set(logs.InGame)
+				if scribeState.GiftCredits then
+					reservedAccessor.GiftCredits.Set(scribeState.GiftCredits)
+				end
+				if scribeState.PurchaseLogs then
+					local logs = scribeState.PurchaseLogs :: { [string]: any }
+					if logs.Robux then
+						reservedAccessor.PurchaseLogs.Robux.Set(logs.Robux)
+					end
+					if logs.InGame then
+						reservedAccessor.PurchaseLogs.InGame.Set(logs.InGame)
+					end
+				end
+				if scribeState.Leaderboards then
+					for name, entries in scribeState.Leaderboards :: { [string]: { any } } do
+						mockLeaderboards[name] = entries
+					end
 				end
 			end
-			if scribeState.Leaderboards then
-				for name, entries in scribeState.Leaderboards :: { [string]: { any } } do
-					mockLeaderboards[name] = entries
-				end
-			end
-		end
+		end)
 	end
 
 	--[=[

@@ -5,7 +5,6 @@
 
 	    Packages          (put this in ReplicatedStorage)
 	        Scribe
-	        Signal
 	    ServerPackages    (put this in ServerStorage)
 	        ProfileStore
 
@@ -21,9 +20,6 @@
 	    For the typed API and autocomplete, enable the new Luau type solver:
 	    select Workspace in the Explorer and set UseNewLuauTypeSolver (under
 	    Scripting) to Enabled. Scribe still runs correctly without it.
-
-	    Signal is bundled for convenience. Scribe has a built in fallback with the
-	    same surface, so it also works if you remove Signal.
 
 	    ProfileStore runs only on the server, which is why it lives in
 	    ServerPackages instead of ReplicatedStorage.

@@ -1,7 +1,7 @@
 [package]
 name = "ericplane/scribe"
 description = "Persistent, fully-typed, automatically-replicated player data for Roblox Luau, built on ProfileStore."
-version = "1.0.2"
+version = "1.0.4"
 license = "MIT"
 authors = ["ericplane"]
 registry = "https://github.com/UpliftGames/wally-index"
@@ -11,9 +11,6 @@ realm = "shared"
 
 include = ["src", "default.project.json", "wally.toml", "LICENSE", "README.md"]
 exclude = ["**"]
-
-[dependencies]
-Signal = "sleitnick/signal@2.0.3"
 
 [server-dependencies]
 ProfileStore = "lm-loleris/profilestore@1.0.3"

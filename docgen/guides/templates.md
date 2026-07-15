@@ -32,8 +32,38 @@ A plain value (`Wins = 0`, `Settings = { ... }`) is the simplest way to declare 
 | [`Scribe.String(default, { MaxLength })`](/api/Scribe#String) | Strings, optionally length-capped |
 | [`Scribe.Enum(default, members)`](/api/Scribe#Enum) | A fixed set of string values (packs to one byte) |
 | [`Scribe.Timed(default)`](/api/Scribe#Timed) | Fields that expire (boosters, buffs) |
+| [`Scribe.Dynamic(factory)`](/api/Scribe#Dynamic) | A default computed per profile (creation timestamps, seeds) |
 
 Don't conflate the three things a declarator carries: the **default value**, the **Luau type** (what your code sees), and the **runtime metadata** (validation/packing). A plain `0` gives you a number field with no bounds; `Scribe.Int(0, { Min = 0 })` gives you a non-negative integer field that clamps.
+
+## Dynamic (per-profile) defaults
+
+A template default is evaluated **once**, when the module loads. So `os.time()`, `os.date()`, or `DateTime.now()` written directly capture the *server's start time* and hand that same frozen value to every new profile:
+
+```lua
+-- WRONG: every player's CreatedUnix is the server-start time, not their own.
+CreatedUnix = os.time(),
+```
+
+`Scribe.Dynamic` fixes this: pass the **function**, and Scribe runs it per profile instead of once at load.
+
+```lua
+CreatedUnix = Scribe.Dynamic(os.time),                             -- number; pass the function itself
+JoinedAt    = Scribe.Dynamic(function() return DateTime.now() end), -- DateTime, packed for you
+```
+
+The field types as the factory's return type, so `CreatedUnix` is a `number` and `JoinedAt` a `DateTime`, with full autocomplete. Datatype results are packed correctly. It's just as handy for per-profile seeds or ids.
+
+**When the factory runs.** Scribe evaluates it the first time a profile actually *has* the field:
+
+- a **brand-new profile** (all of its `Dynamic` fields), and
+- an **existing profile that gains the field** after you add it to the template (just that one field, on its next load).
+
+It never runs when a value is already stored. The check is on the profile's actual saved value, decided before any defaults are backfilled, so a returning player's value is **always preserved and never overwritten**. Player-specific defaults (based on `player.Name`, a `UserId` lookup, and so on) don't fit a no-argument factory, so use [`OnPlayerInit`](./lifecycle) for those.
+
+:::note Late-added timestamps
+Add a creation-timestamp `Dynamic` field long after launch and existing players get it computed on their *next* load, not their true (unrecorded) creation date. That's a value choice, not data loss: everything they already had is untouched.
+:::
 
 ## Reading and writing
 
