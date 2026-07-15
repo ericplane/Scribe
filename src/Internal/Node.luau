@@ -799,10 +799,24 @@ end
 	@within Value
 	@tag Numbers
 	@param amount number
-	@param meta { Source: string? }?
+	@param meta EconomyMeta?
 	@return number
-	Number fields only. Adds `amount` and returns the new value. `meta.Source`
-	tags the change for economy analytics (auto-emits `LogEconomyEvent`).
+	Number fields only. Adds `amount` and returns the new value. Pass `false`
+	instead of `meta` to keep the write server-only.
+
+	Pass an [EconomyMeta](../economy.md) table to auto-emit an economy event
+	(`AnalyticsService:LogEconomyEvent`): the currency is this field's name, the
+	ending balance is the post-change value, and `TransactionType`, `ItemSku`,
+	and per-currency custom `Fields` come from the table. Increment defaults the
+	flow to `Source`.
+
+	```lua
+	Data[player].Coins.Increment(50, {
+	    TransactionType = Enum.AnalyticsEconomyTransactionType.Gameplay,
+	    ItemSku = "quest_daily_01",
+	    Fields = { Location = "Lobby" },
+	})
+	```
 ]=]
 
 --[=[
@@ -810,9 +824,11 @@ end
 	@within Value
 	@tag Numbers
 	@param amount number
-	@param meta { Source: string? }?
+	@param meta EconomyMeta?
 	@return number
-	Number fields only. Subtracts `amount` and returns the new value.
+	Number fields only. Subtracts `amount` and returns the new value. Like
+	[Value.Increment] but the economy flow defaults to `Sink`. See the
+	[Economy Analytics](../economy.md) guide.
 ]=]
 
 --[=[
@@ -872,6 +888,46 @@ end
 	@param value T
 	@return boolean
 	Array fields only. Whether `value` is present.
+]=]
+
+--[=[
+	@function OnInsert
+	@within Value
+	@tag Arrays & Dictionaries
+	@param callback (value: T, index: number) -> ()
+	@return () -> ()
+	Array fields only. Fires when an element is inserted, with the value and the
+	index it landed at. Returns a disconnect function.
+]=]
+
+--[=[
+	@function OnRemove
+	@within Value
+	@tag Arrays & Dictionaries
+	@param callback (value: T, index: number) -> ()
+	@return () -> ()
+	Array fields only. Fires when an element is removed, with the removed value
+	and its former index. Returns a disconnect function.
+]=]
+
+--[=[
+	@function OnKeyAdded
+	@within Value
+	@tag Arrays & Dictionaries
+	@param callback (key: K, value: T) -> ()
+	@return () -> ()
+	Dictionary fields only. Fires when a key is added, with the key and its new
+	value. Returns a disconnect function.
+]=]
+
+--[=[
+	@function OnKeyRemoved
+	@within Value
+	@tag Arrays & Dictionaries
+	@param callback (key: K, value: T) -> ()
+	@return () -> ()
+	Dictionary fields only. Fires when a key is removed, with the key and its
+	former value. Returns a disconnect function.
 ]=]
 
 --[=[

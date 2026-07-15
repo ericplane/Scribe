@@ -359,7 +359,7 @@ codecs.NumberSequence = {
 		checkLen(b, 1, "NumberSequence")
 		local count = buffer.readu8(b, 0)
 		checkLen(b, 1 + count * 12, "NumberSequence")
-		local keypoints = table.create(count)
+		local keypoints = table.create(count) :: { NumberSequenceKeypoint }
 		local offset = 1
 		for _ = 1, count do
 			table.insert(
@@ -398,7 +398,7 @@ codecs.ColorSequence = {
 		checkLen(b, 1, "ColorSequence")
 		local count = buffer.readu8(b, 0)
 		checkLen(b, 1 + count * 16, "ColorSequence")
-		local keypoints = table.create(count)
+		local keypoints = table.create(count) :: { ColorSequenceKeypoint }
 		local offset = 1
 		for _ = 1, count do
 			table.insert(

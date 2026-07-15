@@ -174,13 +174,14 @@ end
 function Util.safeCall(onError: (err: string) -> (), fn: (...any) -> ...any, ...: any): (boolean, ...any)
 	local args = table.pack(...)
 	local results: any
-	local ok, err = xpcall(function()
+	local traceback: string?
+	local ok = xpcall(function()
 		results = table.pack(fn(table.unpack(args, 1, args.n)))
 	end, function(e)
-		return debug.traceback(tostring(e), 2)
+		traceback = debug.traceback(tostring(e), 2)
 	end)
 	if not ok then
-		onError(tostring(err))
+		onError(tostring(traceback))
 		return false
 	end
 	return true, table.unpack(results, 1, results.n)

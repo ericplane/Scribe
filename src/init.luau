@@ -32,6 +32,11 @@ export type SaveInfo = Types.SaveInfo
 export type LeaderboardEntry = Types.LeaderboardEntry
 export type PassConfig = Types.PassConfig
 export type PurchaseFilter = Types.PurchaseFilter
+export type EconomyMeta = Types.EconomyMeta
+export type EconomyConfig = Types.EconomyConfig
+export type EconomyCurrencyConfig = Types.EconomyCurrencyConfig
+export type EconomyFieldSpec = Types.EconomyFieldSpec
+export type EconomyLogFn = Types.EconomyLogFn
 -- LeaderboardConfig<T>, ProductConfig<T>, and PurchaseSpec<T> are defined
 -- after the type functions below; they derive Stat/Cost paths and the Grant
 -- accessor type from the template.
@@ -508,6 +513,23 @@ type ProductConfigLoose = {
 	read Grants: string?,
 }
 
+-- Economy is loose for the same reason: inside the Scribe({ ... }) literal a
+-- Resolve lambda's parameter would generalize and a strict `(Player) -> {…}`
+-- field would reject it. Callers wanting strict checking annotate a config
+-- local with the exported `Scribe.EconomyConfig` instead.
+type EconomyCurrencyConfigLoose = {
+	read Label: string?,
+	read Fields: { Types.EconomyFieldSpec }?,
+	read Resolve: ((player: any) -> { [string]: any })?,
+}
+
+type EconomyConfigLoose = {
+	read Resolve: ((player: any) -> { [string]: any })?,
+	read Prefix: boolean?,
+	read Currencies: { read [string]: EconomyCurrencyConfigLoose }?,
+	read LogEconomyEvent: Types.EconomyLogFn?,
+}
+
 export type ScribeOptions<T> = {
 	Template: T,
 	Transport: (Types.ScribeTransport | "Default")?,
@@ -551,6 +573,9 @@ export type ScribeOptions<T> = {
 	GiftIntentTTL: number?,
 	AllowDuplicateGifts: boolean?,
 	NoGiftIntentPolicy: ("GrantOrCredit" | "Hold")?,
+
+	-- economy analytics
+	Economy: EconomyConfigLoose?,
 
 	-- behaviour / limits
 	CommandRateLimit: number?,
@@ -601,6 +626,7 @@ export type Bundle<T> = {
 	.Products { [string]: ProductConfig }? -- developer products (receipts, grants, gifting)
 	.Passes { [string]: PassConfig }? -- game passes
 	.Perks { string }? -- perk keys grantable via GrantPerk / gifting
+	.Economy EconomyConfig? -- per-currency economy analytics (LogEconomyEvent custom fields)
 	.LoadFailurePolicy ("Kick" | "Wait")? -- on load failure (default "Kick")
 	.VersionAheadPolicy ("Kick" | "Allow")? -- data from a newer deploy (default "Kick", fail closed)
 	.BoundsPolicy ("Clamp" | "Reject")? -- out-of-range numeric writes (default "Clamp")
@@ -648,6 +674,7 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	GiftIntentTTL = true,
 	AllowDuplicateGifts = true,
 	NoGiftIntentPolicy = true,
+	Economy = true,
 	CommandRateLimit = true,
 	RequestTimeout = true,
 	MaxInboundBytes = true,
@@ -1060,7 +1087,7 @@ end
 	module directly (`Scribe(options)`) is sugar for this. Require the same
 	shared module on both the server and the client and use the matching half.
 ]=]
-Scribe.New = buildBundle
+Scribe.new = buildBundle
 
 -- The metatable is attached through a cast so it stays invisible to the type
 -- system; the callable type is declared explicitly below instead (the new

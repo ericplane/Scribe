@@ -200,7 +200,7 @@ function Log.GetRecent(filter: LogFilter?): { LogEntry }
 		end
 	end
 	if filter and filter.Limit and #out > filter.Limit then
-		local trimmed = table.create(filter.Limit)
+		local trimmed = table.create(filter.Limit) :: { LogEntry }
 		for i = #out - filter.Limit + 1, #out do
 			table.insert(trimmed, out[i])
 		end

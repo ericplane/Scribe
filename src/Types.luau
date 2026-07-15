@@ -40,7 +40,7 @@ export type LogCode =
 	-- Persistence
 	"DATASTORE_CRITICAL" | "DATASTORE_RECOVERED" | "EXPORT_ENCODE_FAIL" | "MIGRATED" | "MIGRATION_FAIL" | "OFFLINE_READ_FAIL" | "PROFILE_ERASED" | "PROFILE_LOADED" | "PROFILE_LOAD_FAIL" | "PROFILE_RESET" | "PROFILE_RESTORED" | "PROFILE_SIZE" | "PROFILE_STORE_ERROR" | "PROFILE_STORE_SIGNAL_MISSING" | "PROFILE_VERSION_AHEAD" | "SAVE_INTERVAL_CLAMPED" | "SAVE_INTERVAL_FAIL" | "SAVE_INTERVAL_SET" | "SHUTDOWN_DONE" | "SHUTDOWN_FLUSH" | "SIM_LOAD_FAILURE" | "SIM_SESSION_STEAL" | "STATUS_CHANGED" | "UNKNOWN_ROOT_KEYS" | "VERSION_QUERY_FAIL" | "VERSION_READ_FAIL"
 	-- Integrity
-	| "ANALYTICS_FAIL" | "ANOMALY" | "TIMED_SWEEP_FAIL" | "WIPE_GUARD_BLOCKED" | "WIPE_GUARD_CLEARED" | "WIPE_GUARD_FORCED" | "WIPE_GUARD_TRIPPED"
+	| "ANALYTICS_FAIL" | "ANOMALY" | "ECONOMY_FIELDS_OVERFLOW" | "ECONOMY_FIELD_UNDECLARED" | "TIMED_SWEEP_FAIL" | "WIPE_GUARD_BLOCKED" | "WIPE_GUARD_CLEARED" | "WIPE_GUARD_FORCED" | "WIPE_GUARD_TRIPPED"
 	-- Replication
 	| "CLIENT_HANDSHAKE_TIMEOUT" | "INIT_APPLIED" | "INIT_SENT" | "OP_BEFORE_INIT" | "SCHEMA_MISMATCH" | "SERIALIZE_FAIL" | "SNAPSHOT_ROOT_DROPPED"
 	-- Transport
@@ -117,6 +117,51 @@ export type PurchaseFilter = {
 	ItemId: string?,
 	Since: number?,
 	Limit: number?,
+}
+
+-- Economy analytics -----------------------------------------------------------
+
+-- The tag passed to Increment/Decrement to auto-emit LogEconomyEvent. All
+-- fields are optional: an untagged Increment writes the value without emitting.
+export type EconomyMeta = {
+	Flow: ("Source" | "Sink")?, -- default: Increment -> Source, Decrement -> Sink
+	TransactionType: (Enum.AnalyticsEconomyTransactionType | string)?, -- default "Gameplay"; an EnumItem's .Name is used
+	ItemSku: string?,
+	Currency: string?, -- override the logged currency label (default: the field's name)
+	Fields: { [string]: any }?, -- per-event custom-field values, keyed by declared field name
+	-- Accepted aliases for the pre-1.1 tag shape.
+	Source: string?, -- alias of TransactionType
+	Item: string?, -- alias of ItemSku
+}
+
+-- One declared custom-field slot: a plain name (uses the currency/global Prefix
+-- default) or a name with its own Prefix override.
+export type EconomyFieldSpec = string | { Name: string, Prefix: boolean? }
+
+export type EconomyCurrencyConfig = {
+	Label: string?, -- logged currency name (default: the field's name)
+	Fields: { EconomyFieldSpec }?, -- up to 3 dimensions -> CustomField01/02/03, in order
+	Resolve: ((player: Player) -> { [string]: any })?, -- ambient values for THIS currency, merged over the global Resolve
+}
+
+-- The seam Analytics.Economy calls; defaults to AnalyticsService:LogEconomyEvent.
+-- Override it (e.g. in tests) to capture emitted events.
+export type EconomyLogFn = (
+	player: Player,
+	flowType: Enum.AnalyticsEconomyFlowType,
+	currencyType: string,
+	amount: number,
+	endingBalance: number,
+	transactionType: string,
+	itemSku: string?,
+	customFields: { [string]: any }?
+) -> ()
+
+export type EconomyConfig = {
+	Resolve: ((player: Player) -> { [string]: any })?, -- ambient values shared across every currency
+	Prefix: boolean?, -- format custom-field values as "Team - Red" (default true)
+	Currencies: { [string]: EconomyCurrencyConfig }?,
+	LogEconomyEvent: EconomyLogFn?, -- advanced/test seam; defaults to AnalyticsService:LogEconomyEvent
 }
 
 export type Disconnect = () -> ()

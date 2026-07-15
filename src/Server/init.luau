@@ -628,7 +628,14 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		end,
 	})
 
-	-- Untyped escape hatch: same object, any-typed.
+	--[=[
+		@within Server
+		@tag Escape hatch
+		@server
+		@prop Raw Server
+		The same `Data` object without the typed accessor tree: the untyped escape
+		hatch if the type solver ever trips on your template.
+	]=]
 	Data.Raw = Data
 
 	Metrics.Set("SchemaNodes", compiled.NodeCount)

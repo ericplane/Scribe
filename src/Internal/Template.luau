@@ -388,7 +388,7 @@ function Template.ChildSchema(node: SchemaNode, key: string | number): SchemaNod
 	end
 	local anyChild = node.AnyChild
 	if not anyChild then
-		anyChild = {
+		local created: SchemaNode = {
 			Id = nil,
 			Name = nil,
 			Path = node.Path,
@@ -399,7 +399,8 @@ function Template.ChildSchema(node: SchemaNode, key: string | number): SchemaNod
 			Default = nil,
 			Parent = node,
 		}
-		node.AnyChild = anyChild
+		node.AnyChild = created
+		anyChild = created
 	end
 	return anyChild
 end

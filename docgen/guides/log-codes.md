@@ -74,7 +74,9 @@ The `Context` table carries structured fields that vary by code (the player, a d
 | `WIPE_GUARD_BLOCKED` | Warn  | Fires when the wipe-guard tripped and WipeGuardPolicy is 'Block', so the pending save is held and the last known-good snapshot is persisted instead of the suspicious live data.                                                                                    |
 | `WIPE_GUARD_FORCED`  | Warn  | Fires when a save the wipe-guard had blocked is forcibly flushed through (e.g., Data.Flush with Force=true), pushing live data to storage and overriding the guard's protection.                                                                                    |
 | `WIPE_GUARD_CLEARED` | Info  | Fires when a profile that the wipe-guard had previously blocked passes the check again, so its live data resumes saving normally; this is a routine recovery confirmation.                                                                                          |
-| `ANALYTICS_FAIL`     | Debug | Fires when AnalyticsService:LogEconomyEvent throws while recording an economy transaction, meaning economy events are silently failing to reach the analytics dashboards; an isolated failure is noise, but a sustained stream signals a broken analytics pipeline. |
+| `ANALYTICS_FAIL`     | Debug | Fires when AnalyticsService:LogEconomyEvent (or a custom-field Resolve) throws while recording an economy transaction, meaning economy events are silently failing to reach the analytics dashboards; an isolated failure is noise, but a sustained stream signals a broken analytics pipeline. |
+| `ECONOMY_FIELD_UNDECLARED` | Warn | In DevMode, a tagged Increment/Decrement passed a per-call custom `Fields` name that the currency did not declare in its `Economy` config, so it is not recorded; usually a typo in the field name. |
+| `ECONOMY_FIELDS_OVERFLOW`  | Warn | In DevMode, a currency's `Economy` config declares more than the three custom-field slots Roblox allows, so the fields past the third are dropped; trim the declared list to three. |
 
 ## Replication
 

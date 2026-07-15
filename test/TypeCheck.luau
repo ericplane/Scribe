@@ -58,6 +58,22 @@ local bundle = Scribe({
 	Leaderboards = boards,
 	Products = products,
 	Passes = { VIP = { Id = 333 } },
+	Economy = {
+		Prefix = true,
+		Resolve = function(player)
+			return { Team = player.Name }
+		end,
+		Currencies = {
+			Coins = {
+				Label = "Gold",
+				Fields = { "Location", { Name = "Team", Prefix = false } },
+				Resolve = function(_p)
+					return { Location = "Lobby" }
+				end,
+			},
+			Gems = { Fields = { "Zone" } },
+		},
+	},
 })
 
 local Data = bundle.Server
@@ -65,6 +81,13 @@ local Data = bundle.Server
 local function serverUsage(player: Player)
 	local data = Data[player]
 	local coins: number = data.Coins.Increment(50)
+	-- Economy-tagged mutation: the meta table annotates against Scribe.EconomyMeta.
+	local meta: Scribe.EconomyMeta = {
+		TransactionType = Enum.AnalyticsEconomyTransactionType.Shop,
+		ItemSku = "hat_cowboy",
+		Fields = { Location = "Lobby" },
+	}
+	data.Gems.Decrement(10, meta)
 	data.Settings.Music.Set(false)
 	local dmg: number = data.Inventory.Sword_001.Dmg.Get()
 	data.QuestProgress.Insert(3)
@@ -170,4 +193,30 @@ local function typedApis(player: Player)
 	return purchases, lastResult, metrics, sent
 end
 
-return { serverUsage = serverUsage, clientUsage = clientUsage, diagnosticsUsage = diagnosticsUsage, typedApis = typedApis }
+-- The exported strict config type: annotate a local (outside the Scribe literal)
+-- to get Resolve's `player` typed as Player and the field names checked.
+local function economyUsage(): Scribe.EconomyConfig
+	return {
+		Prefix = true,
+		Resolve = function(player)
+			return { Team = if player.Team then player.Team.Name else "None" }
+		end,
+		Currencies = {
+			Coins = { Label = "Gold", Fields = { "Location", { Name = "Team", Prefix = false } } },
+			Gems = {
+				Fields = { "Zone" },
+				Resolve = function(_p)
+					return { Zone = "Arena" }
+				end,
+			},
+		},
+	}
+end
+
+return {
+	serverUsage = serverUsage,
+	clientUsage = clientUsage,
+	diagnosticsUsage = diagnosticsUsage,
+	typedApis = typedApis,
+	economyUsage = economyUsage,
+}
