@@ -58,6 +58,31 @@ return function()
 		harness.Cleanup()
 	end)
 
+	it("compiles and seeds a Dynamic nested inside containers (datatype result)", function()
+		-- Regression: a Scribe.Dynamic nested in a plain container used to crash
+		-- Template.Compile ("unsupported value type function") because
+		-- checkDefaultValue walked the raw container into the marker's
+		-- Meta.Factory before the marker was stripped.
+		local harness = TestCtx.make({
+			Template = {
+				Files = {
+					Latest = {
+						LandingDate = Scribe.Dynamic(function()
+							return DateTime.now()
+						end),
+						Fpm = Scribe.Int(0),
+					},
+				},
+			},
+		})
+		local _p, entry, data = harness.Join(558)
+		local landed = data.Files.Latest.LandingDate.Get()
+		expect(typeof(landed)).to.equal("DateTime") -- seeded and unpacked
+		-- Stored in packed (buffer) form, like any datatype leaf.
+		expect(type(entry.LiveData.Files.Latest.LandingDate)).to.equal("buffer")
+		harness.Cleanup()
+	end)
+
 	it("survives a throwing factory, keeping the baseline and logging", function()
 		local boom = false
 		local harness = TestCtx.make({

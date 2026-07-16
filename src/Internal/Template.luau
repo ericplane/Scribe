@@ -160,7 +160,16 @@ local function buildNode(
 		value = Datatypes.Pack(datatypeName :: string, value)
 	end
 
-	checkDefaultValue(path, value)
+	-- checkDefaultValue validates raw persistable leaf data. Run it for leaves
+	-- and for array-like default blobs (whose elements are stored as data, not
+	-- recursed as schema). A named container's children are each validated when
+	-- buildNode recurses into them below; here `value` still holds their
+	-- un-stripped markers (a datatype marker's Default is a raw datatype, a
+	-- Dynamic marker's Meta holds a factory function), so walking the whole
+	-- container would wrongly reject valid nested declarators.
+	if type(value) ~= "table" or Util.hasNumericKeys(value) then
+		checkDefaultValue(path, value)
+	end
 
 	local node: SchemaNode = {
 		Id = state.NextId,

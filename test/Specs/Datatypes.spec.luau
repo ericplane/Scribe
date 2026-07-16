@@ -158,5 +158,31 @@ return function()
 				TestCtx.make({ Template = { Bad = Scribe.Vector3(5 :: any) } })
 			end).to.throw()
 		end)
+
+		-- Regression: a datatype declarator nested inside a plain container used
+		-- to crash Template.Compile (checkDefaultValue walked the raw container
+		-- and rejected the marker's raw datatype Default before it was stripped).
+		it("compiles and round-trips a datatype nested inside containers", function()
+			local template = TestCtx.defaultTemplate()
+			template.Settings = {
+				Home = {
+					Spawn = Scribe.Vector3(Vector3.new(1, 2, 3)),
+				},
+			}
+			local harness = TestCtx.make({ Template = template })
+			local player, entry, data = harness.Join(6300)
+
+			local spawn = data.Settings.Home.Spawn.Get()
+			expect(typeof(spawn)).to.equal("Vector3")
+			expect(spawn.X).to.equal(1)
+			expect(spawn.Z).to.equal(3)
+			-- Stored packed, like a top-level datatype.
+			expect(type(entry.LiveData.Settings.Home.Spawn)).to.equal("buffer")
+
+			data.Settings.Home.Spawn.Set(Vector3.new(4, 5, 6))
+			expect(data.Settings.Home.Spawn.Get().Y).to.equal(5)
+
+			harness.Cleanup()
+		end)
 	end)
 end
