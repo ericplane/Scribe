@@ -123,6 +123,37 @@ return function()
 		harness.Cleanup()
 	end)
 
+	itRunning("fires Observe/Changed for a dynamic key created purely via post-Init diffs", function()
+		-- roffcat's scenario, but with the writes happening AFTER the client is
+		-- synced: a dynamic dict key that does NOT exist at Init time and is later
+		-- created and updated via separate diffs must fire the child observer for
+		-- every value (nil -> 5 -> 10), not just the last.
+		local harness, _player, entry, serverData, clientData = makeLoopback()
+
+		local seen, changes = {}, {}
+		clientData.Inventory.Test.Observe(function(v)
+			table.insert(seen, if v == nil then "NIL" else v)
+		end)
+		clientData.Inventory.Test.Changed(function(new, old)
+			table.insert(changes, `{tostring(old)}->{tostring(new)}`)
+		end)
+
+		serverData.Inventory.Test.Set(5) -- key creation, its own flush/diff
+		harness.Ctx.Replication.FlushEntry(entry)
+		harness.Transport:PumpToClient()
+		serverData.Inventory.Test.Set(10) -- value change, a separate flush/diff
+		harness.Ctx.Replication.FlushEntry(entry)
+		harness.Transport:PumpToClient()
+
+		expect(seen[1]).to.equal("NIL") -- Observe's immediate call (absent key)
+		expect(seen[2]).to.equal(5)
+		expect(seen[3]).to.equal(10)
+		expect(changes[1]).to.equal("nil->5")
+		expect(changes[2]).to.equal("5->10")
+
+		harness.Cleanup()
+	end)
+
 	itRunning("Mock fires nested observers registered before the Mock call (edit mode)", function()
 		-- Same whole-root-Set root cause as Init, on the edit-mode path.
 		local harness = TestCtx.make()

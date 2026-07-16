@@ -46,6 +46,15 @@ end)
 
 Scribe derives an identical schema on the server and client from the shared template, then streams **schema-compressed batched diffs** over a pluggable transport. Writes coalesce per frame (a `PostSimulation` flush) and only send when something actually changes. There is no idle traffic. The client applies diffs to a local mirror, so reads are instant and `Observe`/`Changed` fire locally.
 
+:::note The client converges to the current value, not an event log
+When a client finishes its handshake it receives a **snapshot** of the current data, then live diffs from that point on. It never replays writes that happened before it synced, so it is not a log of every value the server ever set.
+
+- A value the server sets and then overwrites before the client syncs is not delivered on its own. Set a field to `5` then `10` while the client is still handshaking, and the client's first value is `10`, never `5`. `Observe` fires once with the synced value, then again on each later change.
+- `Data.WaitForData(player)` on the **server** waits for that player's profile to load server-side, not for the client's handshake to finish. Writes made right after it returns can reach the client only as their final value. To act on a client being ready to receive, drive it from the client (a first `Observe` fire, or a [`Data.Request`](/api/Client#Request) the client sends once loaded).
+
+The client always ends at the correct current value. To have it observe a *sequence* of values, produce those changes after the client is synced and space them across frames, since same-frame writes to one field coalesce to the latest. For UI, read the value passed to `Observe` rather than counting individual fires.
+:::
+
 You never wire up RemoteEvents. The `"Default"` transport uses two RemoteEvents under a folder in `ReplicatedStorage` and is all most games ever need. If you already run your own networking layer, you can route Scribe's traffic through it. See [Custom Transports](./transports).
 
 :::caution Client writes are optimistic
