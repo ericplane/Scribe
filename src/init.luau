@@ -730,6 +730,24 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 	-- mutation of the shared template throws at the call site.
 	Util.deepFreeze(anyOptions.Template)
 
+	-- Sandbox guard: a Sandboxed script cannot fire a non-Sandboxed event, so a
+	-- Sandboxed Scribe silently fails to send its replication frames (the client
+	-- never handshakes, the server never delivers) and data never syncs. Detect
+	-- it up front and say exactly how to fix it. This usually happens when Scribe
+	-- is inserted from a model/toolbox rather than synced from source.
+	local sandboxOk, sandboxed = pcall(function()
+		return (script :: any).Sandboxed
+	end)
+	if sandboxOk and sandboxed == true then
+		Log.Warn(
+			"Lifecycle",
+			"SANDBOXED",
+			"the Scribe package is Sandboxed, so it cannot fire its replication RemoteEvents and nothing will sync. "
+				.. "Set Sandboxed = false on the Scribe package (and ProfileStore).",
+			{}
+		)
+	end
+
 	local bundle: any
 	if RunService:IsServer() then
 		local Server = require(script.Server) :: any

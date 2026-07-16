@@ -120,6 +120,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 
 	-- Frame handling ------------------------------------------------------------------
 
+	local helloSendFailLogged = false
 	local function sendHello()
 		if not transport then
 			return
@@ -128,9 +129,17 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Wire.U8(w, Wire.Frames.Hello)
 		Wire.U32(w, compiled.Hash % 4294967296)
 		Wire.U8(w, Wire.PROTOCOL_VERSION)
-		pcall(function()
+		local ok, err = pcall(function()
 			transport:SendToServer(Wire.Finish(w))
 		end)
+		-- A dropped Hello leaves the client stuck at defaults (the server logs
+		-- CLIENT_HANDSHAKE_TIMEOUT), so surface the underlying send error once
+		-- instead of retrying it silently forever. A Sandboxed Scribe fails here
+		-- ("cannot fire ... the calling thread is sandboxed").
+		if not ok and not helloSendFailLogged then
+			helloSendFailLogged = true
+			Log.Warn("Transport", "SEND_FAIL", `client could not send its Hello handshake: {tostring(err)}`, {})
+		end
 	end
 
 	local function applyInit(reader: Wire.Reader)

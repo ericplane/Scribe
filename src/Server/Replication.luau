@@ -370,7 +370,7 @@ function Replication.new(ctx: any)
 		end
 		task.delay(HANDSHAKE_TIMEOUT, function()
 			if not entry.TornDown and not entry.HandshakeReady then
-				Log.Warn("Replication", "CLIENT_HANDSHAKE_TIMEOUT", "client never sent Hello — check custom transport adapters", {
+				Log.Warn("Replication", "CLIENT_HANDSHAKE_TIMEOUT", "client never sent Hello, so replication never started; require the Scribe bundle on the client (a LocalScript), or check a custom client transport adapter", {
 					Player = entry.Player,
 				})
 			end

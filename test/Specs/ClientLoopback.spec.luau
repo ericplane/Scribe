@@ -313,6 +313,38 @@ return function()
 		harness.Cleanup()
 	end)
 
+	itRunning("surfaces SEND_FAIL when the client cannot send its Hello (e.g. a Sandboxed Scribe)", function()
+		-- Roblox blocks a sandboxed thread from firing a non-sandboxed RemoteEvent,
+		-- so a Sandboxed Scribe silently fails to send its Hello and looks like a
+		-- mysterious handshake timeout. The send failure must be logged (once),
+		-- not swallowed and retried forever.
+		local Scribe = require(ScribeRoot) :: any
+		local harness = TestCtx.make({ AutoPump = false })
+		local blocked = {
+			Name = "Blocked",
+			SendToServer = function()
+				error("cannot fire 'Up': the calling thread is sandboxed")
+			end,
+			ListenClient = function() end,
+			-- Present so Transport.Resolve's adapter validation passes; the client
+			-- path only ever calls SendToServer/ListenClient.
+			SendToClient = function() end,
+			ListenServer = function() end,
+		}
+		local opts = {}
+		for k, v in harness.Options do
+			opts[k] = v
+		end
+		opts.Transport = blocked
+		Client.new(opts, harness.Compiled)
+		-- Let the connect coroutine run sendHello.
+		for _ = 1, 6 do
+			task.wait()
+		end
+		expect(#Scribe.GetRecentLogs({ Code = "SEND_FAIL", Limit = 5 }) > 0).to.equal(true)
+		harness.Cleanup()
+	end)
+
 	itRunning("round-trips commands with validation and rate limiting", function()
 		local harness, player, _, serverData, clientData = makeLoopback({ CommandRateLimit = 1000 })
 
