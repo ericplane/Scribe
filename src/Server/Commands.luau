@@ -55,7 +55,10 @@ function Commands.new(ctx: any)
 		Wire.U8(w, Wire.Frames.CommandReply)
 		Wire.U32(w, correlation)
 		Wire.U8(w, if ok then 1 else 0)
-		local n = math.min(#results, MAX_RETURNS)
+		-- results.n (from table.pack) is the true count and survives an embedded
+		-- nil that `#` would stop short at; fall back to `#` for the plain-array
+		-- caller above, which has no holes.
+		local n = math.min((results :: any).n or #results, MAX_RETURNS)
 		Wire.U8(w, n)
 		for i = 1, n do
 			Wire.EncodeGeneric(w, results[i])

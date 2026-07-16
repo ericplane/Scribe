@@ -925,19 +925,30 @@ end
 	@function Dynamic
 	@param factory () -> T
 	@return T
-	Declares a field whose default is produced by `factory` **the first time a
-	profile is created**, instead of once at module load. Use it for values that
-	must be evaluated per profile rather than frozen at server start, like a
-	creation timestamp:
+	Declares a field whose default is produced by `factory` **per profile** rather
+	than frozen once at server start. Use it for values that must be evaluated for
+	each profile, like a creation timestamp:
 
 	```lua
 	CREATION_UNIX = Scribe.Dynamic(os.time),
 	JOINED_AT     = Scribe.Dynamic(function() return DateTime.now() end), -- datatype, packed for you
 	```
 
-	Returning players keep their stored value; only brand-new profiles run the
-	factory. The field types as the factory's return type. Player-specific
-	defaults (e.g. based on `player.Name`) still belong in `OnPlayerInit`.
+	Returning players keep their stored value; the factory only runs to seed the
+	field on a brand-new profile (or one that gains the field after you add it to
+	the template later). The field types as the factory's return type.
+
+	**The factory must be pure.** It is also called once at declaration time (while
+	your template module loads) to sample its return type, so it must be
+	side-effect-free and must neither yield nor error; keep it to plain producers
+	like `os.time` / `DateTime.now`. Anything that reserves an id, reads a store, or
+	has other side effects would fire that effect at module load with no profile
+	attached. Player-specific defaults (based on `player.Name`, a lookup, and so on)
+	belong in `OnPlayerInit`.
+
+	`Scribe.Dynamic` cannot sit inside a `Scribe.Session` root (a startup error):
+	Session data is rebuilt from its default every session, so a one-time seed has
+	nowhere to live. Use `OnPlayerInit` for per-session values.
 ]=]
 -- `(...any) -> T` (not `() -> T`) so standard-library functions with optional
 -- params typecheck when passed directly, e.g. `Scribe.Dynamic(os.time)`.

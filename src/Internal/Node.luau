@@ -64,7 +64,7 @@ export type Tree = typeof(setmetatable(
 		_replaying: boolean,
 		_accessors: { [string]: any },
 		_batchDepth: number,
-		_txn: { Snapshots: { [string]: { Path: { string | number }, Value: any } }, Ops: { { Op: Op, Schema: SchemaNode? } }, Created: { { string | number } } }?,
+		_txn: { Snapshots: { [string]: { Path: { string | number }, Value: any } }, Ops: { { Op: Op, Schema: SchemaNode? } }, Created: { { string | number } }, RawRestores: { [string]: { Store: { [string]: any }, Value: any } } }?,
 	},
 	Tree
 ))
@@ -75,7 +75,13 @@ local function newAccessor(tree: Tree, path: { string | number }, schema: Schema
 	rawset(accessor, "_path", path)
 	rawset(accessor, "_key", Util.pathKey(path))
 	rawset(accessor, "_schema", schema)
-	rawset(accessor, "_children", {})
+	-- Weak VALUES: child accessors are lazily materialized on index and cached
+	-- here, but they carry no state (listeners live on the tree, keyed by pathKey,
+	-- not by accessor identity), so once nothing else holds a child it may be
+	-- collected and its entry drops. This prevents an unbounded, session-long leak
+	-- when a dictionary is indexed by high-cardinality transient keys (GUIDs,
+	-- per-trade ids); a re-index simply rebuilds an equivalent accessor.
+	rawset(accessor, "_children", setmetatable({}, { __mode = "v" }))
 	return accessor
 end
 
@@ -211,7 +217,22 @@ local function fire(tree: Tree, pathKey: string, event: string, ...: any)
 		return
 	end
 	local args = table.pack(...)
-	for _, fn in list do
+	-- Snapshot the listeners before dispatch: a callback may connect() into (or
+	-- disconnect from) this same live table, and inserting during generalized
+	-- iteration is undefined in Luau (empirically double-fires or skips entries).
+	-- Semantics match GoodSignal: a listener connected during the fire does NOT
+	-- receive the in-flight event; one disconnected mid-fire is not called after.
+	local tokens = {}
+	local fns = {}
+	for token, fn in list do
+		tokens[#tokens + 1] = token
+		fns[#fns + 1] = fn
+	end
+	for i = 1, #fns do
+		if list[tokens[i]] == nil then
+			continue -- disconnected by an earlier listener during this fire
+		end
+		local fn = fns[i]
 		local ok, err = xpcall(function()
 			fn(table.unpack(args, 1, args.n))
 		end, function(e)
@@ -454,6 +475,22 @@ local function setNested(root: { [any]: any }, relPath: { string | number }, val
 	container[relPath[#relPath]] = value
 end
 
+-- Remove `relPath` from `root` WITHOUT creating any intermediate tables (unlike
+-- setNested): if an ancestor along the way is already absent, there is nothing to
+-- remove. Used to strip txn-materialized descendant containers out of a rollback
+-- reconstruction so no phantom empty sub-table survives.
+local function removeNested(root: { [any]: any }, relPath: { string | number })
+	local container = root
+	for i = 1, #relPath - 1 do
+		local nextContainer = container[relPath[i]]
+		if type(nextContainer) ~= "table" then
+			return
+		end
+		container = nextContainer
+	end
+	container[relPath[#relPath]] = nil
+end
+
 -- Records the pre-transaction value of `path`, keeping snapshots DISJOINT so
 -- rollback order is irrelevant. If an ancestor is already snapshotted, this
 -- subtree is covered. If descendants were snapshotted earlier, this path's true
@@ -471,6 +508,10 @@ local function snapshotForTxn(tree: Tree, path: { string | number }, pathKey: st
 		end
 	end
 	local value = Util.deepClone(oldValue)
+	-- Track which descendant snapshots get overlaid: each one is the AUTHORITATIVE
+	-- pre-txn state at its path (first-write-wins), which the Created-strip below
+	-- must not undo.
+	local overlaid: { { string | number } }? = nil
 	for descKey, snap in txn.Snapshots do
 		if pathIsStrictAncestor(path, snap.Path) then
 			if type(value) ~= "table" then
@@ -478,7 +519,71 @@ local function snapshotForTxn(tree: Tree, path: { string | number }, pathKey: st
 			end
 			local relPath = table.move(snap.Path, #path + 1, #snap.Path, 1, table.create(#snap.Path - #path))
 			setNested(value, relPath, snap.Value)
+			overlaid = overlaid or {}
+			table.insert(overlaid :: { { string | number } }, snap.Path)
 			txn.Snapshots[descKey] = nil
+		end
+	end
+	-- Reconcile the reconstruction with containers materialized during this txn
+	-- (txn.Created), so a rollback cannot resurrect them as phantom empty tables
+	-- (which coveredBySnapshot would then shield from the Created-prune). Two cases:
+	-- the snapshotted container ITSELF was created (its pre-txn value is nil), or a
+	-- STRICT DESCENDANT container was created (strip it out of the reconstruction).
+	-- CAVEAT on the strip: txn.Created records containers materialized MID-txn, which
+	-- includes a PRE-EXISTING container deleted then recreated within this txn. Its
+	-- deletion recorded a snapshot whose overlay above just re-established the genuine
+	-- pre-txn subtree -- stripping that would destroy committed data on rollback. So
+	-- only strip a created path when NO overlaid snapshot sits at or above it (an
+	-- overlay strictly BELOW it only materialized intermediates, not the container).
+	local function establishedByOverlay(createdPath: { string | number }): boolean
+		if not overlaid then
+			return false
+		end
+		for _, snapPath in overlaid :: { { string | number } } do
+			if #snapPath <= #createdPath then
+				local isPrefix = true
+				for i = 1, #snapPath do
+					if snapPath[i] ~= createdPath[i] then
+						isPrefix = false
+						break
+					end
+				end
+				if isPrefix then
+					return true
+				end
+			end
+		end
+		return false
+	end
+	if value ~= nil then
+		local pathCreated = false
+		for _, createdPath in txn.Created do
+			if #createdPath == #path then
+				local same = true
+				for i = 1, #path do
+					if createdPath[i] ~= path[i] then
+						same = false
+						break
+					end
+				end
+				if same then
+					pathCreated = true
+					break
+				end
+			end
+		end
+		if pathCreated then
+			value = nil
+		elseif type(value) == "table" then
+			for _, createdPath in txn.Created do
+				if pathIsStrictAncestor(path, createdPath) and not establishedByOverlay(createdPath) then
+					local relPath: { string | number } = {}
+					for i = #path + 1, #createdPath do
+						relPath[#relPath + 1] = createdPath[i]
+					end
+					removeNested(value, relPath)
+				end
+			end
 		end
 	end
 	txn.Snapshots[pathKey] = { Path = table.clone(path), Value = value }
@@ -492,7 +597,13 @@ local function applySet(tree: Tree, path: { string | number }, schema: SchemaNod
 		newValue = Util.deepClone(newValue)
 	end
 
-	local container, key = resolveContainer(tree, path, newValue ~= nil)
+	-- A REMOTE nil-Set must materialize missing parents: the server only emits a
+	-- removal when the parent chain existed at emission (a local nil-Set under a
+	-- missing parent never emits), so if this mirror lacks the parents, the op that
+	-- created them was coalesced away in the same flush and the server still holds
+	-- them as (possibly empty) containers. Creating them here keeps existence and
+	-- Count() parity. Local writes keep the no-op semantics.
+	local container, key = resolveContainer(tree, path, newValue ~= nil or opts.FromRemote == true)
 	if container == nil then
 		if newValue == nil then
 			return nil -- removing under a missing parent is a no-op
@@ -552,7 +663,11 @@ local function applyInsert(tree: Tree, path: { string | number }, schema: Schema
 	-- Validate the item BEFORE creating any container, so a rejected item can
 	-- never leave a phantom container behind.
 	local elementSchema = if schema then Template.ChildSchema(schema, 1) else nil
-	local value = if opts.NoValidate then Util.deepClone(item) else validateWrite(tree, elementSchema, path, item)
+	-- Pass depth = #path: an inserted element sits one level BELOW the array's own
+	-- path, so the default (#path - 1) under-budgets its nesting by one and would
+	-- admit an element the Init-snapshot re-encode (wire depth cap == MAX_VALUE_DEPTH)
+	-- cannot serialize, dropping the whole root from that client's snapshot.
+	local value = if opts.NoValidate then Util.deepClone(item) else validateWrite(tree, elementSchema, path, item, #path)
 
 	local pathKey = Util.pathKey(path)
 	-- Snapshot the pre-creation value (nil if the array does not yet exist) so a
@@ -591,10 +706,18 @@ local function applyArrayRemove(tree: Tree, path: { string | number }, schema: S
 end
 
 local function applyClear(tree: Tree, path: { string | number }, schema: SchemaNode?, opts: WriteOpts)
-	local container, key = resolveContainer(tree, path, false)
+	local container, key = resolveContainer(tree, path, opts.FromRemote == true)
 	local value = if container then container[key] else nil
 	if type(value) ~= "table" then
-		return
+		if not (opts.FromRemote and container) then
+			return
+		end
+		-- A remote Clear implies the container existed (as a table) server-side at
+		-- emission -- a local Clear on a missing container never emits. If the op
+		-- that created it was coalesced away in this flush, materialize it as {} so
+		-- existence/Count() parity with the server holds.
+		value = {}
+		container[key] = value
 	end
 	local pathKey = Util.pathKey(path)
 	snapshotForTxn(tree, path, pathKey, value)
@@ -698,12 +821,26 @@ function Tree.RunBatch(self: Tree, fn: () -> ())
 	end
 end
 
+-- Register a pre-transaction value for a RAW store mutation (a direct write into
+-- a plain dict that does not go through applySet -- e.g. the _Scribe.Timed store,
+-- whose keys are full pathKeys containing \31 that the accessor tree rejects). If
+-- a transaction is active, the first write to a given key records its pre-txn
+-- value so a rollback can restore it; commits keep the write. No-op outside a
+-- transaction. `key` is unique per store in practice (one raw store per tree).
+function Tree.RecordRawWrite(self: Tree, store: { [string]: any }, key: string)
+	local txn = self._txn
+	if not txn or txn.RawRestores[key] ~= nil then
+		return
+	end
+	txn.RawRestores[key] = { Store = store, Value = store[key] }
+end
+
 function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 	assertAlive(self)
 	if self._txn then
 		error("Scribe: transactions do not nest", 2)
 	end
-	self._txn = { Snapshots = {}, Ops = {}, Created = {} }
+	self._txn = { Snapshots = {}, Ops = {}, Created = {}, RawRestores = {} }
 	self._batchDepth += 1
 	local ok, err = xpcall(fn :: any, function(e)
 		return debug.traceback(tostring(e), 2)
@@ -725,9 +862,16 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 		return true, nil
 	end
 
-	-- Roll back every touched field to its pre-transaction value, suppressing
-	-- replication ops (listeners fire with the restored values). Snapshots are
-	-- disjoint, so restore order does not matter.
+	-- Roll back every touched field to its pre-transaction value (listeners fire
+	-- with the restored values). Restores EMIT replication ops: the client never
+	-- saw the txn's deferred ops, so a restore op is normally a no-op Set of the
+	-- value the client already holds (and compactOps coalesces the batch) -- but if
+	-- a listener fired by an EARLIER restore wrote a field this txn also touched,
+	-- that listener write replicated, and only an emitted restore corrects the
+	-- client back to the server's final (pre-txn) value. Suppressing them (the old
+	-- NoOp) left the client holding the listener's value while the server kept the
+	-- restore: a silent mirror divergence. Snapshots are disjoint, so restore order
+	-- does not matter.
 	for _, snapshot in txn.Snapshots :: { [string]: { Path: { string | number }, Value: any } } do
 		local baseSchema, dynStart = Template.Resolve(self.Compiled, snapshot.Path)
 		local exactSchema: SchemaNode? = baseSchema
@@ -735,9 +879,13 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 			exactSchema = if exactSchema then Template.ChildSchema(exactSchema, snapshot.Path[i]) else nil
 		end
 		applySet(self, snapshot.Path, exactSchema, snapshot.Value, {
-			NoOp = true,
 			NoValidate = true,
 		})
+	end
+	-- Restore raw store writes (e.g. _Scribe.Timed expiries) that bypassed applySet;
+	-- a nil pre-txn value restores by removing the key.
+	for key, restore in txn.RawRestores :: { [string]: { Store: { [string]: any }, Value: any } } do
+		restore.Store[key] = restore.Value
 	end
 	-- Prune containers materialized during the transaction (deepest first) so no
 	-- phantom empty tables survive a rollback. A created path covered by a
@@ -768,7 +916,17 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 		if not coveredBySnapshot(created[i]) then
 			local container, key = resolveContainer(self, created[i], false)
 			if container ~= nil and type(container[key]) == "table" and next(container[key]) == nil then
-				container[key] = nil
+				-- Prune through applySet so the removal EMITS: the restore ops above
+				-- replicate, and a restore op beneath this created container has just
+				-- materialized it on the client (remote removals create intermediates
+				-- for parity). A silent raw removal here would strand that client-side
+				-- phantom {} forever. Deepest-first order ships child removals first.
+				local baseSchema, dynStart = Template.Resolve(self.Compiled, created[i])
+				local exactSchema: SchemaNode? = baseSchema
+				for j = dynStart, #created[i] do
+					exactSchema = if exactSchema then Template.ChildSchema(exactSchema, created[i][j]) else nil
+				end
+				applySet(self, created[i], exactSchema, nil, { NoValidate = true })
 			end
 		end
 	end
@@ -1053,7 +1211,12 @@ end
 	@param seconds number
 	@param replicate boolean?
 	`Scribe.Timed` fields only. Sets `value` for `seconds`, after which it
-	auto-clears back to the declared default (firing `Changed`).
+	auto-clears back to the declared default (firing `Changed`). Durations floor
+	to 1 second (a once-per-second sweep checks expiries) and cap at a finite
+	~126 years, so `SetTimed(value, math.huge)` means "effectively permanent".
+	Note that a later plain `Set` does NOT cancel the running timer: the field
+	still resets to its default when the timer lapses. To make a timed value
+	permanent, re-issue `SetTimed(value, math.huge)`.
 ]=]
 
 --[=[
@@ -1110,13 +1273,54 @@ local function unpackIfDatatype(schema: SchemaNode?, value: any): any
 	return value
 end
 
+-- Read-boundary unpack that also handles CONTAINERS: a container whose schema has
+-- datatype descendants (compile-time HasDatatype flag) is returned as a fresh table
+-- with every packed buffer converted back to its datatype, so a container-level read
+-- never leaks a buffer. Non-datatype subtrees are shared by reference (same as a
+-- plain container read today) and containers with no datatypes below return unchanged
+-- -- no walk, no allocation for the overwhelming common case.
+local function unpackRead(schema: SchemaNode?, value: any): any
+	if type(value) == "table" then
+		if schema and schema.HasDatatype then
+			local out: { [any]: any } = {}
+			for k, v in value do
+				out[k] = unpackRead(Template.ChildSchema(schema, k), v)
+			end
+			return out
+		end
+		return value
+	end
+	return unpackIfDatatype(schema, value)
+end
+
+-- Clone counterpart: a full deep copy with datatype descendants unpacked, so
+-- Clone() of a datatype-bearing container yields an independent, buffer-free value.
+local function cloneUnpack(schema: SchemaNode?, value: any): any
+	if type(value) ~= "table" then
+		local unpacked = unpackIfDatatype(schema, value)
+		-- A raw (non-datatype) buffer leaf must be COPIED, not aliased: buffers are
+		-- mutable and Clone()/the Shared-mirror clone promise an independent value.
+		-- A datatype leaf already became an immutable Roblox datatype above, so this
+		-- only ever catches a ValueType=="buffer" field (matching Util.deepClone).
+		if type(unpacked) == "buffer" then
+			return Util.cloneBuffer(unpacked)
+		end
+		return unpacked
+	end
+	local out: { [any]: any } = {}
+	for k, v in value do
+		out[k] = cloneUnpack(if schema then Template.ChildSchema(schema, k) else nil, v)
+	end
+	return out
+end
+
 local METHOD_FACTORIES: { [string]: (Accessor) -> any } = {}
 
 METHOD_FACTORIES.Get = function(accessor)
 	return function()
 		local tree = accessorTree(accessor)
 		assertAlive(tree)
-		return unpackIfDatatype(accessorSchema(accessor), readValue(tree, accessorPath(accessor)))
+		return unpackRead(accessorSchema(accessor), readValue(tree, accessorPath(accessor)))
 	end
 end
 
@@ -1126,7 +1330,7 @@ METHOD_FACTORIES.Set = function(accessor)
 		assertAlive(tree)
 		local schema = accessorSchema(accessor)
 		local stored = applySet(tree, accessorPath(accessor), schema, value, { Replicate = replicate })
-		return unpackIfDatatype(schema, stored)
+		return unpackRead(schema, stored)
 	end
 end
 
@@ -1135,9 +1339,9 @@ METHOD_FACTORIES.Update = function(accessor)
 		local tree = accessorTree(accessor)
 		assertAlive(tree)
 		local schema = accessorSchema(accessor)
-		local current = unpackIfDatatype(schema, readValue(tree, accessorPath(accessor)))
+		local current = unpackRead(schema, readValue(tree, accessorPath(accessor)))
 		local stored = applySet(tree, accessorPath(accessor), schema, fn(current), { Replicate = replicate })
-		return unpackIfDatatype(schema, stored)
+		return unpackRead(schema, stored)
 	end
 end
 
@@ -1146,8 +1350,10 @@ METHOD_FACTORIES.Clone = function(accessor)
 		local tree = accessorTree(accessor)
 		assertAlive(tree)
 		local schema = accessorSchema(accessor)
-		if schema and schema.ValueType == "datatype" then
-			return unpackIfDatatype(schema, readValue(tree, accessorPath(accessor)))
+		if schema and (schema.ValueType == "datatype" or schema.HasDatatype) then
+			-- Leaf datatype or a container with datatype descendants: deep-clone
+			-- and unpack together so the copy is independent AND buffer-free.
+			return cloneUnpack(schema, readValue(tree, accessorPath(accessor)))
 		end
 		return Util.deepClone(readValue(tree, accessorPath(accessor)))
 	end
@@ -1166,12 +1372,17 @@ local function incrementImpl(accessor: Accessor, delta: number, tagsOrReplicate:
 	end
 	local tags, replicate = parseIncrementArgs(tagsOrReplicate)
 	local newValue = applySet(tree, path, accessorSchema(accessor), current + delta, { Replicate = replicate }) :: number
-	if tags and tree.Params.OnEconomy then
+	-- Report the EFFECTIVE change, not the requested delta: a bounded field may
+	-- clamp (or reject) so the balance moves less than asked, or not at all.
+	-- Logging the raw delta over-reports economy amounts, and firing on a no-op
+	-- logs a phantom transaction the balance never made.
+	local effectiveDelta = newValue - current
+	if tags and tree.Params.OnEconomy and effectiveDelta ~= 0 then
 		local applied = table.clone(tags)
 		if applied.Flow == nil then
 			applied.Flow = defaultFlow
 		end
-		tree.Params.OnEconomy(path, delta, newValue, applied)
+		tree.Params.OnEconomy(path, effectiveDelta, newValue, applied)
 	end
 	return newValue
 end
@@ -1220,8 +1431,12 @@ METHOD_FACTORIES.Default = function(accessor)
 		if schema == nil then
 			return nil
 		end
-		if schema.ValueType == "datatype" then
-			return unpackIfDatatype(schema, schema.Default)
+		if schema.ValueType == "datatype" or schema.HasDatatype then
+			-- Leaf datatype or a container with datatype descendants: the stored
+			-- Default holds PACKED buffers (leaf datatype defaults are packed at
+			-- compile time), so deep-clone AND unpack, matching Clone(). A plain
+			-- deepClone would leak the buffer for a datatype-bearing container.
+			return cloneUnpack(schema, schema.Default)
 		end
 		return Util.deepClone(schema.Default)
 	end
@@ -1244,10 +1459,15 @@ METHOD_FACTORIES.Changed = function(accessor)
 	return function(fn: (any, any, any?) -> ())
 		local tree = accessorTree(accessor)
 		local schema = accessorSchema(accessor)
-		if schema and schema.ValueType == "datatype" then
+		if schema and (schema.ValueType == "datatype" or schema.HasDatatype) then
 			local inner = fn
 			fn = function(newValue, oldValue, key)
-				inner(unpackIfDatatype(schema, newValue), unpackIfDatatype(schema, oldValue), key)
+				local newUnpacked = unpackRead(schema, newValue)
+				-- An ancestor container fire passes the SAME reference for new and old;
+				-- reuse the unpacked value to skip a second walk and to preserve
+				-- reference-equality for a listener's `if new == old then return` guard.
+				local oldUnpacked = if oldValue == newValue then newUnpacked else unpackRead(schema, oldValue)
+				inner(newUnpacked, oldUnpacked, key)
 			end
 		end
 		return connect(tree, accessorPath(accessor), "Changed", fn)
@@ -1260,10 +1480,10 @@ METHOD_FACTORIES.Observe = function(accessor)
 		assertAlive(tree)
 		local schema = accessorSchema(accessor)
 		local disconnect = connect(tree, accessorPath(accessor), "Changed", function(newValue)
-			fn(unpackIfDatatype(schema, newValue))
+			fn(unpackRead(schema, newValue))
 		end)
 		local ok, err = xpcall(function()
-			fn(unpackIfDatatype(schema, readValue(tree, accessorPath(accessor))))
+			fn(unpackRead(schema, readValue(tree, accessorPath(accessor))))
 		end, function(e)
 			return debug.traceback(tostring(e), 2)
 		end)
@@ -1297,7 +1517,9 @@ METHOD_FACTORIES.Remove = function(accessor)
 			if old ~= nil then
 				applySet(tree, path, childSchema, nil, { Replicate = replicate })
 			end
-			return old
+			-- Convert at the datatype boundary like every other read accessor: a
+			-- removed static datatype leaf is stored packed, so return the real value.
+			return unpackRead(childSchema, old)
 		end
 		return applyArrayRemove(tree, accessorPath(accessor), accessorSchema(accessor), posOrKey :: number?, { Replicate = replicate })
 	end
@@ -1427,6 +1649,13 @@ local function accessorIndex(accessor: Accessor, key: any): any
 	if type(key) == "string" and string.find(key, "\31", 1, true) then
 		error("Scribe: dictionary keys may not contain control character \\31", 2)
 	end
+	-- Fractional / non-finite numeric keys do not survive the DataStore JSON round
+	-- trip (coerced to strings, or breaking JSON outright), which would silently
+	-- diverge the stored key from its pathKey/listeners. Reject at the accessor
+	-- boundary, mirroring validateWrite's guard for whole-table writes.
+	if type(key) == "number" and (key ~= key or key == math.huge or key == -math.huge or key % 1 ~= 0) then
+		error(`Scribe: numeric dictionary keys must be finite integers, got {tostring(key)}`, 2)
+	end
 
 	local children = rawget(accessor, "_children") :: { [any]: any }
 	local child = children[key]
@@ -1466,5 +1695,10 @@ Node.METHOD_NAMES = {} :: { [string]: boolean }
 for name in METHOD_FACTORIES do
 	Node.METHOD_NAMES[name] = true
 end
+
+-- Deep-clone a value while unpacking every declared datatype descendant back to
+-- its Roblox datatype. Exposed for the client's Shared mirror, which stores the
+-- packed buffer wire form but has no accessor tree to convert it on read.
+Node.CloneUnpack = cloneUnpack
 
 return Node

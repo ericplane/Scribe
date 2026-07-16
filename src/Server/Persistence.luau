@@ -33,9 +33,18 @@ export type Entry = {
 	StateChanged: any,
 	SaveInfo: { LastSaveAt: number?, LastResult: ("Ok" | "Fail")?, Dirty: boolean },
 	SaveT0: number?,
-	SaveWaiters: { thread },
+	-- Monotonic count of save ATTEMPTS started (OnSave = payload serialized). A
+	-- completing save only covers writes made BEFORE its payload snapshot, so
+	-- waiters carry the generation current at registration and are resumed only
+	-- by a save that STARTED after they registered.
+	SaveGen: number,
+	DirtyAtSaveStart: boolean?,
+	SaveWaiters: { { Thread: thread, Gen: number } },
 	Blocked: boolean,
 	ForceSaveOnce: boolean,
+	WipeGuardRebaselinePending: boolean?,
+	LocalSessionEnd: boolean?, -- set before every locally-initiated EndSession
+	SessionStolen: boolean?, -- OnSessionEnd fired that we did not initiate (external steal)
 	LastSavedSize: number?,
 	SizeWarned: boolean,
 	TornDown: boolean,
@@ -180,10 +189,35 @@ function Persistence.new(ctx: any)
 		end
 	end
 
+	-- Resume ALL waiters (failure/teardown paths: a failed save answers every
+	-- pending waiter with false, which is the safe retry direction).
 	local function resumeWaiters(entry: Entry, ok: boolean)
 		local waiters = entry.SaveWaiters
 		entry.SaveWaiters = {}
-		for _, thread in waiters do
+		for _, waiter in waiters do
+			resumeWaiter(waiter.Thread, ok)
+		end
+	end
+
+	-- Resume only the waiters COVERED by the just-completed save: those registered
+	-- before its payload snapshot (Gen < entry.SaveGen). A waiter registered while
+	-- the save was in flight wrote AFTER the payload was serialized, so acking it
+	-- would report durability for data that exists only in memory (e.g. returning
+	-- PurchaseGranted for an unsaved grant). Those stay queued for the next save,
+	-- which their own AwaitSave already triggered.
+	local function resumeCoveredWaiters(entry: Entry, ok: boolean)
+		local waiters = entry.SaveWaiters
+		local kept: { { Thread: thread, Gen: number } } = {}
+		local covered: { thread } = {}
+		for _, waiter in waiters do
+			if waiter.Gen < entry.SaveGen then
+				table.insert(covered, waiter.Thread)
+			else
+				table.insert(kept, waiter)
+			end
+		end
+		entry.SaveWaiters = kept
+		for _, thread in covered do
 			resumeWaiter(thread, ok)
 		end
 	end
@@ -204,7 +238,17 @@ function Persistence.new(ctx: any)
 			Log.Warn("Persistence", "PROFILE_STORE_ERROR", tostring(message), { Store = storeName, Key = profileKey })
 			for _, entry in self.Entries :: { [Player]: Entry } do
 				if entry.Key == profileKey and entry.SaveT0 ~= nil then
+					-- Attribute this failure to the in-flight save AT MOST ONCE, then
+					-- clear SaveT0. A real save failure fires OnError (never
+					-- OnAfterSave/onProfileSaved), so without clearing it here SaveT0
+					-- lingers and every later unrelated same-key error (an operator
+					-- view read or version query on this online player) would keep
+					-- re-reporting the same save as failed.
+					entry.SaveT0 = nil
 					entry.SaveInfo.LastResult = "Fail"
+					-- The failed save's payload never persisted: restore the dirtiness
+					-- captured at its start (plus anything written since).
+					entry.SaveInfo.Dirty = entry.DirtyAtSaveStart or entry.SaveInfo.Dirty
 					ctx.Signals.OnSave:Fire({ Player = entry.Player, Ok = false, Duration = nil, At = os.time() })
 					Metrics.Add("SavesFailed")
 					self.UpdateSaveInfoMirror(entry)
@@ -264,6 +308,45 @@ function Persistence.new(ctx: any)
 		end
 	end
 
+	-- Deep-compare stored profile data against the current template defaults,
+	-- skipping Scribe.Dynamic leaves (their declaration-time samples differ per
+	-- server boot) and comparing packed datatype buffers by content. Used to detect
+	-- a profile whose first session hard-crashed before its first save: durably
+	-- template-shaped, but SessionLoadCount already advanced past 1.
+	local dynamicPathKeys: { [string]: boolean } = {}
+	for _, node in compiled.DynamicNodes do
+		dynamicPathKeys[Util.pathKey(node.Path :: any)] = true
+	end
+	local function templateEquals(a: any, b: any, pathKey: string?): boolean
+		if pathKey ~= nil and dynamicPathKeys[pathKey] then
+			return true
+		end
+		if type(a) == "buffer" and type(b) == "buffer" then
+			return buffer.tostring(a) == buffer.tostring(b)
+		end
+		if type(a) ~= type(b) then
+			return false
+		end
+		if type(a) ~= "table" then
+			return a == b
+		end
+		for k, v in a do
+			local childKey = if pathKey then pathKey .. "\31" .. tostring(k) else tostring(k)
+			if not templateEquals(v, (b :: { [any]: any })[k], childKey) then
+				return false
+			end
+		end
+		for k in b :: { [any]: any } do
+			if (a :: { [any]: any })[k] == nil then
+				return false
+			end
+		end
+		return true
+	end
+	local function equalsTemplateDefaults(data: { [string]: any }): boolean
+		return templateEquals(data, persistentDefaults, nil)
+	end
+
 	-- Wipe guard: compare against the last successful save.
 	local function wipeGuardCheck(entry: Entry): (boolean, string?)
 		local profile = entry.Profile
@@ -295,6 +378,13 @@ function Persistence.new(ctx: any)
 
 	local function onProfileSaving(entry: Entry)
 		entry.SaveT0 = os.clock()
+		-- This save's payload is serialized NOW: bump the generation (used to gate
+		-- which AwaitSave waiters the completion covers) and reset Dirty so it
+		-- re-accumulates from writes landing AFTER the payload snapshot. The pre-
+		-- snapshot state is kept so a FAILED save can restore it (OnError path).
+		entry.SaveGen += 1
+		entry.DirtyAtSaveStart = entry.SaveInfo.Dirty
+		entry.SaveInfo.Dirty = false
 		local profile = entry.Profile
 		if not profile or not entry.LiveData then
 			return
@@ -307,6 +397,16 @@ function Persistence.new(ctx: any)
 				profile.Data = entry.LiveData
 				Log.Warn("Integrity", "WIPE_GUARD_FORCED", "blocked save forced through", { Player = entry.Player })
 			end
+			return
+		end
+
+		if entry.WipeGuardRebaselinePending then
+			-- First save after a reshaping migration: the LastSavedData baseline
+			-- predates the migration, so a comparison would false-trip on any key the
+			-- migration intentionally removed. The flag is cleared on save SUCCESS
+			-- (onProfileSaved), not here: this hook fires per ATTEMPT, and clearing on
+			-- a failed attempt would re-arm the guard against the stale pre-migration
+			-- baseline (under Block policy: a permanent stall persisting old data).
 			return
 		end
 
@@ -342,11 +442,27 @@ function Persistence.new(ctx: any)
 	end
 
 	local function onProfileSaved(entry: Entry, lastSavedData: any)
+		-- ProfileStore fires OnAfterSave even when the session was STOLEN and nothing
+		-- local persisted; teardown already resumed waiters false. Skip the success
+		-- bookkeeping only for steals: a locally-initiated final save (clean leave,
+		-- shutdown drain, migration fail-closed) genuinely persisted and its metrics
+		-- and Health success must still be recorded, or shutdown skews Health.
+		if entry.TornDown and entry.SessionStolen then
+			return
+		end
 		local duration = if entry.SaveT0 then os.clock() - entry.SaveT0 else nil
 		entry.SaveT0 = nil -- save settled; OnError should no longer attribute a failure here
 		entry.SaveInfo.LastSaveAt = os.time()
 		entry.SaveInfo.LastResult = "Ok"
-		entry.SaveInfo.Dirty = entry.Blocked -- blocked saves persisted old data; live data is still unsaved
+		-- Keep any dirtiness accumulated from writes landing AFTER this save's payload
+		-- snapshot (onProfileSaving reset the flag at that moment); blocked saves
+		-- persisted old data, so live data stays unsaved regardless.
+		entry.SaveInfo.Dirty = entry.SaveInfo.Dirty or entry.Blocked
+		-- A successful, unblocked save re-established the wipe-guard baseline with the
+		-- migrated shape; the one-time post-migration skip is complete.
+		if not entry.Blocked then
+			entry.WipeGuardRebaselinePending = false
+		end
 		Metrics.Add("SavesOk")
 		if duration then
 			Metrics.Observe("SaveDuration", duration)
@@ -370,7 +486,15 @@ function Persistence.new(ctx: any)
 		end
 
 		self.UpdateSaveInfoMirror(entry)
-		resumeWaiters(entry, true)
+		-- A BLOCKED save persisted the last-good snapshot, NOT the live data (Dirty
+		-- stayed set above), so it is NOT durable. Report that honestly to AwaitSave
+		-- waiters: acking success here would let a receipt/gift path return
+		-- PurchaseGranted for a grant that lives only in memory, losing paid Robux
+		-- (Roblox never retries a granted receipt). Not-durable makes the receipt
+		-- retry until the block clears and the grant truly persists. Only waiters
+		-- COVERED by this save's payload are answered; later registrants wait for
+		-- the follow-up save their own AwaitSave triggered.
+		resumeCoveredWaiters(entry, not entry.Blocked)
 	end
 
 	local function runMigrations(entry: Entry, data: { [string]: any }): boolean
@@ -427,6 +551,13 @@ function Persistence.new(ctx: any)
 			data[k] = v
 		end
 		Log.Info("Persistence", "MIGRATED", `profile migrated {stored} -> {currentVersion}`, { Player = entry.Player })
+		-- The migration may legitimately remove/rename top-level keys, but the wipe
+		-- guard's baseline (profile.LastSavedData) still holds the PRE-migration shape
+		-- until the first save commits. Skip the guard for that first save so an
+		-- intentional key removal does not trip it (which under WipeGuardPolicy="Block"
+		-- would re-persist the old data and permanently stall the migration). The
+		-- first save re-establishes the baseline; the guard resumes normally after.
+		entry.WipeGuardRebaselinePending = true
 		return true
 	end
 
@@ -517,6 +648,11 @@ function Persistence.new(ctx: any)
 		local profile = entry.Profile :: any
 		local player = entry.Player
 
+		-- A brand-new profile's very first session ever. In-place ProfileStore/
+		-- ProfileService adoption keeps the SessionLoadCount from the old game, so
+		-- returning/legacy players are NOT flagged new and still migrate normally.
+		local isNew = profile.SessionLoadCount == 1
+
 		-- Decide which Scribe.Dynamic fields to seed, BEFORE Reconcile backfills
 		-- their baseline: all of them on a brand-new profile, plus any the STORED
 		-- data is missing (a field added to the template after this profile was
@@ -524,7 +660,6 @@ function Persistence.new(ctx: any)
 		-- saved value IS present, so it is never flagged and never overwritten.
 		local dynamicToSeed: { any } = {}
 		if #compiled.DynamicNodes > 0 then
-			local isNew = profile.SessionLoadCount == 1
 			for _, node in compiled.DynamicNodes do
 				local present = true
 				local at: any = profile.Data
@@ -535,7 +670,11 @@ function Persistence.new(ctx: any)
 					end
 					at = at[seg]
 				end
-				if isNew or not present then
+				-- ResetData wipes to persistentDefaults, which carry each Dynamic
+				-- field's FROZEN declaration-time sample -- so a returning player
+				-- who resets must be re-seeded exactly like a new profile, or they
+				-- keep the shared sample instead of a freshly-generated value.
+				if isNew or options.ResetData or not present then
 					table.insert(dynamicToSeed, node)
 				end
 			end
@@ -543,6 +682,38 @@ function Persistence.new(ctx: any)
 
 		profile:AddUserId(entry.UserId)
 		profile:Reconcile()
+
+		-- A hard crash inside the very first session persists template-shaped data
+		-- with the default Version (the new-profile stamp below only mutated memory)
+		-- while SessionLoadCount advanced past 1. Detect that shape -- stored data
+		-- still identical to the current template, ignoring per-boot Dynamic samples
+		-- -- and treat the profile as fresh, or every migration would run against
+		-- effectively new-player defaults (the double-apply hazard the stamp
+		-- prevents). Gated to migrating profiles only, so the deep compare is rare.
+		local freshAsTemplate = false
+		if not isNew and not options.ResetData then
+			local storedReserved = profile.Data[Template.RESERVED_ROOT]
+			local storedVersion = if type(storedReserved) == "table" and type(storedReserved.Version) == "number"
+				then storedReserved.Version
+				else 1
+			if storedVersion < currentVersion then
+				freshAsTemplate = equalsTemplateDefaults(profile.Data)
+				if freshAsTemplate then
+					Log.Info(
+						"Persistence",
+						"PROFILE_LOADED",
+						"stored data is template-fresh (first session crashed before saving); treating as new",
+						{ Player = player }
+					)
+					-- Effectively a brand-new player: re-seed every Dynamic field too
+					-- (the stored values are a dead boot's declaration-time samples).
+					table.clear(dynamicToSeed)
+					for _, node in compiled.DynamicNodes do
+						table.insert(dynamicToSeed, node)
+					end
+				end
+			end
+		end
 
 		if options.ResetData then
 			local fresh = Util.deepClone(persistentDefaults)
@@ -553,10 +724,25 @@ function Persistence.new(ctx: any)
 			Log.Warn("Persistence", "PROFILE_RESET", "profile reset via ResetData option", { Player = player })
 		end
 
+		-- Fresh data (a brand-new profile, or a ResetData wipe) is built entirely
+		-- from the CURRENT template, so it is already at the latest version --
+		-- stamp it and let runMigrations no-op. Migrations reshape OLDER stored
+		-- data; running them against fresh defaults double-applies (e.g. a one-time
+		-- compensation grant handed to a new player, or a rename step overwriting a
+		-- field's default with nil). Returning/legacy profiles keep their stored
+		-- version and migrate as before.
+		if isNew or options.ResetData or freshAsTemplate then
+			local reserved = profile.Data[Template.RESERVED_ROOT]
+			if type(reserved) == "table" then
+				reserved.Version = currentVersion
+			end
+		end
+
 		if not runMigrations(entry, profile.Data) then
 			-- Fail-closed: never persist a half-migrated profile. Migrations ran
 			-- on a clone, so profile.Data is untouched; ending the session saves
 			-- the unmodified original.
+			entry.LocalSessionEnd = true
 			profile:EndSession()
 			if player.Parent == Players then
 				player:Kick(options.LoadFailureMessage or "We couldn't load your data. Please rejoin!")
@@ -616,6 +802,10 @@ function Persistence.new(ctx: any)
 			onProfileSaved(entry, lastSavedData)
 		end)
 		profile.OnSessionEnd:Connect(function()
+			-- A session end WE did not initiate (and not the shutdown drain) is an
+			-- external steal: its final save persists nothing locally, so save
+			-- bookkeeping must not report success for it (onProfileSaved checks this).
+			entry.SessionStolen = not entry.LocalSessionEnd and not self.Closing
 			teardown(entry, if player.Parent == Players then "session-end" else "left")
 		end)
 
@@ -693,6 +883,16 @@ function Persistence.new(ctx: any)
 				})
 			end)
 
+			if entry.TornDown then
+				-- Torn down while the load was in flight (shutdown drain or a leave
+				-- processed elsewhere): release any session the racing load just won
+				-- and stop -- finishing a load for a dead entry would leak the lock.
+				if ok and profile then
+					profile:EndSession()
+				end
+				return
+			end
+
 			if player.Parent ~= Players then
 				if ok and profile then
 					profile:EndSession()
@@ -759,6 +959,8 @@ function Persistence.new(ctx: any)
 			StateChanged = Signal.new(),
 			SaveInfo = { LastSaveAt = nil, LastResult = nil, Dirty = false },
 			SaveT0 = nil,
+			SaveGen = 0,
+			DirtyAtSaveStart = nil,
 			SaveWaiters = {},
 			Blocked = false,
 			ForceSaveOnce = false,
@@ -786,6 +988,7 @@ function Persistence.new(ctx: any)
 			return
 		end
 		if entry.Profile and entry.Profile:IsActive() then
+			entry.LocalSessionEnd = true
 			entry.Profile:EndSession() -- final save; OnSessionEnd triggers teardown
 		elseif entry.State ~= "Loading" then
 			-- (Loading sessions abort via the StartSessionAsync Cancel guard.)
@@ -843,14 +1046,18 @@ function Persistence.new(ctx: any)
 			return false
 		end
 		local thread = coroutine.running()
-		table.insert(entry.SaveWaiters, thread)
+		-- Record the save generation current at registration: only a save that
+		-- STARTS after this point serializes this caller's writes into its payload.
+		table.insert(entry.SaveWaiters, { Thread = thread, Gen = entry.SaveGen })
 		local done = false
 		task.delay(timeout, function()
 			if not done then
-				local idx = table.find(entry.SaveWaiters, thread)
-				if idx then
-					table.remove(entry.SaveWaiters, idx)
-					resumeWaiter(thread, false)
+				for idx, waiter in entry.SaveWaiters do
+					if waiter.Thread == thread then
+						table.remove(entry.SaveWaiters, idx)
+						resumeWaiter(thread, false)
+						break
+					end
 				end
 			end
 		end)
@@ -895,10 +1102,38 @@ function Persistence.new(ctx: any)
 		return if profile then Util.deepClone(profile.Data) else nil
 	end
 
+	-- Serialize same-user offline read-modify-writes on THIS server. A ProfileStore
+	-- view-mode SetAsync writes the whole GetAsync snapshot back, so two UpdateOffline
+	-- cycles for one userId that interleave (Get_A, Get_B, Set_A, Set_B) would have
+	-- the second clobber the first with stale data -- silently dropping a grant (and
+	-- its ProcessedPurchaseIds dedup marker) while both report success. A per-userId
+	-- FIFO lock forces the cycles to run one at a time so each reads the prior's save.
+	-- (Concurrent offline writes from a DIFFERENT server remain a view-mode limitation
+	-- inherent to writing without holding the session lock.)
+	local offlineLocks: { [number]: { thread } } = {}
+	local function acquireOffline(userId: number)
+		local waiters = offlineLocks[userId]
+		if waiters == nil then
+			offlineLocks[userId] = {} -- lock now held, no waiters
+			return
+		end
+		table.insert(waiters, coroutine.running())
+		coroutine.yield() -- resumed by releaseOffline when it is our turn
+	end
+	local function releaseOffline(userId: number)
+		local waiters = offlineLocks[userId]
+		if waiters and #waiters > 0 then
+			task.spawn(table.remove(waiters, 1) :: thread) -- next waiter takes the lock
+		else
+			offlineLocks[userId] = nil
+		end
+	end
+
 	function self.UpdateOffline(userId: number, fn: (data: { [string]: any }) -> ()): (boolean, string?)
 		if self.EntryForUserId(userId) then
 			return false, "user has an active session on this server"
 		end
+		acquireOffline(userId)
 		local ok, err = pcall(function()
 			local profile = store:GetAsync(self.KeyFor(userId))
 			if not profile then
@@ -913,6 +1148,7 @@ function Persistence.new(ctx: any)
 			fn(profile.Data)
 			profile:SetAsync()
 		end)
+		releaseOffline(userId)
 		if not ok then
 			Health.ReportFailure("OfflineWrite")
 			return false, tostring(err)
@@ -1011,6 +1247,14 @@ function Persistence.new(ctx: any)
 			return false, "user has an active session on this server"
 		end
 		local ok, err = pcall(function()
+			-- Fail closed if the user is active on another server: RemoveAsync
+			-- bypasses the session lock, so a live session elsewhere would re-save
+			-- and resurrect the "erased" profile, silently defeating the deletion
+			-- (same guard as UpdateOffline/RestoreVersion).
+			local profile = store:GetAsync(self.KeyFor(userId))
+			if profile and profile.Session then
+				error("profile has an active session on another server")
+			end
 			if not store:RemoveAsync(self.KeyFor(userId)) then
 				error("RemoveAsync returned false")
 			end
@@ -1079,8 +1323,24 @@ function Persistence.new(ctx: any)
 		-- Profile saves (player data) are started first; the leaderboard queue
 		-- is rebuildable and gets whatever time remains.
 		local deadline = os.clock() + (budget or 25)
+		-- Tear down profile-less Loading entries up front: one parked in a
+		-- LoadFailurePolicy="Wait" backoff sleeps up to 60s before noticing Closing,
+		-- which would otherwise hold the drain loop below to its FULL budget during
+		-- exactly the DataStore incidents the budget is meant to protect. Their
+		-- StartSessionAsync cannot succeed anymore (the Cancel hook sees Closing),
+		-- and the loader no-ops on TornDown when it wakes.
+		local strandedLoading: { Entry } = {}
+		for _, entry in self.Entries :: { [Player]: Entry } do
+			if entry.State == "Loading" and entry.Profile == nil then
+				table.insert(strandedLoading, entry)
+			end
+		end
+		for _, entry in strandedLoading do
+			teardown(entry, "shutdown")
+		end
 		for _, entry in self.Entries :: { [Player]: Entry } do
 			if entry.Profile and entry.Profile:IsActive() then
+				entry.LocalSessionEnd = true
 				task.spawn(function()
 					entry.Profile:EndSession()
 				end)

@@ -26,7 +26,7 @@ return Scribe({
 })
 ```
 
-Your template's field names must match the keys already in the stored data (or a migration bridges the difference). **Test against a copy first** with `DontSave = true` (loads real data, never writes) or `ViewedUserId` before you point a live game at it.
+Your template's field names must match the keys already in the stored data (or a migration bridges the difference). **Validate against real data first** with `ViewedUserId` (loads that user's real profile read-only, never writes) before you point a live game at it. Note that `DontSave = true` is NOT a dry-run against real data: it swaps in a full in-memory mock store, so every profile loads as blank template defaults and validates nothing about your stored shapes.
 
 ### Coming from ProfileService
 
@@ -109,4 +109,4 @@ end
 
 - **Keep the legacy store readable** until you're confident. Don't delete old data the moment you cut over. The guard flag means a re-run is harmless.
 - **Convert shapes explicitly**: copy field by field into your Scribe template rather than assigning the whole old table, so the result matches your declarators.
-- **Dry-run first** with `DontSave = true`, or against a throwaway `ProfileStoreIndex`, before touching production.
+- **Dry-run first** with `ViewedUserId` (reads a real profile without writing), or against a throwaway `ProfileStoreIndex` seeded with copies, before touching production. (`DontSave = true` uses an in-memory mock and never reads real data, so it cannot validate a migration.)

@@ -258,6 +258,14 @@ codecs.Color3 = {
 	end,
 	Unpack = function(b: buffer): Color3
 		checkLen(b, 4, "Color3")
+		-- The f32 mode reads 13 bytes; checkLen(4) only covers the mode byte + the
+		-- RGB (mode 0) path. unpackColor3From takes the 13-byte branch for ANY
+		-- non-zero mode, so re-check on `~= 0` (not `== 1`): a truncated/hostile
+		-- buffer with mode 2..255 must fail as a clean malformed-Color3 error, not
+		-- an out-of-bounds read at Get() time (mirrors the CFrame extended-tag check).
+		if buffer.readu8(b, 0) ~= 0 then
+			checkLen(b, 13, "Color3")
+		end
 		local color = unpackColor3From(b, 0)
 		return color
 	end,
@@ -440,11 +448,22 @@ end
 
 local function readShortString(b: buffer, offset: number): (string, number)
 	local length = buffer.readu8(b, offset)
+	-- Bounds-check the declared string before reading it, so a truncated/hostile
+	-- buffer fails as a clean malformed error rather than a raw out-of-bounds read.
+	checkLen(b, offset + 1 + length, "string")
 	return buffer.readstring(b, offset + 1, length), offset + 1 + length
 end
 
 local function enumItemFromValue(enumTypeName: string, value: number): EnumItem
-	local enumType = (Enum :: any)[enumTypeName]
+	-- Indexing Enum with an unknown name THROWS a raw Roblox error, so a corrupt/
+	-- crafted buffer's enum type name would escape the "Scribe:"-prefixed malformed
+	-- contract. Resolve it under pcall and fail as a clean, path-taggable error.
+	local gotType, enumType = pcall(function()
+		return (Enum :: any)[enumTypeName]
+	end)
+	if not gotType or enumType == nil then
+		error(`Scribe: malformed packed EnumItem (unknown enum type "{enumTypeName}")`)
+	end
 	local ok, item = pcall(function()
 		return enumType:FromValue(value)
 	end)
@@ -473,6 +492,9 @@ codecs.EnumItem = {
 	Unpack = function(b: buffer): EnumItem
 		checkLen(b, 5, "EnumItem")
 		local typeName, offset = readShortString(b, 0)
+		-- Re-check for the u32 value that follows the variable-length type name
+		-- (mirrors the CFrame/Color3 extended-tag re-checks).
+		checkLen(b, offset + 4, "EnumItem")
 		return enumItemFromValue(typeName, buffer.readu32(b, offset))
 	end,
 }
@@ -492,6 +514,8 @@ codecs.Font = {
 	Unpack = function(b: buffer): Font
 		checkLen(b, 4, "Font")
 		local family, offset = readShortString(b, 0)
+		-- Re-check for the u16 weight + u8 style that follow the variable-length family.
+		checkLen(b, offset + 3, "Font")
 		local weight = enumItemFromValue("FontWeight", buffer.readu16(b, offset))
 		local style = enumItemFromValue("FontStyle", buffer.readu8(b, offset + 2))
 		return Font.new(family, weight :: any, style :: any)

@@ -41,7 +41,7 @@ return function()
 		harness.Cleanup()
 	end)
 
-	it("does not re-run migrations for up-to-date profiles", function()
+	it("does not run migrations on a brand-new profile, only stamps the current version", function()
 		local runs = 0
 		local harness = TestCtx.make({
 			Options = {
@@ -52,13 +52,18 @@ return function()
 				},
 			},
 		})
-		local player = harness.Join(556)
+		-- A brand-new profile's data is built from the CURRENT template, so it is
+		-- already the latest shape: migrations (which reshape OLDER data) must NOT
+		-- run against it, and it is stamped straight to the current version.
+		local player, entry = harness.Join(556)
+		expect(runs).to.equal(0)
+		expect(entry.LiveData._Scribe.Version).to.equal(2)
 		harness.Data.Flush(player)
 		harness.Leave(player)
-		expect(runs).to.equal(1)
 
+		-- Returning, up-to-date profile: still no migration.
 		harness.Join(556)
-		expect(runs).to.equal(1) -- stamped at 2; step must not run again
+		expect(runs).to.equal(0)
 		harness.Cleanup()
 	end)
 
@@ -120,5 +125,67 @@ return function()
 				},
 			})
 		end).to.throw()
+	end)
+
+	it("a key-removing migration does not trip the wipe guard on the first save (Block policy)", function()
+		local harness = TestCtx.make({
+			Options = {
+				WipeGuardPolicy = "Block",
+				Migrations = {
+					[2] = function(data)
+						data.Legacy = nil -- a migration legitimately removes a top-level key
+					end,
+				},
+			},
+		})
+		-- Legacy (version-1) profile carrying the soon-removed top-level key.
+		harness.Fake.Persisted["Default/PLAYER_700"] = { Coins = 9, Legacy = "old", _Scribe = { Version = 1 } }
+
+		local player, entry = harness.Join(700)
+		expect(entry.LiveData._Scribe.Version).to.equal(2)
+		expect(entry.LiveData.Legacy).to.equal(nil) -- migration removed it
+
+		-- The first save must PERSIST the migrated shape (Legacy gone, version 2), not be
+		-- blocked into re-persisting the pre-migration snapshot (which would stall the migration).
+		harness.Data.Flush(player)
+		local persisted = harness.Fake.Persisted["Default/PLAYER_700"]
+		expect(persisted.Legacy).to.equal(nil)
+		expect(persisted._Scribe.Version).to.equal(2)
+		expect(persisted.Coins).to.equal(9)
+
+		harness.Cleanup()
+	end)
+
+	it("the wipe-guard rebaseline skip survives a FAILED first post-migration save", function()
+		local harness = TestCtx.make({
+			Options = {
+				WipeGuardPolicy = "Block",
+				Migrations = {
+					[2] = function(data)
+						data.Legacy = nil
+					end,
+				},
+			},
+		})
+		harness.Fake.Persisted["Default/PLAYER_701"] = { Coins = 3, Legacy = "old", _Scribe = { Version = 1 } }
+
+		local player, entry = harness.Join(701)
+		expect(entry.LiveData.Legacy).to.equal(nil)
+
+		-- First post-migration save attempt FAILS: the skip is consumed on SUCCESS,
+		-- not on attempt, so it must stay armed for the retry.
+		harness.Fake.FailSaves = true
+		harness.Data.Flush(player)
+		harness.Fake.FailSaves = false
+
+		-- The retry must persist the migrated shape, not false-trip the guard against
+		-- the stale pre-migration baseline (Block would stall the migration forever).
+		expect(harness.Data.Flush(player)).to.equal(true)
+		local persisted = harness.Fake.Persisted["Default/PLAYER_701"]
+		expect(persisted.Legacy).to.equal(nil)
+		expect(persisted._Scribe.Version).to.equal(2)
+		expect(persisted.Coins).to.equal(3)
+
+		harness.Cleanup()
 	end)
 end

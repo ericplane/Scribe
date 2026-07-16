@@ -45,7 +45,7 @@ A template default is evaluated **once**, when the module loads. So `os.time()`,
 CreatedUnix = os.time(),
 ```
 
-`Scribe.Dynamic` fixes this: pass the **function**, and Scribe runs it per profile instead of once at load.
+`Scribe.Dynamic` fixes this: pass the **function**, and Scribe runs it per new profile. (It also runs the factory ONCE at module load, to sample the return type for typing and packing -- so the factory must be pure: no yields, no errors, no side effects. A `Scribe.Dynamic` field cannot be combined with `Scribe.Session`; use [`OnPlayerInit`](./lifecycle) for per-session values.)
 
 ```lua
 CreatedUnix = Scribe.Dynamic(os.time),                             -- number; pass the function itself
@@ -93,6 +93,11 @@ data.XPBooster.SetTimed(true, 3600)  -- true for one hour
 data.XPBooster.ExtendTimed(1800)     -- add 30 minutes
 local active, remaining = data.XPBooster.Active()
 ```
+
+Two behaviors to know:
+
+- **Durations floor to 1 second**, and expiries are checked by a once-per-second sweep -- sub-second timers are not possible.
+- **A plain `Set` does not cancel a running timer.** If you `Set` a "permanent" value while an earlier `SetTimed` is still armed, the old timer still lapses and resets the field to its template default, discarding your value. To convert a timed value to a permanent one, use `SetTimed(value, math.huge)` -- or wait for `Active()` to report false before the plain `Set`.
 
 ## Cooldowns
 

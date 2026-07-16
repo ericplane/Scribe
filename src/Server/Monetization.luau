@@ -29,8 +29,11 @@ function Monetization.new(ctx: any)
 	local compiled: Template.Compiled = ctx.Compiled
 
 	local logOptions = options.PurchaseLog or {}
-	local robuxCap: number = logOptions.RobuxCap or 100
-	local inGameCap: number = logOptions.InGameCap or 100
+	-- Floor at 1: the ring evictors loop `while count >= cap`, and a configured
+	-- cap of 0 (or negative) would otherwise spin forever on an empty ring
+	-- (removing from an empty array is a no-op, so the count never reaches -1).
+	local robuxCap: number = math.max(1, tonumber(logOptions.RobuxCap) or 100)
+	local inGameCap: number = math.max(1, tonumber(logOptions.InGameCap) or 100)
 	local declaredCategories: { [string]: boolean }? = nil
 	if logOptions.PurchaseLogCategories then
 		declaredCategories = {}
@@ -42,6 +45,13 @@ function Monetization.new(ctx: any)
 	local giftCooldown: number = options.GiftCooldown or 5
 	local giftMaxPending: number = options.GiftMaxPending or 20
 	local giftIntentTTL: number = options.GiftIntentTTL or 3600
+	-- How long a same-product re-gift is blocked while a purchase could still be
+	-- in flight (so a second gift can't overwrite a live intent and misdeliver the
+	-- first purchase to the second recipient). Past this, a lingering intent is
+	-- treated as an abandoned/cancelled prompt (a real purchase would have
+	-- receipted by now) and may be overwritten -- so dismissing the purchase dialog
+	-- does not block re-gifting for the whole intent TTL.
+	local giftPromptWindow: number = math.min(120, giftIntentTTL)
 	local allowDuplicateGifts: boolean = options.AllowDuplicateGifts == true
 	local noGiftIntentPolicy: string = options.NoGiftIntentPolicy or "GrantOrCredit"
 
@@ -126,9 +136,12 @@ function Monetization.new(ctx: any)
 		return entry.LiveData ~= nil and isProcessedRaw(entry.LiveData, purchaseId)
 	end
 
+	-- Ring evictions use `while`, not `if`: a stored ring larger than the CURRENT
+	-- cap (the cap was lowered between deploys) must shrink back under it instead
+	-- of staying frozen at its old size forever.
 	local function markProcessedRaw(data: { [string]: any }, purchaseId: string)
 		local list = reservedRaw(data).ProcessedPurchaseIds
-		if #list >= PROCESSED_CAP then
+		while #list >= PROCESSED_CAP and #list > 0 do
 			table.remove(list, 1)
 		end
 		table.insert(list, purchaseId)
@@ -136,7 +149,7 @@ function Monetization.new(ctx: any)
 
 	local function markProcessed(entry: any, purchaseId: string)
 		local accessor = reservedAcc(entry).ProcessedPurchaseIds
-		if accessor.Count() >= PROCESSED_CAP then
+		while accessor.Count() >= PROCESSED_CAP and accessor.Count() > 0 do
 			accessor.Remove(1)
 		end
 		accessor.Insert(purchaseId)
@@ -149,7 +162,7 @@ function Monetization.new(ctx: any)
 	end
 
 	local function appendRing(ringAccessor: any, cap: number, logEntry: { [string]: any })
-		if ringAccessor.Count() >= cap then
+		while ringAccessor.Count() >= cap and ringAccessor.Count() > 0 do
 			ringAccessor.Remove(1)
 		end
 		ringAccessor.Insert(logEntry)
@@ -164,7 +177,7 @@ function Monetization.new(ctx: any)
 
 	local function robuxLogRaw(data: { [string]: any }, logEntry: { [string]: any })
 		local ring = reservedRaw(data).PurchaseLogs.Robux
-		if #ring >= robuxCap then
+		while #ring >= robuxCap and #ring > 0 do
 			table.remove(ring, 1)
 		end
 		table.insert(ring, logEntry)
@@ -362,9 +375,15 @@ function Monetization.new(ctx: any)
 			)
 			return -- keep the message; a later deploy can process it
 		end
-		if
+		-- Gate on `durable` (2nd return), NOT `applied` (1st): this queued message is
+		-- the only surviving durable copy of the paid gift, and processed() removes
+		-- it for good. Ack-ing on a merely-in-memory grant would drop the message
+		-- before the recipient's save committed, losing the gift on a crash.
+		-- Re-delivery is dedupe-safe: the message carries a FIXED purchaseId that
+		-- isProcessed catches, so an un-acked message re-applies harmlessly.
+		local _, durable =
 			deliverGiftLocal(entry, product, purchaseId, tostring(message.GiftId), tonumber(message.FromUserId) or 0)
-		then
+		if durable then
 			processed()
 		end
 	end
@@ -428,6 +447,18 @@ function Monetization.new(ctx: any)
 		local reserved = reservedRaw(entry.LiveData)
 		local intent = reserved.PendingGifts[tostring(product.Id)]
 		if type(intent) ~= "table" then
+			return nil
+		end
+		-- Intents are keyed by product ID; if a deploy retired the product and
+		-- reused its Id for a different one within the TTL, the stored intent
+		-- belongs to the OLD product -- honoring it would deliver the new product
+		-- as a gift to the old intended recipient. Expire it instead.
+		if intent.Product ~= nil and intent.Product ~= product.Name then
+			reservedAcc(entry).PendingGifts[tostring(product.Id)].Set(nil)
+			Log.Warn("Gifting", "GIFT_INTENT_EXPIRED", "gift intent belonged to a retired product reusing this Id", {
+				Player = entry.Player,
+				Product = product.Name,
+			})
 			return nil
 		end
 		if os.time() - (tonumber(intent.Ts) or 0) > giftIntentTTL then
@@ -503,6 +534,18 @@ function Monetization.new(ctx: any)
 			-- Not confirmed durable (delivery failed, or grant applied but the
 			-- recipient's save is unconfirmed); intent persists, the receipt
 			-- retries, and the retry dedupes on the recipient. Nothing is lost.
+			-- Refresh the intent timestamp so PromptGift's short overwrite window
+			-- (giftPromptWindow) keeps refusing a second same-product gift while
+			-- THIS paid purchase is still actively retrying -- an overwrite here
+			-- would route this purchase's value to the second recipient and strand
+			-- the first. deliverGift YIELDS, so re-check the intent still exists and
+			-- is still OURS first: a blind Ts write after the intent was cleared
+			-- would materialize a phantom {Ts} intent (no RecipientId/GiftId) that a
+			-- later retry then delivers to userId 0.
+			local liveIntent = reservedRaw(entry.LiveData).PendingGifts[tostring(product.Id)]
+			if type(liveIntent) == "table" and tostring(liveIntent.GiftId) == giftId then
+				reservedAcc(entry).PendingGifts[tostring(product.Id)].Ts.Set(os.time())
+			end
 			Metrics.Add("ReceiptsRetried")
 			return NOT_PROCESSED
 		end
@@ -679,6 +722,17 @@ function Monetization.new(ctx: any)
 
 		local reserved = reservedRaw(data)
 		local intent = reserved.PendingGifts[tostring(product.Id)]
+		-- Mirror intentFor's reused-Id guard: an intent whose stored Product name
+		-- differs belongs to a RETIRED product that reused this Id -- honoring it
+		-- would gift the new product to the old intended recipient. Treat as
+		-- no-intent (the stale record TTL-expires; the name check keeps catching it).
+		if type(intent) == "table" and intent.Product ~= nil and intent.Product ~= product.Name then
+			Log.Warn("Gifting", "GIFT_INTENT_EXPIRED", "offline gift intent belonged to a retired product reusing this Id", {
+				UserId = userId,
+				Product = product.Name,
+			})
+			intent = nil
+		end
 		if type(intent) == "table" and os.time() - (tonumber(intent.Ts) or 0) <= giftIntentTTL then
 			local recipientId = tonumber(intent.RecipientId) or 0
 			local giftId = tostring(intent.GiftId)
@@ -830,9 +884,12 @@ function Monetization.new(ctx: any)
 		if entry and entry.State == "Ready" and isProcessed(entry, tostring(receiptInfo.PurchaseId)) then
 			Metrics.Add("ReceiptsDuplicate")
 			-- Acknowledge a duplicate only when the grant that set this marker is
-			-- durable; a still-dirty profile means the original save has not
-			-- confirmed, so a crash would lose both the grant and the marker.
-			if not entry.SaveInfo.Dirty or ctx.Persistence.AwaitSave(entry, 10) then
+			-- durable. Dirty alone is not enough: it resets when a save's payload is
+			-- serialized, so Dirty == false with a save still IN FLIGHT (SaveT0 set)
+			-- means the covering save has not confirmed and may yet fail -- a crash
+			-- after GRANTED would then lose both the grant and the marker. Require a
+			-- clean flag AND no in-flight save, else wait for a confirmed save.
+			if (not entry.SaveInfo.Dirty and entry.SaveT0 == nil) or ctx.Persistence.AwaitSave(entry, 10) then
 				return GRANTED
 			end
 			Metrics.Add("ReceiptsRetried")
@@ -911,8 +968,16 @@ function Monetization.new(ctx: any)
 				refundCredit()
 				return false, "could not reserve gift credit; try again later"
 			end
+			-- Gate on `applied` (1st return), NOT `durable`: a same-server recipient's
+			-- grant is applied to their live data here and marked processed under this
+			-- giftId, so it persists on their next save. Refunding on a merely
+			-- non-durable save would let the buyer re-spend the credit under a FRESH
+			-- giftId (a new `credit:{giftId}` purchaseId the recipient's dedupe cannot
+			-- catch), double-granting a stackable Grant. The rare cost is a recipient
+			-- crash before autosave losing the in-memory grant while the credit is
+			-- gone; that is the accepted tradeoff (unlike the receipt path, whose
+			-- retries reuse the same purchaseId and so are dedupe-safe).
 			if not deliverGift(product, recipientUserId, `credit:{giftId}`, giftId, entry.UserId) then
-				-- Delivery was not durably committed; refund the reserved credit.
 				refundCredit()
 				task.spawn(function()
 					ctx.Persistence.AwaitSave(entry, 15)
@@ -928,6 +993,16 @@ function Monetization.new(ctx: any)
 		end
 
 		-- Step 3: durable intent BEFORE money moves.
+		-- Refuse a second gift of the SAME product only while a purchase could still
+		-- be in flight: a developer-product receipt carries only the product Id
+		-- (never the recipient), so intents are keyed by product Id, and overwriting
+		-- a live intent would deliver the first purchase's receipt to the second
+		-- recipient. Past giftPromptWindow the intent is an abandoned/cancelled
+		-- prompt (no receipt ever came) and is safe to overwrite below.
+		local pendingIntent = intentFor(entry, product)
+		if pendingIntent ~= nil and os.time() - (tonumber(pendingIntent.Ts) or 0) < giftPromptWindow then
+			return false, "a gift of this item is already pending; try again shortly"
+		end
 		local giftId = Util.guid()
 		local intentAccessor = reservedAcc(entry).PendingGifts[tostring(product.Id)]
 		intentAccessor.Set({
@@ -1102,6 +1177,21 @@ function Monetization.new(ctx: any)
 		for productIdStr, intent in reserved.PendingGifts do
 			if type(intent) ~= "table" or now - (tonumber(intent.Ts) or 0) > giftIntentTTL then
 				reservedAcc(entry).PendingGifts[productIdStr].Set(nil)
+			end
+		end
+		-- Gift credits are durable paid value keyed by product NAME; a product
+		-- renamed or removed from the config silently strands them (no read path can
+		-- resolve them). Surface it so the operator adds a rename migration or
+		-- restores the product entry -- never delete: the credit is player money.
+		for creditName, count in reserved.GiftCredits do
+			if productsByName[creditName] == nil and (tonumber(count) or 0) > 0 then
+				Log.Warn(
+					"Gifting",
+					"GIFT_CREDIT_UNKNOWN_PRODUCT",
+					`player holds {tostring(count)} gift credit(s) for "{tostring(creditName)}", which is not in Products; `
+						.. "they are unspendable until the product returns or a migration renames the credit key",
+					{ Player = entry.Player, Product = tostring(creditName) }
+				)
 			end
 		end
 		task.spawn(refreshOwnership, entry)

@@ -108,9 +108,13 @@ local function applyPlainOp(root: { [any]: any }, op: any)
 		local seg = op.Path[i]
 		local nextContainer = container[seg]
 		if type(nextContainer) ~= "table" then
-			if op.Kind == "Remove" or op.Kind == "Clear" or (op.Kind == "Set" and op.Value == nil) then
-				return
+			if op.Kind == "Remove" then
+				return -- array removals always ship alongside their creating Insert
 			end
+			-- Materialize intermediates for Set(nil)/Clear too (matching the client
+			-- mirror): a removal op only emits when the parent chain existed
+			-- server-side, so a missing parent means its creating op was coalesced
+			-- away in the same flush while the container still exists live.
 			nextContainer = {}
 			container[seg] = nextContainer
 		end
@@ -129,7 +133,12 @@ local function applyPlainOp(root: { [any]: any }, op: any)
 			arr = {}
 			container[key] = arr
 		end
-		table.insert(arr, math.clamp(op.Index or #arr + 1, 1, #arr + 1), op.Value)
+		-- deepClone like the Set branch: an Insert op's Value is the LIVE-stored
+		-- element reference (Node.applyInsert emits the same table it inserted), so
+		-- inserting it raw would alias live data into this diagnostics mirror. A
+		-- later op descending through that element would then re-apply to the live
+		-- object and corrupt the real (saved) data.
+		table.insert(arr, math.clamp(op.Index or #arr + 1, 1, #arr + 1), Util.deepClone(op.Value))
 	elseif op.Kind == "Remove" then
 		local arr = container[key]
 		if type(arr) == "table" and #arr > 0 then
@@ -139,6 +148,11 @@ local function applyPlainOp(root: { [any]: any }, op: any)
 		local value = container[key]
 		if type(value) == "table" then
 			table.clear(value)
+		else
+			-- Matches the client mirror: a Clear only emits for a container that
+			-- existed server-side, so materialize the cleared {} if its creating op
+			-- was coalesced away.
+			container[key] = {}
 		end
 	end
 end
@@ -906,10 +920,22 @@ function DebugHook.Attach(Data: any, ctx: any)
 				end
 				accessorAt(entry, path).ExtendTimed(seconds)
 			elseif mode == "ClearTimed" then
-				-- Cancel the timer, leave the value in place (same bookkeeping
-				-- write the core Timed sweep performs).
+				-- Cancel the timer, leave the value in place. Write the flat
+				-- _Scribe.Timed store DIRECTLY (as the core Timed sweep does): a NESTED
+				-- Timed field's pathKey embeds \31, which the accessor tree rejects, so
+				-- it must not route through Accessor[_Scribe].Timed[pathKey].
 				accessorAt(entry, path).Active() -- errors early on non-Timed fields
-				entry.Tree.Accessor[Template.RESERVED_ROOT].Timed[Util.pathKey(path)].Set(nil, false)
+				local reserved = entry.LiveData and entry.LiveData[Template.RESERVED_ROOT]
+				if type(reserved) == "table" and type(reserved.Timed) == "table" then
+					reserved.Timed[Util.pathKey(path)] = nil
+					-- Mirror core setTimed (Timed.luau): flag the profile dirty so the
+					-- cleared timer is saved promptly and Dirty-gated flows do not report
+					-- it clean (a crash before autosave would otherwise resurrect it).
+					local saveInfo = entry.SaveInfo :: any
+					if saveInfo then
+						saveInfo.Dirty = true
+					end
+				end
 			else
 				error(`unknown write mode "{mode}"`)
 			end
@@ -1015,6 +1041,11 @@ function DebugHook.Attach(Data: any, ctx: any)
 		local player = entry.Player
 		local profile: any = entry.Profile
 		if profileIsActive(profile) then
+			-- Locally-initiated end: without this flag Persistence would classify
+			-- the OnSessionEnd as an external steal and skip the final save's
+			-- bookkeeping. (SimulateSessionSteal deliberately OMITS the flag -- a
+			-- steal misclassification is exactly what that simulation exercises.)
+			entry.LocalSessionEnd = true
 			profile:EndSession()
 		end
 		-- Re-run the load path against the armed store so LoadFailurePolicy is

@@ -60,7 +60,10 @@ return function()
 		data.Nick.Set(nil) -- looks like a wipe
 		data.Coins.Set(99) -- a legitimate concurrent change
 
-		expect(harness.Data.Flush(player)).to.equal(true)
+		-- The blocked save persists the last-good snapshot, NOT the live data, so
+		-- Flush honestly reports the live data is not durable (false). This is what
+		-- keeps a receipt/gift path from acking PurchaseGranted on an unsaved grant.
+		expect(harness.Data.Flush(player)).to.equal(false)
 		task.wait()
 		expect(#anomalies).to.equal(1)
 

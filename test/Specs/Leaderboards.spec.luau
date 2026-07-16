@@ -128,4 +128,30 @@ return function()
 
 		harness.Cleanup()
 	end)
+
+	it("EraseUser scrubs the erased user from the in-memory board cache (GDPR)", function()
+		local harness = makeHarness()
+		local player, _, data = harness.Join(8006)
+		data.Coins.Set(777)
+		harness.Ctx.Leaderboards.FlushAllBlocking(1)
+		harness.Ctx.Leaderboards.RefreshNow()
+
+		-- The user is in the cached board.
+		local before = harness.Data.GetLeaderboard("TopCoins", 10)
+		expect(#before).to.equal(1)
+		expect(before[1].UserId).to.equal(8006)
+
+		-- Erase must remove the PII from the cache IMMEDIATELY, not only at the next refresh.
+		harness.Ctx.Leaderboards.EraseUser(8006)
+		local after = harness.Data.GetLeaderboard("TopCoins", 10)
+		local found = false
+		for _, e in after do
+			if e.UserId == 8006 then
+				found = true
+			end
+		end
+		expect(found).to.equal(false)
+
+		harness.Cleanup()
+	end)
 end

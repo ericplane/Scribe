@@ -191,6 +191,73 @@ return function()
 
 			harness.Cleanup()
 		end)
+
+		it("restores a txn-created container to nil (not {}) when a later parent Set subsumes it", function()
+			local template = TestCtx.defaultTemplate()
+			template.Dyn = {} :: { [string]: any }
+			local harness = TestCtx.make({ Template = template })
+			local player, _, data = harness.Join()
+
+			expect(data.Dyn.Count()).to.equal(0)
+			local ok = harness.Data.Transaction(player, function()
+				data.Dyn.a.b.Set(5) -- materializes Dyn.a (recorded in txn.Created)
+				data.Dyn.a.Set({ x = 1 }) -- parent Set snapshots Dyn.a; reconstruction must be nil, not {}
+				error("boom")
+			end)
+			expect(ok).to.equal(false)
+			-- True pre-txn state was Dyn.a == nil; a phantom {} must NOT survive the rollback.
+			expect(data.Dyn.a.Get()).to.equal(nil)
+			expect(data.Dyn.Count()).to.equal(0)
+
+			harness.Cleanup()
+		end)
+
+		it("strips a txn-created DESCENDANT container from the rollback of a subsuming parent Set", function()
+			local template = TestCtx.defaultTemplate()
+			template.Dyn = {} :: { [string]: any }
+			local harness = TestCtx.make({ Template = template })
+			local player, _, data = harness.Join()
+
+			data.Dyn.a.Set({}) -- Dyn.a pre-exists as an empty container (NOT txn-created)
+			expect(data.Dyn.a.Count()).to.equal(0)
+
+			local ok = harness.Data.Transaction(player, function()
+				data.Dyn.a.sub.x.Set(5) -- materializes Dyn.a.sub (a strict descendant, recorded in txn.Created)
+				data.Dyn.a.Set({ y = 1 }) -- subsuming parent Set; reconstruction must drop the created sub
+				error("boom")
+			end)
+			expect(ok).to.equal(false)
+			-- Dyn.a pre-existed so it stays, but the phantom Dyn.a.sub must NOT survive the rollback.
+			expect(data.Dyn.a.Get() ~= nil).to.equal(true)
+			expect(data.Dyn.a.Count()).to.equal(0)
+			expect(data.Dyn.a.sub.Get()).to.equal(nil)
+
+			harness.Cleanup()
+		end)
+
+		it("restores a PRE-EXISTING container deleted then recreated inside an aborted txn", function()
+			local template = TestCtx.defaultTemplate()
+			template.Dyn = {} :: { [string]: any }
+			local harness = TestCtx.make({ Template = template })
+			local player, _, data = harness.Join()
+
+			data.Dyn.a.sub.Set({ y = 9 }) -- committed pre-txn state
+
+			local ok = harness.Data.Transaction(player, function()
+				data.Dyn.a.sub.Set(nil) -- delete (snapshots the true pre-txn value)
+				data.Dyn.a.sub.x.Set(5) -- recreate: sub lands in txn.Created despite pre-existing
+				data.Dyn.a.Set({ z = 1 }) -- subsuming parent Set triggers reconstruction
+				error("boom")
+			end)
+			expect(ok).to.equal(false)
+			-- The overlaid delete-snapshot is authoritative: rollback must restore the
+			-- committed { y = 9 }, not strip sub as a phantom (silent data loss).
+			expect(data.Dyn.a.sub.y.Get()).to.equal(9)
+			expect(data.Dyn.a.sub.x.Get()).to.equal(nil)
+			expect(data.Dyn.a.z.Get()).to.equal(nil)
+
+			harness.Cleanup()
+		end)
 	end)
 
 	describe("op coalescing preserves emission order", function()
@@ -224,6 +291,38 @@ return function()
 			end
 			expect(mirror.Bag.Slot.Gold).to.equal(9)
 			expect(data.Bag.Slot.Gold.Get()).to.equal(9)
+
+			harness.Cleanup()
+		end)
+
+		it("keeps the container-creating Set when a Clear on a fresh dynamic key follows it (same flush)", function()
+			local template = TestCtx.defaultTemplate()
+			template.Dict = {} :: { [string]: any }
+			local harness = TestCtx.make({ Template = template })
+			local player, entry, data = harness.Join()
+			harness.SendHello(player)
+
+			data.Dict.newKey.Set({ x = 1 }) -- creates a fresh dynamic key
+			data.Dict.newKey.Clear() -- empties it, same flush
+			harness.Ctx.Replication.FlushEntry(entry)
+
+			-- The creating Set must survive compaction: Clear is a client no-op on an
+			-- absent key, so dropping the Set would leave the client without the key.
+			local sawSet, sawClear = false, false
+			for _, frame in harness.FramesFor(player, Wire.Frames.Diff) do
+				for _, op in frame.Ops do
+					if op.Path[#op.Path] == "newKey" then
+						if op.Kind == "Set" then
+							sawSet = true
+						elseif op.Kind == "Clear" then
+							sawClear = true
+						end
+					end
+				end
+			end
+			expect(sawSet).to.equal(true)
+			expect(sawClear).to.equal(true)
+			expect(data.Dict.newKey.Get() ~= nil).to.equal(true) -- server keeps it (empty)
 
 			harness.Cleanup()
 		end)
@@ -512,6 +611,211 @@ return function()
 			harness.Data.HandleReceipt(receipt)
 			expect(harness.Data.GetGiftCredits(buyer).GiftVIP).to.equal(nil)
 
+			harness.Cleanup()
+		end)
+	end)
+
+	describe("whole-module audit fixes", function()
+		it("rejects a Scribe declarator nested inside an array-like container", function()
+			expect(function()
+				TestCtx.make({
+					Options = {
+						Template = {
+							Board = { [1] = "a", [2] = "b", Meta = { Score = Scribe.Int(0) } },
+						},
+					},
+				})
+			end).to.throw()
+		end)
+
+		it("rejects a fractional numeric dictionary key at the accessor boundary", function()
+			local harness = TestCtx.make()
+			local player, _, data = harness.Join(50100)
+			-- Whole-table writes already reject fractional keys; the per-key accessor path must too.
+			expect(function()
+				data.Inventory[1.5].Set(3)
+			end).to.throw()
+			harness.Cleanup()
+		end)
+	end)
+
+	describe("v1.0.6 release gate regressions", function()
+		it("a listener connected during a Changed dispatch neither double-fires nor skips others", function()
+			local harness = TestCtx.make()
+			local _p, _e, data = harness.Join()
+			local firstCount, lateCount = 0, 0
+			data.Coins.Changed(function()
+				firstCount += 1
+				if firstCount == 1 then
+					data.Coins.Changed(function()
+						lateCount += 1
+					end)
+				end
+			end)
+			data.Coins.Set(1)
+			-- The existing listener fires exactly once; the mid-dispatch connect does
+			-- not receive the in-flight event (undefined-iteration double-fire/skip).
+			expect(firstCount).to.equal(1)
+			expect(lateCount).to.equal(0)
+			data.Coins.Set(2)
+			expect(firstCount).to.equal(2)
+			expect(lateCount).to.equal(1)
+			harness.Cleanup()
+		end)
+
+		it("rollback prune replicates: no phantom container survives in the client mirror", function()
+			local Client = require(Root.Scribe.Client)
+			local template = TestCtx.defaultTemplate()
+			template.Dyn = {} :: { [string]: any }
+			local harness = TestCtx.make({ AutoPump = false, Template = template })
+			local player, entry, serverData = harness.Join()
+			harness.Transport.LocalPlayer = player
+			local clientData = Client.new(harness.Options, harness.Compiled)
+			harness.Transport:PumpToServer()
+			harness.Transport:PumpToClient()
+
+			local ok = harness.Data.Transaction(player, function()
+				serverData.Dyn.a.b.Set(5) -- materializes Dyn.a inside the txn
+				error("abort")
+			end)
+			expect(ok).to.equal(false)
+			harness.Ctx.Replication.FlushEntry(entry)
+			harness.Transport:PumpToClient()
+
+			-- The emitted restore op (Set Dyn.a.b = nil) materializes Dyn.a on the client
+			-- for parity; the prune must therefore ALSO replicate its removal, or the
+			-- client keeps a phantom {} the server no longer has.
+			expect(serverData.Dyn.Count()).to.equal(0)
+			expect(clientData.Dyn.Count()).to.equal(0)
+			expect(clientData.Dyn.a.Get()).to.equal(nil)
+			harness.Cleanup()
+		end)
+
+		it("AwaitSave is not acked by a save whose payload predates the wait (save generations)", function()
+			local harness = TestCtx.make()
+			local _player, entry = harness.Join()
+			local profile = entry.Profile
+			local realSave = profile.Save
+			profile.Save = function() end -- drive the save cycle manually
+
+			profile.OnSave:Fire() -- an in-flight save whose payload predates the wait below
+			local result: boolean? = nil
+			task.spawn(function()
+				result = harness.Ctx.Persistence.AwaitSave(entry, 5)
+			end)
+			task.wait() -- let the waiter register
+			profile.OnAfterSave:Fire(profile.Data) -- completes the PRE-registration save
+			task.wait()
+			-- Must NOT be acked: this save serialized before the caller registered, so
+			-- acking would report durability for data that may only exist in memory.
+			expect(result).to.equal(nil)
+
+			profile.OnSave:Fire() -- a save STARTED after registration covers the waiter
+			profile.OnAfterSave:Fire(profile.Data)
+			task.wait()
+			expect(result).to.equal(true)
+			profile.Save = realSave
+			harness.Cleanup()
+		end)
+
+		it("client mirror keeps existence parity when a removal supersedes the creating op in one flush", function()
+			local Client = require(Root.Scribe.Client)
+			local template = TestCtx.defaultTemplate()
+			template.Dict = {} :: { [string]: any }
+			template.Dict2 = {} :: { [string]: any }
+			local harness = TestCtx.make({ AutoPump = false, Template = template })
+			local player, entry, serverData = harness.Join()
+			harness.Transport.LocalPlayer = player
+			local clientData = Client.new(harness.Options, harness.Compiled)
+			harness.Transport:PumpToServer()
+			harness.Transport:PumpToClient()
+
+			-- Variant 1: a nil-Set at the same path supersedes the creating Set; the
+			-- server keeps the implicitly materialized parent container.
+			serverData.Dict.newKey.sub.Set(5)
+			serverData.Dict.newKey.sub.Set(nil)
+			-- Variant 2: a Clear supersedes the descendant write that created the key.
+			serverData.Dict2.k.x.Set(1)
+			serverData.Dict2.k.Clear()
+			harness.Ctx.Replication.FlushEntry(entry)
+			harness.Transport:PumpToClient()
+
+			expect(serverData.Dict.Count()).to.equal(1)
+			expect(clientData.Dict.Count()).to.equal(1) -- parent materialized, parity holds
+			expect(typeof(clientData.Dict.newKey.Get())).to.equal("table")
+			expect(serverData.Dict2.Count()).to.equal(1)
+			expect(clientData.Dict2.Count()).to.equal(1)
+			expect(typeof(clientData.Dict2.k.Get())).to.equal("table")
+			expect(clientData.Dict2.k.Count()).to.equal(0)
+			harness.Cleanup()
+		end)
+
+		it("the Timed sweep does not clobber a SetTimed issued by a listener mid-sweep", function()
+			local Scribe = require(Root.Scribe) :: any
+			local template = TestCtx.defaultTemplate()
+			template.BoostA = Scribe.Timed(false)
+			template.BoostB = Scribe.Timed(false)
+			local harness = TestCtx.make({ Template = template })
+			local _p, entry, data = harness.Join()
+
+			data.BoostA.SetTimed(true, 60)
+			data.BoostB.SetTimed(true, 60)
+			-- Whichever field the sweep resets first re-arms the OTHER via its listener.
+			data.BoostA.Changed(function(newValue)
+				if newValue == false then
+					data.BoostB.SetTimed(true, 120)
+				end
+			end)
+			data.BoostB.Changed(function(newValue)
+				if newValue == false then
+					data.BoostA.SetTimed(true, 120)
+				end
+			end)
+			-- Lapse both, then sweep once.
+			entry.LiveData._Scribe.Timed["BoostA"] = os.time() - 5
+			entry.LiveData._Scribe.Timed["BoostB"] = os.time() - 5
+			harness.Ctx.Timed.OnLoad(entry)
+
+			-- The first-processed field resets and re-arms the second; the second must
+			-- be SKIPPED (stale precollected entry), keeping its fresh timer and value.
+			local aActive = (data.BoostA.Active())
+			local bActive = (data.BoostB.Active())
+			expect(aActive ~= bActive).to.equal(true) -- exactly one survived, none clobbered
+			harness.Cleanup()
+		end)
+
+		it("client mirror converges when a listener writes during transaction rollback", function()
+			local Client = require(Root.Scribe.Client)
+			local harness = TestCtx.make({ AutoPump = false })
+			local player, entry, serverData = harness.Join()
+			harness.Transport.LocalPlayer = player
+			local clientData = Client.new(harness.Options, harness.Compiled)
+			harness.Transport:PumpToServer()
+			harness.Transport:PumpToClient()
+
+			serverData.Coins.Set(10)
+			serverData.Gems.Set(5)
+			harness.Ctx.Replication.FlushEntry(entry)
+			harness.Transport:PumpToClient()
+
+			-- Fires on the ROLLBACK restore of Coins (back to 10) and writes Gems.
+			serverData.Coins.Changed(function(newValue)
+				if newValue == 10 then
+					serverData.Gems.Set(1001)
+				end
+			end)
+			local ok = harness.Data.Transaction(player, function()
+				serverData.Coins.Set(99)
+				serverData.Gems.Set(77)
+				error("abort")
+			end)
+			expect(ok).to.equal(false)
+			harness.Ctx.Replication.FlushEntry(entry)
+			harness.Transport:PumpToClient()
+
+			-- Whatever the restore order was, the mirror must equal the server exactly.
+			expect(clientData.Coins.Get()).to.equal(serverData.Coins.Get())
+			expect(clientData.Gems.Get()).to.equal(serverData.Gems.Get())
 			harness.Cleanup()
 		end)
 	end)

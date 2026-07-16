@@ -79,10 +79,20 @@ function Replication.new(ctx: any)
 				end
 			else
 				-- Whole-container writes (table Set, nil Set, Clear) and array
-				-- ops append; break scalar coalescing at this path so a later
-				-- scalar Set cannot collapse into a slot that now precedes this.
+				-- ops append; break scalar coalescing at this path AND every
+				-- descendant path. A later scalar Set to a child would otherwise
+				-- collapse into a slot that now precedes this whole-container write,
+				-- and compactOps would then drop it as superseded even though it
+				-- happened after, silently losing the newest value on the client.
 				table.insert(queue, op)
 				entry.QueueIndex[pathKey] = nil
+				local descendantPrefix = pathKey .. "\31"
+				local prefixLen = #descendantPrefix
+				for k in entry.QueueIndex do
+					if string.sub(k, 1, prefixLen) == descendantPrefix then
+						entry.QueueIndex[k] = nil
+					end
+				end
 			end
 		end
 		-- Before the handshake the snapshot supersedes diffs; skip queueing.
@@ -120,15 +130,17 @@ function Replication.new(ctx: any)
 		end
 	end
 
-	-- Single backward pass that drops every op superseded by a later
-	-- whole-container write (table Set, nil Set, or Clear) at its path or an
-	-- ancestor, preserving emission order for the survivors. O(N x depth),
-	-- run once per flush instead of rescanning the queue on every push.
-	local function isWholeWrite(op: Wire.Op): boolean
-		return op.Kind == "Clear" or (op.Kind == "Set" and (op.Value == nil or type(op.Value) == "table"))
-	end
+	-- Single backward pass that drops every op superseded by a later write,
+	-- preserving emission order for the survivors. O(N x depth), run once per flush.
+	-- A whole-container Set (table or nil) supersedes ops at its OWN path AND all
+	-- descendants (it re-establishes or deletes the whole subtree on replay). A Clear
+	-- supersedes only strict DESCENDANTS (the entries it wipes) -- NOT the op at its
+	-- own path, because Clear is a client-side no-op on an absent key: dropping the
+	-- Set/Insert that created a fresh dynamic key would leave the client without the
+	-- key while the server keeps an empty-but-present container.
 	local function compactOps(queue: { Wire.Op }): { Wire.Op }
-		local supersede: { [string]: boolean } = {}
+		local supersede: { [string]: boolean } = {} -- own path + descendants (Set table/nil)
+		local descendantSupersede: { [string]: boolean } = {} -- descendants only (Clear)
 		local reversed: { Wire.Op } = {}
 		for i = #queue, 1, -1 do
 			local op = queue[i]
@@ -137,7 +149,8 @@ function Replication.new(ctx: any)
 			if not superseded then
 				local pos = string.find(k, "\31", 1, true)
 				while pos do
-					if supersede[string.sub(k, 1, pos - 1)] then
+					local ancestor = string.sub(k, 1, pos - 1)
+					if supersede[ancestor] or descendantSupersede[ancestor] then
 						superseded = true
 						break
 					end
@@ -146,7 +159,9 @@ function Replication.new(ctx: any)
 			end
 			if not superseded then
 				reversed[#reversed + 1] = op
-				if isWholeWrite(op) then
+				if op.Kind == "Clear" then
+					descendantSupersede[k] = true
+				elseif op.Kind == "Set" and (op.Value == nil or type(op.Value) == "table") then
 					supersede[k] = true
 				end
 			end
@@ -335,6 +350,17 @@ function Replication.new(ctx: any)
 
 	local function onHello(entry: any, reader: Wire.Reader)
 		local schemaHash = Wire.RU32(reader)
+		-- The client sends its wire PROTOCOL_VERSION after the hash. A mismatch means
+		-- the binary layout itself differs (not just the template), so decoding would
+		-- be unsafe -- fail closed (no HelloReceived, no Init), unlike the hash check
+		-- below which the value-mode prefix keeps decode-safe.
+		local protocolVersion = Wire.RU8(reader)
+		if protocolVersion ~= Wire.PROTOCOL_VERSION then
+			Log.Warn("Replication", "PROTOCOL_MISMATCH", "client wire protocol version differs from the server", {
+				Player = entry.Player,
+			})
+			return
+		end
 		if schemaHash ~= compiled.Hash % 4294967296 then
 			Log.Warn("Replication", "SCHEMA_MISMATCH", "client derived a different schema than the server", {
 				Player = entry.Player,

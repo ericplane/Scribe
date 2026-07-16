@@ -27,6 +27,21 @@ jobs:
           fi
           echo "value=${VER}" >> "$GITHUB_OUTPUT"
 
+      # Guard: the tag must match the source-of-truth version files, or the
+      # release would ship an artifact whose runtime self-reports a different
+      # version than its label (and a stale Wally/docs version).
+      - name: Verify version files match the tag
+        env:
+          VER: ${{ steps.ver.outputs.value }}
+        run: |
+          WALLY_VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
+          SRC_VER="$(grep -o '"[0-9][^"]*"' src/Internal/Version.luau | tr -d '"')"
+          if [ "$WALLY_VER" != "$VER" ] || [ "$SRC_VER" != "$VER" ]; then
+            echo "::error::version mismatch: tag=$VER wally.toml=$WALLY_VER Version.luau=$SRC_VER"
+            echo "Bump wally.toml, src/Internal/Version.luau, and the README install snippet before tagging."
+            exit 1
+          fi
+
       - name: Install Wally dependencies
         run: wally install
 

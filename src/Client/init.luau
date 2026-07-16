@@ -28,9 +28,14 @@ local function applyPlainOp(root: { [any]: any }, op: Wire.Op)
 		local segment = op.Path[i]
 		local nextContainer = container[segment]
 		if type(nextContainer) ~= "table" then
-			if op.Kind == "Remove" or op.Kind == "Clear" or (op.Kind == "Set" and op.Value == nil) then
-				return
+			if op.Kind == "Remove" then
+				return -- array removals always ship alongside their creating Insert
 			end
+			-- Materialize intermediates for Set (any value) and Clear too: the
+			-- server only emits an op when the parent chain existed at emission, so
+			-- a missing parent here means its creating op was coalesced away in the
+			-- same flush while the server still holds the (possibly empty)
+			-- container. Creating it keeps existence parity with the server.
 			nextContainer = {}
 			container[segment] = nextContainer
 		end
@@ -55,6 +60,10 @@ local function applyPlainOp(root: { [any]: any }, op: Wire.Op)
 		local value = container[key]
 		if type(value) == "table" then
 			table.clear(value)
+		else
+			-- A Clear only emits for a container that existed server-side; if its
+			-- creating op was coalesced away, materialize the cleared {} here.
+			container[key] = {}
 		end
 	end
 end
@@ -146,11 +155,19 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		local ops = Wire.DecodeOps(reader, compiled)
 		-- The snapshot supersedes local state: reset to defaults, then apply.
 		local defaults = Template.BuildDefaults(compiled, "Client")
-		table.clear(mirror)
-		for key, value in defaults do
-			mirror[key] = value
-		end
-		tree:ReplayInit(ops)
+		-- Do the reset + apply INSIDE ReplayFire so that on a re-Init (a second
+		-- snapshot after a resync) Changed listeners see their true pre-snapshot
+		-- value as `old`. ReplayFire snapshots olds before running this closure;
+		-- resetting the mirror outside it would make every `old` the default.
+		tree:ReplayFire(function()
+			table.clear(mirror)
+			for key, value in defaults do
+				mirror[key] = value
+			end
+			for _, op in ops do
+				tree:ApplyOp(op)
+			end
+		end)
 		if not loaded then
 			loaded = true
 			loadedSignal:Fire()
@@ -212,7 +229,10 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			end
 			-- One event per update carrying the current shared data (a clone, so
 			-- listeners can't mutate the mirror); nil is reserved for SharedGone.
-			OnSharedChanged:Fire(userId, Util.deepClone(shared))
+			-- CloneUnpack also converts any datatype fields from their packed wire
+			-- buffer back to the real datatype (the Shared mirror has no accessor
+			-- tree to do this on read).
+			OnSharedChanged:Fire(userId, Node.CloneUnpack(compiled.Root, shared))
 		elseif frameType == Wire.Frames.SharedGone then
 			local userId = Wire.RF64(reader)
 			sharedMirrors[userId] = nil
@@ -501,7 +521,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			then (playerOrUserId :: Player).UserId
 			else playerOrUserId :: number
 		local shared = sharedMirrors[userId]
-		return if shared then Util.deepClone(shared) else nil
+		-- CloneUnpack converts packed datatype buffers (wire form) back to the real
+		-- datatype; the Shared mirror has no accessor tree to do it on read.
+		return if shared then Node.CloneUnpack(compiled.Root, shared) else nil
 	end
 
 	--[=[

@@ -10,10 +10,10 @@ A handful of options let you play-test without touching (or corrupting) live dat
 
 | Option | Effect |
 | --- | --- |
-| `UseMock = true` | Leaderboards use an in-memory store instead of OrderedDataStore. |
-| `DontSave = true` | Load real data but never persist changes. |
+| `UseMock = true` | Full in-memory mock store: profiles AND leaderboards. Nothing is read from or written to real DataStores; every profile loads as fresh template defaults. |
+| `DontSave = true` | Same as `UseMock` for profiles: a full in-memory mock. It does **not** load real data -- to inspect real profiles without writing, use `ViewedUserId`. |
 | `ResetData = true` | **Destructive**: every profile loads as template defaults. Development only. |
-| `ViewedUserId = <id>` | Load another user's profile read-only (never saves). |
+| `ViewedUserId = <id>` | Load that user's REAL profile read-only (never saves). This is the option for validating real data safely. |
 | `Banner = false` | Silence the one-line load banner. |
 
 ## Edit mode & storybooks

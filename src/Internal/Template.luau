@@ -32,6 +32,8 @@ export type SchemaNode = {
 	ChildOrdinal: { [string]: number }?,
 	Parent: SchemaNode?,
 	AnyChild: SchemaNode?, -- lazily created pseudo-node for dynamic keys
+	HasDatatype: boolean?, -- true if any declared descendant is a packed datatype;
+	-- lets container reads skip the deep-unpack walk when there is nothing to convert
 }
 
 export type Compiled = {
@@ -132,6 +134,17 @@ local function buildNode(
 			-- field per brand-new profile.
 			if default == nil then
 				compileError(path, "Scribe.Dynamic factory must return a non-nil value")
+			end
+			-- Dynamic seeds into the persistent store on a brand-new profile, but
+			-- Session data lives in a separate, non-persisted store that is rebuilt
+			-- from its default every session -- so a Session+Dynamic field's seed
+			-- would land in the wrong store (invisible and wrongly saved). Reject
+			-- the combination; use OnPlayerInit to generate per-session values.
+			if visibility == "Session" then
+				compileError(
+					path,
+					"Scribe.Dynamic is not supported on a Session field; generate per-session values in OnPlayerInit instead"
+				)
 			end
 			local factory = if markerMeta then markerMeta.Factory else nil
 			local sampleType = typeof(default)
@@ -253,14 +266,35 @@ local function buildNode(
 
 	if node.Kind == "table" then
 		if Util.hasNumericKeys(value) then
-			-- Array-like default: entries are data, not schema. Elements are
-			-- encoded generically.
+			-- Array-like default: entries are DATA (deep-cloned, generically encoded),
+			-- not schema. A Scribe declarator (Scribe.Int, Scribe.Vector3, ...) anywhere
+			-- inside -- directly under a key OR nested one or more plain sub-tables
+			-- deeper -- would be silently stored as its raw marker table instead of
+			-- compiled into a schema field, so reject the ambiguous shape outright. A
+			-- valid data blob contains no markers, so scanning the whole blob is safe.
+			local function rejectNestedMarker(v: any, where: string)
+				if Marker.inspect(v) ~= nil then
+					compileError(
+						path,
+						`"{where}" is a Scribe declarator inside an array-like container; `
+							.. `a table may hold array entries OR named schema fields, not both`
+					)
+				elseif type(v) == "table" then
+					for k, child in v do
+						rejectNestedMarker(child, if where == "" then tostring(k) else where .. "." .. tostring(k))
+					end
+				end
+			end
+			for k, v in value do
+				rejectNestedMarker(v, tostring(k))
+			end
 			node.Default = Util.deepClone(value)
 		else
 			local children: { [string]: SchemaNode } = {}
 			local order = Util.sortedKeys(value)
 			local ordinal: { [string]: number } = {}
 			local default = {}
+			local hasDatatype = false
 			for i, key in order do
 				local childPath = table.clone(path)
 				table.insert(childPath, key)
@@ -268,11 +302,16 @@ local function buildNode(
 				children[key] = child
 				ordinal[key] = i
 				default[key] = child.Default
+				-- Bubble the datatype marker up (post-order: child is fully built).
+				if child.ValueType == "datatype" or child.HasDatatype then
+					hasDatatype = true
+				end
 			end
 			node.Children = children
 			node.ChildOrder = order
 			node.ChildOrdinal = ordinal
 			node.Default = default
+			node.HasDatatype = hasDatatype
 		end
 	else
 		node.Default = value
@@ -381,6 +420,17 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 	root.Children = children
 	root.ChildOrder = order
 	root.ChildOrdinal = ordinal
+	-- The root node is hand-built here rather than by buildNode, so bubble its
+	-- HasDatatype flag the same way (else a whole-data Get()/Clone() on the root
+	-- accessor would leak packed buffers for a ROOT-level datatype field).
+	local rootHasDatatype = false
+	for _, child in children do
+		if child.ValueType == "datatype" or child.HasDatatype then
+			rootHasDatatype = true
+			break
+		end
+	end
+	root.HasDatatype = rootHasDatatype
 
 	-- The hash must fold every field that affects the wire byte layout, or a
 	-- server/client schema drift decodes silently wrong. Min/Max drive int

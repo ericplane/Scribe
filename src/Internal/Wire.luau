@@ -498,7 +498,13 @@ local function decodeValue(r: Reader, node: SchemaNode?, depth: number): any
 			else
 				error("Scribe: bad key tag")
 			end
-			out[key] = decodeValue(r, child, depth + 1)
+			local value = decodeValue(r, child, depth + 1)
+			-- Skip a NaN key (only a crafted TAG_KEY_F64 can decode to one): Lua
+			-- forbids t[NaN] and would throw, dropping the whole frame. Decode the
+			-- value first to keep the reader in sync. Matches decodeGeneric.
+			if key == key then
+				out[key] = value
+			end
 		end
 		return out
 	end

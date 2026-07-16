@@ -21,6 +21,7 @@ local REFRESH_INTERVAL = 60
 local QUEUE_CAP = 1000
 local NAME_TTL = 900
 local NAME_NEGATIVE_TTL = 120
+local NAME_CACHE_CAP = 4096 -- bound the resolved-name cache; entries are re-resolvable
 
 type Board = {
 	Name: string,
@@ -216,7 +217,17 @@ function Leaderboards.new(ctx: any)
 				if isErased(item.UserId) then
 					continue
 				end
-				if not performWrite(item) then
+				local wrote = performWrite(item)
+				-- performWrite's SetAsync yields; if EraseUser ran during that yield,
+				-- this write resurrected the score past its RemoveAsync. Re-check and
+				-- undo just this board's write so the erase holds.
+				if wrote and isErased(item.UserId) then
+					pcall(function()
+						orderedStore(item.Board.StoreName):RemoveAsync(tostring(item.UserId))
+					end)
+					continue
+				end
+				if not wrote then
 					item.Attempts += 1
 					-- Only requeue if no newer value for this key arrived during
 					-- the SetAsync yield (dedup) and the user was not erased.
@@ -237,6 +248,50 @@ function Leaderboards.new(ctx: any)
 
 	-- Reads + refresh cycle -----------------------------------------------------------
 
+	-- Cache a resolved name, keeping the map bounded: names are re-resolvable, so
+	-- once the cache fills, drop entries whose TTL has lapsed. Without this it
+	-- grows one entry per distinct userId ever seen in any board's top-N, for the
+	-- server's whole lifetime.
+	local nameCacheCount = 0
+	local function cacheName(userId: number, entry: { Name: string?, At: number })
+		if nameCache[userId] == nil then
+			nameCacheCount += 1
+		end
+		nameCache[userId] = entry
+		if nameCacheCount >= NAME_CACHE_CAP then
+			local now = os.clock()
+			local kept = 0
+			for id, c in nameCache do
+				local ttl = if c.Name then NAME_TTL else NAME_NEGATIVE_TTL
+				if now - c.At >= ttl then
+					nameCache[id] = nil
+				else
+					kept += 1
+				end
+			end
+			nameCacheCount = kept
+			-- TTL eviction alone does not bound the map when distinct-user inflow
+			-- outpaces expiry (all entries still fresh). Fall back to evicting the
+			-- oldest-by-refresh-time entries down to half the cap, so the cache is
+			-- hard-bounded regardless of freshness and this O(n log n) pass amortizes
+			-- across the next ~cap/2 inserts.
+			if nameCacheCount >= NAME_CACHE_CAP then
+				local ordered: { { Id: number, At: number } } = {}
+				for id, c in nameCache do
+					table.insert(ordered, { Id = id, At = c.At })
+				end
+				table.sort(ordered, function(a: { Id: number, At: number }, b: { Id: number, At: number })
+					return a.At < b.At
+				end)
+				local target = NAME_CACHE_CAP // 2
+				for i = 1, #ordered - target do
+					nameCache[ordered[i].Id] = nil
+				end
+				nameCacheCount = target
+			end
+		end
+	end
+
 	local function resolveName(userId: number): string
 		local cached = nameCache[userId]
 		local now = os.clock()
@@ -248,14 +303,14 @@ function Leaderboards.new(ctx: any)
 		end
 		local player = Players:GetPlayerByUserId(userId)
 		if player then
-			nameCache[userId] = { Name = player.Name, At = now }
+			cacheName(userId, { Name = player.Name, At = now })
 			return player.Name
 		end
 		local ok, name = pcall(function()
 			return Players:GetNameFromUserIdAsync(userId)
 		end)
 		-- Negative caching: failed lookups are cached briefly.
-		nameCache[userId] = { Name = if ok then name else nil, At = now }
+		cacheName(userId, { Name = if ok then name else nil, At = now })
 		return if ok then name else "Unknown"
 	end
 
@@ -475,8 +530,19 @@ function Leaderboards.new(ctx: any)
 				break
 			end
 			writeQueueMap[`{item.Board.Name}|{item.UserId}`] = nil
-			performWrite(item)
 			flushed += 1
+			-- Mirror the pacer's GDPR guard: skip a user erased before the write, and
+			-- undo a write whose SetAsync yield raced a concurrent EraseUser (which
+			-- would otherwise resurrect the score past its RemoveAsync).
+			if isErased(item.UserId) then
+				continue
+			end
+			local wrote = performWrite(item)
+			if wrote and isErased(item.UserId) then
+				pcall(function()
+					orderedStore(item.Board.StoreName):RemoveAsync(tostring(item.UserId))
+				end)
+			end
 		end
 		Log.Info("Leaderboards", "LB_SHUTDOWN_FLUSH", "leaderboard queue drained on shutdown", {
 			Flushed = flushed,
@@ -519,6 +585,34 @@ function Leaderboards.new(ctx: any)
 			board.MyRanks[userId] = nil
 			board.MyScores[userId] = nil
 			board.SentState[userId] = nil
+			-- Also drop the erased user from the in-memory cache so their userId /
+			-- resolved Name / Score are not served (GetLeaderboard) or freshly pushed
+			-- to a client completing the handshake before the next refreshBoard.
+			local entries = board.Cache.Entries
+			local pruned = false
+			for i = #entries, 1, -1 do
+				if entries[i].UserId == userId then
+					table.remove(entries, i)
+					pruned = true
+				end
+			end
+			if pruned then
+				-- Renumber so GetLeaderboard serves a contiguous rank sequence rather
+				-- than a gapped one (1, 3, 4, ...) until the next refresh. Then
+				-- recompute the signature (same format as refreshBoard) so the change
+				-- broadcasts and stale SentState entries do not suppress the update.
+				local signatureParts = {}
+				for i, item in entries do
+					item.Rank = i
+					table.insert(signatureParts, `{item.UserId}:{item.Score}`)
+				end
+				board.Signature = table.concat(signatureParts, "|")
+			end
+		end
+		-- Evict the resolved name so it is neither re-served nor re-broadcast.
+		if nameCache[userId] ~= nil then
+			nameCache[userId] = nil
+			nameCacheCount -= 1
 		end
 		if failed then
 			return false, `profile removed, but a leaderboard erase failed: {failed}`

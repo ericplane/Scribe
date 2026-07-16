@@ -18,7 +18,11 @@ local thresholds = {
 	FailWindow = 60, -- seconds
 	FailCount = 3, -- failures within window: Healthy -> Degraded
 	RecoverStreak = 5, -- consecutive successes to step one state down
-	OutageFailCount = 8, -- failures within window: -> Outage
+	-- failures within window -> Outage. Derived from FailCount by the same formula
+	-- Configure uses (max(FailCount*2, FailCount+1)), so passing a StatusThresholds
+	-- table that leaves FailCount at its default doesn't silently shift the Outage
+	-- threshold from this value.
+	OutageFailCount = math.max(3 * 2, 3 + 1),
 	CriticalOutageDelay = 30, -- seconds of sustained ProfileStore critical state -> Outage
 }
 
@@ -104,7 +108,19 @@ end
 -- Bound to ProfileStore.OnCriticalToggle.
 function Health.SetCritical(isCritical: boolean)
 	if isCritical then
-		criticalSince = criticalSince or os.clock()
+		if not criticalSince then
+			criticalSince = os.clock()
+			-- evaluate() runs only on ReportFailure / SetCritical, so a sustained
+			-- critical window with no further failures would never escalate to
+			-- Outage. Re-check once the sustained-critical delay elapses; evaluate()
+			-- re-reads the real elapsed time, so a since-cleared or freshly-reset
+			-- critical state won't escalate prematurely.
+			task.delay(thresholds.CriticalOutageDelay, function()
+				if criticalSince then
+					evaluate()
+				end
+			end)
+		end
 		evaluate()
 	else
 		criticalSince = nil

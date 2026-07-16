@@ -13,6 +13,8 @@ By default, a field persists and replicates to its **owner**, the player it belo
 | [`Scribe.Shared(v)`](/api/Scribe#Shared) | ✅ | **every** client | public info (name, team) |
 | [`Scribe.Session(v)`](/api/Scribe#Session) | ❌ | the owner | runtime-only state |
 
+`Scribe.Session` cannot wrap a `Scribe.Dynamic` field (a startup error): Session data is rebuilt from its default every session, so a one-time seed has nowhere to live. Generate per-session values in [`OnPlayerInit`](./lifecycle) instead.
+
 ```lua
 local template = {
     Coins   = 0,                                 -- persists, owner sees it

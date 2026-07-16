@@ -13,6 +13,15 @@ local Timed = {}
 
 local COOLDOWN_PREFIX = "@cd|"
 local SWEEP_INTERVAL = 1
+-- Finite ceiling (~126 years) so SetTimed(value, math.huge) is a safe way to say
+-- "effectively permanent": expiries are written RAW into the persisted _Scribe.Timed
+-- store, and an infinite expiry would break the DataStore JSON round trip.
+local MAX_TIMED_SECONDS = 4e9
+
+-- Whole seconds, floored to at least 1 and capped finite.
+local function clampSeconds(seconds: number): number
+	return math.max(1, math.floor(math.min(seconds, MAX_TIMED_SECONDS)))
+end
 
 function Timed.new(ctx: any)
 	local self = {} :: any
@@ -30,8 +39,30 @@ function Timed.new(ctx: any)
 		return reserved.Timed
 	end
 
-	local function timedAccessor(entry: any, pathKey: string): any
-		return entry.Tree.Accessor[Template.RESERVED_ROOT].Timed[pathKey]
+	-- Write an internal expiry (or clear it, with value == nil) directly into the
+	-- ServerOnly _Scribe.Timed dict. This deliberately bypasses the accessor tree:
+	-- the store is a FLAT dict keyed by each field's full pathKey, and a NESTED
+	-- Scribe.Timed field's pathKey embeds the \31 path separator, which the
+	-- accessor's dictionary-key guard rejects (Node.luau). The store is ServerOnly
+	-- and lives in profile.Data, so a raw write persists on the next save; flag
+	-- Dirty so that save happens promptly rather than only on the autosave tick.
+	local function setTimed(entry: any, pathKey: string, value: number?)
+		local store = timedStore(entry)
+		if not store then
+			return
+		end
+		-- If a transaction is open, record the pre-write expiry so a rollback reverts
+		-- it in lockstep with the field's value (which rolls back via the accessor).
+		-- Without this the value would revert but the timer would not, or a cooldown
+		-- armed inside an aborted transaction would persist. No-op outside a txn.
+		local tree = entry.Tree
+		if tree then
+			tree:RecordRawWrite(store, pathKey)
+		end
+		store[pathKey] = value
+		if entry.SaveInfo then
+			entry.SaveInfo.Dirty = true
+		end
 	end
 
 	local function fieldAccessorFromKey(entry: any, pathKey: string): (any, Template.SchemaNode?)
@@ -40,7 +71,15 @@ function Timed.new(ctx: any)
 		for _, segment in segments do
 			accessor = accessor[segment]
 		end
-		local node = Template.Resolve(compiled, segments)
+		-- Only treat node.Default as the field default when Resolve FULLY consumed the
+		-- path (the field still has a static schema). If a template version removed the
+		-- field, Resolve stops at a surviving ancestor whose Default is that whole
+		-- container -- writing THAT into the removed field's path would fabricate a
+		-- phantom sub-table. A dynamic (non-static) key has no template default either.
+		local node, dynStart = Template.Resolve(compiled, segments)
+		if dynStart <= #segments then
+			return accessor, nil
+		end
 		return accessor, node
 	end
 
@@ -53,7 +92,7 @@ function Timed.new(ctx: any)
 				end
 				accessor.Set(value, replicate)
 				local pathKey = rawget(accessor, "_key") :: string
-				timedAccessor(entry, pathKey).Set(os.time() + math.floor(seconds), false)
+				setTimed(entry, pathKey, os.time() + clampSeconds(seconds))
 			end,
 			ExtendTimed = function(accessor: any, seconds: number, replicate: boolean?)
 				if type(seconds) ~= "number" or seconds <= 0 then
@@ -66,7 +105,7 @@ function Timed.new(ctx: any)
 				-- Stack onto a running timer; if expired/inactive, behave like
 				-- SetTimed from now (the value itself is left untouched).
 				local base = if current and current > now then current else now
-				timedAccessor(entry, pathKey).Set(base + math.floor(seconds), false)
+				setTimed(entry, pathKey, base + clampSeconds(seconds))
 				local _ = replicate
 			end,
 			Active = function(accessor: any): (boolean, number?)
@@ -85,6 +124,12 @@ function Timed.new(ctx: any)
 	-- Keyed cooldowns: checks and — when off cooldown — ARMS it. Call this only
 	-- at the grant/claim moment; use PeekCooldown for display checks.
 	function self.OnCooldown(entry: any, key: string, seconds: number): (boolean, number)
+		-- Zero/negative seconds means "no cooldown": report off-cooldown WITHOUT
+		-- arming. (clampSeconds floors to 1, which would otherwise silently turn a
+		-- computed 0 into a real 1-second gate.)
+		if type(seconds) ~= "number" or seconds <= 0 then
+			return false, 0
+		end
 		local pathKey = COOLDOWN_PREFIX .. key
 		local store = timedStore(entry)
 		if not store then
@@ -95,7 +140,7 @@ function Timed.new(ctx: any)
 		if expiry and now < expiry then
 			return true, expiry - now
 		end
-		timedAccessor(entry, pathKey).Set(now + math.floor(seconds), false)
+		setTimed(entry, pathKey, now + clampSeconds(seconds))
 		return false, 0
 	end
 
@@ -116,7 +161,7 @@ function Timed.new(ctx: any)
 	-- Clear a cooldown (support/testing resets).
 	function self.ClearCooldown(entry: any, key: string)
 		if timedStore(entry) then
-			timedAccessor(entry, COOLDOWN_PREFIX .. key).Set(nil, false)
+			setTimed(entry, COOLDOWN_PREFIX .. key, nil)
 		end
 	end
 
@@ -129,18 +174,26 @@ function Timed.new(ctx: any)
 			return
 		end
 		local now = os.time()
-		local lapsed: { string }? = nil
+		local lapsed: { { Key: string, Expiry: number } }? = nil
 		for pathKey, expiry in store do
 			if type(expiry) == "number" and now >= expiry then
 				lapsed = lapsed or {}
-				table.insert(lapsed :: { string }, pathKey)
+				table.insert(lapsed :: { { Key: string, Expiry: number } }, { Key = pathKey, Expiry = expiry })
 			end
 		end
 		if not lapsed then
 			return
 		end
-		for _, pathKey in lapsed :: { string } do
-			timedAccessor(entry, pathKey).Set(nil, false)
+		for _, item in lapsed :: { { Key: string, Expiry: number } } do
+			local pathKey = item.Key
+			-- Re-check before processing: a Changed listener fired while resetting an
+			-- EARLIER lapsed field may have re-armed (SetTimed) or cleared this one.
+			-- Processing the stale precollected entry would wipe that fresh expiry and
+			-- reset the field, silently destroying the listener's write.
+			if store[pathKey] ~= item.Expiry then
+				continue
+			end
+			setTimed(entry, pathKey, nil)
 			if string.sub(pathKey, 1, #COOLDOWN_PREFIX) ~= COOLDOWN_PREFIX then
 				local ok, err = pcall(function()
 					local accessor, node = fieldAccessorFromKey(entry, pathKey)
