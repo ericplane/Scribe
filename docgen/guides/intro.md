@@ -82,6 +82,10 @@ Data.Coins.Observe(function(coins)
 end)
 ```
 
+:::caution The client must require the module too
+Replication only starts when the bundle is required from a **client-side script** (a `LocalScript`). That `require` runs the client's handshake with the server. If you set Scribe up on the server but never require it on the client, the client never syncs: `Observe`/`Changed` never fire with real data (reads stay at your template defaults), `GetShared` is empty, and the server logs a `CLIENT_HANDSHAKE_TIMEOUT` warning (`"client never sent Hello"`). Requiring the same shared module on both realms is the whole setup. There is nothing else to wire up.
+:::
+
 Unlike the server, the client never makes you wait. Reads return your template defaults until the first sync arrives, and `Observe` (and `Changed`) fire the moment real data lands, so reactive UI updates itself without any gating. For a one-off imperative read at startup, where the default would be wrong, check `Data.IsReady()` or yield on `Data.WaitForData(timeout)` first.
 
 Client writes are **local-only** (optimistic UI). Server ops always win. To change data authoritatively, call a server command:
