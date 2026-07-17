@@ -1,0 +1,61 @@
+name: Publish to Wally
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only verify the version match; do not publish"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the exact tools pinned in rokit.toml (wally + rojo).
+      - uses: CompeyDev/setup-rokit@v0.1.2
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VER="${{ github.event.release.tag_name }}"
+            VER="${VER#v}"                 # strip a leading v (v1.0.1 -> 1.0.1)
+          else
+            VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
+          fi
+          echo "value=${VER}" >> "$GITHUB_OUTPUT"
+
+      # Guard: refuse to publish unless wally.toml and Version.luau agree (and,
+      # on a real release, unless the tag agrees too).
+      - name: Verify wally.toml and Version.luau match
+        env:
+          VER: ${{ steps.ver.outputs.value }}
+        run: |
+          WALLY_VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
+          SRC_VER="$(grep -o '"[0-9][^"]*"' src/Internal/Version.luau | tr -d '"')"
+          if [ "$WALLY_VER" != "$SRC_VER" ]; then
+            echo "::error::version mismatch: wally.toml=$WALLY_VER Version.luau=$SRC_VER"
+            echo "Bump wally.toml and src/Internal/Version.luau together before releasing."
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "release" ] && [ "$WALLY_VER" != "$VER" ]; then
+            echo "::error::tag $VER does not match wally.toml/Version.luau $WALLY_VER"
+            exit 1
+          fi
+          echo "Version $WALLY_VER verified."
+
+      - name: Publish to Wally
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        env:
+          WALLY_AUTH_TOKEN: ${{ secrets.WALLY_AUTH_TOKEN }}
+        run: |
+          wally login --token "$WALLY_AUTH_TOKEN"
+          wally publish

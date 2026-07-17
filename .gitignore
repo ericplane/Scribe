@@ -29,3 +29,4 @@ __pycache__/
 .cache/
 # Edge render temp for devforum-post assets
 /devforum-post
+.DS_Store
