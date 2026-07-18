@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
       - name: Cache rokit tool store
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.rokit
           key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
       - name: Cache rokit tool store
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.rokit
           key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
@@ -53,7 +53,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
       - name: Cache rokit tool store
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.rokit
           key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
@@ -66,12 +66,12 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
       - name: Cache rokit tool store
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.rokit
           key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
       - name: Cache Wally packages
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/wally
           key: wally-${{ runner.os }}-${{ hashFiles('wally.toml') }}
