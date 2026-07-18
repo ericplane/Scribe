@@ -31,6 +31,21 @@ The mkdocs hook regenerates `docs_gen/` before every build, and `mkdocs serve`
 watches `src/` and `docgen/`, so editing a doc-comment or a guide live-reloads
 the page. To generate once without serving: `python docgen/gen.py`.
 
+## Doc-comment convention (one block per member)
+
+Each API member must have **exactly one** moonwave (`--[=[ ]=]`) doc block. Most
+public server/client functions exist twice in the source: a public `Data.<name>`
+wrapper in `Server/init.luau` or `Client/init.luau`, and an internal
+`self.<name>` implementation in a subsystem module (e.g. `Monetization.luau`).
+Put the `@within` doc block on the **`Data.<name>` wrapper only**, and use a plain
+`-- ...` comment on the internal `self.<name>`. Two blocks that resolve to the
+same `Class.member` would emit a duplicate API entry and a duplicate table-of-
+contents line.
+
+`gen.py` enforces this: it **fails the build** (and thus the `docs-check` CI, which
+runs `mkdocs build --strict`) if any `Class.member` is documented by more than one
+block, naming both source locations.
+
 ## Deployment
 
 Everything — this generator, `mkdocs.yml`, the guides, and the library — lives on

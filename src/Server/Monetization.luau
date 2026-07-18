@@ -341,21 +341,13 @@ function Monetization.new(ctx: any)
 		end
 	end
 
-	--[=[
-		@within Server
-		@tag Monetization
-		@server
-		@yields
-		@param player Player
-		@param key string
-		@param timeout number?
-		@return boolean
-		Like [Server.Owns], but **yields** until the initial asynchronous gamepass
-		ownership refresh has completed, so it returns an authoritative answer even
-		the instant a player joins (perks/gifts resolve immediately; only real
-		gamepass ownership has the async warm-up). Falls back to the current cached
-		answer if `timeout` seconds (default 10) pass first.
-	]=]
+	-- Like self.Owns, but YIELDS until the initial async gamepass ownership refresh
+	-- has completed (the OwnershipWaiters / markOwnershipReady handshake), so it
+	-- returns an authoritative answer even the instant a player joins. Perks/gifts
+	-- resolve synchronously; only real gamepass ownership has the warm-up. Falls
+	-- back to the current cached answer after `timeout` seconds (default 10). Public
+	-- API doc-comment lives on Data.OwnsAsync (Server/init.luau) -- keep this a plain
+	-- comment so the docgen does not emit a duplicate ".OwnsAsync" entry.
 	function self.OwnsAsync(player: Player, key: string, timeout: number?): boolean
 		checkOwnsKey(key)
 		local entry = ctx.Persistence.EntryFor(player)

@@ -8,6 +8,7 @@ Run directly (`python docgen/gen.py`) or let mkdocs_hooks.py invoke main() on
 every build/serve.
 """
 import re
+import sys
 import pathlib
 import textwrap
 import shutil
@@ -63,6 +64,8 @@ def parse_block(body, next_code):
 
 def collect():
     classes = {}  # name -> {desc, members:[]}
+    seen = {}     # (within, name) -> "path:line" of the doc block that defined it first
+    dups = []     # (within, name, first_src, dup_src) for every redefinition
     for path in SRC.rglob("*.luau"):
         text = path.read_text(encoding="utf-8")
         for m in BLOCK.finditer(text):
@@ -76,7 +79,40 @@ def collect():
             if e["cls"]:
                 classes.setdefault(e["cls"], {"desc": "", "members": []})["desc"] = e["desc"]
             elif e["within"] and e["name"]:
+                # Two moonwave blocks resolving to the same Class.member emit a
+                # duplicate API entry (and a duplicate TOC line). Almost always a
+                # public doc-comment accidentally left on BOTH the internal self.<name>
+                # and the Data.<name> wrapper. Flag every collision and fail the build.
+                src = f"{path.relative_to(ROOT)}:{text.count(chr(10), 0, m.start()) + 1}"
+                key = (e["within"], e["name"])
+                if key in seen:
+                    dups.append((key[0], key[1], seen[key], src))
+                else:
+                    seen[key] = src
                 classes.setdefault(e["within"], {"desc": "", "members": []})["members"].append(e)
+    if dups:
+        lines = [
+            "",
+            "[docgen] ERROR: duplicate API doc-comment(s) -- the same member is documented",
+            "by more than one moonwave block, which emits a duplicate entry in the API page",
+            "and its table of contents:",
+            "",
+        ]
+        for within, name, first, dup in dups:
+            lines += [f"  * {within}.{name}",
+                      f"        first defined at: {first}",
+                      f"        duplicated at:    {dup}"]
+        lines += [
+            "",
+            "Give each API member exactly ONE moonwave (--[=[ ]=]) doc block. Convention:",
+            "keep the public block on the Data.<name> wrapper (Server/Client init.luau) and",
+            "use a plain -- comment on the internal self.<name>. See docgen/README.md.",
+            "",
+        ]
+        # Print explicitly (not just via SystemExit's arg) so the message is visible
+        # even when mkdocs surfaces the hook failure, then fail the build non-zero.
+        print("\n".join(lines), file=sys.stderr)
+        raise SystemExit(1)
     return classes
 
 
