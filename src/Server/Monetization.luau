@@ -419,7 +419,12 @@ function Monetization.new(ctx: any)
 			end)
 			if not ok then
 				Metrics.Add("OwnershipCheckFailures")
-				Log.Warn("Monetization", "OWNERSHIP_CHECK_FAIL", tostring(owned), { UserId = recipientUserId, PassId = pass.Id })
+				Log.Warn(
+					"Monetization",
+					"OWNERSHIP_CHECK_FAIL",
+					tostring(owned),
+					{ UserId = recipientUserId, PassId = pass.Id }
+				)
 			elseif owned == true then
 				return true
 			end
@@ -727,10 +732,15 @@ function Monetization.new(ctx: any)
 		-- would gift the new product to the old intended recipient. Treat as
 		-- no-intent (the stale record TTL-expires; the name check keeps catching it).
 		if type(intent) == "table" and intent.Product ~= nil and intent.Product ~= product.Name then
-			Log.Warn("Gifting", "GIFT_INTENT_EXPIRED", "offline gift intent belonged to a retired product reusing this Id", {
-				UserId = userId,
-				Product = product.Name,
-			})
+			Log.Warn(
+				"Gifting",
+				"GIFT_INTENT_EXPIRED",
+				"offline gift intent belonged to a retired product reusing this Id",
+				{
+					UserId = userId,
+					Product = product.Name,
+				}
+			)
 			intent = nil
 		end
 		if type(intent) == "table" and os.time() - (tonumber(intent.Ts) or 0) <= giftIntentTTL then

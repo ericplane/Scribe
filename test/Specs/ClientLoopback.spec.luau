@@ -157,7 +157,8 @@ return function()
 	itRunning("Mock fires nested observers registered before the Mock call (edit mode)", function()
 		-- Same whole-root-Set root cause as Init, on the edit-mode path.
 		local harness = TestCtx.make()
-		local RunService = game:GetService("RunService")
+		-- Reuse the module-level RunService singleton (same object) rather than
+		-- redeclaring it here, which would shadow it.
 		local origIsRunning = RunService.IsRunning
 		RunService.IsRunning = function() -- edit mode at construction
 			return false
@@ -331,10 +332,7 @@ return function()
 			SendToClient = function() end,
 			ListenServer = function() end,
 		}
-		local opts = {}
-		for k, v in harness.Options do
-			opts[k] = v
-		end
+		local opts = table.clone(harness.Options)
 		opts.Transport = blocked
 		Client.new(opts, harness.Compiled)
 		-- Let the connect coroutine run sendHello.

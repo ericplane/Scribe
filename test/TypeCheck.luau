@@ -135,7 +135,30 @@ local function serverUsage(player: Player)
 		end,
 	})
 
-	return coins, dmg, has, active, remaining, equipped, flagged, inCombat, reason, owns, ok, err, onCooldown, cooldownRemaining, blob, spawnPoint, door, tint, bought, coinMin, coinMax, coinDefault, spawnDefault, createdAt
+	return coins,
+		dmg,
+		has,
+		active,
+		remaining,
+		equipped,
+		flagged,
+		inCombat,
+		reason,
+		owns,
+		ok,
+		err,
+		onCooldown,
+		cooldownRemaining,
+		blob,
+		spawnPoint,
+		door,
+		tint,
+		bought,
+		coinMin,
+		coinMax,
+		coinDefault,
+		spawnDefault,
+		createdAt
 end
 
 local ClientData = bundle.Client
@@ -156,7 +179,8 @@ end
 
 local function diagnosticsUsage()
 	-- Valid codes, levels, and categories are accepted and fully typed.
-	local recent = Scribe.GetRecentLogs({ Code = "PROFILE_LOAD_FAIL", Level = "Error", Category = "Persistence", Limit = 10 })
+	local recent =
+		Scribe.GetRecentLogs({ Code = "PROFILE_LOAD_FAIL", Level = "Error", Category = "Persistence", Limit = 10 })
 	local count: number = #recent
 	Scribe.AddLogSink(function(entry)
 		if entry.Code == "PROFILE_SIZE" or entry.Level == "Fatal" then

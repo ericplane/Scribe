@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call: # lets the release workflows gate on a green run
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One in-flight run per ref; newer pushes cancel older ones. Release runs use a
+# distinct ref (a tag), so this never cancels a release's verify job.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
+      - name: Cache rokit tool store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.rokit
+          key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
+      # The headless runner ships its own mini-TestEZ, so no `wally install` here.
+      - name: Run test suite
+        run: lune run lune/run-tests
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
+      - name: Cache rokit tool store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.rokit
+          key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
+      # selene.toml uses std = "roblox+testez"; selene fetches/caches the roblox
+      # std on first run. If a runner ever flakes on that fetch, add a
+      # `selene generate-roblox-std` step before this one.
+      - name: Lint
+        run: selene src test lune
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
+      - name: Cache rokit tool store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.rokit
+          key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
+      - name: Check formatting
+        run: stylua --check src test lune
+
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
+      - name: Cache rokit tool store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.rokit
+          key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
+      - name: Cache Wally packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/wally
+          key: wally-${{ runner.os }}-${{ hashFiles('wally.toml') }}
+      # Populates DevPackages (TestEZ) so the test.project.json sourcemap resolves.
+      - name: Install Wally dependencies
+        run: wally install
+      - name: Generate sourcemap
+        run: rojo sourcemap test.project.json -o sourcemap.json
+      - name: Fetch Roblox global type defs
+        run: |
+          curl -fsSL \
+            "https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/${LUAU_LSP_VER}/scripts/globalTypes.d.luau" \
+            -o globalTypes.d.luau
+        env:
+          # Keep in sync with rokit.toml's luau-lsp pin.
+          LUAU_LSP_VER: "1.68.1"
+      # Positive gate: the typed accessor API and the Scribe() entry point must
+      # type-check clean under the NEW solver (--settings mirrors the editor's
+      # enableNewSolver). `src` itself is intentionally NOT gated here: the new
+      # solver still reports dozens of false positives on the internal code, so
+      # only the user-facing type surface (exercised by TypeCheck.luau) is
+      # asserted clean.
+      - name: Type-check (positive fixture must be clean)
+        run: |
+          luau-lsp analyze \
+            --sourcemap=sourcemap.json \
+            --defs=globalTypes.d.luau \
+            --settings=.vscode/settings.json \
+            --ignore="**/DevPackages/**" \
+            --ignore="**/ServerPackages/**" \
+            test/TypeCheck.luau
+      # Negative gate: TypeCheckErrors.luau is a fixture of deliberate type
+      # errors. It must report EXACTLY the number of diagnostics declared in its
+      # own `EXPECTED_ERRORS:` header. If a change silently loosens the
+      # template-aware config types, the count drops and this fails — catching a
+      # regression the positive fixture cannot.
+      - name: Type-check (negative fixture must report the expected count)
+        run: |
+          # `|| true`: grep exits 1 on no match, which under `set -eo pipefail`
+          # would abort the step before the guard below can print its message.
+          expected="$(grep -oE 'EXPECTED_ERRORS: [0-9]+' test/TypeCheckErrors.luau | grep -oE '[0-9]+' || true)"
+          if [ -z "$expected" ]; then
+            echo "::error::could not read EXPECTED_ERRORS from test/TypeCheckErrors.luau"
+            exit 1
+          fi
+          # analyze exits nonzero because the fixture has errors by design, so we
+          # capture output rather than trust the exit code, then count diagnostics
+          # (each is anchored by a `(line,col): TypeError:` location prefix).
+          set +e
+          out="$(luau-lsp analyze \
+            --sourcemap=sourcemap.json \
+            --defs=globalTypes.d.luau \
+            --settings=.vscode/settings.json \
+            --ignore="**/DevPackages/**" \
+            --ignore="**/ServerPackages/**" \
+            test/TypeCheckErrors.luau 2>&1)"
+          set -e
+          # `|| true`: grep -c exits 1 when the count is 0 (the exact regression
+          # this gate catches); without it the step would die before reporting.
+          actual="$(printf '%s\n' "$out" | grep -cE '\([0-9]+,[0-9]+\): (TypeError|SyntaxError):' || true)"
+          echo "TypeCheckErrors.luau: expected ${expected} diagnostics, got ${actual}"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::negative fixture drift: expected ${expected} type errors, got ${actual}. If this change is intentional, update the EXPECTED_ERRORS header in test/TypeCheckErrors.luau."
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Same guard the release workflows run — moved left to PR time so version
+      # drift is caught on the branch that introduced it, not at (immutable)
+      # publish time.
+      - name: wally.toml must match src/Internal/Version.luau
+        run: |
+          WALLY_VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
+          SRC_VER="$(grep -o '"[0-9][^"]*"' src/Internal/Version.luau | tr -d '"')"
+          if [ "$WALLY_VER" != "$SRC_VER" ]; then
+            echo "::error::version mismatch: wally.toml=$WALLY_VER Version.luau=$SRC_VER"
+            echo "Bump wally.toml and src/Internal/Version.luau together."
+            exit 1
+          fi
+          echo "Version $WALLY_VER consistent."

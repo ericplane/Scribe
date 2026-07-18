@@ -51,7 +51,9 @@ export type Harness = {
 	Cleanup: () -> (),
 }
 
-function TestCtx.make(config: { Template: { [string]: any }?, Options: { [string]: any }?, AutoPump: boolean? }?): Harness
+function TestCtx.make(
+	config: { Template: { [string]: any }?, Options: { [string]: any }?, AutoPump: boolean? }?
+): Harness
 	local cfg = config or {}
 	local fake = FakeProfileStore.new()
 	local transport = StubTransport.new({ AutoPump = cfg.AutoPump })

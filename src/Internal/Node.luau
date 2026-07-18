@@ -64,7 +64,12 @@ export type Tree = typeof(setmetatable(
 		_replaying: boolean,
 		_accessors: { [string]: any },
 		_batchDepth: number,
-		_txn: { Snapshots: { [string]: { Path: { string | number }, Value: any } }, Ops: { { Op: Op, Schema: SchemaNode? } }, Created: { { string | number } }, RawRestores: { [string]: { Store: { [string]: any }, Value: any } } }?,
+		_txn: {
+			Snapshots: { [string]: { Path: { string | number }, Value: any } },
+			Ops: { { Op: Op, Schema: SchemaNode? } },
+			Created: { { string | number } },
+			RawRestores: { [string]: { Store: { [string]: any }, Value: any } },
+		}?,
 	},
 	Tree
 ))
@@ -659,7 +664,14 @@ local function ensureContainerValue(tree: Tree, path: { string | number }, _sche
 	return value
 end
 
-local function applyInsert(tree: Tree, path: { string | number }, schema: SchemaNode?, item: any, pos: number?, opts: WriteOpts)
+local function applyInsert(
+	tree: Tree,
+	path: { string | number },
+	schema: SchemaNode?,
+	item: any,
+	pos: number?,
+	opts: WriteOpts
+)
 	-- Validate the item BEFORE creating any container, so a rejected item can
 	-- never leave a phantom container behind.
 	local elementSchema = if schema then Template.ChildSchema(schema, 1) else nil
@@ -667,7 +679,9 @@ local function applyInsert(tree: Tree, path: { string | number }, schema: Schema
 	-- path, so the default (#path - 1) under-budgets its nesting by one and would
 	-- admit an element the Init-snapshot re-encode (wire depth cap == MAX_VALUE_DEPTH)
 	-- cannot serialize, dropping the whole root from that client's snapshot.
-	local value = if opts.NoValidate then Util.deepClone(item) else validateWrite(tree, elementSchema, path, item, #path)
+	local value = if opts.NoValidate
+		then Util.deepClone(item)
+		else validateWrite(tree, elementSchema, path, item, #path)
 
 	local pathKey = Util.pathKey(path)
 	-- Snapshot the pre-creation value (nil if the array does not yet exist) so a
@@ -686,7 +700,13 @@ local function applyInsert(tree: Tree, path: { string | number }, schema: Schema
 	fireAncestors(tree, path)
 end
 
-local function applyArrayRemove(tree: Tree, path: { string | number }, schema: SchemaNode?, pos: number?, opts: WriteOpts): any
+local function applyArrayRemove(
+	tree: Tree,
+	path: { string | number },
+	schema: SchemaNode?,
+	pos: number?,
+	opts: WriteOpts
+): any
 	local container, key = resolveContainer(tree, path, false)
 	local arr = if container then container[key] else nil
 	if type(arr) ~= "table" or #arr == 0 then
@@ -1371,7 +1391,8 @@ local function incrementImpl(accessor: Accessor, delta: number, tagsOrReplicate:
 		validationError(path, `Increment on non-number value ({typeof(current)})`)
 	end
 	local tags, replicate = parseIncrementArgs(tagsOrReplicate)
-	local newValue = applySet(tree, path, accessorSchema(accessor), current + delta, { Replicate = replicate }) :: number
+	local newValue =
+		applySet(tree, path, accessorSchema(accessor), current + delta, { Replicate = replicate }) :: number
 	-- Report the EFFECTIVE change, not the requested delta: a bounded field may
 	-- clamp (or reject) so the balance moves less than asked, or not at all.
 	-- Logging the raw delta over-reports economy amounts, and firing on a no-op
@@ -1399,7 +1420,9 @@ METHOD_FACTORIES.Decrement = function(accessor)
 		if tree.Params.DevMode and type(delta) == "number" and delta < 0 then
 			local warnFn = tree.Params.LogWarn
 			if warnFn then
-				warnFn(`Decrement called with a negative delta at "{Util.pathString(accessorPath(accessor))}" — likely a sign error`)
+				warnFn(
+					`Decrement called with a negative delta at "{Util.pathString(accessorPath(accessor))}" — likely a sign error`
+				)
 			end
 		end
 		return incrementImpl(accessor, -delta, tagsOrReplicate, "Sink")
@@ -1521,7 +1544,13 @@ METHOD_FACTORIES.Remove = function(accessor)
 			-- removed static datatype leaf is stored packed, so return the real value.
 			return unpackRead(childSchema, old)
 		end
-		return applyArrayRemove(tree, accessorPath(accessor), accessorSchema(accessor), posOrKey :: number?, { Replicate = replicate })
+		return applyArrayRemove(
+			tree,
+			accessorPath(accessor),
+			accessorSchema(accessor),
+			posOrKey :: number?,
+			{ Replicate = replicate }
+		)
 	end
 end
 
@@ -1537,7 +1566,8 @@ METHOD_FACTORIES.RemoveValue = function(accessor)
 		if index == nil then
 			return nil, nil
 		end
-		local removed = applyArrayRemove(tree, accessorPath(accessor), accessorSchema(accessor), index, { Replicate = replicate })
+		local removed =
+			applyArrayRemove(tree, accessorPath(accessor), accessorSchema(accessor), index, { Replicate = replicate })
 		return removed, index
 	end
 end

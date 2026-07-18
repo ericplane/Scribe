@@ -1,0 +1,35 @@
+name: Docs check
+
+# Builds the MkDocs site with --strict on PRs that touch docs sources, so a
+# broken doc-comment tag (@function/@within/...) or dead internal link is caught
+# on the PR. Build only, no GitHub Pages deploy — that stays in docs.yml on main.
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "docgen/**"
+      - "mkdocs.yml"
+      - "requirements-docs.txt"
+      - ".github/workflows/docs-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.x"
+      - name: Install docs dependencies
+        run: pip install -r requirements-docs.txt
+      - name: Build site (strict)
+        run: mkdocs build --strict # runs docgen/gen.py via the mkdocs hook

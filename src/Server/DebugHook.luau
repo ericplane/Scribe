@@ -168,7 +168,12 @@ function DebugHook.Attach(Data: any, ctx: any)
 		return
 	end
 	if attached or ServerStorage:FindFirstChild(DebugHook.CONTAINER_NAME) then
-		Log.Warn("Lifecycle", "DEBUG_HOOK_DUPLICATE", "a Scribe debug hook already exists; only the first bundle is inspectable", {})
+		Log.Warn(
+			"Lifecycle",
+			"DEBUG_HOOK_DUPLICATE",
+			"a Scribe debug hook already exists; only the first bundle is inspectable",
+			{}
+		)
 		return
 	end
 	attached = true
@@ -492,7 +497,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 					Kind = op.Kind,
 					Path = table.clone(op.Path),
 					Index = op.Index,
-					Value = if type(op.Value) == "table" or type(op.Value) == "buffer" then Util.deepClone(op.Value) else op.Value,
+					Value = if type(op.Value) == "table" or type(op.Value) == "buffer"
+						then Util.deepClone(op.Value)
+						else op.Value,
 					Old = if type(old) == "table" or type(old) == "buffer" then Util.deepClone(old) else old,
 					Visibility = visibility,
 					FieldId = if schema then schema.Id else nil,
@@ -669,7 +676,12 @@ function DebugHook.Attach(Data: any, ctx: any)
 				if armedLoadFailures[key] == 0 then
 					armedLoadFailures[key] = nil
 				end
-				Log.Warn("Persistence", "SIM_LOAD_FAILURE", "simulated profile load failure (Scribe Studio)", { Key = key })
+				Log.Warn(
+					"Persistence",
+					"SIM_LOAD_FAILURE",
+					"simulated profile load failure (Scribe Studio)",
+					{ Key = key }
+				)
 				error("Scribe Studio: simulated load failure")
 			end
 			return origStart(self, key, params)
@@ -843,13 +855,23 @@ function DebugHook.Attach(Data: any, ctx: any)
 
 	function handlers.SetAttribution(args: any): any
 		attributionEnabled = args.Enabled == true
-		Log.Info("Lifecycle", "DEBUG_HOOK_ATTRIBUTION", `attribution capture {if attributionEnabled then "enabled" else "disabled"}`, {})
+		Log.Info(
+			"Lifecycle",
+			"DEBUG_HOOK_ATTRIBUTION",
+			`attribution capture {if attributionEnabled then "enabled" else "disabled"}`,
+			{}
+		)
 		return { Ok = true, Enabled = attributionEnabled }
 	end
 
 	function handlers.SetWritesEnabled(args: any): any
 		writesEnabled = args.Enabled == true
-		Log.Warn("Lifecycle", "DEBUG_HOOK_WRITES", `Scribe Studio writes {if writesEnabled then "ENABLED" else "disabled"}`, {})
+		Log.Warn(
+			"Lifecycle",
+			"DEBUG_HOOK_WRITES",
+			`Scribe Studio writes {if writesEnabled then "ENABLED" else "disabled"}`,
+			{}
+		)
 		return { Ok = true, Enabled = writesEnabled }
 	end
 
@@ -1072,7 +1094,12 @@ function DebugHook.Attach(Data: any, ctx: any)
 		if not entry then
 			return { Ok = false, Error = "no session for that UserId" }
 		end
-		Log.Warn("Persistence", "SIM_SESSION_STEAL", "Scribe Studio simulating a session steal", { UserId = entry.UserId })
+		Log.Warn(
+			"Persistence",
+			"SIM_SESSION_STEAL",
+			"Scribe Studio simulating a session steal",
+			{ UserId = entry.UserId }
+		)
 		local profile: any = entry.Profile
 		if profileIsActive(profile) then
 			profile:EndSession()
@@ -1137,7 +1164,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 			GiftCredits = tableOrEmpty(reserved.GiftCredits),
 			Robux = tableOrEmpty(logs.Robux),
 			InGame = tableOrEmpty(logs.InGame),
-			ProcessedCount = if type(reserved.ProcessedPurchaseIds) == "table" then #reserved.ProcessedPurchaseIds else 0,
+			ProcessedCount = if type(reserved.ProcessedPurchaseIds) == "table"
+				then #reserved.ProcessedPurchaseIds
+				else 0,
 		}
 	end
 
@@ -1176,7 +1205,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 		if not entry then
 			return { Ok = false, Error = "no session for the buyer UserId" }
 		end
-		local ok, granted, reason = studioCall(Data.PromptGift, entry.Player, tostring(args.ProductName), tonumber(args.RecipientUserId) or 0)
+		local ok, granted, reason =
+			studioCall(Data.PromptGift, entry.Player, tostring(args.ProductName), tonumber(args.RecipientUserId) or 0)
 		if not ok then
 			return { Ok = false, Error = tostring(granted) }
 		end
@@ -1189,7 +1219,10 @@ function DebugHook.Attach(Data: any, ctx: any)
 			return { Ok = false, Error = gate }
 		end
 		if options.UseMock ~= true then
-			return { Ok = false, Error = "receipt injection requires UseMock — matching the core's testing posture, no real store is ever touched" }
+			return {
+				Ok = false,
+				Error = "receipt injection requires UseMock — matching the core's testing posture, no real store is ever touched",
+			}
 		end
 		local receipt = args.ReceiptInfo
 		if type(receipt) ~= "table" then
@@ -1236,7 +1269,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 		if not entry or entry.State ~= "Ready" then
 			return { Ok = false, Error = "no Ready session for that UserId" }
 		end
-		local commandArgs: { any } = if type(args.Args) == "table" then (args.Args :: any) else {}
+		local commandArgs: { any } = if type(args.Args) == "table" then args.Args :: any else {}
 		local argCount = tonumber(args.ArgCount) or #commandArgs
 		Log.Info("Commands", "SIM_COMMAND", `Scribe Studio invoking command "{record.Name}"`, {
 			Player = entry.Player,

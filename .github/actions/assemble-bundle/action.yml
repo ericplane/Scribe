@@ -1,0 +1,50 @@
+name: Assemble Scribe bundle
+description: >
+  Install Wally deps, copy and sanitize the ProfileStore dependency, stamp the
+  version into the bundle, and build Scribe.rbxm at the repo root. Shared by the
+  release workflow (which publishes the result) and the PR smoke test (which
+  discards it). Assumes wally + rojo are already on PATH (setup-rokit).
+inputs:
+  version:
+    description: Version string stamped into the bundle (README + root folder name).
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install Wally dependencies
+      shell: bash
+      run: wally install
+
+    - name: Assemble the bundle
+      shell: bash
+      env:
+        VER: ${{ inputs.version }}
+      run: |
+        # Copy the real ProfileStore module out of Wally's _Index (not the link
+        # file). It is mapped as a single file named "ProfileStore" (Scribe looks
+        # it up by that exact name), not "profilestore" from its own project file.
+        mkdir -p bundle/deps
+        cp ServerPackages/_Index/lm-loleris_profilestore@*/profilestore/ProfileStore.luau bundle/deps/ProfileStore.luau
+
+        # ProfileStore ships a comment linking to stravant's GoodSignal gist.
+        # Roblox discourages sending users off-platform, so redact the
+        # off-platform link in the bundled copy (the on-platform devforum
+        # attribution stays). This edits the copy under bundle/deps only, so the
+        # Wally dependency itself is untouched.
+        sed -i 's|https://gist\.github\.com/[^ ]*|[off-platform link removed]|g' bundle/deps/ProfileStore.luau
+
+        # Backstop: fail the build if any other off-platform (non roblox.com) URL
+        # is present in what we pack, so a future dependency bump that introduces
+        # one is caught here instead of shipping inside the model.
+        if grep -rnoE 'https?://[^ "*]+' bundle/deps src bundle/README.luau | grep -viE 'roblox\.com'; then
+          echo "::error::off-platform URL in bundle inputs; redact it in the Assemble step"
+          exit 1
+        fi
+
+        # Name the root folder after the release and stamp the version into the README.
+        sed -i "s|\"name\": \"Scribe\"|\"name\": \"Scribe v${VER}\"|" bundle/rbxm.project.json
+        sed -i "s|__VERSION__|${VER}|g" bundle/README.luau
+
+    - name: Build Scribe.rbxm
+      shell: bash
+      run: rojo build bundle/rbxm.project.json -o Scribe.rbxm

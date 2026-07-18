@@ -14,20 +14,32 @@ permissions:
   contents: read
 
 jobs:
+  # Gate the (permanent, unrevocable) Wally publish on the full test/lint/
+  # type-check suite so a broken version can never be published.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Installs the exact tools pinned in rokit.toml (wally + rojo).
-      - uses: CompeyDev/setup-rokit@v0.1.2
+      - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
 
       - name: Determine version
         id: ver
+        # Event data is passed via env, never interpolated into the script body:
+        # a release tag can legally contain shell metacharacters, so `run:` with
+        # `${{ github.event.release.tag_name }}` inline would be a code-injection
+        # vector (and this job later handles WALLY_AUTH_TOKEN).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            VER="${{ github.event.release.tag_name }}"
-            VER="${VER#v}"                 # strip a leading v (v1.0.1 -> 1.0.1)
+          if [ "$EVENT_NAME" = "release" ]; then
+            VER="${TAG_NAME#v}"            # strip a leading v (v1.0.1 -> 1.0.1)
           else
             VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
           fi

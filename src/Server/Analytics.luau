@@ -100,7 +100,10 @@ function Analytics.new(ctx: any)
 				fieldPrefix = defaultPrefix
 			end
 			if type(fieldName) ~= "string" then
-				error(`Scribe: Economy.Currencies["{name}"].Fields entries must be a field name or \{ Name = "..." }`, 0)
+				error(
+					`Scribe: Economy.Currencies["{name}"].Fields entries must be a field name or \{ Name = "..." }`,
+					0
+				)
 			end
 			declared[fieldName] = true
 			if #fields >= MAX_FIELDS then
@@ -136,11 +139,7 @@ function Analytics.new(ctx: any)
 		end
 	end
 
-	local function buildCustomFields(
-		player: Player,
-		currency: Currency?,
-		tags: { [string]: any }
-	): { [string]: any }?
+	local function buildCustomFields(player: Player, currency: Currency?, tags: { [string]: any }): { [string]: any }?
 		-- Custom fields need a declared slot mapping; an undeclared currency (or
 		-- one with no Fields) logs a plain event.
 		if not currency or #currency.Fields == 0 then
@@ -198,7 +197,16 @@ function Analytics.new(ctx: any)
 		-- Increment/Decrement caller and abort gameplay after the write applied.
 		local ok, err = pcall(function()
 			local customFields = buildCustomFields(player, currency, tags)
-			logEconomy(player, flowType, currencyLabel, math.abs(delta), newValue, transactionType, itemSku, customFields)
+			logEconomy(
+				player,
+				flowType,
+				currencyLabel,
+				math.abs(delta),
+				newValue,
+				transactionType,
+				itemSku,
+				customFields
+			)
 		end)
 		if ok then
 			Metrics.Add("EconomyEvents") -- count successes, not attempts

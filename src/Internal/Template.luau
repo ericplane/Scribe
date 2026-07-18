@@ -75,10 +75,7 @@ local function checkDefaultValue(path: { string }, value: any)
 			checkDefaultValue(childPath, v)
 		end
 	elseif t ~= "boolean" and t ~= "number" and t ~= "string" and t ~= "buffer" then
-		compileError(
-			path,
-			`unsupported value type "{t}" (only booleans, numbers, strings, buffers and tables persist)`
-		)
+		compileError(path, `unsupported value type "{t}" (only booleans, numbers, strings, buffers and tables persist)`)
 	elseif t == "number" and (value ~= value or value == math.huge or value == -math.huge) then
 		compileError(path, "NaN/inf default")
 	end

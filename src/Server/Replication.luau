@@ -61,8 +61,8 @@ function Replication.new(ctx: any)
 		Metrics.Add("OpsQueued")
 		-- Stamp the coalescing key on every op that may be queued (owner or
 		-- Shared), so the flush-time compaction can read it in either queue.
-		local pathKey = Util.pathKey(op.Path)
-		;(op :: any)._pk = pathKey
+		local pathKey = Util.pathKey(op.Path);
+		(op :: any)._pk = pathKey
 		if entry.HandshakeReady then
 			local queue: { Wire.Op } = entry.Queue
 			if op.Kind == "Set" and op.Value ~= nil and type(op.Value) ~= "table" then
@@ -70,7 +70,12 @@ function Replication.new(ctx: any)
 				-- in place (O(1)). Supersession by whole-container writes is
 				-- resolved once at flush (compactOps), preserving emission order.
 				local existing = entry.QueueIndex[pathKey]
-				if existing and queue[existing] and queue[existing].Kind == "Set" and (queue[existing] :: any)._pk == pathKey then
+				if
+					existing
+					and queue[existing]
+					and queue[existing].Kind == "Set"
+					and (queue[existing] :: any)._pk == pathKey
+				then
 					queue[existing] = op
 					Metrics.Add("OpsCoalesced")
 				else
@@ -333,9 +338,15 @@ function Replication.new(ctx: any)
 			if other ~= entry and other.State == "Ready" then
 				local sharedOps = sharedSnapshotOps(other)
 				if #sharedOps > 0 then
-					local okShared, sharedBytes = pcall(Wire.EncodeOpsFrame, Wire.Frames.SharedInit, compiled, sharedOps, function(w)
-						Wire.F64(w, other.UserId)
-					end)
+					local okShared, sharedBytes = pcall(
+						Wire.EncodeOpsFrame,
+						Wire.Frames.SharedInit,
+						compiled,
+						sharedOps,
+						function(w)
+							Wire.F64(w, other.UserId)
+						end
+					)
 					if okShared then
 						sendBuffer(entry, sharedBytes)
 					end
@@ -396,9 +407,14 @@ function Replication.new(ctx: any)
 		end
 		task.delay(HANDSHAKE_TIMEOUT, function()
 			if not entry.TornDown and not entry.HandshakeReady then
-				Log.Warn("Replication", "CLIENT_HANDSHAKE_TIMEOUT", "client never sent Hello, so replication never started; require the Scribe bundle on the client (a LocalScript), or check a custom client transport adapter", {
-					Player = entry.Player,
-				})
+				Log.Warn(
+					"Replication",
+					"CLIENT_HANDSHAKE_TIMEOUT",
+					"client never sent Hello, so replication never started; require the Scribe bundle on the client (a LocalScript), or check a custom client transport adapter",
+					{
+						Player = entry.Player,
+					}
+				)
 			end
 		end)
 	end

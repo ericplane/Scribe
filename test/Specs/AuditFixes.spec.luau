@@ -630,7 +630,7 @@ return function()
 
 		it("rejects a fractional numeric dictionary key at the accessor boundary", function()
 			local harness = TestCtx.make()
-			local player, _, data = harness.Join(50100)
+			local _player, _, data = harness.Join(50100)
 			-- Whole-table writes already reject fractional keys; the per-key accessor path must too.
 			expect(function()
 				data.Inventory[1.5].Set(3)
@@ -751,10 +751,10 @@ return function()
 		end)
 
 		it("the Timed sweep does not clobber a SetTimed issued by a listener mid-sweep", function()
-			local Scribe = require(Root.Scribe) :: any
+			local ScribeAny = require(Root.Scribe) :: any
 			local template = TestCtx.defaultTemplate()
-			template.BoostA = Scribe.Timed(false)
-			template.BoostB = Scribe.Timed(false)
+			template.BoostA = ScribeAny.Timed(false)
+			template.BoostB = ScribeAny.Timed(false)
 			local harness = TestCtx.make({ Template = template })
 			local _p, entry, data = harness.Join()
 

@@ -119,7 +119,9 @@ function Util.base64FromBuffer(value: buffer): string
 		local chunk = {
 			string.sub(BASE64, math.floor(n / 262144) % 64 + 1, math.floor(n / 262144) % 64 + 1),
 			string.sub(BASE64, math.floor(n / 4096) % 64 + 1, math.floor(n / 4096) % 64 + 1),
-			if index + 1 < length then string.sub(BASE64, math.floor(n / 64) % 64 + 1, math.floor(n / 64) % 64 + 1) else "=",
+			if index + 1 < length
+				then string.sub(BASE64, math.floor(n / 64) % 64 + 1, math.floor(n / 64) % 64 + 1)
+				else "=",
 			if index + 2 < length then string.sub(BASE64, n % 64 + 1, n % 64 + 1) else "=",
 		}
 		table.insert(out, table.concat(chunk))

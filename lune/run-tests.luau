@@ -286,12 +286,7 @@ function FakeCFrame.new(x, y, z, qx, qy, qz, qw)
 end
 
 function FakeCFrame.fromMatrix(pos, vX, vY, vZ)
-	vZ = vZ
-		or FakeVector3.new(
-			vX.Y * vY.Z - vX.Z * vY.Y,
-			vX.Z * vY.X - vX.X * vY.Z,
-			vX.X * vY.Y - vX.Y * vY.X
-		)
+	vZ = vZ or FakeVector3.new(vX.Y * vY.Z - vX.Z * vY.Y, vX.Z * vY.X - vX.X * vY.Z, vX.X * vY.Y - vX.Y * vY.X)
 	return cframeFromComponents(pos.X, pos.Y, pos.Z, vX.X, vY.X, vZ.X, vX.Y, vY.Y, vZ.Y, vX.Z, vY.Z, vZ.Z)
 end
 
@@ -538,7 +533,9 @@ Expectation.__index = function(self, key)
 			end
 			if not pass then
 				error(
-					`expected {if self._negate then "anything but " else ""}{tostring(expected)}, got {tostring(self._value)}`,
+					`expected {if self._negate then "anything but " else ""}{tostring(expected)}, got {tostring(
+						self._value
+					)}`,
 					2
 				)
 			end
@@ -575,7 +572,9 @@ Expectation.__index = function(self, key)
 			end
 			if not pass then
 				error(
-					`expected function {if self._negate then "not " else ""}to throw{if message then ` "{message}"` else ""}, got {tostring(err)}`,
+					`expected function {if self._negate then "not " else ""}to throw{if message
+						then ` "{message}"`
+						else ""}, got {tostring(err)}`,
 					2
 				)
 			end

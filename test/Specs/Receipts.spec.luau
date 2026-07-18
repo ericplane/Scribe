@@ -197,7 +197,9 @@ return function()
 		local buyer, _, _ = harness.Join()
 
 		-- Buyer does not own the perk: grant to buyer (real value received).
-		expect(harness.Data.HandleReceipt(receipt(harness.Ctx.Persistence.EntryFor(buyer).UserId, 222, "ni-1"))).to.equal(GRANTED)
+		expect(harness.Data.HandleReceipt(receipt(harness.Ctx.Persistence.EntryFor(buyer).UserId, 222, "ni-1"))).to.equal(
+			GRANTED
+		)
 		expect(harness.Data.Owns(buyer, "VIP")).to.equal(true)
 
 		-- Buyer already owns it: a no-op grant would burn Robux — issue a

@@ -258,7 +258,12 @@ function Persistence.new(ctx: any)
 		end)
 	end)
 	if not okErr then
-		Log.Warn("Persistence", "PROFILE_STORE_SIGNAL_MISSING", "ProfileStore.OnError not connectable; save-failure observability disabled", {})
+		Log.Warn(
+			"Persistence",
+			"PROFILE_STORE_SIGNAL_MISSING",
+			"ProfileStore.OnError not connectable; save-failure observability disabled",
+			{}
+		)
 	end
 	local okCrit = pcall(function()
 		ProfileStore.OnCriticalToggle:Connect(function(isCritical: boolean)
@@ -476,10 +481,15 @@ function Persistence.new(ctx: any)
 			Metrics.Observe("ProfileSize", size)
 			if size > SIZE_WARN_BYTES and not entry.SizeWarned then
 				entry.SizeWarned = true
-				Log.Warn("Persistence", "PROFILE_SIZE", `profile approaching the ~4 MB DataStore ceiling ({size} bytes)`, {
-					Player = entry.Player,
-					Bytes = size,
-				})
+				Log.Warn(
+					"Persistence",
+					"PROFILE_SIZE",
+					`profile approaching the ~4 MB DataStore ceiling ({size} bytes)`,
+					{
+						Player = entry.Player,
+						Bytes = size,
+					}
+				)
 			elseif size <= SIZE_WARN_BYTES then
 				entry.SizeWarned = false
 			end
@@ -507,18 +517,28 @@ function Persistence.new(ctx: any)
 			-- old code against it (documented staged-deploy hazard).
 			local policy = options.VersionAheadPolicy or "Kick"
 			if policy == "Kick" then
-				Log.Error("Persistence", "PROFILE_VERSION_AHEAD", "stored version is newer than this server's; failing closed", {
+				Log.Error(
+					"Persistence",
+					"PROFILE_VERSION_AHEAD",
+					"stored version is newer than this server's; failing closed",
+					{
+						Player = entry.Player,
+						Stored = stored,
+						Current = currentVersion,
+					}
+				)
+				return false
+			end
+			Log.Warn(
+				"Persistence",
+				"PROFILE_VERSION_AHEAD",
+				"stored version is newer than this server's (VersionAheadPolicy=Allow)",
+				{
 					Player = entry.Player,
 					Stored = stored,
 					Current = currentVersion,
-				})
-				return false
-			end
-			Log.Warn("Persistence", "PROFILE_VERSION_AHEAD", "stored version is newer than this server's (VersionAheadPolicy=Allow)", {
-				Player = entry.Player,
-				Stored = stored,
-				Current = currentVersion,
-			})
+				}
+			)
 			return true
 		end
 		if stored == currentVersion then
@@ -693,7 +713,8 @@ function Persistence.new(ctx: any)
 		local freshAsTemplate = false
 		if not isNew and not options.ResetData then
 			local storedReserved = profile.Data[Template.RESERVED_ROOT]
-			local storedVersion = if type(storedReserved) == "table" and type(storedReserved.Version) == "number"
+			local storedVersion = if type(storedReserved) == "table"
+					and type(storedReserved.Version) == "number"
 				then storedReserved.Version
 				else 1
 			if storedVersion < currentVersion then
@@ -781,11 +802,16 @@ function Persistence.new(ctx: any)
 		if ctx.DevMode then
 			local unknown = Template.UnknownRootKeys(compiled, profile.Data)
 			if #unknown > 0 then
-				Log.Warn("Persistence", "UNKNOWN_ROOT_KEYS", "profile contains top-level keys absent from the template "
-					.. "(removing keys is a migration's job)", {
-					Player = player,
-					Keys = table.concat(unknown, ", "),
-				})
+				Log.Warn(
+					"Persistence",
+					"UNKNOWN_ROOT_KEYS",
+					"profile contains top-level keys absent from the template "
+						.. "(removing keys is a migration's job)",
+					{
+						Player = player,
+						Keys = table.concat(unknown, ", "),
+					}
+				)
 			end
 		end
 
@@ -845,7 +871,12 @@ function Persistence.new(ctx: any)
 		local function runHook(name: string, hook: (any) -> ...any)
 			local ok, err = pcall(hook, entry)
 			if not ok then
-				Log.Error("Lifecycle", "SUBSYSTEM_HOOK_ERROR", `{name} hook failed: {tostring(err)}`, { Player = player })
+				Log.Error(
+					"Lifecycle",
+					"SUBSYSTEM_HOOK_ERROR",
+					`{name} hook failed: {tostring(err)}`,
+					{ Player = player }
+				)
 			end
 		end
 		runHook("Timed", ctx.Timed.OnLoad)
@@ -1159,7 +1190,10 @@ function Persistence.new(ctx: any)
 
 	-- Version history and restore -----------------------------------------------
 
-	function self.ListVersions(userId: number, limit: number?): { { VersionId: string, CreatedAt: number, Size: number? } }
+	function self.ListVersions(
+		userId: number,
+		limit: number?
+	): { { VersionId: string, CreatedAt: number, Size: number? } }
 		local out = {}
 		local ok, err = pcall(function()
 			local query = store:VersionQuery(self.KeyFor(userId), Enum.SortDirection.Descending)

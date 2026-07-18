@@ -64,9 +64,7 @@ function StubTransport.new(options: { AutoPump: boolean?, LocalPlayer: any? }?)
 				break
 			end
 			remaining -= 1
-			local addressed = frame.Player == nil
-				or self.LocalPlayer == nil
-				or frame.Player == self.LocalPlayer
+			local addressed = frame.Player == nil or self.LocalPlayer == nil or frame.Player == self.LocalPlayer
 			if addressed and self._clientListener then
 				self._clientListener(frame.Bytes)
 			end

@@ -1,0 +1,49 @@
+name: Bundle smoke test
+
+# Dry-runs the exact rbxm assembly that release-rbxm.yml performs (wally install
+# -> copy & sanitize ProfileStore -> off-platform URL backstop -> rojo build) on
+# PRs that could break it, WITHOUT publishing. The ProfileStore _Index glob and
+# the URL backstop are fragile to a ProfileStore bump; this catches breakage at
+# PR time instead of at release time.
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "bundle/**"
+      - "wally.toml"
+      - "rokit.toml" # toolchain (wally/rojo) bump can break assembly
+      - ".github/actions/assemble-bundle/**"
+      - ".github/workflows/bundle-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bundle-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
+
+      - name: Determine version
+        id: ver
+        run: |
+          VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
+          echo "value=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble & build (no publish)
+        uses: ./.github/actions/assemble-bundle
+        with:
+          version: ${{ steps.ver.outputs.value }}
+
+      - name: Upload built model for inspection
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Scribe-rbxm-pr
+          path: Scribe.rbxm

@@ -6,6 +6,8 @@
 /*.rbxl.lock
 
 sourcemap*.json
+# Roblox global type defs fetched by the CI analyze job (luau-lsp)
+globalTypes.d.luau
 Packages/
 ServerPackages/
 DevPackages/

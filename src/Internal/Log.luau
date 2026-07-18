@@ -105,7 +105,13 @@ end
 
 local MAX_MESSAGE_LEN = 400
 
-local function emit(level: Types.LogLevel, category: Types.LogCategory, code: Types.LogCode, message: string, context: { [string]: any }?)
+local function emit(
+	level: Types.LogLevel,
+	category: Types.LogCategory,
+	code: Types.LogCode,
+	message: string,
+	context: { [string]: any }?
+)
 	-- Cap the message so a client-supplied string or a long traceback can't
 	-- bloat the ring buffer, the console fallback, or the structured context.
 	if #message > MAX_MESSAGE_LEN then

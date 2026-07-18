@@ -59,11 +59,17 @@ For declarators, replication + visibility, monetization, leaderboards, migration
 ## Development
 
 ```bash
-rokit install            # wally + rojo + selene + luau-lsp + lune toolchain
-wally install            # dependencies
-selene src test lune     # lint
-lune run lune/run-tests  # run the test suite (headless, ~1s)
+rokit install              # wally + rojo + selene + luau-lsp + lune + stylua toolchain
+wally install              # dependencies
+selene src test lune       # lint
+stylua --check src test lune  # formatting (drop --check to apply)
+lune run lune/run-tests    # run the test suite (headless, ~1s)
 ```
+
+The same lint, format, test, and type-check (luau-lsp) checks run in CI on every
+pull request (`.github/workflows/ci.yml`), and releases are gated on a green run.
+Mark the `test`, `lint`, `format`, `analyze`, and `version-check` checks as
+required in the repository's branch-protection settings to enforce them on merge.
 
 Docs are built with Material for MkDocs from the doc-comments in `src/` and the guides in `docgen/guides/`. See [docgen/README.md](docgen/README.md) for details.
 

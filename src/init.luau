@@ -152,7 +152,10 @@ export type function ValueType(T)
 		end
 		add("Clone", fn({}, { valueType }))
 		add("Default", fn({}, { valueType }))
-		add("Changed", fn({ fn({ valueType, valueType, optional(ts.unionof(ts.string, ts.number)) }, {}) }, { disconnectType }))
+		add(
+			"Changed",
+			fn({ fn({ valueType, valueType, optional(ts.unionof(ts.string, ts.number)) }, {}) }, { disconnectType })
+		)
 		add("Observe", fn({ fn({ valueType }, {}) }, { disconnectType }))
 
 		if t:is("number") then
@@ -277,7 +280,8 @@ export type function ClientDataType(T)
 	entryProps[ts.singleton("Name")] = ts.string
 	entryProps[ts.singleton("Score")] = ts.number
 	local leaderboardEntry = ts.newtable(entryProps, nil, nil)
-	local entryArray = ts.newtable(nil, { index = ts.number, readresult = leaderboardEntry, writeresult = leaderboardEntry }, nil)
+	local entryArray =
+		ts.newtable(nil, { index = ts.number, readresult = leaderboardEntry, writeresult = leaderboardEntry }, nil)
 	local anyArray = ts.newtable(nil, { index = ts.number, readresult = anyTable, writeresult = anyTable }, nil)
 
 	local statusType = ts.unionof(ts.singleton("Healthy"), ts.singleton("Degraded"), ts.singleton("Outage"))
@@ -316,7 +320,10 @@ export type function ClientDataType(T)
 	local purchaseFilter = optional(ts.newtable(purchaseFilterProps, nil, nil))
 	add("GetPurchases", fn({ purchaseFilter }, { anyArray }))
 	add("Mock", fn({ optional(anyTable), optional(anyTable) }, {}))
-	add("MockCommand", ts.newfunction({ head = { ts.string, ts.newfunction({ tail = ts.any }, { tail = ts.any }) } }, { head = {} }))
+	add(
+		"MockCommand",
+		ts.newfunction({ head = { ts.string, ts.newfunction({ tail = ts.any }, { tail = ts.any }) } }, { head = {} })
+	)
 	add("Raw", ts.any)
 
 	return out
@@ -352,7 +359,8 @@ export type function ServerDataType(T, P)
 	entryProps[ts.singleton("Name")] = ts.string
 	entryProps[ts.singleton("Score")] = ts.number
 	local leaderboardEntry = ts.newtable(entryProps, nil, nil)
-	local entryArray = ts.newtable(nil, { index = ts.number, readresult = leaderboardEntry, writeresult = leaderboardEntry }, nil)
+	local entryArray =
+		ts.newtable(nil, { index = ts.number, readresult = leaderboardEntry, writeresult = leaderboardEntry }, nil)
 
 	local saveInfoProps: { [type]: type } = {}
 	saveInfoProps[ts.singleton("LastSaveAt")] = optional(ts.number)
@@ -365,7 +373,8 @@ export type function ServerDataType(T, P)
 	versionProps[ts.singleton("CreatedAt")] = ts.number
 	versionProps[ts.singleton("Size")] = optional(ts.number)
 	local versionRecord = ts.newtable(versionProps, nil, nil)
-	local versionArray = ts.newtable(nil, { index = ts.number, readresult = versionRecord, writeresult = versionRecord }, nil)
+	local versionArray =
+		ts.newtable(nil, { index = ts.number, readresult = versionRecord, writeresult = versionRecord }, nil)
 
 	local flushOptsProps: { [type]: type } = {}
 	flushOptsProps[ts.singleton("Force")] = optional(ts.boolean)
@@ -378,7 +387,10 @@ export type function ServerDataType(T, P)
 
 	add("Get", fn({ P }, { node }))
 	add("WaitForData", fn({ P }, { optional(node), optional(ts.string) }))
-	add("GetState", fn({ P }, { ts.unionof(ts.singleton("Loading"), ts.singleton("Ready"), ts.singleton("SessionEnded")) }))
+	add(
+		"GetState",
+		fn({ P }, { ts.unionof(ts.singleton("Loading"), ts.singleton("Ready"), ts.singleton("SessionEnded")) })
+	)
 
 	add("Batch", fn({ P, fn({}, {}) }, {}))
 	add("Transaction", fn({ P, fn({}, {}) }, boolAndReason))
@@ -712,7 +724,12 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 	if RunService:IsStudio() then
 		for key in options :: any do
 			if type(key) == "string" and not KNOWN_OPTION_KEYS[key] then
-				Log.Warn("Lifecycle", "UNKNOWN_OPTION", `unknown Scribe option "{key}" — check the spelling`, { Option = key })
+				Log.Warn(
+					"Lifecycle",
+					"UNKNOWN_OPTION",
+					`unknown Scribe option "{key}" — check the spelling`,
+					{ Option = key }
+				)
 			end
 		end
 	end
@@ -763,7 +780,10 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 		local clientData = Client.new(anyOptions, compiled)
 		local serverStub = setmetatable({}, {
 			__index = function()
-				error("Scribe: the Server API is not available on the client — client writes go through Data.Request commands", 2)
+				error(
+					"Scribe: the Server API is not available on the client — client writes go through Data.Request commands",
+					2
+				)
 			end,
 		})
 		bundle = { Server = serverStub, Client = clientData }

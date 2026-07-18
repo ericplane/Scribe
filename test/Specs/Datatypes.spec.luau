@@ -31,14 +31,20 @@ return function()
 			reencodesIdentically("UDim2", UDim2.new(0.25, 10, 0.75, -30))
 			reencodesIdentically("Rect", Rect.new(Vector2.new(0, 0), Vector2.new(100, 50)))
 			reencodesIdentically("NumberRange", NumberRange.new(2, 8))
-			reencodesIdentically("NumberSequence", NumberSequence.new({
-				NumberSequenceKeypoint.new(0, 1, 0.5),
-				NumberSequenceKeypoint.new(1, 0),
-			}))
-			reencodesIdentically("ColorSequence", ColorSequence.new({
-				ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
-				ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 0, 255)),
-			}))
+			reencodesIdentically(
+				"NumberSequence",
+				NumberSequence.new({
+					NumberSequenceKeypoint.new(0, 1, 0.5),
+					NumberSequenceKeypoint.new(1, 0),
+				})
+			)
+			reencodesIdentically(
+				"ColorSequence",
+				ColorSequence.new({
+					ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
+					ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 0, 255)),
+				})
+			)
 			reencodesIdentically("DateTime", DateTime.fromUnixTimestampMillis(1782600000123))
 			reencodesIdentically("EnumItem", Enum.Material.Plastic)
 			reencodesIdentically("Font", Font.new("rbxasset://fonts/families/GothamSSm.json"))
@@ -170,7 +176,7 @@ return function()
 				},
 			}
 			local harness = TestCtx.make({ Template = template })
-			local player, entry, data = harness.Join(6300)
+			local _player, entry, data = harness.Join(6300)
 
 			local spawn = data.Settings.Home.Spawn.Get()
 			expect(typeof(spawn)).to.equal("Vector3")

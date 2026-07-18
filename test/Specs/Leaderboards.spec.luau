@@ -131,7 +131,7 @@ return function()
 
 	it("EraseUser scrubs the erased user from the in-memory board cache (GDPR)", function()
 		local harness = makeHarness()
-		local player, _, data = harness.Join(8006)
+		local _player, _, data = harness.Join(8006)
 		data.Coins.Set(777)
 		harness.Ctx.Leaderboards.FlushAllBlocking(1)
 		harness.Ctx.Leaderboards.RefreshNow()

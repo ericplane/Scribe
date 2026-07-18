@@ -5,23 +5,35 @@ on:
     types: [published]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  # Gate the release artifact on the full test/lint/type-check suite.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   bundle:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write # upload the asset to the release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Installs the exact tools pinned in rokit.toml (wally + rojo).
-      - uses: CompeyDev/setup-rokit@v0.1.2
+      - uses: CompeyDev/setup-rokit@d49be92bd9502180218c3f43e7988faa945217b0 # v0.1.2
 
       - name: Determine version
         id: ver
+        # Event data via env, never inline in the script body (a release tag can
+        # legally contain shell metacharacters -> code-injection vector).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            VER="${{ github.event.release.tag_name }}"
-            VER="${VER#v}"                 # strip a leading v (v1.0.1 -> 1.0.1)
+          if [ "$EVENT_NAME" = "release" ]; then
+            VER="${TAG_NAME#v}"            # strip a leading v (v1.0.1 -> 1.0.1)
           else
             VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
           fi
@@ -42,50 +54,23 @@ jobs:
             exit 1
           fi
 
-      - name: Install Wally dependencies
-        run: wally install
-
-      - name: Assemble the bundle
-        env:
-          VER: ${{ steps.ver.outputs.value }}
-        run: |
-          # Copy the real ProfileStore module out of Wally's _Index (not the link
-          # file). It is mapped as a single file named "ProfileStore" (Scribe looks
-          # it up by that exact name), not "profilestore" from its own project file.
-          mkdir -p bundle/deps
-          cp ServerPackages/_Index/lm-loleris_profilestore@*/profilestore/ProfileStore.luau bundle/deps/ProfileStore.luau
-
-          # ProfileStore ships a comment linking to stravant's GoodSignal gist.
-          # Roblox discourages sending users off-platform, so redact the
-          # off-platform link in the bundled copy (the on-platform devforum
-          # attribution stays). This edits the copy under bundle/deps only, so the
-          # Wally dependency itself is untouched.
-          sed -i 's|https://gist\.github\.com/[^ ]*|[off-platform link removed]|g' bundle/deps/ProfileStore.luau
-
-          # Backstop: fail the build if any other off-platform (non roblox.com) URL
-          # is present in what we pack, so a future dependency bump that introduces
-          # one is caught here instead of shipping inside the model.
-          if grep -rnoE 'https?://[^ "*]+' bundle/deps src bundle/README.luau | grep -viE 'roblox\.com'; then
-            echo "::error::off-platform URL in bundle inputs; redact it in the Assemble step"
-            exit 1
-          fi
-
-          # Name the root folder after the release and stamp the version into the README.
-          sed -i "s|\"name\": \"Scribe\"|\"name\": \"Scribe v${VER}\"|" bundle/rbxm.project.json
-          sed -i "s|__VERSION__|${VER}|g" bundle/README.luau
-
-      - name: Build Scribe.rbxm
-        run: rojo build bundle/rbxm.project.json -o Scribe.rbxm
+      # Shared with bundle-smoke.yml: install deps, copy & sanitize ProfileStore,
+      # run the off-platform URL backstop, stamp the version, and build the model.
+      - name: Assemble & build Scribe.rbxm
+        uses: ./.github/actions/assemble-bundle
+        with:
+          version: ${{ steps.ver.outputs.value }}
 
       - name: Attach to the release
         if: github.event_name == 'release'
-        run: gh release upload "${{ github.event.release.tag_name }}" Scribe.rbxm --clobber
+        run: gh release upload "$TAG_NAME" Scribe.rbxm --clobber
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
 
       - name: Upload as a workflow artifact
         if: github.event_name != 'release'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Scribe-rbxm
           path: Scribe.rbxm

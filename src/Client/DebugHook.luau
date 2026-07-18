@@ -57,7 +57,12 @@ function ClientDebugHook.Attach(deps: any)
 		return
 	end
 	if attached or ReplicatedStorage:FindFirstChild(ClientDebugHook.CONTAINER_NAME) then
-		Log.Warn("Lifecycle", "DEBUG_HOOK_DUPLICATE", "a Scribe client debug hook already exists; only the first bundle is inspectable", {})
+		Log.Warn(
+			"Lifecycle",
+			"DEBUG_HOOK_DUPLICATE",
+			"a Scribe client debug hook already exists; only the first bundle is inspectable",
+			{}
+		)
 		return
 	end
 	attached = true
@@ -165,7 +170,9 @@ function ClientDebugHook.Attach(deps: any)
 				Kind = op.Kind,
 				Path = table.clone(op.Path),
 				Index = op.Index,
-				Value = if type(op.Value) == "table" or type(op.Value) == "buffer" then Util.deepClone(op.Value) else op.Value,
+				Value = if type(op.Value) == "table" or type(op.Value) == "buffer"
+					then Util.deepClone(op.Value)
+					else op.Value,
 				Old = if type(old) == "table" or type(old) == "buffer" then Util.deepClone(old) else old,
 				Visibility = Template.VisibilityOf(compiled, op.Path),
 			}

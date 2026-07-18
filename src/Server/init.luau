@@ -602,12 +602,22 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		local rootChildren = compiled.Root.Children :: { [string]: any }
 		for key in Data do
 			if rootChildren[key] then
-				Log.Warn("Lifecycle", "API_NAME_COLLISION", `template root field "{key}" collides with a Data API name`, {})
+				Log.Warn(
+					"Lifecycle",
+					"API_NAME_COLLISION",
+					`template root field "{key}" collides with a Data API name`,
+					{}
+				)
 			end
 		end
 		for _, node in compiled.ById do
 			local name = node.Name
-			if name and Node.METHOD_NAMES[name] and node.Path[1] ~= Template.RESERVED_ROOT and node.Path[1] ~= Template.SESSION_ROOT then
+			if
+				name
+				and Node.METHOD_NAMES[name]
+				and node.Path[1] ~= Template.RESERVED_ROOT
+				and node.Path[1] ~= Template.SESSION_ROOT
+			then
 				Log.Warn(
 					"Lifecycle",
 					"API_NAME_COLLISION",

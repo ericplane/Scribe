@@ -461,11 +461,14 @@ function Leaderboards.new(ctx: any)
 			if type(value) == "number" then
 				self.Enqueue(board, entry.UserId, value)
 			end
-			table.insert(disconnects, accessor.Changed(function(newValue: any)
-				if type(newValue) == "number" then
-					self.Enqueue(board, entry.UserId, newValue)
-				end
-			end))
+			table.insert(
+				disconnects,
+				accessor.Changed(function(newValue: any)
+					if type(newValue) == "number" then
+						self.Enqueue(board, entry.UserId, newValue)
+					end
+				end)
+			)
 		end
 		statDisconnects[entry] = disconnects
 	end

@@ -335,7 +335,7 @@ return function()
 	itRunning("unpacks datatype fields inside a Shared root on the receiving client", function()
 		local harness = TestCtx.make({ AutoPump = false, Template = makeTemplate() })
 		-- Player A owns the Shared data; the local client is player B and reads it.
-		local playerA, entryA, dataA = harness.Join(7008)
+		local _playerA, entryA, dataA = harness.Join(7008)
 		dataA.Pub.Home.Set(Vector3.new(4, 5, 6))
 
 		local playerB = harness.Join(7009)
