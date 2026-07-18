@@ -67,8 +67,18 @@ function Monetization.new(ctx: any)
 	local productsByName: { [string]: Product } = {}
 	local productsById: { [number]: Product } = {}
 	for name, config in (options.Products or {}) :: { [string]: any } do
+		-- A product Name is persisted as a GiftCredits object key and a PurchaseLog
+		-- value; Category is a persisted PurchaseLog value. Invalid UTF-8 in either
+		-- would fail the offline gift/receipt DataStore save (error 104), so reject
+		-- it at registration -- the earliest, clearest point -- rather than at save.
+		if not Util.isUtf8(name) then
+			error("Scribe: a product name contains invalid UTF-8 bytes", 0)
+		end
 		if type(config.Id) ~= "number" then
 			error(`Scribe: product "{name}" must declare a numeric Id`, 0)
+		end
+		if config.Category ~= nil and not Util.isUtf8(config.Category) then
+			error(`Scribe: product "{name}" Category contains invalid UTF-8 bytes`, 0)
 		end
 		local product: Product = {
 			Name = name,
@@ -87,8 +97,16 @@ function Monetization.new(ctx: any)
 	local passesByName: { [string]: { Id: number, Category: string? } } = {}
 	local passNamesById: { [number]: string } = {}
 	for name, config in (options.Passes or {}) :: { [string]: any } do
+		-- Pass Name/Category feed the same persisted PurchaseLog/gift structures as
+		-- products; reject invalid UTF-8 at registration for parity.
+		if not Util.isUtf8(name) then
+			error("Scribe: a pass name contains invalid UTF-8 bytes", 0)
+		end
 		if type(config.Id) ~= "number" then
 			error(`Scribe: pass "{name}" must declare a numeric Id`, 0)
+		end
+		if config.Category ~= nil and not Util.isUtf8(config.Category) then
+			error(`Scribe: pass "{name}" Category contains invalid UTF-8 bytes`, 0)
 		end
 		passesByName[name] = { Id = config.Id, Category = config.Category }
 		passNamesById[config.Id] = name
@@ -99,6 +117,37 @@ function Monetization.new(ctx: any)
 		declaredPerks = {}
 		for _, perk in options.Perks :: { string } do
 			(declaredPerks :: { [string]: boolean })[perk] = true
+		end
+	end
+
+	-- Every string Owns() can legitimately answer true for: a registered pass, a
+	-- declared perk, a product's granted perk, or the special "RobloxPlus". Owns
+	-- silently returns false for anything else, which hides a typo'd key -- so warn
+	-- (DevMode only, once per key) when Owns/OwnsAsync is called with an unknown one.
+	local knownOwnsKeys: { [string]: boolean } = { RobloxPlus = true }
+	for name in passesByName do
+		knownOwnsKeys[name] = true
+	end
+	if declaredPerks then
+		for perk in declaredPerks do
+			knownOwnsKeys[perk] = true
+		end
+	end
+	for _, product in productsByName do
+		if product.Grants then
+			knownOwnsKeys[product.Grants] = true
+		end
+	end
+	local warnedOwnsKeys: { [string]: boolean } = {}
+	local function checkOwnsKey(key: string)
+		if ctx.DevMode and not knownOwnsKeys[key] and not warnedOwnsKeys[key] then
+			warnedOwnsKeys[key] = true
+			Log.Warn(
+				"Monetization",
+				"UNKNOWN_OWNS_KEY",
+				`Owns("{key}") — "{key}" is not a registered pass, declared perk, or product grant (typo?); it will always return false`,
+				{}
+			)
 		end
 	end
 
@@ -211,8 +260,12 @@ function Monetization.new(ctx: any)
 	end
 
 	-- True if any of: perk flag set (purchased, gifted, or manually granted);
-	-- real pass owned (cached); Roblox Plus.
+	-- real pass owned (cached); Roblox Plus. NON-YIELDING: reads the cache that
+	-- refreshOwnership fills asynchronously, so right after join a genuinely-owned
+	-- gamepass can still read false until that async refresh lands -- use OwnsAsync
+	-- when you need an authoritative answer immediately (e.g. gating at join).
 	function self.Owns(player: Player, key: string): boolean
+		checkOwnsKey(key)
 		local entry = ctx.Persistence.EntryFor(player)
 		if not entry or entry.State ~= "Ready" or not entry.LiveData then
 			return false
@@ -238,8 +291,40 @@ function Monetization.new(ctx: any)
 		end
 	end
 
+	-- Flip the replicated OwnsSynced flag and wake any OwnsAsync waiters once every
+	-- gamepass check for this entry has resolved. Idempotent per entry.
+	local function markOwnershipReady(entry: any)
+		if entry.OwnershipReady then
+			return
+		end
+		entry.OwnershipReady = true
+		if entry.Tree and not entry.Tree.Dead then
+			entry.Tree.Accessor[Template.SESSION_ROOT].OwnsSynced.Set(true)
+		end
+		local waiters = entry.OwnershipWaiters
+		if waiters then
+			entry.OwnershipWaiters = nil
+			for _, wake in waiters do
+				wake()
+			end
+		end
+	end
+
 	local function refreshOwnership(entry: any)
 		local player = entry.Player
+		entry.OwnershipReady = false
+		setOwnsCache(entry, "RobloxPlus", player.HasRobloxSubscription)
+		-- Count the outstanding gamepass checks; the last one to resolve marks the
+		-- entry ownership-ready. Luau's cooperative scheduling makes `pending`
+		-- updates race-free (no yield between the decrement and the check).
+		local pending = 0
+		for _ in passesByName do
+			pending += 1
+		end
+		if pending == 0 then
+			markOwnershipReady(entry)
+			return
+		end
 		for name, pass in passesByName do
 			task.spawn(function()
 				local ok, owned = pcall(function()
@@ -248,9 +333,53 @@ function Monetization.new(ctx: any)
 				if ok and not entry.TornDown then
 					setOwnsCache(entry, name, owned == true)
 				end
+				pending -= 1
+				if pending <= 0 and not entry.TornDown then
+					markOwnershipReady(entry)
+				end
 			end)
 		end
-		setOwnsCache(entry, "RobloxPlus", player.HasRobloxSubscription)
+	end
+
+	--[=[
+		@within Server
+		@tag Monetization
+		@server
+		@yields
+		@param player Player
+		@param key string
+		@param timeout number?
+		@return boolean
+		Like [Server.Owns], but **yields** until the initial asynchronous gamepass
+		ownership refresh has completed, so it returns an authoritative answer even
+		the instant a player joins (perks/gifts resolve immediately; only real
+		gamepass ownership has the async warm-up). Falls back to the current cached
+		answer if `timeout` seconds (default 10) pass first.
+	]=]
+	function self.OwnsAsync(player: Player, key: string, timeout: number?): boolean
+		checkOwnsKey(key)
+		local entry = ctx.Persistence.EntryFor(player)
+		if not entry or entry.State ~= "Ready" or not entry.LiveData then
+			return false
+		end
+		if self.Owns(player, key) then
+			return true
+		end
+		if not entry.OwnershipReady then
+			local thread = coroutine.running()
+			local settled = false
+			local function wake()
+				if not settled then
+					settled = true
+					task.spawn(thread)
+				end
+			end
+			entry.OwnershipWaiters = entry.OwnershipWaiters or {}
+			table.insert(entry.OwnershipWaiters, wake)
+			task.delay(timeout or 10, wake)
+			coroutine.yield()
+		end
+		return self.Owns(player, key)
 	end
 
 	-- Grant application ----------------------------------------------------------------------
@@ -1207,7 +1336,18 @@ function Monetization.new(ctx: any)
 		task.spawn(refreshOwnership, entry)
 	end
 
-	function self.OnUnload(_entry: any) end
+	function self.OnUnload(entry: any)
+		-- Wake any in-flight OwnsAsync waiters promptly instead of leaving them to
+		-- their timeout; on resume they re-check self.Owns, which returns false for
+		-- the now-departed entry.
+		local waiters = entry.OwnershipWaiters
+		if waiters then
+			entry.OwnershipWaiters = nil
+			for _, wake in waiters do
+				wake()
+			end
+		end
+	end
 
 	function self.Start()
 		-- Only take over ProcessReceipt when there are developer products to grant.

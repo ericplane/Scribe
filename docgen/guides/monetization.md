@@ -49,6 +49,15 @@ if Data.Owns(player, "VIP") then ... end        -- server
 if Data.Owns("VIP") then storeButton.Visible = false end  -- client
 ```
 
+`Owns` is **non-yielding**: perks and gifts resolve the instant a player is Ready, but real game-pass ownership is filled by an asynchronous `UserOwnsGamePassAsync` refresh kicked off at load, so a genuinely-owned pass can briefly read `false` in the window right after join. For a gate that must be correct _at that instant_ (e.g. deciding a spawn loadout), use the yielding [`OwnsAsync`](/api/Server#OwnsAsync), which waits for that refresh:
+
+```lua
+if Data.OwnsAsync(player, "VIP") then ... end  -- server, waits for sync
+if Data.OwnsAsync("VIP") then ... end          -- client, waits for the flag
+```
+
+The client version awaits a replicated "ownership synced" flag, so it never reports a pass un-owned before the server's ownership data has arrived. In DevMode, calling either with a key that isn't a registered pass, declared perk, or product grant logs `UNKNOWN_OWNS_KEY` (it would otherwise silently return `false` forever).
+
 ## Soft-currency purchases
 
 [`Purchase`](/api/Server#Purchase) is atomic: debit, grant, and log succeed or roll back together. Insufficient funds or a throwing `Grant` leaves everything untouched:
@@ -63,7 +72,7 @@ Data.Purchase(player, {
 
 ## Gifting
 
-There's no native "gift a game pass" API, so gifting sells a developer product and grants the recipient a saved **perk**. [`PromptGift`](/api/Server#PromptGift) records a durable intent *before* money moves, and delivery survives cross-server hops and offline recipients.
+There's no native "gift a game pass" API, so gifting sells a developer product and grants the recipient a saved **perk**. [`PromptGift`](/api/Server#PromptGift) records a durable intent _before_ money moves, and delivery survives cross-server hops and offline recipients.
 
 ```lua
 Data.PromptGift(buyer, "GiftVIP", recipientUserId)

@@ -282,6 +282,28 @@ end
 -- validation must always be encodable, so over-deep tables are rejected here.
 local MAX_VALUE_DEPTH = 24
 
+-- Truncate `s` to at most `maxBytes` bytes WITHOUT splitting a multi-byte UTF-8
+-- character. Callers pass a string already validated as UTF-8, so any byte in
+-- 0x80..0xBF is a continuation byte: if the character straddling the cut point
+-- extends past the limit, walk the cut back off it. A plain string.sub would
+-- leave a half-encoded trailing character that fails the DataStore save (the
+-- library must never manufacture invalid UTF-8 while clamping MaxLength). Valid
+-- UTF-8 characters are at most 4 bytes, so the loop runs at most 3 times.
+local function truncateUtf8(s: string, maxBytes: number): string
+	if #s <= maxBytes then
+		return s
+	end
+	local cut = maxBytes
+	while cut > 0 do
+		local nextByte = string.byte(s, cut + 1)
+		if nextByte == nil or nextByte < 0x80 or nextByte >= 0xC0 then
+			break -- byte after the cut starts a fresh character (or end of string)
+		end
+		cut -= 1
+	end
+	return string.sub(s, 1, cut)
+end
+
 -- Returns the (possibly clamped) value to write. Throws on type violations.
 local function validateWrite(
 	tree: Tree,
@@ -332,6 +354,15 @@ local function validateWrite(
 	if t == "number" and (value ~= value or value == math.huge or value == -math.huge) then
 		validationError(path, "NaN/inf")
 	end
+	-- A string with invalid UTF-8 bytes cannot be JSON-encoded for the DataStore:
+	-- the ENTIRE profile save fails (error 104), silently, long after this write.
+	-- Reject it here -- for every string leaf, whatever its declared type (string,
+	-- enum, or an untyped `any` field) -- so the failure names the exact path at
+	-- the write site instead of surfacing as an opaque save error later.
+	if t == "string" and not Util.isUtf8(value :: string) then
+		anomaly(tree, path, value, "InvalidUtf8")
+		validationError(path, "string contains invalid UTF-8 bytes")
+	end
 
 	local vt = if schema then schema.ValueType else "any"
 	local policy = tree.Params.BoundsPolicy or "Clamp"
@@ -378,7 +409,11 @@ local function validateWrite(
 			if policy == "Reject" then
 				validationError(path, `exceeds MaxLength {maxLength}`)
 			end
-			return string.sub(value :: string, 1, maxLength)
+			-- Truncate on a character boundary: MaxLength is a byte budget, and a
+			-- raw string.sub could split the multi-byte character straddling it,
+			-- producing invalid UTF-8 that then fails the save (the value above is
+			-- already validated as UTF-8, so this only ever shortens it).
+			return truncateUtf8(value :: string, maxLength)
 		end
 	elseif vt == "buffer" then
 		if t ~= "buffer" then
@@ -412,10 +447,18 @@ local function validateWrite(
 				if k ~= k or k == math.huge or k == -math.huge or k % 1 ~= 0 then
 					validationError(path, "invalid numeric key (must be a finite integer)")
 				end
-			elseif string.find(k :: string, "\31", 1, true) then
-				-- char 31 is the pathKey separator; a key containing it would
-				-- alias a distinct path in coalescing/listeners/rollback.
-				validationError(path, "string key may not contain control character \\31")
+			else
+				local ks = k :: string
+				if string.find(ks, "\31", 1, true) then
+					-- char 31 is the pathKey separator; a key containing it would
+					-- alias a distinct path in coalescing/listeners/rollback.
+					validationError(path, "string key may not contain control character \\31")
+				end
+				-- A JSON object key must be valid UTF-8 too; an invalid-byte key
+				-- fails the whole profile save exactly like an invalid string value.
+				if not Util.isUtf8(ks) then
+					validationError(path, "string key contains invalid UTF-8 bytes")
+				end
 			end
 			local childSchema = if schema then Template.ChildSchema(schema, k) else nil
 			local childPath = table.clone(path)
@@ -1678,6 +1721,12 @@ local function accessorIndex(accessor: Accessor, key: any): any
 	-- distinct path — corrupting coalescing, listeners, and txn rollback.
 	if type(key) == "string" and string.find(key, "\31", 1, true) then
 		error("Scribe: dictionary keys may not contain control character \\31", 2)
+	end
+	-- Invalid UTF-8 bytes in a dynamic key would fail the DataStore save for the
+	-- entire profile (JSON object keys must be valid UTF-8). Reject at the accessor
+	-- boundary so the error points at the offending index, not a later opaque save.
+	if type(key) == "string" and not Util.isUtf8(key) then
+		error("Scribe: dictionary keys must be valid UTF-8", 2)
 	end
 	-- Fractional / non-finite numeric keys do not survive the DataStore JSON round
 	-- trip (coerced to strings, or breaking JSON outright), which would silently

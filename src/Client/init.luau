@@ -565,6 +565,63 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		return ownsFromMirror(key)
 	end
 
+	local function ownsSyncedFromMirror(): boolean
+		local session = mirror[Template.SESSION_ROOT]
+		return type(session) == "table" and session.OwnsSynced == true
+	end
+
+	--[=[
+		@within Client
+		@tag Ownership
+		@client
+		@yields
+		@param key string
+		@param timeout number?
+		@return boolean
+		Like [Client.Owns], but **yields until the server has finished syncing
+		ownership** (the initial async gamepass refresh, signalled by a replicated
+		flag). Use it so a genuinely-owned pass is never briefly reported un-owned in
+		the window right after join. Perks/gifts are already synced at load. Falls
+		back to the current mirror value after `timeout` seconds (default 10).
+	]=]
+	function Data.OwnsAsync(key: string, timeout: number?): boolean
+		if editMode then
+			return ownsFromMirror(key)
+		end
+		waitForLoaded()
+		if not ownsSyncedFromMirror() then
+			local thread = coroutine.running()
+			local settled = false
+			local disconnect: (() -> ())? = nil
+			local function wake()
+				if not settled then
+					settled = true
+					if disconnect then
+						disconnect()
+					end
+					task.spawn(thread)
+				end
+			end
+			disconnect = tree.Accessor[Template.SESSION_ROOT].OwnsSynced.Changed(function(v)
+				if v == true then
+					wake()
+				end
+			end)
+			task.delay(timeout or 10, wake)
+			-- If the flag arrived between the check and the connect, clean up and
+			-- skip the yield -- never task.spawn a thread that has not yielded.
+			if ownsSyncedFromMirror() then
+				settled = true
+				if disconnect then
+					disconnect()
+				end
+			else
+				coroutine.yield()
+			end
+		end
+		return ownsFromMirror(key)
+	end
+
 	--[=[
 		@within Client
 		@tag Ownership

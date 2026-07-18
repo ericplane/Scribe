@@ -389,9 +389,30 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@return boolean
 		The unified ownership check: a granted perk **or** an owned game pass
 		(cached) **or** RobloxPlus. Hide "buy" buttons whenever this is true.
+
+		Non-yielding, so it reads the gamepass cache that fills asynchronously right
+		after a player joins — for a gate that must be correct at that instant, use
+		[Server.OwnsAsync].
 	]=]
 	function Data.Owns(player: Player, key: string)
 		return ctx.Monetization.Owns(player, key)
+	end
+	--[=[
+		@within Server
+		@tag Monetization
+		@server
+		@yields
+		@param player Player
+		@param key string
+		@param timeout number?
+		@return boolean
+		Like [Server.Owns] but **yields** until the initial gamepass ownership
+		refresh has completed, giving an authoritative answer even the moment a
+		player joins. Falls back to the cached answer after `timeout` seconds
+		(default 10).
+	]=]
+	function Data.OwnsAsync(player: Player, key: string, timeout: number?)
+		return ctx.Monetization.OwnsAsync(player, key, timeout)
 	end
 	--[=[
 		@within Server

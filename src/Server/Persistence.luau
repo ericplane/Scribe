@@ -562,6 +562,22 @@ function Persistence.new(ctx: any)
 				return false
 			end
 		end
+		-- Migration functions mutate `work` raw, bypassing Node.validateWrite, so a
+		-- step that introduces unpersistable data (invalid-UTF-8 string/key, or a
+		-- userdata/Instance/function value) would fail every save. Scan BEFORE
+		-- committing into `data`, so failure takes the same fail-closed path below
+		-- (the unmodified original persists).
+		local badMigrated = Util.findUnpersistable(work)
+		if badMigrated ~= nil then
+			Log.Error(
+				"Persistence",
+				"MIGRATION_FAIL",
+				`migration produced unpersistable data ({badMigrated.Detail}) at "{Util.pathString(badMigrated.Path)}"`,
+				{ Player = entry.Player, Path = Util.pathString(badMigrated.Path) }
+			)
+			Metrics.Add("MigrationsFailed")
+			return false
+		end
 		if type(work[Template.RESERVED_ROOT]) ~= "table" then
 			work[Template.RESERVED_ROOT] = {}
 		end
@@ -819,6 +835,26 @@ function Persistence.new(ctx: any)
 			Util.safeCall(function(err)
 				Log.Error("Lifecycle", "ON_PLAYER_INIT_ERROR", err, { Player = player })
 			end, options.OnPlayerInit, player, profile.Data)
+		end
+
+		-- Scribe.Dynamic factories and OnPlayerInit write raw into profile.Data
+		-- WITHOUT passing Node.validateWrite (the tree wraps this table only after
+		-- this point). Unpersistable data introduced there -- invalid UTF-8, or a
+		-- userdata/Instance/function value -- would fail the ENTIRE next save (or
+		-- replication) opaquely, with no path in the log. Scan once here and
+		-- surface the exact location loudly instead -- non-fatal, because the
+		-- library cannot safely rewrite developer data; the developer fixes it.
+		local badInit = Util.findUnpersistable(profile.Data)
+		if badInit ~= nil then
+			local where = Util.pathString(badInit.Path)
+			Log.Error(
+				"Lifecycle",
+				"PROFILE_UNPERSISTABLE",
+				`unpersistable data written during load at "{where}" ({badInit.Detail}) -- this WILL fail the `
+					.. `DataStore save; fix the value set by OnPlayerInit or a Scribe.Dynamic factory`,
+				{ Player = player, Path = where }
+			)
+			ctx.Signals.OnAnomaly:Fire({ Player = player, Path = badInit.Path, Value = nil, Reason = badInit.Kind })
 		end
 
 		profile.OnSave:Connect(function()
@@ -1177,6 +1213,13 @@ function Persistence.new(ctx: any)
 				error("profile has an active session on another server")
 			end
 			fn(profile.Data)
+			-- The callback mutates profile.Data raw, bypassing Node.validateWrite, so
+			-- unpersistable data (invalid UTF-8, or a userdata/Instance value) would
+			-- make SetAsync fail the whole profile opaquely. Reject before writing.
+			local bad = Util.findUnpersistable(profile.Data)
+			if bad ~= nil then
+				error(`unpersistable data ({bad.Detail}) at "{Util.pathString(bad.Path)}"`)
+			end
 			profile:SetAsync()
 		end)
 		releaseOffline(userId)

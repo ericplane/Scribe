@@ -70,6 +70,11 @@ local function checkDefaultValue(path: { string }, value: any)
 			if kt ~= "string" and kt ~= "number" then
 				compileError(path, `unsupported key type "{kt}"`)
 			end
+			-- A string default key becomes a persisted JSON object key, so it must
+			-- be valid UTF-8 or the very first save of a new profile fails.
+			if kt == "string" and not Util.isUtf8(k :: string) then
+				compileError(path, `default key "{k}" contains invalid UTF-8 bytes`)
+			end
 			local childPath = table.clone(path)
 			table.insert(childPath, tostring(k))
 			checkDefaultValue(childPath, v)
@@ -78,6 +83,9 @@ local function checkDefaultValue(path: { string }, value: any)
 		compileError(path, `unsupported value type "{t}" (only booleans, numbers, strings, buffers and tables persist)`)
 	elseif t == "number" and (value ~= value or value == math.huge or value == -math.huge) then
 		compileError(path, "NaN/inf default")
+	elseif t == "string" and not Util.isUtf8(value :: string) then
+		-- A string default is seeded verbatim into every new profile and saved.
+		compileError(path, "string default contains invalid UTF-8 bytes")
 	end
 end
 
@@ -90,6 +98,14 @@ local function buildNode(
 	inheritedVisibility: Visibility,
 	parent: SchemaNode?
 ): SchemaNode
+	-- A field name is a persisted JSON object key. Reject invalid UTF-8 at compile
+	-- time (covers every named field, root and nested) so a bad template fails
+	-- loudly at startup instead of at the first save. Field names built from
+	-- external/dynamic data are the realistic way this slips in.
+	if name ~= nil and not Util.isUtf8(name) then
+		compileError(path, `field name contains invalid UTF-8 bytes`)
+	end
+
 	local visibility: Visibility = inheritedVisibility
 	local timed = false
 	local meta: Marker.Meta? = nil
@@ -357,10 +373,13 @@ local function buildInternalRoots(state: any, root: SchemaNode, config: CompileC
 	setVisibility(logChildren.InGame, (if replicateInGame then "Replicated" else "ServerOnly") :: Visibility)
 
 	-- _ScribeSession: never persisted, replicated to the owner. Holds the pass/
-	-- pass/Plus ownership cache and the player's own save info.
+	-- pass/Plus ownership cache, the player's own save info, and an ownership-sync
+	-- flag the server flips true once the async gamepass refresh completes (so the
+	-- client can await it before trusting OwnsCache -- see Client/Server OwnsAsync).
 	local sessionTemplate = {
 		OwnsCache = {},
 		SaveInfo = {},
+		OwnsSynced = false,
 	}
 	local sessionNode = buildNode(state, SESSION_ROOT, sessionTemplate, { SESSION_ROOT }, "Session", root)
 

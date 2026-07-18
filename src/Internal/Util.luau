@@ -11,6 +11,72 @@ function Util.cloneBuffer(value: buffer): buffer
 	return out
 end
 
+-- True when `s` is valid UTF-8 -- the only strings (and JSON object keys) a
+-- DataStore will persist. `utf8.len` returns nil at the first malformed byte;
+-- an empty string is valid (len 0). Any string that fails this cannot be
+-- JSON-encoded and would fail the whole profile save with DataStore error 104.
+function Util.isUtf8(s: string): boolean
+	return utf8.len(s) ~= nil
+end
+
+export type Unpersistable = {
+	Path: { string | number }, -- ancestor keys are all valid UTF-8, so safe to log
+	Kind: string, -- stable anomaly reason: "InvalidUtf8" or "Unserializable"
+	Detail: string, -- human-readable message
+}
+
+-- Depth-first scan for the first value or key in a persistable data structure
+-- that a DataStore cannot store. The raw-table save boundaries that bypass
+-- Node.validateWrite (OnPlayerInit, UpdateOffline, migrations, Dynamic seeds)
+-- use this to catch data that would otherwise fail the ENTIRE profile save (or
+-- replication) opaquely -- invalid UTF-8 (error 104), or an unserializable leaf
+-- (userdata/Instance/function/thread/native vector, or a NaN/inf number).
+--
+-- Returns the first offender (its ancestor keys are all valid UTF-8, since a bad
+-- key is reported before recursing under it, so `Path` never embeds bad bytes),
+-- or nil when the whole structure is DataStore-safe. Buffers and finite
+-- numbers/booleans/strings are DataStore-safe and pass.
+function Util.findUnpersistable(value: any, path: { string | number }?): Unpersistable?
+	local at = path or {}
+	local t = type(value)
+	if t == "string" then
+		if Util.isUtf8(value :: string) then
+			return nil
+		end
+		return { Path = at, Kind = "InvalidUtf8", Detail = "string contains invalid UTF-8 bytes" }
+	elseif t == "boolean" or t == "buffer" then
+		return nil
+	elseif t == "number" then
+		if value ~= value or value == math.huge or value == -math.huge then
+			return { Path = at, Kind = "Unserializable", Detail = "NaN/inf number" }
+		end
+		return nil
+	elseif t == "table" then
+		for k, v in value :: any do
+			local kt = type(k)
+			if kt ~= "string" and kt ~= "number" then
+				local kp = table.clone(at)
+				table.insert(kp, "<key>")
+				return { Path = kp, Kind = "Unserializable", Detail = `unsupported key type "{kt}"` }
+			end
+			if kt == "string" and not Util.isUtf8(k :: string) then
+				local kp = table.clone(at)
+				table.insert(kp, "<invalid-key>")
+				return { Path = kp, Kind = "InvalidUtf8", Detail = "object key contains invalid UTF-8 bytes" }
+			end
+			local childPath = table.clone(at)
+			table.insert(childPath, k)
+			local found = Util.findUnpersistable(v, childPath)
+			if found ~= nil then
+				return found
+			end
+		end
+		return nil
+	end
+	-- userdata (Instance, EnumItem), function, thread, native vector, etc.
+	return { Path = at, Kind = "Unserializable", Detail = `unsupported type "{typeof(value)}"` }
+end
+
 -- Deep copy of a plain data value. Buffers are mutable, so they are copied
 -- too; other non-table values are returned as-is.
 function Util.deepClone<T>(value: T): T
