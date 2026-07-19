@@ -89,6 +89,14 @@ function Signal.Connect(self: any, fn: (...any) -> ()): any
 	return connection
 end
 
+-- Whether the signal currently has at least one live connection. Lets a caller
+-- skip computing an expensive Fire argument when nothing is listening. `_head` is
+-- `false` when empty, a connection when non-empty, and nil after the last
+-- disconnect (Disconnect unlinks, so the chain only holds live connections).
+function Signal.HasListeners(self: any): boolean
+	return not not self._head
+end
+
 function Signal.Once(self: any, fn: (...any) -> ()): any
 	local connection
 	connection = Signal.Connect(self, function(...)

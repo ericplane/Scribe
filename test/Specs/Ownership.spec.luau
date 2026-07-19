@@ -53,4 +53,47 @@ return function()
 			harness.Cleanup()
 		end)
 	end)
+
+	describe("gamepass ownership", function()
+		local mps = game:GetService("MarketplaceService")
+		local AIR_TRAFFIC_ID = 14966357
+
+		afterEach(function()
+			mps.OwnedGamePasses = {}
+			mps.OwnsYield = false
+		end)
+
+		it("Owns and OwnsAsync return true for an owned gamepass (warm cache)", function()
+			mps.OwnedGamePasses = { [AIR_TRAFFIC_ID] = true }
+			local harness = withPasses()
+			local player = harness.Join()
+			-- refreshOwnership ran synchronously at load (OwnsYield is false).
+			expect(harness.Data.Owns(player, "Air Traffic Controller")).to.equal(true)
+			expect(harness.Data.OwnsAsync(player, "Air Traffic Controller")).to.equal(true)
+			harness.Cleanup()
+		end)
+
+		it("OwnsAsync verifies live and returns true even before the background refresh finishes", function()
+			mps.OwnedGamePasses = { [AIR_TRAFFIC_ID] = true }
+			mps.OwnsYield = true -- the gamepass check yields, so the cache is not warm at join
+			local harness = withPasses()
+			local player, entry = harness.Join()
+			expect(entry.OwnershipReady).never.to.equal(true)
+			-- Cache is cold, so OwnsAsync does its own live UserOwnsGamePassAsync and
+			-- returns the authoritative answer without waiting on the background refresh.
+			expect(harness.Data.OwnsAsync(player, "Air Traffic Controller")).to.equal(true)
+			harness.Cleanup()
+		end)
+
+		it("OwnsAsync re-checks live on every call, reflecting a purchase between calls", function()
+			local harness = withPasses()
+			local player = harness.Join()
+			-- Not owned yet.
+			expect(harness.Data.OwnsAsync(player, "Air Traffic Controller")).to.equal(false)
+			-- The player buys the pass; the very next OwnsAsync must reflect it (no TTL).
+			mps.OwnedGamePasses = { [AIR_TRAFFIC_ID] = true }
+			expect(harness.Data.OwnsAsync(player, "Air Traffic Controller")).to.equal(true)
+			harness.Cleanup()
+		end)
+	end)
 end

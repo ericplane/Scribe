@@ -290,6 +290,7 @@ export type function ClientDataType(T)
 	saveInfoProps[ts.singleton("LastSaveAt")] = optional(ts.number)
 	saveInfoProps[ts.singleton("LastResult")] = optional(ts.unionof(ts.singleton("Ok"), ts.singleton("Fail")))
 	saveInfoProps[ts.singleton("Dirty")] = ts.boolean
+	saveInfoProps[ts.singleton("Size")] = optional(ts.number)
 	local saveInfo = ts.newtable(saveInfoProps, nil, nil)
 
 	local out = ts.copy(ValueType(T))
@@ -308,6 +309,7 @@ export type function ClientDataType(T)
 	add("GetShared", fn({ ts.any }, { optional(anyTable) }))
 	add("OnSharedChanged", ts.any)
 	add("Owns", fn({ ts.string }, { ts.boolean }))
+	add("OwnsAsync", fn({ ts.string, optional(ts.number) }, { ts.boolean }))
 	add("ObserveOwned", fn({ ts.string, fn({ ts.boolean }, {}) }, { fn({}, {}) }))
 	add("GetSaveInfo", fn({}, { saveInfo }))
 	add("GetGiftCredits", fn({}, { stringToNumber }))
@@ -366,6 +368,7 @@ export type function ServerDataType(T, P)
 	saveInfoProps[ts.singleton("LastSaveAt")] = optional(ts.number)
 	saveInfoProps[ts.singleton("LastResult")] = optional(ts.unionof(ts.singleton("Ok"), ts.singleton("Fail")))
 	saveInfoProps[ts.singleton("Dirty")] = ts.boolean
+	saveInfoProps[ts.singleton("Size")] = optional(ts.number)
 	local saveInfo = ts.newtable(saveInfoProps, nil, nil)
 
 	local versionProps: { [type]: type } = {}
@@ -419,6 +422,7 @@ export type function ServerDataType(T, P)
 	add("GetGiftCredits", fn({ P }, { stringToNumber }))
 	add("HandleReceipt", fn({ ts.any }, { ts.any }))
 	add("Owns", fn({ P, ts.string }, { ts.boolean }))
+	add("OwnsAsync", fn({ P, ts.string, optional(ts.number) }, { ts.boolean }))
 	add("GrantPerk", fn({ P, ts.string }, {}))
 	add("RevokePerk", fn({ P, ts.string }, {}))
 
@@ -550,7 +554,7 @@ export type ScribeOptions<T> = {
 	Transport: (Types.ScribeTransport | "Default")?,
 
 	Migrations: { [number]: (data: { [string]: any }) -> () }?,
-	OnPlayerInit: ((player: Player, rawData: { [string]: any }) -> ())?,
+	OnPlayerInit: ((player: Player, rawData: { [string]: any }, isNewProfile: boolean) -> ())?,
 
 	-- persistence
 	ProfileStoreIndex: string, -- REQUIRED: the DataStore name (each game must name its own store)
@@ -636,7 +640,7 @@ export type Bundle<T> = {
 	.Transport ("Default" | ScribeTransport)? -- replication channel; "Default" uses two RemoteEvents
 	.SaveInterval number? -- seconds between autosaves per profile (default 300, floor 15)
 	.Migrations { [number]: (data) -> () }? -- versioned, fail-closed data reshapers
-	.OnPlayerInit ((player, rawData) -> ())? -- runs after load, before Ready
+	.OnPlayerInit ((player, rawData, isNewProfile) -> ())? -- runs after load, before Ready; isNewProfile is true on a brand-new/reset profile
 	.Leaderboards { [string]: LeaderboardConfig }? -- all-time OrderedDataStore boards
 	.Products { [string]: ProductConfig }? -- developer products (receipts, grants, gifting)
 	.Passes { [string]: PassConfig }? -- game passes

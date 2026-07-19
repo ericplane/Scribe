@@ -224,6 +224,32 @@ return function()
 		end)
 	end)
 
+	describe("Timed cooldown keys", function()
+		it("OnCooldown rejects a cooldown key with invalid UTF-8", function()
+			local harness = TestCtx.make()
+			local player = harness.Join()
+			expect(function()
+				harness.Data.OnCooldown(player, BAD, 60)
+			end).to.throw()
+			harness.Cleanup()
+		end)
+	end)
+
+	describe("reserved template key prefixes", function()
+		it("rejects a root field using the cooldown prefix", function()
+			-- A top-level field's pathKey is just its name, so "@cd|Daily" would alias
+			-- the cooldown slot of the same name in the flat _Scribe.Timed dict.
+			expect(function()
+				TestCtx.make({ Template = { ["@cd|Daily"] = 0 } })
+			end).to.throw()
+		end)
+
+		it("still allows a normal field name containing the prefix later in the string", function()
+			local harness = TestCtx.make({ Template = { ["Daily@cd|X"] = 0 } })
+			harness.Cleanup()
+		end)
+	end)
+
 	describe("monetization registration checks", function()
 		it("rejects a product name with invalid UTF-8", function()
 			expect(function()

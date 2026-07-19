@@ -53,10 +53,15 @@ export type CompileConfig = {
 
 local RESERVED_ROOT = "_Scribe"
 local SESSION_ROOT = "_ScribeSession"
+-- Cooldown slots share the flat _Scribe.Timed dict with timed-field pathKeys and
+-- are namespaced by this prefix. Owned here (not in Server/Timed) so Compile can
+-- reject a root field that would alias a cooldown slot.
+local COOLDOWN_PREFIX = "@cd|"
 
 local Template = {}
 Template.RESERVED_ROOT = RESERVED_ROOT
 Template.SESSION_ROOT = SESSION_ROOT
+Template.COOLDOWN_PREFIX = COOLDOWN_PREFIX
 
 local function compileError(path: { string }, message: string): never
 	error(`Scribe: template error at "{table.concat(path, ".")}": {message}`, 0)
@@ -394,6 +399,16 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 	for key in userTemplate do
 		if type(key) ~= "string" then
 			error("Scribe: template root keys must be strings", 0)
+		end
+		-- A top-level field's pathKey is just its name, so a root named "@cd|Daily"
+		-- would collide with the cooldown slot of the same name in the flat
+		-- _Scribe.Timed dict. Nested fields are safe: their pathKeys always contain
+		-- the \31 separator, which a cooldown key never has.
+		if string.sub(key, 1, #COOLDOWN_PREFIX) == COOLDOWN_PREFIX then
+			error(
+				`Scribe: template may not declare a "{key}" key: the "{COOLDOWN_PREFIX}" prefix is reserved for cooldown slots`,
+				0
+			)
 		end
 		if string.sub(key, 1, #RESERVED_ROOT) == RESERVED_ROOT then
 			error(`Scribe: template may not declare a "{key}" key — the {RESERVED_ROOT} root is library-owned`, 0)

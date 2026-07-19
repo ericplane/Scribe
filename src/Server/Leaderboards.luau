@@ -121,6 +121,17 @@ function Leaderboards.new(ctx: any)
 			end
 			walkNode = if i < #statPath then Template.ChildSchema(walkNode, segment) else nil
 		end
+		-- Scale multiplies into the stored integer and divides back out on read, so a
+		-- zero divides by zero (NaN scores served to every client), a negative one
+		-- silently inverts the ordering against the descending query, and a
+		-- non-finite one makes every write a guaranteed OrderedDataStore rejection.
+		-- Fail fast like Stat/Period rather than serving nonsense at runtime.
+		if config.Scale ~= nil then
+			local scale = config.Scale
+			if type(scale) ~= "number" or scale ~= scale or scale <= 0 or scale == math.huge then
+				error(`Scribe: leaderboard "{name}" Scale must be a finite number greater than 0`, 0)
+			end
+		end
 		boards[name] = {
 			Name = name,
 			StatPath = Util.parsePath(config.Stat),
@@ -163,6 +174,22 @@ function Leaderboards.new(ctx: any)
 			return -- within the GDPR tombstone window; do not re-add
 		end
 		local scaled = math.floor(score * board.Scale + 0.5)
+		-- OrderedDataStore only accepts a signed 64-bit integer. A scaled value past
+		-- that (an idle-game currency, an unbounded stat, an aggressive Scale) is
+		-- rejected by SetAsync EVERY time, and the value is re-enqueued on every
+		-- Changed and again on unload, so it becomes a permanent failure stream.
+		-- Drop it here, loudly and once per (board, user), instead of queueing a write
+		-- that cannot succeed.
+		if scaled ~= scaled or math.abs(scaled) > 9223372036854775807 then
+			Metrics.Add("LbScoreOutOfRange")
+			Log.Warn(
+				"Leaderboards",
+				"LB_SCORE_OUT_OF_RANGE",
+				`score {score} x Scale {board.Scale} is outside the OrderedDataStore integer range; not written`,
+				{ Board = board.Name, UserId = userId }
+			)
+			return
+		end
 		local key = `{board.Name}|{userId}`
 		local existing = writeQueueMap[key]
 		if existing then
@@ -190,10 +217,14 @@ function Leaderboards.new(ctx: any)
 			orderedStore(board.StoreName):SetAsync(tostring(item.UserId), item.Score)
 		end)
 		if ok then
-			Health.ReportSuccess("Leaderboards")
 			Metrics.Add("LbWrites")
 		else
-			Health.ReportFailure("Leaderboards")
+			-- Deliberately NOT Health.ReportFailure: OrderedDataStore writes are the
+			-- highest-volume, least-critical DataStore traffic Scribe generates and are
+			-- routinely throttled under load. Feeding them into the shared health budget
+			-- let ordinary leaderboard throttling flip the GLOBAL status to Outage,
+			-- which makes ProcessReceipt return NotProcessedYet and blocks Robux
+			-- purchases. LbWriteFailures + LB_WRITE_FAIL are the fail-loud signal here.
 			Metrics.Add("LbWriteFailures")
 			Log.Warn("Leaderboards", "LB_WRITE_FAIL", tostring(err), {
 				Board = board.Name,
@@ -364,11 +395,12 @@ function Leaderboards.new(ctx: any)
 			return orderedStore(board.StoreName):GetSortedAsync(false, board.Limit)
 		end)
 		if not ok then
-			Health.ReportFailure("Leaderboards")
+			-- Same reasoning as performWrite: a throttled board read is routine and must
+			-- not drive the global health gate that receipts key off.
+			Metrics.Add("LbReadFailures")
 			Log.Warn("Leaderboards", "LB_READ_FAIL", tostring(page), { Board = board.Name })
 			return
 		end
-		Health.ReportSuccess("Leaderboards")
 
 		local entries = {}
 		local rankByUserId: { [number]: number } = {}

@@ -181,21 +181,26 @@ function Analytics.new(ctx: any)
 		newValue: number,
 		tags: { [string]: any }
 	)
-		local fieldName = tostring(path[#path])
+		local fieldName = tostring(path[#path]) -- internal path segment; always safe
 		local currency = currencies[fieldName]
-		local currencyLabel = tostring(tags.Currency or (currency and currency.Label) or fieldName)
 		local flowType = if tags.Flow == "Sink"
 			then Enum.AnalyticsEconomyFlowType.Sink
 			else Enum.AnalyticsEconomyFlowType.Source
-		local transactionType = txnName(if tags.TransactionType ~= nil then tags.TransactionType else tags.Source)
-		local itemSkuRaw = if tags.ItemSku ~= nil then tags.ItemSku else tags.Item
-		local itemSku = if itemSkuRaw ~= nil then tostring(itemSkuRaw) else nil
+		-- Safe fallback so the failure log below always has a label, even when the
+		-- caller-supplied Currency is the value that threw.
+		local currencyLabel = fieldName
 
-		-- Build the custom fields AND log inside one guard. Formatting a
-		-- user-supplied field value (a `__tostring` that throws, a resolver whose
-		-- returned table has a throwing `__iter`) must never escape into the
-		-- Increment/Decrement caller and abort gameplay after the write applied.
+		-- FORMAT every caller-supplied value, build the custom fields, AND log inside
+		-- one guard. Formatting a user-supplied value (a `__tostring` that throws, a
+		-- resolver whose returned table has a throwing `__iter`) must never escape into
+		-- the Increment/Decrement caller and abort gameplay after the write already
+		-- applied. Currency, TransactionType, Source, ItemSku, and Item are all
+		-- caller-supplied, so their tostring calls belong inside the guard too.
 		local ok, err = pcall(function()
+			currencyLabel = tostring(tags.Currency or (currency and currency.Label) or fieldName)
+			local transactionType = txnName(if tags.TransactionType ~= nil then tags.TransactionType else tags.Source)
+			local itemSkuRaw = if tags.ItemSku ~= nil then tags.ItemSku else tags.Item
+			local itemSku = if itemSkuRaw ~= nil then tostring(itemSkuRaw) else nil
 			local customFields = buildCustomFields(player, currency, tags)
 			logEconomy(
 				player,

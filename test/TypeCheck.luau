@@ -122,6 +122,7 @@ local function serverUsage(player: Player)
 	end)
 
 	local owns: boolean = Data.Owns(player, "VIP")
+	local ownsAsync: boolean = Data.OwnsAsync(player, "VIP")
 	local ok, err = Data.PromptGift(player, "GiftVIP", 12345)
 	local onCooldown, cooldownRemaining = Data.OnCooldown(player, "DailyReward", 86400)
 
@@ -145,6 +146,7 @@ local function serverUsage(player: Player)
 		inCombat,
 		reason,
 		owns,
+		ownsAsync,
 		ok,
 		err,
 		onCooldown,
@@ -173,8 +175,9 @@ local function clientUsage()
 	end)
 	local rank: number? = ClientData.GetMyRank("TopCoins")
 	local owns: boolean = ClientData.Owns("VIP")
+	local ownsAsync: boolean = ClientData.OwnsAsync("VIP")
 	local requestOk = ClientData.Request("EquipItem", "Sword_001")
-	return rank, owns, requestOk, ready
+	return rank, owns, ownsAsync, requestOk, ready
 end
 
 local function diagnosticsUsage()

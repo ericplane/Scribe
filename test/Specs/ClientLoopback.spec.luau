@@ -377,6 +377,43 @@ return function()
 		harness.Cleanup()
 	end)
 
+	itRunning("rejects a command with too many arguments instead of silently dropping them", function()
+		local harness, _, _, _, clientData = makeLoopback()
+		harness.Data.Command("Many", function()
+			return true
+		end)
+		-- 17 > Wire.MAX_COMMAND_ARGS: previously the client clamped to 16 and the
+		-- handler ran with the trailing arguments missing.
+		expect(function()
+			clientData.Request("Many", 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
+		end).to.throw()
+		harness.Cleanup()
+	end)
+
+	itRunning("returns 'error' when a command handler throws", function()
+		local harness, _, _, _, clientData = makeLoopback()
+		harness.Data.Command("Boom", function()
+			error("kaboom")
+		end)
+		local ok, reason = clientData.Request("Boom")
+		expect(ok).to.equal(false)
+		expect(reason).to.equal("error")
+		harness.Cleanup()
+	end)
+
+	itRunning("replies not-ready for a command before the player is Ready", function()
+		local harness, _, entry, _, clientData = makeLoopback()
+		harness.Data.Command("Ping", function()
+			return true
+		end)
+		entry.State = "Loading" -- force the not-ready branch
+		local ok, reason = clientData.Request("Ping")
+		entry.State = "Ready" -- restore so teardown is clean
+		expect(ok).to.equal(false)
+		expect(reason).to.equal("not-ready")
+		harness.Cleanup()
+	end)
+
 	itRunning("rate-limits command floods", function()
 		local harness, _, _, _, clientData = makeLoopback({ CommandRateLimit = 5 })
 		harness.Data.Command("Ping", function()

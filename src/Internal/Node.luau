@@ -124,6 +124,23 @@ local function storeFor(tree: Tree, rootKey: string | number): { [string]: any }
 	return tree.Params.Stores.Persist
 end
 
+-- The OTHER-typed form of a key that would produce the SAME Util.pathKey: a
+-- number and its canonical string (7 <-> "7"). Returns nil when there is no such
+-- alias (a non-integer string, "07", a named field, etc.). Used to reject a
+-- numeric key and its string form coexisting in one container, whose colliding
+-- pathKeys would alias listeners, coalescing, and transaction rollback.
+local function aliasForm(seg: any): any
+	if type(seg) == "number" then
+		return tostring(seg)
+	elseif type(seg) == "string" then
+		local n = tonumber(seg)
+		if n ~= nil and n % 1 == 0 and tostring(n) == seg then
+			return n
+		end
+	end
+	return nil
+end
+
 -- Resolves the container holding path's last segment. When `create` is true,
 -- missing intermediate tables are materialized.
 local function resolveContainer(tree: Tree, path: { string | number }, create: boolean): (any, any)
@@ -138,6 +155,19 @@ local function resolveContainer(tree: Tree, path: { string | number }, create: b
 		if nextContainer == nil then
 			if not create then
 				return nil, nil
+			end
+			-- Materializing an INTERMEDIATE segment whose other-typed form already
+			-- occupies this container is the same alias hazard applySet guards for the
+			-- leaf key; reject it here so a nested write like Dict[7].Sub cannot create
+			-- a numeric 7 alongside an existing string "7" (server data never carries
+			-- such a pair, so remote/restore writes never trip this).
+			local alias = aliasForm(seg)
+			if alias ~= nil and container[alias] ~= nil then
+				error(
+					`Scribe: key "{tostring(seg)}" at "{Util.pathString(path)}" collides with the existing `
+						.. `"{tostring(alias)}" key form (a numeric key and its string form cannot coexist)`,
+					0
+				)
 			end
 			nextContainer = {}
 			container[seg] = nextContainer
@@ -435,6 +465,20 @@ local function validateWrite(
 		-- Recursive Tier-1 over the written table; cost is proportional to the
 		-- table being written. The root-relative depth guard at the top rejects
 		-- any level the wire codec could not encode.
+		-- A numeric key N and the string key tostring(N) produce the SAME pathKey
+		-- (Util.pathKey tostring's every segment), so they would alias distinct slots
+		-- in listeners, coalescing, and transaction rollback. Reject that ambiguity,
+		-- mirroring the \31 guard below. Only scanned when numeric keys are present.
+		if Util.hasNumericKeys(value :: any) then
+			for k in value :: any do
+				if type(k) == "number" and (value :: any)[tostring(k)] ~= nil then
+					validationError(
+						path,
+						`numeric key {k} and string key "{tostring(k)}" cannot coexist (their paths would alias)`
+					)
+				end
+			end
+		end
 		local out = {}
 		for k, v in value do
 			local kt = type(k)
@@ -657,6 +701,21 @@ local function applySet(tree: Tree, path: { string | number }, schema: SchemaNod
 			return nil -- removing under a missing parent is a no-op
 		end
 		error(`Scribe: cannot write to "{Util.pathString(path)}"`, 0)
+	end
+
+	-- Reject a keyed write whose OTHER-typed form already occupies the container
+	-- (number 7 vs string "7"): their pathKeys alias (see validateWrite's whole-table
+	-- guard, and resolveContainer for intermediate segments). Local validated writes
+	-- only; remote/restore writes are trusted.
+	if newValue ~= nil and not opts.NoValidate and not opts.FromRemote then
+		local aliasKey = aliasForm(key)
+		if aliasKey ~= nil and container[aliasKey] ~= nil then
+			error(
+				`Scribe: key at "{Util.pathString(path)}" collides with the existing "{tostring(aliasKey)}" key form `
+					.. "(a numeric key and its string form cannot coexist)",
+				0
+			)
+		end
 	end
 
 	local old = container[key]
@@ -905,9 +964,30 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 	end
 	self._txn = { Snapshots = {}, Ops = {}, Created = {}, RawRestores = {} }
 	self._batchDepth += 1
-	local ok, err = xpcall(fn :: any, function(e)
-		return debug.traceback(tostring(e), 2)
+	-- Run fn in its OWN coroutine so a yield can be detected. self._txn is set for
+	-- the whole of fn, and every write path absorbs into it while it is set; if fn
+	-- yielded (task.wait, a DataStore/Marketplace call), a concurrent write landing
+	-- during the yield would be silently pulled into this transaction and rolled back
+	-- with it (e.g. reverting a receipt grant, losing paid currency). Transactions
+	-- must be synchronous, so refuse a yield loudly and roll back fn's writes so far.
+	-- The inner xpcall preserves the original error traceback for the non-yield case.
+	local co = coroutine.create(function()
+		return xpcall(fn :: any, function(e)
+			return debug.traceback(tostring(e), 2)
+		end)
 	end)
+	local resumed, innerOk, innerErr = coroutine.resume(co)
+	local ok, err
+	if coroutine.status(co) ~= "dead" then
+		coroutine.close(co) -- cancel it so the scheduler never resumes it after rollback
+		ok, err =
+			false,
+			"Scribe: a transaction function must not yield (no task.wait, DataStore, or MarketplaceService calls inside Data.Transaction; do async work before or after it)"
+	elseif not resumed then
+		ok, err = false, tostring(innerOk) -- coroutine itself errored (should not happen)
+	else
+		ok, err = innerOk, innerErr
+	end
 	local txn = self._txn :: any
 	self._txn = nil
 	self._batchDepth -= 1

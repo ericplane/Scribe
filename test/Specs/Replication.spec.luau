@@ -294,5 +294,56 @@ return function()
 			expect(entry.MalformedCount).to.equal(1)
 			expect(anomalies).to.equal(1)
 		end)
+
+		local function garbageFrame()
+			local g = buffer.create(8)
+			buffer.writeu8(g, 0, Wire.Frames.Command)
+			for i = 1, 7 do
+				buffer.writeu8(g, i, 0xFF)
+			end
+			return g
+		end
+
+		it("throttles the anomaly/log under a flood but still counts every frame", function()
+			local player, entry = joinAndHandshake()
+			local anomalies = 0
+			harness.Ctx.Signals.OnAnomaly:Connect(function(info)
+				if info.Reason == "MalformedFrame" then
+					anomalies += 1
+				end
+			end)
+			for _ = 1, 5 do
+				harness.Transport:InjectToServer(player, garbageFrame())
+			end
+			task.wait()
+			expect(entry.MalformedCount).to.equal(5)
+			expect(anomalies).to.equal(1) -- throttled within the interval, not one per frame
+		end)
+
+		it("stops dispatching a player's frames after too many malformed frames", function()
+			local player, entry = joinAndHandshake()
+			for _ = 1, 40 do -- MALFORMED_MAX is 32
+				harness.Transport:InjectToServer(player, garbageFrame())
+			end
+			task.wait()
+			expect(entry.MalformedBlocked).to.equal(true)
+			local countWhenBlocked = entry.MalformedCount
+			harness.Transport:InjectToServer(player, garbageFrame())
+			task.wait()
+			-- Blocked frames are dropped before parsing, so the count does not grow.
+			expect(entry.MalformedCount).to.equal(countWhenBlocked)
+		end)
+
+		it("fails closed on a schema-hash mismatch (no Init sent)", function()
+			local player, entry = harness.Join()
+			local w = Wire.NewWriter(8)
+			Wire.U8(w, Wire.Frames.Hello)
+			Wire.U32(w, (harness.Compiled.Hash + 1) % 4294967296) -- deliberately wrong hash
+			Wire.U8(w, Wire.PROTOCOL_VERSION)
+			harness.Transport:InjectToServer(player, Wire.Finish(w))
+			task.wait()
+			expect(entry.HelloReceived).never.to.equal(true)
+			expect(#harness.FramesFor(player, Wire.Frames.Init)).to.equal(0)
+		end)
 	end)
 end

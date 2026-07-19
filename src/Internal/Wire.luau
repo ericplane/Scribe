@@ -14,6 +14,11 @@ local Wire = {}
 
 Wire.PROTOCOL_VERSION = 1
 
+-- Max arguments a command frame carries. Shared so the client's encode cap and the
+-- server's decode guard cannot drift (a client-side clamp would otherwise silently
+-- drop the extras before the server ever saw them).
+Wire.MAX_COMMAND_ARGS = 16
+
 Wire.Frames = {
 	Hello = 1,
 	Init = 2,

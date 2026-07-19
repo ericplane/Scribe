@@ -6,6 +6,7 @@ return function()
 	local Root = script.Parent.Parent.Parent
 	local ScribeRoot = Root.Scribe
 	local Wire = require(ScribeRoot.Internal.Wire)
+	local Scribe = require(ScribeRoot)
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
 
 	local function makeHarness()
@@ -21,6 +22,39 @@ return function()
 	local function boardFrames(harness, player)
 		return harness.FramesFor(player, Wire.Frames.Leaderboard)
 	end
+
+	it("rejects an invalid Scale at construction", function()
+		local function withScale(scale)
+			return function()
+				TestCtx.make({
+					Options = { Leaderboards = { Bad = { Stat = "Coins", Scale = scale } } },
+				}).Cleanup()
+			end
+		end
+		-- Scale = 0 divided by zero on read and served NaN scores to every client.
+		expect(withScale(0)).to.throw()
+		expect(withScale(-1)).to.throw() -- silently inverted the ordering
+		expect(withScale(math.huge)).to.throw() -- every write rejected by the store
+		expect(withScale(0 / 0)).to.throw()
+	end)
+
+	it("drops a score whose scaled value is outside the OrderedDataStore range", function()
+		local harness = TestCtx.make({
+			Options = { Leaderboards = { Huge = { Stat = "Gems", Scale = 1000 } } },
+		})
+		local _, _, data = harness.Join(8600)
+		-- 1e18 * 1000 overflows int64; previously this queued a write that SetAsync
+		-- rejects every time and was re-enqueued on every change, forever.
+		data.Gems.Set(1e18) -- Gems is Scribe.Int(0, { Min = 0 }): unbounded above
+		harness.Ctx.Leaderboards.FlushAllBlocking(1)
+		harness.Ctx.Leaderboards.RefreshNow()
+		-- The out-of-range write is dropped, so the score stays at the initial 0
+		-- instead of queueing a write SetAsync rejects on every retry, forever.
+		local board = harness.Data.GetLeaderboard("Huge")
+		expect(board[1].Score).to.equal(0)
+		expect((Scribe.GetMetrics().LbScoreOutOfRange or 0) > 0).to.equal(true)
+		harness.Cleanup()
+	end)
 
 	it("sends the cached board once at handshake, not before", function()
 		local harness = makeHarness()

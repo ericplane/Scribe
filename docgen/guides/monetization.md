@@ -42,21 +42,21 @@ Perks = { "VIP", "DoubleXP", "StarterPack" },
 
 ## Ownership
 
-[`Owns`](/api/Server#Owns) is the unified check. It passes for a granted perk **or** a real game pass (cached) **or** RobloxPlus:
+There are two ownership checks, and both pass for a granted perk, an owned game pass, or RobloxPlus. Prefer [`OwnsAsync`](/api/Server#OwnsAsync) by default: on the server it verifies live against `UserOwnsGamePassAsync` whenever the cache does not already say owned, so it is authoritative including for a pass bought moments ago. It still needs a loaded profile, so gate it behind `WaitForData` on join. [`Owns`](/api/Server#Owns) is the non-yielding version for hot paths where the data is already warm, such as a button click or a mid-session gate.
 
 ```lua
-if Data.Owns(player, "VIP") then ... end        -- server
-if Data.Owns("VIP") then storeButton.Visible = false end  -- client
+-- server
+if Data.OwnsAsync(player, "VIP") then ... end   -- preferred, verifies live
+if Data.Owns(player, "VIP") then ... end         -- fast, non-yielding
+
+-- client
+if Data.OwnsAsync("VIP") then ... end            -- preferred, waits for the replicated flag
+if Data.Owns("VIP") then storeButton.Visible = false end
 ```
 
-`Owns` is **non-yielding**: perks and gifts resolve the instant a player is Ready, but real game-pass ownership is filled by an asynchronous `UserOwnsGamePassAsync` refresh kicked off at load, so a genuinely-owned pass can briefly read `false` in the window right after join. For a gate that must be correct _at that instant_ (e.g. deciding a spawn loadout), use the yielding [`OwnsAsync`](/api/Server#OwnsAsync), which waits for that refresh:
+The difference matters because perks and gifts resolve the instant a player is Ready, but real game pass ownership is filled by an asynchronous `UserOwnsGamePassAsync` refresh kicked off at load. `Owns` reads that cache, so a genuinely-owned pass can briefly read `false` in the window right after join. On the server, `OwnsAsync` closes that gap by verifying live: when a pass is not already owned in the cache, it calls the authoritative, server-side `UserOwnsGamePassAsync` on every call, so a pass bought moments ago, in-experience or on the Roblox website, is reflected immediately. Once a pass is owned the cached value is returned without a re-check (ownership only gains for a session). The client version instead waits on a replicated ownership-synced flag.
 
-```lua
-if Data.OwnsAsync(player, "VIP") then ... end  -- server, waits for sync
-if Data.OwnsAsync("VIP") then ... end          -- client, waits for the flag
-```
-
-The client version awaits a replicated "ownership synced" flag, so it never reports a pass un-owned before the server's ownership data has arrived. In DevMode, calling either with a key that isn't a registered pass, declared perk, or product grant logs `UNKNOWN_OWNS_KEY` (it would otherwise silently return `false` forever).
+Gate grants on the **server's** `Owns` or `OwnsAsync`, never the client's. The client versions are only reads of the replicated mirror, so an exploiter can make them return `true` locally; only the server's `OwnsAsync` (backed by `UserOwnsGamePassAsync`) is authoritative. A pass purchased in-experience is also picked up immediately by the `PromptGamePassPurchaseFinished` engine event, which is server-fired and cannot be triggered by a client. In DevMode, calling either with a key that is not a registered pass, declared perk, or product grant logs `UNKNOWN_OWNS_KEY`, since it would otherwise silently return `false` forever.
 
 ## Soft-currency purchases
 

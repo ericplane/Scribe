@@ -161,7 +161,11 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param fn () -> ()
 		@return (boolean, string?)
 		Runs `fn` atomically: if it throws, **every** write inside is rolled back
-		and `(false, error)` is returned. On success returns `(true, nil)`.
+		and `(false, error)` is returned. On success returns `(true, nil)`. `fn`
+		must run synchronously and **must not yield** (no `task.wait`, DataStore, or
+		MarketplaceService calls inside it): a yield is refused with `(false, error)`
+		and rolled back, because a concurrent write landing during the yield could be
+		pulled into the transaction. Do any async work before or after.
 	]=]
 	function Data.Transaction(player: Player, fn: () -> ()): (boolean, string?)
 		local entry = entryOrError(player, "Data.Transaction")
@@ -189,8 +193,10 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@server
 		@param player Player
 		@return SaveInfo
-		The player's save state (`{ LastSaveAt, LastResult, Dirty }`) for
+		The player's save state (`{ LastSaveAt, LastResult, Dirty, Size }`) for
 		"Saving… / Saved ✓ / Unsaved changes" UI. Also mirrored to the owner.
+		`Size` is the approximate byte size of the last successful save (nil before
+		the first), useful for spotting a profile growing toward the ~4 MB ceiling.
 	]=]
 	function Data.GetSaveInfo(player: Player)
 		return ctx.Persistence.GetSaveInfo(player)
@@ -406,10 +412,14 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param key string
 		@param timeout number?
 		@return boolean
-		Like [Server.Owns] but **yields** until the initial gamepass ownership
-		refresh has completed, giving an authoritative answer even the moment a
-		player joins. Falls back to the cached answer after `timeout` seconds
-		(default 10).
+		Like [Server.Owns] but **authoritative and yielding**: if the pass is not
+		already owned in the cache, it verifies live with the server-side
+		`UserOwnsGamePassAsync` on every call, so a pass bought moments ago (in
+		experience or on the Roblox website) is reflected immediately. Once owned,
+		the cached value is returned without a re-check. This is the ownership check
+		to gate grants on. The client's `Owns`/`OwnsAsync` are only mirror reads and
+		must never gate a grant. (`timeout` applies only to the client version, which
+		waits on a replicated flag.)
 	]=]
 	function Data.OwnsAsync(player: Player, key: string, timeout: number?)
 		return ctx.Monetization.OwnsAsync(player, key, timeout)

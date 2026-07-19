@@ -291,8 +291,9 @@ function Monetization.new(ctx: any)
 		end
 	end
 
-	-- Flip the replicated OwnsSynced flag and wake any OwnsAsync waiters once every
-	-- gamepass check for this entry has resolved. Idempotent per entry.
+	-- Flip the replicated OwnsSynced flag once every gamepass check for this entry
+	-- has resolved, so the CLIENT OwnsAsync (which cannot query MarketplaceService)
+	-- knows the initial ownership sync is complete. Idempotent per entry.
 	local function markOwnershipReady(entry: any)
 		if entry.OwnershipReady then
 			return
@@ -300,13 +301,6 @@ function Monetization.new(ctx: any)
 		entry.OwnershipReady = true
 		if entry.Tree and not entry.Tree.Dead then
 			entry.Tree.Accessor[Template.SESSION_ROOT].OwnsSynced.Set(true)
-		end
-		local waiters = entry.OwnershipWaiters
-		if waiters then
-			entry.OwnershipWaiters = nil
-			for _, wake in waiters do
-				wake()
-			end
 		end
 	end
 
@@ -332,6 +326,18 @@ function Monetization.new(ctx: any)
 				end)
 				if ok and not entry.TornDown then
 					setOwnsCache(entry, name, owned == true)
+				elseif not ok then
+					-- A MarketplaceService throw/throttle leaves this pass unresolved
+					-- (cache stays not-owned). Surface it like recipientAlreadyOwns does,
+					-- instead of silently treating a failed check as a confirmed
+					-- not-owned, so an ownership outage is visible to operators.
+					Metrics.Add("OwnershipCheckFailures")
+					Log.Warn(
+						"Monetization",
+						"OWNERSHIP_CHECK_FAIL",
+						tostring(owned),
+						{ Player = entry.Player, Pass = name, PassId = pass.Id }
+					)
 				end
 				pending -= 1
 				if pending <= 0 and not entry.TornDown then
@@ -341,35 +347,51 @@ function Monetization.new(ctx: any)
 		end
 	end
 
-	-- Like self.Owns, but YIELDS until the initial async gamepass ownership refresh
-	-- has completed (the OwnershipWaiters / markOwnershipReady handshake), so it
-	-- returns an authoritative answer even the instant a player joins. Perks/gifts
-	-- resolve synchronously; only real gamepass ownership has the warm-up. Falls
-	-- back to the current cached answer after `timeout` seconds (default 10). Public
-	-- API doc-comment lives on Data.OwnsAsync (Server/init.luau) -- keep this a plain
-	-- comment so the docgen does not emit a duplicate ".OwnsAsync" entry.
-	function self.OwnsAsync(player: Player, key: string, timeout: number?): boolean
+	-- Like self.Owns, but AUTHORITATIVE: a cached "owned" is returned as-is, and
+	-- anything else is verified live against MarketplaceService on every call, so a
+	-- pass bought moments ago is reflected immediately. Yields for that web call.
+	-- `_timeout` is accepted only for signature parity with the client version (which
+	-- waits on the replicated OwnsSynced flag); the server does not wait on anything.
+	-- Public API doc-comment lives on Data.OwnsAsync (Server/init.luau) -- keep this a
+	-- plain comment so the docgen does not emit a duplicate ".OwnsAsync" entry.
+	function self.OwnsAsync(player: Player, key: string, _timeout: number?): boolean
 		checkOwnsKey(key)
 		local entry = ctx.Persistence.EntryFor(player)
 		if not entry or entry.State ~= "Ready" or not entry.LiveData then
 			return false
 		end
+		-- Already owned -- a granted perk or gift, or a pass the cache has recorded
+		-- true (set only by the server-authoritative background refresh, a prior live
+		-- check, or the PromptGamePassPurchaseFinished engine event). Ownership only
+		-- ever gains for the session, so a true here is already verified; skip the query.
 		if self.Owns(player, key) then
 			return true
 		end
-		if not entry.OwnershipReady then
-			local thread = coroutine.running()
-			local settled = false
-			local function wake()
-				if not settled then
-					settled = true
-					task.spawn(thread)
+		-- Not owned per the cache. For a registered pass, verify LIVE on EVERY call
+		-- (no throttle) with the authoritative, server-side UserOwnsGamePassAsync, so a
+		-- pass bought moments ago -- in-experience or on the Roblox website -- is
+		-- reflected immediately. This is the exploit-proof check to gate grants on:
+		-- the client's Owns/OwnsAsync are only mirror reads and must never gate a grant.
+		-- Refresh the cache so a later plain Owns read is correct too. Perks/gifts
+		-- resolved synchronously above, so only real passes reach here.
+		local pass = passesByName[key]
+		if pass and not entry.TornDown then
+			local ok, owned = pcall(function()
+				return MarketplaceService:UserOwnsGamePassAsync(entry.UserId, pass.Id)
+			end)
+			if ok then
+				if not entry.TornDown then
+					setOwnsCache(entry, key, owned == true)
 				end
+				return owned == true
 			end
-			entry.OwnershipWaiters = entry.OwnershipWaiters or {}
-			table.insert(entry.OwnershipWaiters, wake)
-			task.delay(timeout or 10, wake)
-			coroutine.yield()
+			Metrics.Add("OwnershipCheckFailures")
+			Log.Warn(
+				"Monetization",
+				"OWNERSHIP_CHECK_FAIL",
+				tostring(owned),
+				{ Player = entry.Player, Pass = key, PassId = pass.Id }
+			)
 		end
 		return self.Owns(player, key)
 	end
@@ -1328,18 +1350,7 @@ function Monetization.new(ctx: any)
 		task.spawn(refreshOwnership, entry)
 	end
 
-	function self.OnUnload(entry: any)
-		-- Wake any in-flight OwnsAsync waiters promptly instead of leaving them to
-		-- their timeout; on resume they re-check self.Owns, which returns false for
-		-- the now-departed entry.
-		local waiters = entry.OwnershipWaiters
-		if waiters then
-			entry.OwnershipWaiters = nil
-			for _, wake in waiters do
-				wake()
-			end
-		end
-	end
+	function self.OnUnload(_entry: any) end
 
 	function self.Start()
 		-- Only take over ProcessReceipt when there are developer products to grant.

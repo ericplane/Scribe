@@ -55,7 +55,7 @@ Observe save state for "Saving… / Saved ✓" UI:
 Data.OnSave:Connect(function(info)
     -- { Player, Ok, Duration, At }
 end)
-local info = Data.GetSaveInfo(player) -- { LastSaveAt, LastResult, Dirty }
+local info = Data.GetSaveInfo(player) -- { LastSaveAt, LastResult, Dirty, Size }
 ```
 
 :::note Not-ready reads return defaults
@@ -71,7 +71,7 @@ When a session ends (leave, or a session stolen by another server), [`SessionEnd
 By default each write replicates on the next frame. Two server helpers change that for a burst of writes:
 
 - **`Batch`** coalesces every write inside it into a **single replication flush and one `Changed` pass**, so the client gets one update instead of many. Reach for it on bulk updates.
-- **`Transaction`** runs writes **atomically**: if the function throws, every write inside is rolled back and it returns `(false, error)`; on success it returns `(true, nil)`. A transaction also batches, so it is already a single flush.
+- **`Transaction`** runs writes **atomically**: if the function throws, every write inside is rolled back and it returns `(false, error)`; on success it returns `(true, nil)`. A transaction also batches, so it is already a single flush. The function **must not yield** (no `task.wait`, DataStore, or MarketplaceService calls inside it): a yield is refused with `(false, error)` and rolled back, because a concurrent write landing during the yield could be pulled into the transaction. Do any async work before or after.
 
 ```lua
 -- Batch: one replication flush and one Changed for a bulk update

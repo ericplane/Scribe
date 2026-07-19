@@ -18,6 +18,8 @@ local Replication = {}
 local HANDSHAKE_TIMEOUT = 10
 local MAX_OPS_PER_FRAME = 60000
 local REINIT_COOLDOWN = 5 -- seconds between full snapshots for repeated Hellos
+local MALFORMED_LOG_INTERVAL = 1 -- seconds; throttle malformed-frame logs/anomalies per player
+local MALFORMED_MAX = 32 -- after this many malformed frames, ignore all further inbound from the player
 
 local STATUS_TO_ID: { [string]: number } = { Healthy = 0, Degraded = 1, Outage = 2 }
 
@@ -178,6 +180,33 @@ function Replication.new(ctx: any)
 		return out
 	end
 
+	-- Flush an entry's queued Shared ops as SharedDiff frames to every OTHER ready
+	-- client. Extracted so sendInit can drain a player's Shared queue BEFORE a new
+	-- client snapshots that player (see sendInit) -- otherwise a still-queued op is
+	-- both reflected in the snapshot and re-broadcast on the next flush, double-
+	-- applying non-idempotent Shared ops (Insert/Remove/Clear) on the new mirror.
+	local function flushSharedQueue(entry: any)
+		local shared: { Wire.Op } = entry.SharedQueue
+		if #shared == 0 then
+			return
+		end
+		entry.SharedQueue = {}
+		shared = compactOps(shared)
+		local offset = 1
+		while offset <= #shared do
+			local chunk = table.move(shared, offset, math.min(offset + MAX_OPS_PER_FRAME - 1, #shared), 1, {})
+			local ok, bytesOrErr = pcall(Wire.EncodeOpsFrame, Wire.Frames.SharedDiff, compiled, chunk, function(w)
+				Wire.F64(w, entry.UserId)
+			end)
+			if ok then
+				broadcastBuffer(bytesOrErr, entry)
+			else
+				Log.Error("Replication", "SERIALIZE_FAIL", tostring(bytesOrErr), { Player = entry.Player })
+			end
+			offset += MAX_OPS_PER_FRAME
+		end
+	end
+
 	function self.FlushEntry(entry: any)
 		local queue: { Wire.Op } = entry.Queue
 		if #queue > 0 and entry.HandshakeReady then
@@ -202,24 +231,7 @@ function Replication.new(ctx: any)
 			entry.QueueIndex = {}
 		end
 
-		local shared: { Wire.Op } = entry.SharedQueue
-		if #shared > 0 then
-			entry.SharedQueue = {}
-			shared = compactOps(shared)
-			local offset = 1
-			while offset <= #shared do
-				local chunk = table.move(shared, offset, math.min(offset + MAX_OPS_PER_FRAME - 1, #shared), 1, {})
-				local ok, bytesOrErr = pcall(Wire.EncodeOpsFrame, Wire.Frames.SharedDiff, compiled, chunk, function(w)
-					Wire.F64(w, entry.UserId)
-				end)
-				if ok then
-					broadcastBuffer(bytesOrErr, entry)
-				else
-					Log.Error("Replication", "SERIALIZE_FAIL", tostring(bytesOrErr), { Player = entry.Player })
-				end
-				offset += MAX_OPS_PER_FRAME
-			end
-		end
+		flushSharedQueue(entry)
 	end
 
 	RunService.PostSimulation:Connect(function()
@@ -322,6 +334,19 @@ function Replication.new(ctx: any)
 			end
 			bytesOrErr = safeBytes
 		end
+		-- Drain every OTHER ready player's pending Shared ops to the already-ready
+		-- clients BEFORE this client becomes ready and snapshots them below. An op
+		-- still sitting in other.SharedQueue is already reflected in other.LiveData
+		-- (so it lands in the snapshot we take), and it would ALSO be re-broadcast to
+		-- this client on the next flush -- double-applying non-idempotent Shared ops
+		-- (Insert/Remove/Clear). Flushing here (while this entry is not yet ready, so
+		-- broadcastBuffer excludes it) makes the snapshot the single source.
+		for _, other in ctx.Persistence.Entries do
+			if other ~= entry and other.State == "Ready" and #other.SharedQueue > 0 then
+				flushSharedQueue(other)
+			end
+		end
+
 		-- Anything queued before Init is superseded by the snapshot.
 		entry.Queue = {}
 		entry.QueueIndex = {}
@@ -373,11 +398,19 @@ function Replication.new(ctx: any)
 			return
 		end
 		if schemaHash ~= compiled.Hash % 4294967296 then
-			Log.Warn("Replication", "SCHEMA_MISMATCH", "client derived a different schema than the server", {
-				Player = entry.Player,
-			})
-			-- Proceed anyway: the value-mode prefix keeps decoding safe, but
-			-- this indicates a template drift bug worth surfacing.
+			-- Fail closed. Paths are decoded from the RECEIVER's own compiled.ById[id]
+			-- table (Wire.DecodePath), so a field id shared by two drifted templates
+			-- maps to a DIFFERENT path on each side and a server op would land on the
+			-- wrong client key (e.g. a Coins Set applied to Gems). The value-mode prefix
+			-- only keeps VALUE decoding safe, not path remapping, so refuse to replicate
+			-- rather than corrupt the client mirror.
+			Log.Warn(
+				"Replication",
+				"SCHEMA_MISMATCH",
+				"client derived a different schema than the server; refusing to replicate (template drift)",
+				{ Player = entry.Player }
+			)
+			return
 		end
 		entry.HelloReceived = true
 		if entry.State == "Ready" then
@@ -450,6 +483,11 @@ function Replication.new(ctx: any)
 		if not entry then
 			return
 		end
+		if entry.MalformedBlocked then
+			-- This player crossed the malformed-frame limit; drop without parsing so a
+			-- flood of crafted frames can't keep burning CPU or spamming handlers.
+			return
+		end
 		if buffer.len(bytes) > maxInbound then
 			Metrics.Add("InboundOversize")
 			Log.Warn("Transport", "INBOUND_OVERSIZE", `dropped oversized inbound frame ({buffer.len(bytes)} bytes)`, {
@@ -471,16 +509,33 @@ function Replication.new(ctx: any)
 		if not ok then
 			entry.MalformedCount += 1
 			Metrics.Add("MalformedFrames")
-			Log.Warn("Transport", "MALFORMED_FRAME", tostring(err), {
-				Player = player,
-				Count = entry.MalformedCount,
-			})
-			ctx.Signals.OnAnomaly:Fire({
-				Player = player,
-				Path = {},
-				Value = nil,
-				Reason = "MalformedFrame",
-			})
+			-- Throttle the log + anomaly so a crafted-frame flood can't spam the log
+			-- buffer or an OnAnomaly handler (the count still increments every time).
+			local now = os.clock()
+			if now - (entry.LastMalformedLog or -math.huge) >= MALFORMED_LOG_INTERVAL then
+				entry.LastMalformedLog = now
+				Log.Warn("Transport", "MALFORMED_FRAME", tostring(err), {
+					Player = player,
+					Count = entry.MalformedCount,
+				})
+				ctx.Signals.OnAnomaly:Fire({
+					Player = player,
+					Path = {},
+					Value = nil,
+					Reason = "MalformedFrame",
+				})
+			end
+			-- Past the limit, stop dispatching this player's inbound frames entirely
+			-- for the rest of the session (a real client never sends malformed frames).
+			if entry.MalformedCount >= MALFORMED_MAX and not entry.MalformedBlocked then
+				entry.MalformedBlocked = true
+				Log.Warn(
+					"Transport",
+					"MALFORMED_FRAME_LIMIT",
+					`player exceeded {MALFORMED_MAX} malformed frames; ignoring further inbound frames this session`,
+					{ Player = player, Count = entry.MalformedCount }
+				)
+			end
 		end
 	end)
 

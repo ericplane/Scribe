@@ -52,6 +52,7 @@ export type LogCode =
 	| "PROFILE_SIZE"
 	| "PROFILE_STORE_ERROR"
 	| "PROFILE_STORE_SIGNAL_MISSING"
+	| "PROFILE_TOO_LARGE"
 	| "PROFILE_UNPERSISTABLE"
 	| "PROFILE_VERSION_AHEAD"
 	| "SAVE_INTERVAL_CLAMPED"
@@ -87,12 +88,14 @@ export type LogCode =
 	-- Transport
 	| "INBOUND_OVERSIZE"
 	| "MALFORMED_FRAME"
+	| "MALFORMED_FRAME_LIMIT"
 	| "SEND_FAIL"
 	-- Commands
 	| "COMMAND_BAD_ARGS"
 	| "COMMAND_ERROR"
 	| "COMMAND_RATE_LIMITED"
 	| "COMMAND_REPLY_ENCODE_FAIL"
+	| "COMMAND_REPLY_TRUNCATED"
 	| "COMMAND_UNKNOWN"
 	| "SIM_COMMAND"
 	-- Monetization
@@ -127,6 +130,7 @@ export type LogCode =
 	| "LB_ERASE_FAIL"
 	| "LB_QUEUE_OVERFLOW"
 	| "LB_READ_FAIL"
+	| "LB_SCORE_OUT_OF_RANGE"
 	| "LB_SHUTDOWN_FLUSH"
 	| "LB_WRITE_DROPPED"
 	| "LB_WRITE_FAIL"
@@ -166,6 +170,7 @@ export type SaveInfo = {
 	LastSaveAt: number?,
 	LastResult: ("Ok" | "Fail")?,
 	Dirty: boolean,
+	Size: number?, -- approx bytes of the last successful save (nil before the first)
 }
 
 export type Visibility = "Replicated" | "ServerOnly" | "Shared" | "Session"

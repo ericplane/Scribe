@@ -293,6 +293,30 @@ return function()
 		harness.Cleanup()
 	end)
 
+	it("never lets a throwing Currency/ItemSku tag abort the mutation", function()
+		-- Regression: these tags used to be stringified OUTSIDE the pcall, so a
+		-- throwing __tostring escaped into Increment AFTER the balance had already
+		-- been committed and replicated, leaving the caller's grant half-applied.
+		local harness, events = makeHarness({ Currencies = { Coins = {} } })
+		local _, _, data = harness.Join()
+		local bomb = setmetatable({}, {
+			__tostring = function()
+				error("boom")
+			end,
+		})
+
+		local before = Scribe.GetMetrics().EconomyEventFailures or 0
+		expect(data.Coins.Increment(10, { Currency = bomb })).to.equal(10)
+		expect(data.Coins.Increment(5, { ItemSku = bomb })).to.equal(15)
+		expect(data.Coins.Increment(5, { TransactionType = bomb })).to.equal(20)
+		-- Balance advanced normally and no event was emitted for the bad tags.
+		expect(data.Coins.Get()).to.equal(20)
+		expect(#events).to.equal(0)
+		local after = Scribe.GetMetrics().EconomyEventFailures or 0
+		expect(after - before).to.equal(3)
+		harness.Cleanup()
+	end)
+
 	it("warns in DevMode on an undeclared per-call field and on field overflow", function()
 		-- The two config warnings are DevMode-gated; force Studio like Server.new does.
 		local RunService = game:GetService("RunService")

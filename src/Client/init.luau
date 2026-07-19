@@ -231,8 +231,12 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			-- listeners can't mutate the mirror); nil is reserved for SharedGone.
 			-- CloneUnpack also converts any datatype fields from their packed wire
 			-- buffer back to the real datatype (the Shared mirror has no accessor
-			-- tree to do this on read).
-			OnSharedChanged:Fire(userId, Node.CloneUnpack(compiled.Root, shared))
+			-- tree to do this on read). Only pay for that full-mirror unpack+clone
+			-- when something is actually listening: a game that reads Shared data via
+			-- Data.GetShared (pull) instead of OnSharedChanged (push) then skips it.
+			if OnSharedChanged:HasListeners() then
+				OnSharedChanged:Fire(userId, Node.CloneUnpack(compiled.Root, shared))
+			end
 		elseif frameType == Wire.Frames.SharedGone then
 			local userId = Wire.RF64(reader)
 			sharedMirrors[userId] = nil
@@ -406,12 +410,18 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		nextCorrelation = (nextCorrelation + 1) % 4294967296
 		local correlation = nextCorrelation
 		local args = table.pack(...)
+		-- Fail loud rather than clamping: a silent clamp here would drop the extras
+		-- before the server ever saw them, so the handler would run with missing
+		-- trailing arguments instead of the server's "too many command arguments".
+		if args.n > Wire.MAX_COMMAND_ARGS then
+			error(`Scribe: a command takes at most {Wire.MAX_COMMAND_ARGS} arguments (got {args.n})`, 2)
+		end
 		local w = Wire.NewWriter(64)
 		Wire.U8(w, Wire.Frames.Command)
 		Wire.U32(w, correlation)
 		Wire.Str(w, name)
-		Wire.U8(w, math.min(args.n, 16))
-		for i = 1, math.min(args.n, 16) do
+		Wire.U8(w, args.n)
+		for i = 1, args.n do
 			Wire.EncodeGeneric(w, args[i])
 		end
 
@@ -659,8 +669,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@tag Reads
 		@client
 		@return SaveInfo
-		The owner's replicated save state (`{ LastSaveAt, LastResult, Dirty }`) for
-		"Saving… / Saved ✓" UI.
+		The owner's replicated save state (`{ LastSaveAt, LastResult, Dirty, Size }`)
+		for "Saving… / Saved ✓" UI. `Size` is the approximate byte size of the last
+		successful save (nil before the first).
 	]=]
 	function Data.GetSaveInfo(): { [string]: any }
 		if not editMode then

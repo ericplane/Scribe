@@ -10,8 +10,15 @@ local Metrics = require(Internal.Metrics)
 
 local Commands = {}
 
-local MAX_ARGS = 16
+local MAX_ARGS = Wire.MAX_COMMAND_ARGS
 local MAX_RETURNS = 8
+-- Rate-limited frames still cost a log line and an outbound reply each, so a flood
+-- is throttled: at most one log per interval per player, and past a sustained-flood
+-- cutoff the reply is dropped too. The count decays after a quiet window so an
+-- occasional legitimate burst never accumulates toward the cutoff.
+local RATE_LOG_INTERVAL = 1 -- seconds between COMMAND_RATE_LIMITED logs per player
+local RATE_RESET_WINDOW = 10 -- seconds of no rate-limiting that resets the counter
+local RATE_LIMIT_MAX = 256 -- sustained rate-limited frames before replies stop
 
 type Handler = (player: Player, ...any) -> ...any
 type Registered = {
@@ -67,6 +74,19 @@ function Commands.new(ctx: any)
 	end
 
 	local function reply(entry: any, correlation: number, ok: boolean, results: { any })
+		-- encodeReply clamps to MAX_RETURNS. Silently dropping the extras contradicts
+		-- the documented "the handler's return values ARE the Request results", and the
+		-- caller just sees trailing nils, so say so. Only meaningful on a success
+		-- reply; the internal failure replies are always single-value.
+		local resultCount = (results :: any).n or #results
+		if ok and resultCount > MAX_RETURNS then
+			Log.Warn(
+				"Commands",
+				"COMMAND_REPLY_TRUNCATED",
+				`handler returned {resultCount} values; only the first {MAX_RETURNS} are sent`,
+				{ Player = entry.Player }
+			)
+		end
 		local encoded, bytes = pcall(encodeReply, correlation, ok, results)
 		if not encoded then
 			-- The handler returned something the wire can't carry (Instance,
@@ -120,8 +140,30 @@ function Commands.new(ctx: any)
 
 		if not takeToken(entry) then
 			Metrics.Add("CommandsRateLimited")
-			Log.Warn("Commands", "COMMAND_RATE_LIMITED", `player exceeded {rateLimit}/s`, { Player = entry.Player })
-			reply(entry, correlation, false, { "rate-limited" })
+			local now = os.clock()
+			-- Decay first: a player who stopped flooding starts fresh, so a rare
+			-- legitimate burst never creeps toward the sustained-flood cutoff.
+			if now - (entry.LastRateLimitAt or -math.huge) > RATE_RESET_WINDOW then
+				entry.RateLimitedCount = 0
+			end
+			entry.LastRateLimitAt = now
+			entry.RateLimitedCount = (entry.RateLimitedCount or 0) + 1
+			-- Throttle the LOG. Unthrottled this is the one command path an exploiter
+			-- can drive without bound, and it would evict the whole log ring, erasing
+			-- the evidence of the flood itself.
+			if now - (entry.LastRateLimitLog or -math.huge) >= RATE_LOG_INTERVAL then
+				entry.LastRateLimitLog = now
+				Log.Warn("Commands", "COMMAND_RATE_LIMITED", `player exceeded {rateLimit}/s`, {
+					Player = entry.Player,
+					Count = entry.RateLimitedCount,
+				})
+			end
+			-- Keep replying up to the cutoff so a well-behaved client that briefly
+			-- overruns is not stranded until its request timeout; past it, a client is
+			-- clearly not waiting on answers and each reply is just outbound cost.
+			if entry.RateLimitedCount < RATE_LIMIT_MAX then
+				reply(entry, correlation, false, { "rate-limited" })
+			end
 			return
 		end
 

@@ -463,8 +463,16 @@ services.Players = {
 services.MarketplaceService = {
 	ProcessReceipt = nil,
 	PromptGamePassPurchaseFinished = FakeSignal.new(),
-	UserOwnsGamePassAsync = function()
-		return false
+	-- Test-controllable gamepass ownership. OwnedGamePasses[passId] = true marks a
+	-- pass owned; OwnsYield makes the check yield once (to exercise the async
+	-- cold-cache path). Both default to "nobody owns anything, resolve synchronously".
+	OwnedGamePasses = {},
+	OwnsYield = false,
+	UserOwnsGamePassAsync = function(self, _userId, passId)
+		if self.OwnsYield then
+			task.wait()
+		end
+		return self.OwnedGamePasses[passId] == true
 	end,
 	PromptProductPurchase = function()
 		error("shim: PromptProductPurchase is not available headless (inject options.PromptProductPurchase)")

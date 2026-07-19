@@ -11,7 +11,9 @@ local Log = require(Internal.Log)
 
 local Timed = {}
 
-local COOLDOWN_PREFIX = "@cd|"
+-- Shared with Template, which rejects a root field using this prefix so a template
+-- field can never alias a cooldown slot in the flat _Scribe.Timed dict.
+local COOLDOWN_PREFIX = Template.COOLDOWN_PREFIX
 local SWEEP_INTERVAL = 1
 -- Finite ceiling (~126 years) so SetTimed(value, math.huge) is a safe way to say
 -- "effectively permanent": expiries are written RAW into the persisted _Scribe.Timed
@@ -130,6 +132,13 @@ function Timed.new(ctx: any)
 		if type(seconds) ~= "number" or seconds <= 0 then
 			return false, 0
 		end
+		-- The cooldown key becomes a persisted table key in the raw _Scribe.Timed
+		-- dict, bypassing Node.validateWrite, so an invalid-UTF-8 key would fail the
+		-- whole profile save (error 104). Reject it loudly at the call site, matching
+		-- the accessor write guard and the other raw-write boundaries.
+		if not Util.isUtf8(key) then
+			error("Scribe: cooldown key contains invalid UTF-8 bytes (would corrupt the profile save)", 2)
+		end
 		local pathKey = COOLDOWN_PREFIX .. key
 		local store = timedStore(entry)
 		if not store then
@@ -146,6 +155,9 @@ function Timed.new(ctx: any)
 
 	-- Read-only cooldown check: never arms. Returns (onCooldown, remaining).
 	function self.PeekCooldown(entry: any, key: string): (boolean, number)
+		if not Util.isUtf8(key) then
+			error("Scribe: cooldown key contains invalid UTF-8 bytes", 2)
+		end
 		local store = timedStore(entry)
 		if not store then
 			return false, 0
@@ -160,6 +172,9 @@ function Timed.new(ctx: any)
 
 	-- Clear a cooldown (support/testing resets).
 	function self.ClearCooldown(entry: any, key: string)
+		if not Util.isUtf8(key) then
+			error("Scribe: cooldown key contains invalid UTF-8 bytes", 2)
+		end
 		if timedStore(entry) then
 			setTimed(entry, COOLDOWN_PREFIX .. key, nil)
 		end

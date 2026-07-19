@@ -46,6 +46,7 @@ export type Entry = {
 	LocalSessionEnd: boolean?, -- set before every locally-initiated EndSession
 	SessionStolen: boolean?, -- OnSessionEnd fired that we did not initiate (external steal)
 	LastSavedSize: number?,
+	LiveSize: number?, -- approx bytes measured at the start of the last save attempt
 	SizeWarned: boolean,
 	TornDown: boolean,
 	-- Replication state (owned by Replication.luau)
@@ -56,9 +57,14 @@ export type Entry = {
 	QueueIndex: { [string]: number },
 	SharedQueue: { any },
 	MalformedCount: number,
+	MalformedBlocked: boolean?, -- crossed the malformed-frame limit; inbound frames ignored
+	LastMalformedLog: number?, -- os.clock of the last emitted malformed-frame log/anomaly
 	-- Commands state
 	RateTokens: number,
 	RateLast: number,
+	RateLimitedCount: number?, -- consecutive rate-limited frames (decays when quiet)
+	LastRateLimitAt: number?, -- os.clock of the last rate-limited frame
+	LastRateLimitLog: number?, -- os.clock of the last emitted COMMAND_RATE_LIMITED
 	-- Monetization state
 	GiftLastAt: number,
 }
@@ -246,6 +252,18 @@ function Persistence.new(ctx: any)
 					-- re-reporting the same save as failed.
 					entry.SaveT0 = nil
 					entry.SaveInfo.LastResult = "Fail"
+					-- Classify a likely-oversize failure distinctly from a transient
+					-- throttle/outage: a profile already over the size-warning threshold
+					-- will fail EVERY UpdateAsync (unrecoverable) until it is trimmed,
+					-- which the developer must act on differently from "retry later".
+					if entry.LiveSize and entry.LiveSize > SIZE_WARN_BYTES then
+						Log.Error(
+							"Persistence",
+							"PROFILE_TOO_LARGE",
+							`save failed and the profile is {entry.LiveSize} bytes (~4 MB DataStore ceiling); this will not recover until the profile is trimmed`,
+							{ Player = entry.Player, Bytes = entry.LiveSize }
+						)
+					end
 					-- The failed save's payload never persisted: restore the dirtiness
 					-- captured at its start (plus anything written since).
 					entry.SaveInfo.Dirty = entry.DirtyAtSaveStart or entry.SaveInfo.Dirty
@@ -309,6 +327,7 @@ function Persistence.new(ctx: any)
 				LastSaveAt = entry.SaveInfo.LastSaveAt,
 				LastResult = entry.SaveInfo.LastResult,
 				Dirty = entry.SaveInfo.Dirty,
+				Size = entry.LastSavedSize,
 			})
 		end
 	end
@@ -395,6 +414,28 @@ function Persistence.new(ctx: any)
 			return
 		end
 
+		-- Measure the payload on the way IN, not only on save success. A profile that
+		-- balloons past the ~4 MB DataStore ceiling makes every UpdateAsync throw, so
+		-- the success-path size check below would never run for it and the developer
+		-- would see only generic, retryable-looking failures. Warn (and fire an
+		-- anomaly) here regardless of the save's outcome, latched to once per crossing.
+		local liveSize = Util.approxSize(entry.LiveData)
+		if liveSize then
+			entry.LiveSize = liveSize
+			if liveSize > SIZE_WARN_BYTES and not entry.SizeWarned then
+				entry.SizeWarned = true
+				Log.Warn(
+					"Persistence",
+					"PROFILE_SIZE",
+					`profile approaching the ~4 MB DataStore ceiling ({liveSize} bytes); trim it or saves will start failing`,
+					{ Player = entry.Player, Bytes = liveSize }
+				)
+				ctx.Signals.OnAnomaly:Fire({ Player = entry.Player, Path = {}, Value = nil, Reason = "ProfileSize" })
+			elseif liveSize <= SIZE_WARN_BYTES then
+				entry.SizeWarned = false
+			end
+		end
+
 		if entry.ForceSaveOnce then
 			entry.ForceSaveOnce = false
 			if entry.Blocked then
@@ -475,24 +516,13 @@ function Persistence.new(ctx: any)
 		Health.ReportSuccess("Saves")
 		ctx.Signals.OnSave:Fire({ Player = entry.Player, Ok = true, Duration = duration, At = os.time() })
 
+		-- Record the size that actually persisted (the warning + anomaly are owned by
+		-- the pre-save check in onProfileSaving, which also fires when a save fails).
 		local size = Util.approxSize(lastSavedData)
 		if size then
 			entry.LastSavedSize = size
+			entry.LiveSize = size
 			Metrics.Observe("ProfileSize", size)
-			if size > SIZE_WARN_BYTES and not entry.SizeWarned then
-				entry.SizeWarned = true
-				Log.Warn(
-					"Persistence",
-					"PROFILE_SIZE",
-					`profile approaching the ~4 MB DataStore ceiling ({size} bytes)`,
-					{
-						Player = entry.Player,
-						Bytes = size,
-					}
-				)
-			elseif size <= SIZE_WARN_BYTES then
-				entry.SizeWarned = false
-			end
 		end
 
 		self.UpdateSaveInfoMirror(entry)
@@ -832,9 +862,13 @@ function Persistence.new(ctx: any)
 		end
 
 		if options.OnPlayerInit then
+			-- A brand-new profile, a ResetData wipe, or a first-session crash recovery
+			-- (freshAsTemplate) all mean "this player has no prior saved data", which is
+			-- exactly what first-session logic (starter kits, welcome flows) needs.
+			local isNewProfile = isNew or options.ResetData == true or freshAsTemplate
 			Util.safeCall(function(err)
 				Log.Error("Lifecycle", "ON_PLAYER_INIT_ERROR", err, { Player = player })
-			end, options.OnPlayerInit, player, profile.Data)
+			end, options.OnPlayerInit, player, profile.Data, isNewProfile)
 		end
 
 		-- Scribe.Dynamic factories and OnPlayerInit write raw into profile.Data
@@ -1140,12 +1174,16 @@ function Persistence.new(ctx: any)
 		return ok == true
 	end
 
-	function self.GetSaveInfo(player: Player): { LastSaveAt: number?, LastResult: ("Ok" | "Fail")?, Dirty: boolean }
+	function self.GetSaveInfo(
+		player: Player
+	): { LastSaveAt: number?, LastResult: ("Ok" | "Fail")?, Dirty: boolean, Size: number? }
 		local entry = self.Entries[player]
 		if not entry then
-			return { LastSaveAt = nil, LastResult = nil, Dirty = false }
+			return { LastSaveAt = nil, LastResult = nil, Dirty = false, Size = nil }
 		end
-		return table.clone(entry.SaveInfo)
+		local info = table.clone(entry.SaveInfo)
+		info.Size = entry.LastSavedSize
+		return info
 	end
 
 	-- Offline access ----------------------------------------------------------

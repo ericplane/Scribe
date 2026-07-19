@@ -79,7 +79,7 @@ data.Inventory.Sword.Set({ Health = 100, Dmg = 5 })
 data.Coins.Observe(function(v) print("coins:", v) end)
 ```
 
-Writes are validated against the declarator: out-of-range numbers clamp (or reject, under `BoundsPolicy = "Reject"`), enum values outside the set are refused, and unsupported types (functions, threads) throw.
+Writes are validated against the declarator: out-of-range numbers clamp (or reject, under `BoundsPolicy = "Reject"`), enum values outside the set are refused, and a string past a field's `MaxLength` is truncated on a character boundary (so a multi-byte character is never split), or rejected under `BoundsPolicy = "Reject"`. Separately, values that simply cannot be stored are always rejected outright: unsupported types (functions, threads, Instances and other userdata), non-finite numbers (NaN or infinity), and strings or table keys that are not valid UTF-8. Note `MaxLength` counts **bytes**, not characters, so budget for multi-byte text. Data written through raw paths that bypass the accessor, such as migrations or `OnPlayerInit`, is scanned for the same problems at load and reported as `PROFILE_UNPERSISTABLE`.
 
 ## Timed fields
 
