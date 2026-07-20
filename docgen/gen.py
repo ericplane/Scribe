@@ -36,7 +36,7 @@ def read_version():
 
 
 def parse_block(body, next_code):
-    e = dict(cls=None, within=None, kind=None, name=None, ptype=None,
+    e = dict(cls=None, within=None, kind=None, name=None, ptype=None, interface=False,
              params=[], returns=[], tags=[], flags=[], desc=[])
     for line in body.split("\n"):
         s = line.strip()
@@ -48,6 +48,9 @@ def parse_block(body, next_code):
             p = s[6:].strip().split(None, 1)
             e["kind"], e["name"] = "prop", p[0]
             e["ptype"] = p[1] if len(p) > 1 else "any"
+        # @interface/@type declare a shape, not a member. This generator does not
+        # render them, so they legitimately resolve to no member name.
+        elif s.startswith("@interface ") or s.startswith("@type "): e["interface"] = True
         elif s.startswith("@param "): e["params"].append(s[7:].strip())
         elif s.startswith("@return "): e["returns"].append(s[8:].strip())
         elif s.startswith("@tag "): e["tags"].append(s[5:].strip())
@@ -66,6 +69,7 @@ def collect():
     classes = {}  # name -> {desc, members:[]}
     seen = {}     # (within, name) -> "path:line" of the doc block that defined it first
     dups = []     # (within, name, first_src, dup_src) for every redefinition
+    orphans = []  # (within, src, next_code) for a @within block whose member is unresolvable
     for path in SRC.rglob("*.luau"):
         text = path.read_text(encoding="utf-8")
         for m in BLOCK.finditer(text):
@@ -90,6 +94,36 @@ def collect():
                 else:
                     seen[key] = src
                 classes.setdefault(e["within"], {"desc": "", "members": []})["members"].append(e)
+            elif e["within"] and not e["interface"]:
+                # A @within block whose member name cannot be resolved (no explicit
+                # @function/@method/@prop, and the next code line is not a definition)
+                # is silently DROPPED from the API page, which dangles every
+                # [Class.member] link pointing at it. In practice this means code was
+                # inserted between the doc block and the thing it documents.
+                orphans.append((
+                    e["within"],
+                    f"{path.relative_to(ROOT)}:{text.count(chr(10), 0, m.start()) + 1}",
+                    nxt[:70],
+                ))
+    if orphans:
+        lines = [
+            "",
+            "[docgen] ERROR: orphaned API doc-comment(s) -- a @within block whose member",
+            "name could not be resolved, so it would be dropped from the API page and any",
+            "[Class.member] link to it would dangle:",
+            "",
+        ]
+        for within, src, nxt_code in orphans:
+            lines += [f"  * @within {within} at {src}",
+                      f"        next code line: {nxt_code or '(none)'}"]
+        lines += [
+            "",
+            "Put the doc block directly above the function/property it documents (no code",
+            "in between), or name it explicitly with @function/@method/@prop.",
+            "",
+        ]
+        print("\n".join(lines), file=sys.stderr)
+        raise SystemExit(1)
     if dups:
         lines = [
             "",

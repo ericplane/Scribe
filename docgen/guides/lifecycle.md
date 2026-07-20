@@ -38,6 +38,22 @@ if Data.WaitForData() then
 end
 ```
 
+## OnPlayerInit
+
+`OnPlayerInit` runs once per player right after their profile finishes loading and before they are Ready, receiving the Player, their **raw** data table, and whether this is a brand-new profile:
+
+```lua
+OnPlayerInit = function(player, rawData, isNewProfile)
+    if isNewProfile then
+        rawData.Coins = 500 -- starter grant, only for a first-time player
+    end
+end,
+```
+
+`isNewProfile` is true for a genuinely new profile, a `ResetData` wipe, and a first-session crash recovery, so you can run starter kits and welcome flows without keeping your own sentinel field. Use it for per-player setup that needs the freshly loaded data, such as building leaderstats. An error it throws is caught and logged rather than blocking the load.
+
+Two things to know. The table you get is the raw profile data, not the accessor tree, so writes here bypass the usual validation: Scribe scans it afterwards and reports anything unstorable as `PROFILE_UNPERSISTABLE`. And for a value that depends only on the profile itself (a creation timestamp, a seed), prefer [`Scribe.Dynamic`](./templates) instead, which is declared in the template and runs per profile automatically.
+
 ## Saving
 
 Scribe autosaves each profile every `SaveInterval` seconds (default **300**; lower it to shrink the window of progress lost to a crash). It also saves on leave and on `BindToClose`. For a grant or purchase you don't want to lose, force a save:

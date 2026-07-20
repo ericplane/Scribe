@@ -67,6 +67,8 @@ export type Entry = {
 	LastRateLimitLog: number?, -- os.clock of the last emitted COMMAND_RATE_LIMITED
 	-- Monetization state
 	GiftLastAt: number,
+	OwnsLast: { [string]: boolean }?, -- last reported effective ownership, for change detection
+	OwnsWatchers: { () -> () }?, -- Perks/OwnsCache listeners driving OnOwnershipChanged
 }
 
 local SIZE_WARN_BYTES = 3.5 * 1024 * 1024 -- warn approaching the ~4 MB DataStore ceiling

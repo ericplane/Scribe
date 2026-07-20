@@ -42,6 +42,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		OnGiftReceived = Signal.new(), -- (player, { FromUserId, Product, GiftId })
 		OnGiftCredit = Signal.new(), -- (player, productName)
 		OnMessage = Signal.new(), -- (player, message)
+		OnOwnershipChanged = Signal.new(), -- (player, key, owned)
 	}
 
 	if options.LogLevel then
@@ -430,6 +431,22 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@server
 		@param player Player
 		@param key string
+		@param callback (owned: boolean) -> ()
+		@return () -> ()
+		Calls `callback` with the player's current ownership of `key`, then again
+		whenever it changes. Returns a disconnect function. The server twin of
+		[Client.ObserveOwned]. To react to any key without subscribing per key, use
+		[Server.OnOwnershipChanged].
+	]=]
+	function Data.ObserveOwned(player: Player, key: string, callback: (owned: boolean) -> ())
+		return ctx.Monetization.ObserveOwned(player, key, callback)
+	end
+	--[=[
+		@within Server
+		@tag Monetization
+		@server
+		@param player Player
+		@param key string
 		Grants a perk directly (admin/reward flows).
 	]=]
 	function Data.GrantPerk(player: Player, key: string)
@@ -570,6 +587,21 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@prop OnGiftReceived Signal
 		Fires when a player receives a gift with `(player, { FromUserId, Product, GiftId })`.
 	]=]
+	--[=[
+		@within Server
+		@tag Monetization
+		@server
+		@prop OnOwnershipChanged Signal
+		Fires `(player, key, owned)` whenever a player's effective ownership of a
+		pass, perk, or RobloxPlus actually changes, covering purchases, grants, gift
+		deliveries, and revokes. Pre-existing ownership at join is the baseline and
+		does not fire. Use this to react to any grant without subscribing per key;
+		use [Server.ObserveOwned] for one specific key.
+
+		Ownership only ever gains within a session, so a game pass **refund** is not
+		detected until the player rejoins (a cached `true` is never re-verified).
+	]=]
+	Data.OnOwnershipChanged = ctx.Signals.OnOwnershipChanged
 	Data.OnGiftReceived = ctx.Signals.OnGiftReceived
 	--[=[
 		@within Server

@@ -377,6 +377,21 @@ return function()
 		harness.Cleanup()
 	end)
 
+	itRunning("fires the client OnOwnershipChanged when the server grants a perk", function()
+		local harness, player, entry, _, clientData = makeLoopback()
+		local seen = {}
+		clientData.OnOwnershipChanged:Connect(function(key, owned)
+			table.insert(seen, { Key = key, Owned = owned })
+		end)
+		-- The perk replicates into the client mirror, which drives the signal.
+		harness.Data.GrantPerk(player, "VIP")
+		harness.Ctx.Replication.FlushEntry(entry)
+		expect(#seen).to.equal(1)
+		expect(seen[1].Key).to.equal("VIP")
+		expect(seen[1].Owned).to.equal(true)
+		harness.Cleanup()
+	end)
+
 	itRunning("rejects a command with too many arguments instead of silently dropping them", function()
 		local harness, _, _, _, clientData = makeLoopback()
 		harness.Data.Command("Many", function()

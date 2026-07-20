@@ -156,3 +156,15 @@ jobs:
             exit 1
           fi
           echo "Version $WALLY_VER consistent."
+      # sync-version.yml rewrites the README on a push to main, but a silently
+      # failed sync would leave the front-page install snippet on the previous
+      # version with no signal. Verify it here instead of trusting the bot.
+      - name: README install snippet must match wally.toml
+        run: |
+          WALLY_VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
+          if ! grep -q "ericplane/scribe@$WALLY_VER" README.md; then
+            echo "::error::README.md install snippet does not reference $WALLY_VER"
+            grep -n 'ericplane/scribe@' README.md || true
+            exit 1
+          fi
+          echo "README install snippet consistent."

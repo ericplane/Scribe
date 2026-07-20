@@ -54,6 +54,56 @@ return function()
 		end)
 	end)
 
+	describe("ownership change signal", function()
+		it("fires on a perk grant and revoke", function()
+			local harness = withPasses()
+			local player = harness.Join()
+			local events = {}
+			harness.Data.OnOwnershipChanged:Connect(function(p, key, owned)
+				table.insert(events, { Player = p, Key = key, Owned = owned })
+			end)
+			harness.Data.GrantPerk(player, "VIP")
+			expect(#events).to.equal(1)
+			expect(events[1].Player).to.equal(player)
+			expect(events[1].Key).to.equal("VIP")
+			expect(events[1].Owned).to.equal(true)
+			harness.Data.RevokePerk(player, "VIP")
+			expect(#events).to.equal(2)
+			expect(events[2].Owned).to.equal(false)
+			harness.Cleanup()
+		end)
+
+		it("treats ownership already held at join as the baseline, not a change", function()
+			local harness = withPasses()
+			-- A returning player who already owns the perk.
+			harness.Fake.Persisted["Default/PLAYER_96001"] = { _Scribe = { Perks = { VIP = true } } }
+			local events = 0
+			harness.Data.OnOwnershipChanged:Connect(function()
+				events += 1
+			end)
+			local player = harness.Join(96001)
+			expect(harness.Data.Owns(player, "VIP")).to.equal(true)
+			expect(events).to.equal(0)
+			harness.Cleanup()
+		end)
+
+		it("ObserveOwned pushes the current value, then changes, until disconnected", function()
+			local harness = withPasses()
+			local player = harness.Join()
+			local seen = {}
+			local disconnect = harness.Data.ObserveOwned(player, "VIP", function(owned)
+				table.insert(seen, owned)
+			end)
+			expect(seen[1]).to.equal(false) -- immediate push of the current value
+			harness.Data.GrantPerk(player, "VIP")
+			expect(seen[2]).to.equal(true)
+			disconnect()
+			harness.Data.RevokePerk(player, "VIP")
+			expect(#seen).to.equal(2) -- no further pushes after disconnect
+			harness.Cleanup()
+		end)
+	end)
+
 	describe("gamepass ownership", function()
 		local mps = game:GetService("MarketplaceService")
 		local AIR_TRAFFIC_ID = 14966357

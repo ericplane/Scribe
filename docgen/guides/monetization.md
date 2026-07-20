@@ -58,6 +58,46 @@ The difference matters because perks and gifts resolve the instant a player is R
 
 Gate grants on the **server's** `Owns` or `OwnsAsync`, never the client's. The client versions are only reads of the replicated mirror, so an exploiter can make them return `true` locally; only the server's `OwnsAsync` (backed by `UserOwnsGamePassAsync`) is authoritative. A pass purchased in-experience is also picked up immediately by the `PromptGamePassPurchaseFinished` engine event, which is server-fired and cannot be triggered by a client. In DevMode, calling either with a key that is not a registered pass, declared perk, or product grant logs `UNKNOWN_OWNS_KEY`, since it would otherwise silently return `false` forever.
 
+### RobloxPlus
+
+`"RobloxPlus"` is a **built-in ownership key**. You never declare it in `Passes` or `Perks`: it is always available and resolves from the player's Roblox subscription, so you can gate a subscriber perk without wiring anything up.
+
+```lua
+-- server
+if Data.OwnsAsync(player, "RobloxPlus") then
+    grantDailyBonus(player)
+end
+
+-- client
+Data.ObserveOwned("RobloxPlus", function(subscribed)
+    subscriberBadge.Visible = subscribed
+end)
+```
+
+Because it is an ordinary ownership key, it works everywhere the others do (`Owns`, `OwnsAsync`, `ObserveOwned`, `OnOwnershipChanged`, on both realms) and it never triggers the `UNKNOWN_OWNS_KEY` warning. On the server it is read from the live player property, so it is correct even before the ownership cache is populated; the client reads the replicated value.
+
+It is also the one ownership key that reliably changes in **both** directions during a session. Scribe seeds it at load and keeps it current from `Players.PlayerMembershipChanged`, so a player who subscribes or lapses mid-session fires `OnOwnershipChanged` in the matching direction. Game pass ownership, by contrast, only ever gains within a session.
+
+### Reacting to ownership changes
+
+To run something the moment a player gains a pass or perk, react instead of polling. `OnOwnershipChanged` covers every key at once, which is what you want for applying effects on purchase:
+
+```lua
+-- server
+Data.OnOwnershipChanged:Connect(function(player, key, owned)
+    if key == "VIP" and owned then giveVipKit(player) end
+end)
+
+-- one specific key, with the current value delivered immediately
+local disconnect = Data.ObserveOwned(player, "VIP", function(owned)
+    vipDoor:SetEnabled(owned)
+end)
+```
+
+Both exist on the client too (`Data.OnOwnershipChanged` fires `(key, owned)` for the local player, and `Data.ObserveOwned(key, callback)`), which is the easy way to toggle a "buy" button the instant a purchase completes. Ownership already held when the player joined is the baseline and does not fire.
+
+These cover purchases, grants, gift deliveries, and revokes. They do **not** fire for a game pass refund mid-session, because ownership only ever gains within a session: a cached `true` is never re-verified. A refund is picked up on the player's next join.
+
 ## Soft-currency purchases
 
 [`Purchase`](/api/Server#Purchase) is atomic: debit, grant, and log succeed or roll back together. Insufficient funds or a throwing `Grant` leaves everything untouched:

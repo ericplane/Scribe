@@ -115,6 +115,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 
 	local OnServiceStatus = Signal.new()
 	local OnSharedChanged = Signal.new()
+	local OnOwnershipChanged = Signal.new()
 	local OnLeaderboard = Signal.new()
 
 	local transport: any = nil
@@ -544,6 +545,17 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Fires `(userId, sharedData)` when another player's Shared data changes.
 	]=]
 	Data.OnSharedChanged = OnSharedChanged
+	--[=[
+		@within Client
+		@tag Ownership
+		@client
+		@prop OnOwnershipChanged Signal
+		Fires `(key, owned)` whenever the local player's ownership of a pass or perk
+		actually changes. Ownership already held at load is the baseline and does not
+		fire. Use [Client.ObserveOwned] instead when you care about one specific key
+		and want the current value immediately.
+	]=]
+	Data.OnOwnershipChanged = OnOwnershipChanged
 
 	-- Ownership: reads the replicated mirror.
 	local function ownsFromMirror(key: string): boolean
@@ -630,6 +642,55 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			end
 		end
 		return ownsFromMirror(key)
+	end
+
+	-- Drives OnOwnershipChanged. Mirrors ObserveOwned's dedupe, but across every key
+	-- the mirror actually holds, so a listener does not have to know keys up front.
+	local ownsLast: { [string]: boolean } = {}
+	local ownsWatched = false
+	local function scanOwnership(silent: boolean?)
+		local candidates: { [string]: boolean } = {}
+		local reserved = mirror[Template.RESERVED_ROOT]
+		if type(reserved) == "table" and type(reserved.Perks) == "table" then
+			for key in reserved.Perks do
+				candidates[key] = true
+			end
+		end
+		local session = mirror[Template.SESSION_ROOT]
+		if type(session) == "table" and type(session.OwnsCache) == "table" then
+			for key in session.OwnsCache do
+				candidates[key] = true
+			end
+		end
+		-- Keys that went away still need a false transition.
+		for key in ownsLast do
+			candidates[key] = true
+		end
+		for key in candidates do
+			local owned = ownsFromMirror(key)
+			if owned ~= (ownsLast[key] == true) then
+				ownsLast[key] = owned
+				if not silent then
+					OnOwnershipChanged:Fire(key, owned)
+				end
+			end
+		end
+	end
+	-- Attached lazily on first subscribe: a game that never listens pays nothing.
+	local function ensureOwnershipWatched()
+		if ownsWatched or editMode then
+			return
+		end
+		ownsWatched = true
+		waitForLoaded()
+		scanOwnership(true) -- baseline: current ownership is not a "change"
+		local accessor = tree.Accessor
+		accessor[Template.RESERVED_ROOT].Perks.Changed(function()
+			scanOwnership()
+		end)
+		accessor[Template.SESSION_ROOT].OwnsCache.Changed(function()
+			scanOwnership()
+		end)
 	end
 
 	--[=[
@@ -882,6 +943,10 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	if options.Banner ~= false then
 		print(`Running Scribe v{Version} by ericplane — client is now initialized`)
 	end
+
+	-- Drive OnOwnershipChanged once the first snapshot lands. Two listeners plus a
+	-- small scan over the keys the mirror holds, so the cost is negligible.
+	task.spawn(ensureOwnershipWatched)
 
 	return Data
 end

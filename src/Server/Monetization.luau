@@ -264,12 +264,10 @@ function Monetization.new(ctx: any)
 	-- refreshOwnership fills asynchronously, so right after join a genuinely-owned
 	-- gamepass can still read false until that async refresh lands -- use OwnsAsync
 	-- when you need an authoritative answer immediately (e.g. gating at join).
-	function self.Owns(player: Player, key: string): boolean
-		checkOwnsKey(key)
-		local entry = ctx.Persistence.EntryFor(player)
-		if not entry or entry.State ~= "Ready" or not entry.LiveData then
-			return false
-		end
+	-- The ownership predicate itself, WITHOUT the DevMode unknown-key warning and
+	-- without the entry lookup. Internal scans legitimately walk keys that were never
+	-- registered (a perk granted with an undeclared name), so they must stay quiet.
+	local function ownsInternal(player: Player, entry: any, key: string): boolean
 		local reserved = reservedRaw(entry.LiveData)
 		if reserved.Perks[key] == true then
 			return true
@@ -280,14 +278,123 @@ function Monetization.new(ctx: any)
 			return true
 		end
 		if key == "RobloxPlus" then
-			return player.HasRobloxSubscription
+			-- Coerce: the property is nil on a player object that predates it, and a
+			-- nil here would read as "changed" against a false baseline on every
+			-- ownership scan, firing OnOwnershipChanged forever.
+			return player.HasRobloxSubscription == true
 		end
 		return false
+	end
+
+	function self.Owns(player: Player, key: string): boolean
+		checkOwnsKey(key)
+		local entry = ctx.Persistence.EntryFor(player)
+		if not entry or entry.State ~= "Ready" or not entry.LiveData then
+			return false
+		end
+		return ownsInternal(player, entry, key)
 	end
 
 	local function setOwnsCache(entry: any, key: string, owned: boolean)
 		if entry.Tree and not entry.Tree.Dead then
 			entry.Tree.Accessor[Template.SESSION_ROOT].OwnsCache[key].Set(if owned then true else nil)
+		end
+	end
+
+	-- Every key whose ownership is worth tracking: everything registered, plus
+	-- whatever the profile actually holds (a perk granted with an undeclared name
+	-- still counts as ownership, and OwnsCache holds the resolved passes).
+	local function ownershipCandidates(entry: any): { [string]: boolean }
+		local candidates: { [string]: boolean } = {}
+		for key in knownOwnsKeys do
+			candidates[key] = true
+		end
+		local reserved = reservedRaw(entry.LiveData)
+		for key in reserved.Perks do
+			candidates[key] = true
+		end
+		local session = entry.SessionStore[Template.SESSION_ROOT]
+		local ownsCache = if type(session) == "table" then session.OwnsCache else nil
+		if type(ownsCache) == "table" then
+			for key in ownsCache do
+				candidates[key] = true
+			end
+		end
+		return candidates
+	end
+
+	-- Recompute effective ownership and fire OnOwnershipChanged for keys that
+	-- actually flipped. Watching the two INPUTS (Perks and OwnsCache) and
+	-- recomputing covers every write site automatically -- GrantPerk, RevokePerk,
+	-- product grants, gift delivery, setOwnsCache, RobloxPlus -- with no per-site
+	-- instrumentation, and the union semantics match self.Owns exactly.
+	-- `silent` seeds the baseline at load so pre-existing ownership is not reported
+	-- as a change.
+	local function scanOwnership(entry: any, silent: boolean?)
+		if entry.TornDown or not entry.LiveData or entry.State ~= "Ready" then
+			return
+		end
+		local player = entry.Player
+		local last = entry.OwnsLast
+		if not last then
+			last = {}
+			entry.OwnsLast = last
+		end
+		for key in ownershipCandidates(entry) do
+			local owned = ownsInternal(player, entry, key)
+			if owned ~= (last[key] == true) then
+				last[key] = owned
+				if not silent then
+					ctx.Signals.OnOwnershipChanged:Fire(player, key, owned)
+				end
+			end
+		end
+	end
+
+	-- Attach the ownership watchers for an entry. Detached on unload.
+	local function watchOwnership(entry: any)
+		if not entry.Tree or entry.Tree.Dead then
+			return
+		end
+		local accessor = entry.Tree.Accessor
+		scanOwnership(entry, true) -- baseline: record current state without firing
+		local function onChange()
+			scanOwnership(entry)
+		end
+		entry.OwnsWatchers = {
+			accessor[Template.RESERVED_ROOT].Perks.Changed(onChange),
+			accessor[Template.SESSION_ROOT].OwnsCache.Changed(onChange),
+		}
+	end
+
+	-- Push the player's current ownership of `key`, then again on every change,
+	-- deduped so only real transitions fire. Returns a disconnect. Public API
+	-- doc-comment lives on Data.ObserveOwned (Server/init.luau) -- keep this a plain
+	-- comment so the docgen does not emit a duplicate ".ObserveOwned" entry.
+	function self.ObserveOwned(player: Player, key: string, callback: (owned: boolean) -> ()): () -> ()
+		checkOwnsKey(key)
+		local entry = ctx.Persistence.EntryFor(player)
+		if not entry or entry.State ~= "Ready" or not entry.Tree or entry.Tree.Dead then
+			error("Scribe: ObserveOwned requires a Ready player (use Data.WaitForData)", 3)
+		end
+		local last: boolean? = nil
+		local function push()
+			if entry.TornDown or not entry.LiveData then
+				return
+			end
+			local owned = ownsInternal(player, entry, key)
+			if owned ~= last then
+				last = owned
+				task.spawn(callback, owned)
+			end
+		end
+		local accessor = entry.Tree.Accessor
+		local disconnectPerk = accessor[Template.RESERVED_ROOT].Perks.Changed(push)
+		local disconnectCache = accessor[Template.SESSION_ROOT].OwnsCache.Changed(push)
+		push()
+		return function()
+			disconnectPerk()
+			disconnectCache()
 		end
 	end
 
@@ -1348,9 +1455,18 @@ function Monetization.new(ctx: any)
 			end
 		end
 		task.spawn(refreshOwnership, entry)
+		watchOwnership(entry)
 	end
 
-	function self.OnUnload(_entry: any) end
+	function self.OnUnload(entry: any)
+		local watchers = entry.OwnsWatchers
+		if watchers then
+			entry.OwnsWatchers = nil
+			for _, disconnect in watchers do
+				disconnect()
+			end
+		end
+	end
 
 	function self.Start()
 		-- Only take over ProcessReceipt when there are developer products to grant.
