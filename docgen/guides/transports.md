@@ -16,12 +16,12 @@ A transport is a table matching `Scribe.ScribeTransport`:
 export type ScribeTransport = {
     Name: string,
     -- Server
-    SendToClient: (self, player: Player, bytes: buffer) -> (),
-    SendToAllClients: ((self, bytes: buffer) -> ())?, -- optional broadcast fast-path
-    ListenServer: (self, callback: (player: Player, bytes: buffer) -> ()) -> (),
+    SendToClient: (self: any, player: Player, bytes: buffer) -> (),
+    SendToAllClients: ((self: any, bytes: buffer) -> ())?, -- optional broadcast fast-path
+    ListenServer: (self: any, callback: (player: Player, bytes: buffer) -> ()) -> (),
     -- Client
-    SendToServer: (self, bytes: buffer) -> (),
-    ListenClient: (self, callback: (bytes: buffer) -> ()) -> (),
+    SendToServer: (self: any, bytes: buffer) -> (),
+    ListenClient: (self: any, callback: (bytes: buffer) -> ()) -> (),
 }
 ```
 
@@ -60,7 +60,7 @@ return Scribe({
 
 - **The channel must be reliable and ordered.** Scribe sends diffs that build on each other; a dropped or reordered packet corrupts the client mirror. Use a reliable RemoteEvent (or your library's reliable channel), never an unreliable one.
 - **Sender identity comes from the engine callback, never the payload.** In `ListenServer`, the `player` your callback receives is authoritative; do not read a user id out of the bytes. This is what keeps commands spoof-proof.
-- **A custom transport won't make the payload smaller.** Scribe already schema-packs everything into a tight buffer before it reaches the transport, so a networking library adds its own conveniences but no extra per-field compression. There's no performance reason to move off the default. Do that only to unify with an existing setup.
+- **A custom transport won't make the payload smaller.** Scribe already schema-packs everything into a tight buffer before it reaches the transport, so there is no performance reason to move off the default.
 
 ## Multiple bundles on one channel
 

@@ -11,7 +11,7 @@ Scribe is built to be observable in production. Every failure has a stable code,
 Logs carry a stable machine-readable code (`PROFILE_LOAD_FAIL`, `MIGRATION_FAIL`, `WIPE_GUARD_TRIPPED`, `LB_WRITE_FAIL`, `MALFORMED_FRAME`, …), a category, a message, and a context table. They land in a 512-entry ring buffer and in any sinks you add.
 
 ```lua
-Scribe.GetRecentLogs({ Code = "PROFILE_LOAD_FAIL", Limit = 20 }) -- newest first
+Scribe.GetRecentLogs({ Code = "PROFILE_LOAD_FAIL", Limit = 20 }) -- oldest first; the newest is last
 Scribe.AddLogSink(function(entry) forwardToMyPipeline(entry) end) -- your own forwarding
 Scribe.OnIssue:Connect(function(entry) alert(entry) end)          -- every Error/Fatal
 ```

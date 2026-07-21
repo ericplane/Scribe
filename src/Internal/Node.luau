@@ -1477,7 +1477,19 @@ end
 	@within Value
 	@tag Core
 	@return T
-	Returns a copy of the field's current value.
+	Returns the field's current value. A datatype field comes back as the real
+	datatype, unpacked from its stored buffer.
+
+	A **table** field returns the stored table, not a copy: only subtrees that
+	actually contain datatypes are rebuilt on the way out, and everything else is
+	shared by reference. Mutating what `Get` hands you edits authoritative state with
+	no validation and no replication, so treat it as read-only and use [Value.Clone]
+	when you intend to mutate.
+
+	A value that has not materialized yet reads `nil`: a field of a `Scribe.DictOf`
+	key nothing has written, or a [Scribe.Optional] field. On a fresh key that `nil`
+	is not the whole story, since [Value.Increment] and [Value.Toggle] start from the
+	element's declared default there.
 ]=]
 
 --[=[
@@ -1490,6 +1502,20 @@ end
 	Writes a new value (validated and clamped per the declarator). Fires
 	`Changed`, replicates, and returns the stored value. Pass `replicate = false`
 	to keep the write server-only.
+
+	`Set(nil)` removes the field, except where that would store a shape nothing can
+	read back:
+
+	- a middle index of a [Scribe.ArrayOf], which punches a hole: `#arr` stops at the
+	  gap and every replicated index below it shifts, so use [Value.Remove] (clearing
+	  the tail is fine)
+	- a declared, non-optional field of an element record, whose field set is closed:
+	  wrap it in [Scribe.Optional] if absence is legitimate
+
+	A whole-container `Set` on a [Scribe.ArrayOf] or [Scribe.DictOf] must match the
+	declared key shape: contiguous integer keys from 1 for an array, string keys
+	within `MaxKeyLength` for a dictionary, and no growth past `MaxItems` or
+	`MaxKeys`. Omitted declared element fields fill from their defaults.
 ]=]
 
 --[=[
@@ -1536,10 +1562,16 @@ end
 	@function Changed
 	@within Value
 	@tag Core
-	@param callback (new: T, old: T) -> ()
+	@param callback (new: T, old: T, key: (string | number)?) -> ()
 	@return () -> ()
-	Like `Observe` but fires only on change (no initial call), with both the new
-	and old values. Returns a disconnect function.
+	Like `Observe` but fires only on change (no initial call). Returns a disconnect
+	function.
+
+	On a **leaf** the callback gets the new and old values. On a **container** it
+	also gets the key that changed, and `old` is the same reference as `new`: the
+	fire happens after the write, and Scribe does not snapshot the container's prior
+	contents. Use `OnInsert` / `OnRemove` / `OnKeyAdded` / `OnKeyRemoved` when you
+	need to know what actually changed, or watch the specific leaf.
 ]=]
 
 --[=[
@@ -1615,18 +1647,34 @@ end
 	@param value T
 	@param index number?
 	@param replicate boolean?
-	Array fields only. Inserts `value` (at `index`, or appended).
+	Array fields only. Inserts `value` at `index`, or appends it. `index` is clamped
+	to the array's contiguous length plus one, and must be an integer: a fractional
+	or NaN position is refused rather than silently writing a hash-part key. `value`
+	may not be `nil`.
+
+	On a [Scribe.ArrayOf] the entry is validated against the element shape, and
+	exceeding `MaxItems` is refused before anything is written, so a rejected
+	`Insert` never leaves a phantom container behind. For a record element shape an
+	undeclared field is an error, and a declared field the caller omitted fills from
+	its default ([Scribe.Optional] fields have none and stay absent).
+
+	Calling `Insert` on a [Scribe.DictOf] is an error: write the key instead.
 ]=]
 
 --[=[
 	@function Remove
 	@within Value
 	@tag Arrays & Dictionaries
-	@param index number?
+	@param indexOrKey (number | string)?
 	@param replicate boolean?
 	@return T?
-	Array fields only. Removes and returns the element at `index` (or the last),
-	or `nil` if empty. (On a dictionary field, `Remove(key)` deletes that key.)
+	Two operations, chosen by the argument's type. Given a **number** (or nothing),
+	removes and returns the array element at that index, or the last one, or `nil`
+	if the array is empty. Given a **string**, deletes that dictionary key and
+	returns its former value.
+
+	The returned value is unpacked, so a datatype element comes back as the real
+	datatype rather than its stored buffer.
 ]=]
 
 --[=[
@@ -1636,8 +1684,9 @@ end
 	@param value T
 	@param replicate boolean?
 	@return (T?, number?)
-	Array fields only. Removes the first element equal to `value`, returning it
-	and its former index.
+	Array fields only. Removes the first element matching `value`, returning it
+	unpacked along with its former index. Matching follows [Value.Find]. Errors on a
+	[Scribe.DictOf]: use `Remove(key)`.
 ]=]
 
 --[=[
@@ -1647,7 +1696,11 @@ end
 	@param value T
 	@return number?
 	Array fields only. The index of the first matching element, or `nil`.
-]=]
+
+	A [Scribe.ArrayOf] element is compared **structurally, by value**, since entries
+	reach you unpacked and copied and an identity search would never match what
+	`Get()` just handed you. An untyped `{}` container keeps `table.find`'s identity
+	comparison. Errors on a [Scribe.DictOf], which is keyed: read the key directly.]=]
 
 --[=[
 	@function Has
@@ -1655,7 +1708,8 @@ end
 	@tag Arrays & Dictionaries
 	@param value T
 	@return boolean
-	Array fields only. Whether `value` is present.
+	Array fields only. Whether `value` is present. Matching follows [Value.Find],
+	including its error on a [Scribe.DictOf].
 ]=]
 
 --[=[
@@ -1684,8 +1738,10 @@ end
 	@tag Arrays & Dictionaries
 	@param callback (key: K, value: T) -> ()
 	@return () -> ()
-	Dictionary fields only. Fires when a key is added, with the key and its new
-	value. Returns a disconnect function.
+	Fires when a key is added, with the key and its new value. Returns a disconnect
+	function. Mainly for dictionaries, but an array fires it too, with the numeric
+	index as the key, when an index is written directly with `Set` rather than
+	`Insert`.
 ]=]
 
 --[=[
@@ -1694,8 +1750,9 @@ end
 	@tag Arrays & Dictionaries
 	@param callback (key: K, value: T) -> ()
 	@return () -> ()
-	Dictionary fields only. Fires when a key is removed, with the key and its
-	former value. Returns a disconnect function.
+	Fires when a key is removed, with the key and its former value. Returns a
+	disconnect function. As with `OnKeyAdded`, an array fires it for a direct
+	`Set(nil)` on an index, with the numeric index as the key.
 ]=]
 
 --[=[
@@ -1735,8 +1792,12 @@ end
 	@within Value
 	@tag Timed
 	@param seconds number
-	@param replicate boolean?
 	`Scribe.Timed` fields only. Adds time to a running timer.
+
+	With no timer running it **arms a fresh one** from now, so a field that was
+	never `SetTimed` starts counting down and will revert to its declared default.
+	Check `Active()` first if that is not what you want. The value itself is never
+	written, so unlike `SetTimed` there is nothing here to replicate.
 ]=]
 
 --[=[

@@ -46,9 +46,20 @@ contents line.
 runs `mkdocs build --strict`) if any `Class.member` is documented by more than one
 block, naming both source locations.
 
+## Links
+
+Only some link forms are rewritten; everything else passes through as written.
+
+In **guides** (`convert_guide`):
+
+- `](/api/Scribe#ArrayOf)` becomes `](api/scribe.md#arrayof)`. Page name and anchor are both lowercased, so the member may be written in its source casing.
+- `](./visibility#wipe-guard)` becomes `](visibility.md#wipe-guard)`. Only the path is rewritten, so the anchor must already be lowercase.
+
+In **doc-comments** (`convert_xref`), the Moonwave autolink form `[Scribe.ArrayOf]` becomes `` [`Scribe.ArrayOf`](scribe.md#arrayof) ``. Use it rather than a hand-written `](#ArrayOf)`: heading ids are lowercased, so a capitalised hand-written anchor silently resolves to nothing.
+
 ## Deployment
 
-Everything — this generator, `mkdocs.yml`, the guides, and the library — lives on
+Everything (this generator, `mkdocs.yml`, the guides, and the library) lives on
 **`main`**. The API pages are generated from `../src/`, so the docs source has to
 sit with the code.
 

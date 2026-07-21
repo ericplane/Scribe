@@ -1031,7 +1031,7 @@ end
 	omits it. `Get()` returns `nil` until something writes it, and `Set(nil)` takes
 	it back to absent.
 
-	This is mainly what makes closed [`ArrayOf`](#ArrayOf) / [`DictOf`](#DictOf)
+	This is mainly what makes closed [Scribe.ArrayOf] / [Scribe.DictOf]
 	element shapes practical: without it, every element field would need a sentinel
 	value standing in for "not set", and `""` or `0` is usually a real value too.
 
@@ -1067,23 +1067,34 @@ end
 	local cf = data.PlacedFurniture[1].Cf.Get() -- a real CFrame, unpacked for you
 	```
 
-	This is the only way to store a Roblox datatype inside a container. A plain
-	array literal stores its entries as opaque data, so a `Scribe.CFrame` inside one
-	is a template error: with no schema for the entries, Scribe cannot tell a packed
-	CFrame from a buffer you stored yourself when reading it back.
+	An element schema is the only way to have Scribe pack and unpack a Roblox
+	datatype inside a container. A plain array literal stores its entries as opaque
+	data, so a `Scribe.CFrame` inside one is a template error: with no schema for the
+	entries, Scribe cannot tell a packed CFrame from a buffer you stored yourself when
+	reading it back. To keep the container free-form, leave it plain and call
+	[Scribe.Datatypes] `Pack` and `Unpack` around the buffer yourself.
 
 	The element shape may be a single leaf declarator (`Scribe.ArrayOf(Scribe.CFrame(CFrame.new()))`
 	is an array of CFrames) and nests freely: an element field may itself be an
 	`ArrayOf` or a `DictOf`.
 
-	Element records are **closed**. Writing a field the shape does not declare is an
-	error rather than a silently stored extra field, which is what makes a typo like
-	`data.PlacedFurniture[1].Colour.Set(...)` fail loudly. An `Insert` that omits a
-	declared field fills it from that field's default.
+	Element records are **closed** at every depth, nested sub-records included.
+	Writing a field the shape does not declare is an error rather than a silently
+	stored extra field, which is what makes a typo like
+	`data.PlacedFurniture[1].Colour.Set(...)` fail loudly.
 
-	`MaxItems` caps the entry count; exceeding it is a write error. Elements may not
-	use `Scribe.Timed`, `Scribe.Dynamic`, `Scribe.Shared` or `Scribe.Session`.
-]=]
+	An `Insert` or `Set` that omits a declared field fills it from that field's
+	default, but strict Luau still asks for every non-optional field, since the type
+	level cannot know the runtime fills them. Pass the whole element, or mark the
+	omittable fields [Scribe.Optional].
+
+	`MaxItems` caps the entry count; exceeding it is a write error, but only growth
+	is refused, so a container a newer-template server already stored over cap stays
+	writable through a rolling deploy. Elements may not use `Scribe.Timed`,
+	`Scribe.Dynamic`, `Scribe.Shared` or `Scribe.Session`.
+
+	[Value.Find], [Value.Has] and [Value.RemoveValue] compare entries by value, not
+	by identity as they do on an untyped array.]=]
 function Scribe.ArrayOf<T>(shape: T, opts: ArrayOpts?): { T }
 	if opts ~= nil then
 		for key in opts :: any do
@@ -1108,7 +1119,7 @@ end
 	@param opts { MaxKeys: number?, MaxKeyLength: number? }?
 	@return { [string]: V }
 	Declares a string-keyed dictionary whose **values have a schema**, the
-	dictionary counterpart of [`ArrayOf`](#ArrayOf):
+	dictionary counterpart of [Scribe.ArrayOf]:
 
 	```lua
 	Resources = Scribe.DictOf(Scribe.Int(0, { Min = 0 }), { MaxKeys = 500 }),
@@ -1119,15 +1130,21 @@ end
 	```
 
 	```lua
-	data.Resources.Wood.Increment(5) -- a fresh key starts at the declared default
-	data.Pets.Dragon.Level.Set(12)
+	data.Resources.Wood.Get()        -- nil: nothing has written this key yet
+	data.Resources.Wood.Increment(5) -- 5: the write starts from the declared default
+	data.Pets.Dragon.Level.Set(12)   -- creates Dragon with Home at its default too
 	```
 
-	Writing to a key that does not exist yet materializes it from the element
-	defaults, which is what a `{ [string]: V }` type promises. Keys are strings
-	only; `MaxKeys` caps how many there may be and `MaxKeyLength` caps each key's
-	byte length. Both are write errors when exceeded, and `MaxKeyLength` rejects
-	rather than truncates, since a truncated key writes to the wrong slot.
+	A key exists only once something writes it: until then `Get()` is `nil` and
+	`Count()` does not include it. The element default is what the first write
+	starts from, not a value every conceivable key already reports.
+
+	Any string is a valid key, so a typo is a new key rather than an error. Use
+	`DictOf` for open-ended keys like catalog ids, and plain declared fields when the
+	key set is fixed, which buys back that typo protection. `MaxKeys` caps how many
+	keys there may be and `MaxKeyLength` caps each key's byte length; both are write
+	errors, and `MaxKeyLength` rejects rather than truncates, since a truncated key
+	writes to the wrong slot.
 
 	The same element rules as `ArrayOf` apply: records are closed, missing fields
 	fill from their defaults, and `Scribe.Timed` / `Scribe.Dynamic` / `Scribe.Shared`
@@ -1305,7 +1322,8 @@ end
 	@function GetRecentLogs
 	@param filter { Level: LogLevel?, Category: LogCategory?, Code: LogCode?, Limit: number? }?
 	@return { LogEntry }
-	Returns entries from the 512-entry ring buffer, newest first, optionally
+	Returns entries from the 512-entry ring buffer in chronological order, so the
+	newest is the LAST element. `Limit` keeps the most recent N. Optionally
 	filtered by level/category/code. `Code`, `Level`, and `Category` are typed
 	string unions, so editors autocomplete valid values (see the Log Code
 	Reference for the full list of codes).

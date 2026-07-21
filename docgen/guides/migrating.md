@@ -16,7 +16,7 @@ Scribe sits directly on ProfileStore, so a game already using ProfileStore adopt
 
 1. Set `ProfileStoreIndex` and `ProfileKeyPrefix` to match your current store name and key prefix.
 2. Existing profiles load unchanged. `Data` is the template root, and the ProfileStore envelope (session metadata, `UserIds`, `GlobalUpdates`) is untouched.
-3. `Reconcile` fills any newly added template fields; use `Migrations` to reshape anything whose structure changed.
+3. `Reconcile` fills any newly added **static** template field; use `Migrations` to reshape anything whose structure changed. Fields you later add to a [`Scribe.ArrayOf` or `Scribe.DictOf` element shape](./templates#typed-containers) are a separate pass: ProfileStore's `Reconcile` walks the static template only, so Scribe backfills stored entries itself on load, **after** your migrations run. That order is deliberate: a guarded rename step like `item.New = item.New or item.Old` has to see the raw stored entry before any default lands on it. `Scribe.Optional` element fields have no default and are left absent.
 
 ```lua
 return Scribe({
@@ -68,7 +68,7 @@ return Scribe({
 `OnPlayerInit` mutates the raw data **before** the player can touch it, so the first Ready state already reflects the imported values. The `LegacyImported` flag makes re-loads safe: the import only ever happens on a player's first Scribe load.
 
 :::caution Preserve timestamps yourself instead of relying on the store's metadata
-Values like a **first-join date** belong in a field of _your_ template, not in a store-specific timestamp. ProfileStore's `FirstSessionTime` is stamped when the profile is first _created_. For a game moving over, that's the migration moment. It's also read-only, so it can't be backdated (and Scribe doesn't surface it anyway). Owning the field means you carry the real date across from your old store, and it survives any future move:
+Values like a **first-join date** belong in a field of _your_ template. ProfileStore's `FirstSessionTime` is stamped when the profile is first _created_, which for a game moving over is the migration moment, and it is read-only so it cannot be backdated (Scribe doesn't surface it either). Own the field and you carry the real date across from your old store, and keep it through any future move:
 
 ```lua
 FirstJoined = 0, -- in your template
@@ -89,24 +89,32 @@ end
 
 Most migrations never need this. With the read-and-seed approach above, every player is imported automatically the next time they log in, so you can leave the old store in place and let it drain on its own.
 
-The one time you'd reach for a batch job is retiring the old store for good: before you can stop reading it, you have to import the stragglers who haven't logged in since the cutover. [`Data.UpdateOffline`](/api/Server#UpdateOffline) edits a profile that has no active session and **fails closed** if the user happens to be online elsewhere, so it can never clobber a live game:
+[`Data.UpdateOffline`](/api/Server#UpdateOffline) edits a profile that has no active session, and **fails closed** if the user is online elsewhere, so it can never clobber a live game. Always check its return value:
 
 ```lua
 for _, userId in userIdsToImport do
     local old = MyOldStore:Get(userId)
     if old then
-        Data.UpdateOffline(userId, function(data)
+        local ok, err = Data.UpdateOffline(userId, function(data)
             if not data.LegacyImported then
                 data.Coins = old.coins
                 data.LegacyImported = true
             end
         end)
+        if not ok then
+            warn(`import failed for {userId}: {err}`)
+        end
     end
 end
 ```
 
+:::caution It cannot create a profile
+`UpdateOffline` edits data that already exists. A player who has never logged in since the cutover has no Scribe profile yet, so the call returns `(false, "profile does not exist")` and writes nothing. That is precisely the population a "retire the old store" batch job targets, so a batch job cannot finish the migration on its own. Keep the read-and-seed path above in place until those players log in, or accept that they import on first join.
+:::
+
 ## Tips
 
 - **Keep the legacy store readable** until you're confident. Don't delete old data the moment you cut over. The guard flag means a re-run is harmless.
-- **Convert shapes explicitly**: copy field by field into your Scribe template rather than assigning the whole old table, so the result matches your declarators.
-- **Dry-run first** with `ViewedUserId` (reads a real profile without writing), or against a throwaway `ProfileStoreIndex` seeded with copies, before touching production. (`DontSave = true` uses an in-memory mock and never reads real data, so it cannot validate a migration.)
+- **Convert shapes explicitly**: copy field by field into your Scribe template rather than assigning the whole old table, so the result matches your declarators. Nothing on the raw import path checks that for you: `OnPlayerInit` and [`Data.UpdateOffline`](/api/Server#UpdateOffline) mutate the profile table directly, so bounds, enum members, `MaxLength`, and `ArrayOf` / `DictOf` element shapes are all unenforced there, and a mismatch surfaces as a wrong-typed read later rather than an error at the write.
+- **Storability *is* checked**, so seed datatypes packed: invalid UTF-8, a NaN/inf number, a table mixing array indices with string keys, or a raw Roblox datatype is reported as `PROFILE_UNPERSISTABLE` on load and refused outright by `UpdateOffline`. [Typed container](./templates#typed-containers) datatype fields store a *packed buffer*, so seed them with `Scribe.Datatypes.Pack("CFrame", cf)` or write them through the accessor tree, which packs for you.
+- **Dry-run first** with `ViewedUserId`, or against a throwaway `ProfileStoreIndex` seeded with copies, before touching production. `DontSave = true` is not a dry-run: it swaps in an in-memory mock store, so nothing you see there came from real data.

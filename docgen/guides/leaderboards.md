@@ -17,6 +17,8 @@ Leaderboards = {
 
 A client can never trigger an OrderedDataStore request either way.
 
+`Stat` is checked at startup only for shapes that can never work: a path descending through a leaf field, or naming a field a [closed element shape](./templates#typed-containers) does not declare. A typo on an ordinary field is **not** caught, since any unknown key on an open container is a legitimate dynamic path; it simply never produces a score. A path through a container, like `"Chars.main.Xp"` on a `Scribe.DictOf`, is fine, and a player missing that key is silently not tracked.
+
 ```lua
 -- server: render a physical board
 for _, entry in Data.GetLeaderboard("TopCoins", 10) do
@@ -29,7 +31,7 @@ local rank = Data.GetMyRank("TopWins")
 ```
 
 :::note How ranks are computed
-`GetMyRank` returns a player's position **within the board's top `Limit`**, or `nil` if they sit outside it. A rank of 100,284 on a `Limit = 100` board is simply `nil` (they are not on the board). The lookup itself is a cached, O(1) read: each refresh pulls the top `Limit` in a single `GetSortedAsync` call shared by every player, so there is no per-player scanning and no paging toward a deep rank. OrderedDataStore has no exact-rank primitive, and resolving a global rank of 100,284 would mean paging through 100k+ entries on every query, so Scribe does not do it. If you want to show something for players off the board, track a separate stat (such as a personal best) and display that.
+`GetMyRank` returns a player's position **within the board's top `Limit`**, or `nil` if they sit outside it: a global rank of 100,284 on a `Limit = 100` board is simply `nil`. Each refresh pulls the top `Limit` in one `GetSortedAsync` shared by every player, so the lookup is a cached O(1) read. OrderedDataStore has no exact-rank primitive, and resolving a deep rank would mean paging 100k+ entries per query, so Scribe does not do it. To show something for players off the board, track a separate stat such as a personal best.
 :::
 
 :::note Universe-global stores

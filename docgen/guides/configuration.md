@@ -4,7 +4,7 @@ sidebar_position: 5
 
 # Configuration
 
-Everything you can pass to `Scribe({ … })`. `Template`, `ProfileStoreIndex`, and `ProfileKeyPrefix` are required; every other option is optional with a sensible default. The whole table is typed as `ScribeOptions<T>`, so your editor autocompletes the field names and flags a wrong type or a misspelled key.
+Everything you can pass to `Scribe({ … })`. `Template`, `ProfileStoreIndex`, and `ProfileKeyPrefix` are required; every other option is optional with a sensible default. The whole table is typed as `ScribeOptions<T>`, so your editor autocompletes the field names and flags a wrong type. It does **not** flag a misspelled key, because Luau does not reject unknown table keys, so a typo is silently ignored. Scribe warns about one at startup in Studio (`UNKNOWN_OPTION`); on a live server it passes unnoticed, so check the output once after editing your options.
 
 For the day-one essentials and a runnable example, see the [quick start](./intro). The feature guides go deeper on the options they use (monetization, leaderboards, testing, and so on); this page is the complete list in one place.
 
@@ -12,7 +12,7 @@ For the day-one essentials and a runnable example, see the [quick start](./intro
 
 | Option | Type | Default | What it does |
 | --- | --- | --- | --- |
-| `Template` **(required)** | `T` | Required, no default | Defines the shape and default values of every player's saved data. It must be a table; Scribe compiles it into the data schema and deep-freezes it, so it acts as the single immutable source of truth for what each player's data looks like. |
+| `Template` **(required)** | `T` | Required, no default | Defines the shape and default values of every player's saved data. It must be a table; Scribe compiles it into the data schema and deep-freezes it, so it is the single immutable source of truth. |
 | `Transport` | `(ScribeTransport \| "Default")?` | "Default" (built-in two-RemoteEvent transport) | Selects the server-to-client replication channel. Leave it unset or set to "Default" to use the built-in transport backed by two RemoteEvents; supply a custom ScribeTransport adapter table only when you need to route replication through your own networking layer. |
 | `Migrations` | `{ [number]: (data) -> () }?` | {} (no migrations; data version stays at 1) | Maps each data version number (an integer of 2 or greater) to a function that upgrades a player's stored data up to that version. Set this when your Template's shape changes over time so older profiles are migrated on load; omitting it keeps the data version pinned at 1 and runs no migrations. |
 | `Economy` | `EconomyConfig?` | nil | Economy analytics configuration: per-currency labels, custom field declarations, and ambient value resolvers, plus the `LogEconomyEvent` test seam. Tagged `Increment`/`Decrement` calls emit `AnalyticsService:LogEconomyEvent` from it. See the [Economy Analytics](./economy) guide. |

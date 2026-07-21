@@ -22,8 +22,8 @@ Scribe binds `MarketplaceService.ProcessReceipt` automatically and runs everythi
 :::caution Already have a `ProcessReceipt`? Set `OwnReceipts = false`
 Roblox allows exactly **one** `ProcessReceipt` callback. By default Scribe installs its own, which **silently overrides any receipt handler your game already has** (a second Scribe bundle instead errors loudly at startup). If your game already handles receipts, pick one of these:
 
-- **Let Scribe take over (recommended).** Move your developer products into `Products`, passes into `Passes`, and gifting into [`PromptGift`](/api/Server#PromptGift). Scribe's receipt path is idempotent by `PurchaseId`, fail-closed (it never returns `PurchaseGranted` until the grant is durably saved, so it can't eat Robux), and it survives cross-server hops and offline recipients. That is genuinely hard to get right by hand, so for most games this is an upgrade over a hand-rolled handler.
-- **Keep your own handler.** Set `OwnReceipts = false`, then call [`Data.HandleReceipt(receiptInfo)`](/api/Server#HandleReceipt) from your `ProcessReceipt` for every Scribe-registered product and return its `Enum.ProductPurchaseDecision`. Route only Scribe's product IDs to it: it returns `NotProcessedYet` for a product it doesn't know, which would stall one of your own purchases in a retry loop.
+- **Let Scribe take over (recommended).** Move your developer products into `Products`, passes into `Passes`, and gifting into [`PromptGift`](/api/Server#PromptGift). Scribe's receipt path survives cross-server hops and offline recipients, which is genuinely hard to get right by hand.
+- **Keep your own handler.** Set `OwnReceipts = false`, then route exactly Scribe's product IDs, no more and no fewer, to [`Data.HandleReceipt(receiptInfo)`](/api/Server#HandleReceipt) from your `ProcessReceipt` and return its `Enum.ProductPurchaseDecision`. It returns `NotProcessedYet` for a product it doesn't know, which would stall one of your own purchases in a retry loop.
 
 If you set `OwnReceipts = false` and **don't** wire up `HandleReceipt`, everything on the receipt path goes dark: **developer-product grants, `PromptGift` delivery, and the Robux purchase log never fire.** Perk ownership and soft-currency [`Purchase`](/api/Server#Purchase) keep working, since those never touch receipts.
 :::
@@ -34,7 +34,7 @@ Receipts are **idempotent by `PurchaseId`** and **fail-closed**: `PurchaseGrante
 
 A **perk** is a saved boolean flag on a player, and it's usually what a developer product or game pass unlocks. A product's `Grants = "VIP"` sets it, as do [`Data.GrantPerk`](/api/Server#GrantPerk) / [`RevokePerk`](/api/Server#RevokePerk) and [gifting](#gifting). Perks persist with the profile and are read through [`Owns`](/api/Server#Owns).
 
-Declaring `Perks` is **optional**, a typo-guard rather than a requirement: granting or checking any perk name works without it. If you do list your perk names, Scribe logs a dev-mode warning whenever you reference one that isn't in the list, which catches typos early:
+Declaring `Perks` is **optional**, a typo-guard rather than a requirement: granting or checking any perk name works without it. If you do list your perk names, Scribe logs a dev-mode warning (`UNDECLARED_PERK`) when `GrantPerk` or an ownership check names one that isn't in the list, which catches typos early. `RevokePerk` is exempt, since revoking a name you never granted is harmless:
 
 ```lua
 Perks = { "VIP", "DoubleXP", "StarterPack" },
@@ -54,9 +54,9 @@ if Data.OwnsAsync("VIP") then ... end            -- preferred, waits for the rep
 if Data.Owns("VIP") then storeButton.Visible = false end
 ```
 
-The difference matters because perks and gifts resolve the instant a player is Ready, but real game pass ownership is filled by an asynchronous `UserOwnsGamePassAsync` refresh kicked off at load. `Owns` reads that cache, so a genuinely-owned pass can briefly read `false` in the window right after join. On the server, `OwnsAsync` closes that gap by verifying live: when a pass is not already owned in the cache, it calls the authoritative, server-side `UserOwnsGamePassAsync` on every call, so a pass bought moments ago, in-experience or on the Roblox website, is reflected immediately. Once a pass is owned the cached value is returned without a re-check (ownership only gains for a session). The client version instead waits on a replicated ownership-synced flag.
+This matters because perks and gifts resolve the instant a player is Ready, while real game pass ownership is filled by an asynchronous refresh kicked off at load. `Owns` reads that cache, so a genuinely-owned pass can briefly read `false` right after join, and that is the gap `OwnsAsync` closes. Once the cache says owned it is trusted without a re-check, since pass ownership only ever gains within a session. The client version instead waits on a replicated ownership-synced flag.
 
-Gate grants on the **server's** `Owns` or `OwnsAsync`, never the client's. The client versions are only reads of the replicated mirror, so an exploiter can make them return `true` locally; only the server's `OwnsAsync` (backed by `UserOwnsGamePassAsync`) is authoritative. A pass purchased in-experience is also picked up immediately by the `PromptGamePassPurchaseFinished` engine event, which is server-fired and cannot be triggered by a client. In DevMode, calling either with a key that is not a registered pass, declared perk, or product grant logs `UNKNOWN_OWNS_KEY`, since it would otherwise silently return `false` forever.
+Gate grants on the **server's** `Owns` or `OwnsAsync`, never the client's. The client versions are only reads of the replicated mirror, so an exploiter can make them return `true` locally; only the server's `OwnsAsync`, backed by `UserOwnsGamePassAsync`, is authoritative. In DevMode, calling either with a key that is not a registered pass, declared perk, or product grant logs `UNKNOWN_OWNS_KEY`, since it would otherwise silently return `false` forever.
 
 ### RobloxPlus
 
@@ -109,6 +109,19 @@ Data.Purchase(player, {
     Grant = function(data) data.Vehicles.Insert("Police01") end,
 })
 ```
+
+`Cost.Path` names any numeric field, and the field's declarator does the work: a `Scribe.Int` currency refuses a fractional `Amount`, and its `Min` is the floor the debit may not cross.
+
+For a **fixed** set of currencies, declare them as ordinary fields. A typo in `Cost.Path` then returns `(false, "invalid cost path")` instead of silently debiting somewhere else:
+
+```lua
+Wallet = { Gold = Scribe.Int(100, { Min = 0 }), Gems = Scribe.Int(0, { Min = 0 }) },
+-- Cost = { Path = "Wallet.Gold", Amount = 30 }   -- 100 -> 70
+```
+
+`Cost.Path` may also descend into a [typed container](./templates#typed-containers), which is the right shape when the currency keys are **open-ended** (a data-driven resource catalog, say). Note the trade-off: a `DictOf` accepts *any* string key by design, so `Wallet.Glod` is a valid path rather than an error, and it spends from the element's declared default. That is fine for a catalog whose keys you cannot enumerate, and wrong for a wallet whose currencies you can.
+
+The atomicity also covers a `Grant` that writes into a capped container: an `Insert` past `MaxItems` throws, so the debit rolls back with it and `Purchase` returns `false` plus the error naming the field and the cap. A full inventory is a clean refusal rather than currency taken for an item the player never received.
 
 ## Gifting
 

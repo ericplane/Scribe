@@ -34,6 +34,10 @@ Data.Mock({
 Data.MockCommand("EquipItem", function(itemId) return true end)
 ```
 
+:::note Mock seeds go through the same validation as a live write
+`Data.Mock` writes each root field with a normal accessor `Set`, so a seed for a [`Scribe.ArrayOf`](/api/Scribe#ArrayOf) or [`Scribe.DictOf`](/api/Scribe#DictOf) field is checked against the element shape: an undeclared field is rejected, array entries must run contiguously from 1, dictionary keys must be strings, and the size caps still apply. Pass real datatypes (a `CFrame`, not a packed buffer); Scribe packs them for you.
+:::
+
 Both [`Mock`](/api/Client#Mock) and [`MockCommand`](/api/Client#MockCommand) error outside edit mode, so they can't leak into a real session.
 
 ## Scribe Studio

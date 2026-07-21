@@ -30,7 +30,13 @@ That is the whole minimum. `Increment` logs a **Source** event, `Decrement` logs
 
 ## Soft-currency purchases emit automatically
 
-You never tag [`Data.Purchase`](/api/Server#Purchase): the atomic soft-currency debit fires a **Sink** economy event on its own once the purchase commits. The currency is the `Cost.Path` field, the transaction type and item SKU come from the purchase's `ItemId` (falling back to `Category`), and any custom fields the spent currency declares are filled from its `Resolve`. So a shop purchase is instrumented exactly like a manual `Decrement`, with nothing extra to wire up.
+You never tag [`Data.Purchase`](/api/Server#Purchase): the atomic soft-currency debit fires a **Sink** economy event on its own once the purchase commits. The currency is the `Cost.Path` field, the transaction type and item SKU both come from the purchase's `ItemId` (the transaction type falls back to `Category` when there is no `ItemId`; the SKU does not), and any custom fields the spent currency declares are filled from its `Resolve`. So a shop purchase is instrumented exactly like a manual `Decrement`, with nothing extra to wire up.
+
+## Rolled-back transactions emit nothing
+
+A tagged `Increment` or `Decrement` inside [`Data.Transaction`](./lifecycle#batching-and-transactions) does not log at the moment it runs. Its event is held alongside the transaction's deferred writes and fires only once the transaction commits, so a transaction that fails, by throwing or by yielding (which Scribe refuses), leaves no economy event behind. A shop flow that debits `Coins` and then errors while granting the item rolls the balance back and logs no sink, so your dashboard never shows a spend that did not happen.
+
+Outside a transaction, including inside a plain `Batch`, events fire immediately as before.
 
 ## Multiple currencies come for free
 
@@ -46,7 +52,7 @@ If a currency's display name differs from its field name, override it per curren
 
 ## Custom fields
 
-Roblox gives economy events exactly **three custom-field slots** (`CustomField01`, `CustomField02`, `CustomField03`). There are only three, and they are the **same three columns for every economy event**, not three per currency (Roblox caps you at 8,000 unique value combinations across all three slots combined). You can still point each currency's slots at completely different dimensions, so `Money` records `Location`/`Team`/`ItemType` while `Gems` records `Zone`/`Team`/`GemTier`. You just declare, per currency, which dimensions fill the shared slots and in what order. Declare it in the `Economy` option:
+Roblox gives economy events exactly **three custom-field slots** (`CustomField01`, `CustomField02`, `CustomField03`). There are only three, and they are the **same three columns for every economy event**, not three per currency (Roblox caps you at 8,000 unique value combinations across all three slots combined). You can still point each currency's slots at completely different dimensions, so `Money` records `Location`/`Team`/`ItemType` while `Gems` records `Zone`/`Team`. You declare, per currency, which dimensions fill the shared slots and in what order. A dimension only reaches the dashboard if it is named in that currency's `Fields`: a value your `Resolve` returns but `Fields` does not list is dropped. Declare it in the `Economy` option:
 
 ```lua
 Scribe({

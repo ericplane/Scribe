@@ -14,7 +14,7 @@ Always wait for data before reading it:
 Players.PlayerAdded:Connect(function(player)
     local data, reason = Data.WaitForData(player)
     if not data then
-        -- reason is "load-failed" | "timeout" | "session-end"; the player is being kicked
+        -- reason says why: "left" (the usual one), "timeout", "load-failed", "session-end"...
         return
     end
     -- ...use data...
@@ -52,7 +52,7 @@ end,
 
 `isNewProfile` is true for a genuinely new profile, a `ResetData` wipe, and a first-session crash recovery, so you can run starter kits and welcome flows without keeping your own sentinel field. Use it for per-player setup that needs the freshly loaded data, such as building leaderstats. An error it throws is caught and logged rather than blocking the load.
 
-Two things to know. The table you get is the raw profile data, not the accessor tree, so writes here bypass the usual validation: Scribe scans it afterwards and reports anything unstorable as `PROFILE_UNPERSISTABLE`. And for a value that depends only on the profile itself (a creation timestamp, a seed), prefer [`Scribe.Dynamic`](./templates) instead, which is declared in the template and runs per profile automatically.
+The table you get is the raw profile data, not the accessor tree, so writes here bypass the usual validation: Scribe scans it afterwards and reports anything unstorable as `PROFILE_UNPERSISTABLE`. For a value that depends only on the profile itself (a creation timestamp, a seed), prefer [`Scribe.Dynamic`](./templates), which is declared in the template and runs per profile automatically.
 
 ## Saving
 
@@ -86,8 +86,8 @@ When a session ends (leave, or a session stolen by another server), [`SessionEnd
 
 By default each write replicates on the next frame. Two server helpers change that for a burst of writes:
 
-- **`Batch`** coalesces every write inside it into a **single replication flush and one `Changed` pass**, so the client gets one update instead of many. Reach for it on bulk updates.
-- **`Transaction`** runs writes **atomically**: if the function throws, every write inside is rolled back and it returns `(false, error)`; on success it returns `(true, nil)`. A transaction also batches, so it is already a single flush. The function **must not yield** (no `task.wait`, DataStore, or MarketplaceService calls inside it): a yield is refused with `(false, error)` and rolled back, because a concurrent write landing during the yield could be pulled into the transaction. Do any async work before or after.
+- **`Batch`** coalesces every write inside it into a **single replication flush**, so the client gets one update instead of many. Server-side `Changed` listeners still fire once per write; it is the replication that batches. Reach for it on bulk updates.
+- **`Transaction`** runs writes **atomically**: if the function throws, every write inside is rolled back and it returns `(false, error)`; on success, `(true, nil)`. It also batches, so it is already a single flush. The function **must not yield** (no `task.wait`, DataStore, or MarketplaceService calls inside it): a yield is refused with `(false, error)` and rolled back, because a concurrent write landing during the yield could be pulled into the transaction. Do any async work before or after. A rollback also drops the economy events a tagged `Increment` / `Decrement` inside it would have logged, so a reverted transaction never reaches your analytics. A plain `Batch` gives you none of that: it defers the replication flush, but a throw inside it leaves every write that already ran in place.
 
 ```lua
 -- Batch: one replication flush and one Changed for a bulk update

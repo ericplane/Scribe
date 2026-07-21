@@ -163,11 +163,13 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@return (boolean, string?)
 		Runs `fn` atomically: if it throws, **every** write inside is rolled back
 		and `(false, error)` is returned. On success returns `(true, nil)`. `fn`
-		must run synchronously and **must not yield** (no `task.wait`, DataStore, or
-		MarketplaceService calls inside it): a yield is refused with `(false, error)`
-		and rolled back, because a concurrent write landing during the yield could be
-		pulled into the transaction. Do any async work before or after.
-	]=]
+		**must not yield** (no `task.wait`, DataStore, or MarketplaceService calls):
+		a yield is refused with `(false, error)` and rolled back, because a concurrent
+		write landing during the yield would be pulled into the transaction. Do async
+		work before or after.
+		Tagged `Increment` / `Decrement` calls inside `fn` defer their economy event
+		to commit and drop it on rollback, so a failed transaction never logs a
+		balance change that did not stick.	]=]
 	function Data.Transaction(player: Player, fn: () -> ()): (boolean, string?)
 		local entry = entryOrError(player, "Data.Transaction")
 		return entry.Tree:RunTransaction(fn)
@@ -474,6 +476,14 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		All or nothing. Insufficient funds or a throwing `Grant` rolls everything
 		back with no debit.
 
+		`Cost.Path` may point into a typed container, for example a [Scribe.DictOf]
+		key (`"Wallet.Gold"`), and the element's `Min` floor and int rule apply to the
+		debit as they would to a plain currency field. An unresolvable path, including
+		a typo of a closed field, returns `(false, "invalid cost path")` rather than
+		throwing, but a `DictOf` accepts any key, so a typo there resolves fine:
+		`"Wallet.Glod"` succeeds, spends the element default as a balance nobody
+		granted, and leaves the phantom key behind. Point costs at declared fields
+		unless the currency set is genuinely open-ended.
 		```lua
 		Data.Purchase(player, {
 		    Cost = { Path = "Coins", Amount = 45000 },

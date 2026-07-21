@@ -38,7 +38,7 @@ Persistent, typed, auto-replicated player data for Roblox, built on ProfileStore
 
     ---
 
-    Vector3, CFrame, Color3, and raw buffer fields pack into compact binary. A Vector3 is 12 bytes and an axis-aligned CFrame is 13, while you keep the real datatype.
+Vector3, CFrame, Color3, and raw buffer fields pack into compact binary (a Vector3 is 12 bytes, an axis-aligned CFrame 13), while you keep the real datatype. Give array and dictionary entries a shape with `Scribe.ArrayOf` or `Scribe.DictOf` and they pack too.
 
     [:octicons-arrow-right-24: Templates and declarators](templates.md)
 

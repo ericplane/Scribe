@@ -30,13 +30,14 @@ Declare the template and options in a single ModuleScript that both the server a
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Scribe = require(ReplicatedStorage.Packages.Scribe)
 
-type ItemData = { Health: number, Dmg: number }
-
 local template = {
     Coins = Scribe.Int(0, { Min = 0 }),
     Gems = 0,
-    Equipped = nil :: string?,
-    Inventory = {} :: { [string]: ItemData },
+    Equipped = Scribe.Optional(Scribe.String("", { MaxLength = 32 })),
+    Inventory = Scribe.DictOf({
+        Health = Scribe.Int(100, { Min = 0 }),
+        Dmg = Scribe.Int(1, { Min = 0 }),
+    }, { MaxKeys = 200 }),
     Settings = { Music = true, Sfx = true },
 }
 
@@ -64,7 +65,8 @@ Players.PlayerAdded:Connect(function(player)
 
     data.Coins.Increment(50)
     data.Settings.Music.Set(false)
-    print(data.Inventory.Sword_001.Dmg.Get())
+    data.Inventory.Sword_001.Dmg.Set(7) -- creates the entry, filling Health from its default
+    print(data.Inventory.Sword_001.Health.Get()) --> 100
 end)
 ```
 
@@ -83,7 +85,7 @@ end)
 ```
 
 :::caution The client must require the module too
-Replication only starts when the bundle is required from a **client-side script** (a `LocalScript`). That `require` runs the client's handshake with the server. If you set Scribe up on the server but never require it on the client, the client never syncs: `Observe`/`Changed` never fire with real data (reads stay at your template defaults), `GetShared` is empty, and the server logs a `CLIENT_HANDSHAKE_TIMEOUT` warning (`"client never sent Hello"`). Requiring the same shared module on both realms is the whole setup. There is nothing else to wire up.
+Replication only starts when the bundle is required from a **client-side script** (a `LocalScript`). That `require` runs the client's handshake with the server. If you set Scribe up on the server but never require it on the client, the client never syncs: `Observe`/`Changed` never fire with real data (reads stay at your template defaults), `GetShared` is empty, and the server logs a `CLIENT_HANDSHAKE_TIMEOUT` warning (`"client never sent Hello"`). Requiring the same shared module on both realms is the whole setup.
 :::
 
 Unlike the server, the client never makes you wait. Reads return your template defaults until the first sync arrives, and `Observe` (and `Changed`) fire the moment real data lands, so reactive UI updates itself without any gating. For a one-off imperative read at startup, where the default would be wrong, check `Data.IsReady()` or yield on `Data.WaitForData(timeout)` first.

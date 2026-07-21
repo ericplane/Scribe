@@ -12,6 +12,7 @@ Scribe = "ericplane/scribe@1.0.10"
 ```
 
 - **Fully typed.** A type-solver-generated accessor tree types your data end to end (`data.Coins.Increment(50)`, nested containers, arrays, and datatype fields), checked at compile time.
+- **Schemas all the way down.** `Scribe.ArrayOf` and `Scribe.DictOf` give array and dictionary *entries* a schema, so `data.Plots[1].Origin` is a typed `CFrame` that packs to 13 bytes, with per-element bounds and size caps.
 - **Replication for free.** Schema-compressed batched diffs stream to clients over a pluggable transport, and you read the same data on the client with the same API, with no RemoteEvents to wire up.
 - **Production-grade.** Migrations, a wipe guard, version history, GDPR export and erase, leaderboards, gifting and perks, and fail-closed monetization all sit on top of ProfileStore's session locking.
 
@@ -63,7 +64,7 @@ rokit install              # wally + rojo + selene + luau-lsp + lune + stylua to
 wally install              # dependencies
 selene src test lune       # lint
 stylua --check src test lune  # formatting (drop --check to apply)
-lune run lune/run-tests    # run the test suite (headless, ~1s)
+lune run lune/run-tests    # run the test suite (headless, ~2s)
 ```
 
 The same lint, format, test, and type-check (luau-lsp) checks run in CI on every
