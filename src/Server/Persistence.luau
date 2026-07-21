@@ -820,6 +820,18 @@ function Persistence.new(ctx: any)
 			return
 		end
 
+		-- Reconcile only fills STATIC template keys; ArrayOf/DictOf element fields
+		-- hang off AnyChild, so a field added to an element shape after profiles
+		-- exist would never reach stored entries. Backfilled HERE, after migrations,
+		-- for two reasons: a migration must observe the raw stored element data (a
+		-- guarded rename like `item.New = item.New or item.Old` would see a
+		-- backfilled default and destroy the real value), and the version-ahead
+		-- fail-closed path above must end the session with the stored bytes
+		-- untouched, exactly as its comment promises.
+		if Template.ReconcileElements(compiled, profile.Data) then
+			entry.SaveInfo.Dirty = true
+		end
+
 		-- Seed the flagged Scribe.Dynamic fields now that Reconcile has created any
 		-- parent containers, before OnPlayerInit so it can still override. Written
 		-- raw into profile.Data (the factory already packs datatypes); the tree

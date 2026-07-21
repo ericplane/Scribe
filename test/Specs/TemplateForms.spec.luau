@@ -434,4 +434,30 @@ return function()
 
 		harness.Cleanup()
 	end)
+
+	describe("declarator inside an array-like container", function()
+		it("names the declarator rather than blaming its default value's type", function()
+			-- Regression: a datatype declarator's default is itself non-persistable, so
+			-- checkDefaultValue used to fire FIRST on the marker's raw .Default and
+			-- report `unsupported value type "CFrame"` at "...cf.Default", burying the
+			-- real problem (the declarator being inside an array at all).
+			local _, err = pcall(function()
+				TestCtx.make({
+					Template = { placed = { { cf = Scribe.CFrame(CFrame.new()), id = Scribe.String("") } } },
+				})
+			end)
+			local message = tostring(err)
+			expect(string.find(message, "is a Scribe declarator inside an array%-like container") ~= nil).to.equal(true)
+			expect(string.find(message, "unsupported value type") == nil).to.equal(true)
+		end)
+
+		it("still rejects a declarator whose default IS persistable", function()
+			local _, err = pcall(function()
+				TestCtx.make({ Template = { placed = { { n = Scribe.Int(0) } } } })
+			end)
+			expect(string.find(tostring(err), "is a Scribe declarator inside an array%-like container") ~= nil).to.equal(
+				true
+			)
+		end)
+	end)
 end

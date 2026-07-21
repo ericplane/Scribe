@@ -31,6 +31,7 @@ local Players = game:GetService("Players")
 local Internal = script.Parent.Parent.Internal
 local Util = require(Internal.Util)
 local Template = require(Internal.Template)
+local Datatypes = require(Internal.Datatypes)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
@@ -715,9 +716,18 @@ function DebugHook.Attach(Data: any, ctx: any)
 		return merged
 	end
 
-	local function describeValue(value: any, depth: number, budget: { n: number }): any
+	local function describeValue(value: any, depth: number, budget: { n: number }, schema: any): any
 		budget.n -= 1
 		if type(value) ~= "table" then
+			-- A packed datatype leaf is a bare buffer in the store; show the real
+			-- value as a display string (StudioCodec cannot carry Roblox datatypes).
+			if type(value) == "buffer" and schema and schema.ValueType == "datatype" then
+				local name = schema.Datatype :: string
+				local ok, unpacked = pcall(Datatypes.Unpack, name, value)
+				if ok then
+					return { Leaf = true, Value = `{name}({tostring(unpacked)})`, Datatype = name }
+				end
+			end
 			return { Leaf = true, Value = value }
 		end
 		local count = Util.count(value)
@@ -729,7 +739,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 			if budget.n <= 0 then
 				return { Table = true, Count = count, Truncated = true, Children = children }
 			end
-			children[k] = describeValue(v, depth - 1, budget)
+			local childSchema = if schema then Template.ChildSchema(schema, k) else nil
+			children[k] = describeValue(v, depth - 1, budget, childSchema)
 		end
 		return { Table = true, Count = count, Children = children }
 	end
@@ -739,7 +750,11 @@ function DebugHook.Attach(Data: any, ctx: any)
 	-- response can explode.
 	local function readTreePage(entry: any, path: { string | number }, depth: number, budget: { n: number }): any
 		local value = readPath(liveRootsFor(entry), path)
-		return describeValue(value, depth, budget)
+		local schema: any, dynStart = Template.Resolve(compiled, path)
+		for i = dynStart, #path do
+			schema = if schema then Template.ChildSchema(schema, path[i]) else nil
+		end
+		return describeValue(value, depth, budget, schema)
 	end
 
 	-- Command handlers -------------------------------------------------------------
@@ -993,7 +1008,44 @@ function DebugHook.Attach(Data: any, ctx: any)
 				})
 			end
 		end
-		return { Ok = true, Hash = compiled.Hash, NodeCount = compiled.NodeCount, Nodes = nodes }
+		-- Element subtrees are id-less (reached only through AnyChild), so the ById
+		-- walk above cannot see them. Export them additively, keyed by the container
+		-- node's id; older plugins ignore the extra field.
+		local elements: { [any]: any } = {}
+		local function describeSchemaNode(node: any): any
+			local children: { [string]: any }? = nil
+			if node.Children then
+				children = {}
+				for name, child in node.Children do
+					(children :: any)[name] = describeSchemaNode(child)
+				end
+			end
+			return {
+				Name = node.Name,
+				Kind = node.Kind,
+				ValueType = node.ValueType,
+				Datatype = node.Datatype,
+				Visibility = node.Visibility,
+				Min = node.Min,
+				Max = node.Max,
+				MaxLength = node.MaxLength,
+				Members = if node.Members then table.clone(node.Members) else nil,
+				Nullable = node.Nullable,
+				Container = node.Container,
+				MaxItems = node.MaxItems,
+				MaxKeys = node.MaxKeys,
+				MaxKeyLength = node.MaxKeyLength,
+				Children = children,
+				Element = if node.AnyChild and node.AnyChild.IsElement then describeSchemaNode(node.AnyChild) else nil,
+			}
+		end
+		for id = 0, compiled.NodeCount - 1 do
+			local node = compiled.ById[id]
+			if node and node.Container ~= nil and node.AnyChild then
+				elements[id] = describeSchemaNode(node.AnyChild)
+			end
+		end
+		return { Ok = true, Hash = compiled.Hash, NodeCount = compiled.NodeCount, Nodes = nodes, Elements = elements }
 	end
 
 	function handlers.GetRecentLogs(args: any): any

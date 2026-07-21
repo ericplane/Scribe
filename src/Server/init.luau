@@ -673,7 +673,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 				)
 			end
 		end
-		for _, node in compiled.ById do
+		local function warnCollision(node: any)
 			local name = node.Name
 			if
 				name
@@ -689,6 +689,35 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 				)
 			end
 		end
+		-- ById covers static fields; element subtrees are id-less and hang off
+		-- AnyChild, so walk them explicitly or an element field named "Get" would
+		-- compile without warning while being shadowed by the method.
+		local function walkElements(node: any)
+			local anyChild = node.AnyChild
+			if anyChild and anyChild.IsElement then
+				local function walkSubtree(n: any)
+					warnCollision(n)
+					if n.Children then
+						for _, child in n.Children do
+							walkSubtree(child)
+						end
+					end
+					if n.AnyChild and n.AnyChild.IsElement then
+						walkSubtree(n.AnyChild)
+					end
+				end
+				walkSubtree(anyChild)
+			end
+			if node.Children then
+				for _, child in node.Children do
+					walkElements(child)
+				end
+			end
+		end
+		for _, node in compiled.ById do
+			warnCollision(node)
+		end
+		walkElements(compiled.Root)
 	end
 
 	-- Data[player] -> typed accessor tree.

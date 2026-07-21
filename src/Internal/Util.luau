@@ -5,6 +5,12 @@ local HttpService = game:GetService("HttpService")
 
 local Util = {}
 
+-- Deepest nesting a written value may have, counted from the root. Enforced at
+-- write time by Node.validateWrite and at compile time against an ArrayOf/DictOf
+-- element shape, so a template that declares a tree no write could ever satisfy
+-- fails at startup instead of on every write.
+Util.MAX_VALUE_DEPTH = 24
+
 function Util.cloneBuffer(value: buffer): buffer
 	local out = buffer.create(buffer.len(value))
 	buffer.copy(out, 0, value)
@@ -36,8 +42,9 @@ export type Unpersistable = {
 -- key is reported before recursing under it, so `Path` never embeds bad bytes),
 -- or nil when the whole structure is DataStore-safe. Buffers and finite
 -- numbers/booleans/strings are DataStore-safe and pass.
-function Util.findUnpersistable(value: any, path: { string | number }?): Unpersistable?
+function Util.findUnpersistable(value: any, path: { string | number }?, depth: number?): Unpersistable?
 	local at = path or {}
+	local d = depth or 0
 	local t = type(value)
 	if t == "string" then
 		if Util.isUtf8(value :: string) then
@@ -52,12 +59,27 @@ function Util.findUnpersistable(value: any, path: { string | number }?): Unpersi
 		end
 		return nil
 	elseif t == "table" then
+		-- A cyclic table (OnPlayerInit/migration data can carry one) would recurse
+		-- forever; this scan runs UNPROTECTED inside the load path, so an overflow
+		-- kills the player's load. Depth-cap well past MAX_VALUE_DEPTH: anything
+		-- this deep cannot be written or wire-encoded either.
+		if d > 64 then
+			return { Path = at, Kind = "Unserializable", Detail = "nested deeper than 64 levels (or cyclic)" }
+		end
+		local hasNum, hasStr = false, false
 		for k, v in value :: any do
 			local kt = type(k)
 			if kt ~= "string" and kt ~= "number" then
 				local kp = table.clone(at)
 				table.insert(kp, "<key>")
 				return { Path = kp, Kind = "Unserializable", Detail = `unsupported key type "{kt}"` }
+			end
+			hasNum = hasNum or kt == "number"
+			hasStr = hasStr or kt == "string"
+			if hasNum and hasStr then
+				-- JSON cannot encode a table mixing array indices and object keys;
+				-- the whole profile save fails.
+				return { Path = at, Kind = "Unserializable", Detail = "table mixes array indices and string keys" }
 			end
 			if kt == "string" and not Util.isUtf8(k :: string) then
 				local kp = table.clone(at)
@@ -66,7 +88,7 @@ function Util.findUnpersistable(value: any, path: { string | number }?): Unpersi
 			end
 			local childPath = table.clone(at)
 			table.insert(childPath, k)
-			local found = Util.findUnpersistable(v, childPath)
+			local found = Util.findUnpersistable(v, childPath, d + 1)
 			if found ~= nil then
 				return found
 			end
@@ -203,6 +225,30 @@ end
 -- Shallow equality suitable for "did this leaf change" checks. Tables and
 -- buffers always count as changes: both are mutable, so a re-Set of the same
 -- reference may carry in-place edits that must replicate.
+-- Byte equality for two buffers. Buffers compare by IDENTITY under `==`, so a
+-- packed datatype sitting in the store never equals a freshly packed needle even
+-- when they hold the same value. Used by the array search accessors.
+function Util.bufferEquals(a: buffer, b: buffer): boolean
+	local len = buffer.len(a)
+	if len ~= buffer.len(b) then
+		return false
+	end
+	local i = 0
+	while i + 4 <= len do
+		if buffer.readu32(a, i) ~= buffer.readu32(b, i) then
+			return false
+		end
+		i += 4
+	end
+	while i < len do
+		if buffer.readu8(a, i) ~= buffer.readu8(b, i) then
+			return false
+		end
+		i += 1
+	end
+	return true
+end
+
 function Util.leafEquals(a: any, b: any): boolean
 	local t = type(a)
 	return a == b and t ~= "table" and t ~= "buffer"

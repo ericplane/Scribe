@@ -22,6 +22,12 @@ local template = {
 	SpawnPoint = Scribe.Vector3(Vector3.zero),
 	HomeDoor = Scribe.CFrame(CFrame.identity),
 	Tint = Scribe.Color3(Color3.fromRGB(255, 120, 0)),
+	PlacedFurniture = Scribe.ArrayOf({
+		Cf = Scribe.CFrame(CFrame.identity),
+		ItemId = Scribe.String("", { MaxLength = 64 }),
+		Note = Scribe.Optional(Scribe.String("")),
+	}, { MaxItems = 200 }),
+	Resources = Scribe.DictOf(Scribe.Int(0, { Min = 0 }), { MaxKeys = 64 }),
 	Secret = Scribe.ServerOnly({ Flagged = false }),
 	Runtime = Scribe.Session({ InCombat = false }),
 }
@@ -100,6 +106,18 @@ local function serverUsage(player: Player)
 	local dmg: number = data.Inventory.Sword_001.Dmg.Get()
 	data.QuestProgress.Insert(3)
 	local has: boolean = data.QuestProgress.Has(3)
+
+	-- Scribe.ArrayOf: elements are typed accessor nodes, reached by numeric index.
+	data.PlacedFurniture.Insert({ Cf = CFrame.identity, ItemId = "OakChair" })
+	local placedCf: CFrame = data.PlacedFurniture[1].Cf.Get()
+	data.PlacedFurniture[1].Cf.Set(CFrame.identity)
+	local note: string? = data.PlacedFurniture[1].Note.Get()
+	local placedCount: number = data.PlacedFurniture.Count()
+	local snapshot: { { Cf: CFrame, ItemId: string, Note: string? } } = data.PlacedFurniture.Get()
+
+	-- Scribe.DictOf: a fresh key still types as the declared element.
+	local wood: number = data.Resources.Wood.Increment(5)
+	local dropped: number? = data.Resources.Remove("Wood")
 	data.XPBooster.SetTimed(true, 3600)
 	local active: boolean, remaining: number? = data.XPBooster.Active()
 	local blob: buffer = data.BuildData.Get()
@@ -160,7 +178,13 @@ local function serverUsage(player: Player)
 		coinMax,
 		coinDefault,
 		spawnDefault,
-		createdAt
+		createdAt,
+		placedCf,
+		note,
+		placedCount,
+		snapshot,
+		wood,
+		dropped
 end
 
 local ClientData = bundle.Client

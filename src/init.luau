@@ -78,7 +78,21 @@ export type function ValueType(T)
 		return t
 	end
 
-	local function build(rawType: type, isRoot: boolean): type
+	-- Recursion budget. A self-referential template type (a record whose indexer
+	-- element type reaches back to the record, e.g. `{ Id: string, Kids: { Node } }`)
+	-- would otherwise recurse forever and blow the type-function stack, which
+	-- degrades the whole accessor tree to an error type and silently disables
+	-- checking for the entire template. Matches StatPathsType's depth cap below.
+	-- One past Util.MAX_VALUE_DEPTH (a leaf at path depth N sits at build depth N,
+	-- and the deepest runtime-writable leaf has a 25-segment path), so this can
+	-- never bind before the runtime does: a legal template is always fully typed,
+	-- and only a cyclic type (which no write could satisfy either) is cut off.
+	local MAX_DEPTH = 25
+
+	local function build(rawType: type, isRoot: boolean, depth: number): type
+		if depth > MAX_DEPTH then
+			return anyType
+		end
 		local t = widen(rawType)
 
 		-- Scribe.Timed fields carry a { __scribeTimed: V } marker type.
@@ -106,7 +120,7 @@ export type function ValueType(T)
 			for key, prop in t:properties() do
 				local childType = prop.read or prop.write
 				if childType ~= nil then
-					props[key] = build(childType, false)
+					props[key] = build(childType, false, depth + 1)
 				end
 			end
 
@@ -114,7 +128,15 @@ export type function ValueType(T)
 			if indexer ~= nil then
 				local elementType = widen(indexer.readresult)
 				if indexer.index:is("number") then
-					-- Array node.
+					-- Array node. The indexer makes `arr[i]` an accessor node, matching
+					-- the runtime (Node.accessorIndex already resolves numeric keys); a
+					-- Scribe.ArrayOf element field is only reachable this way.
+					local elemNode = build(indexer.readresult, false, depth + 1)
+					indexerSpec = {
+						index = indexer.index,
+						readresult = elemNode,
+						writeresult = elemNode,
+					}
 					add("Insert", fn({ elementType, optNumber, optBool }, {}))
 					-- Remove returns nil on an empty/missing array (matches RemoveValue).
 					add("Remove", fn({ optNumber, optBool }, { optional(elementType) }))
@@ -125,7 +147,7 @@ export type function ValueType(T)
 					add("OnRemove", fn({ fn({ elementType, ts.number }, {}) }, { disconnectType }))
 				else
 					-- Dictionary node: children are accessor nodes.
-					local childNode = build(indexer.readresult, false)
+					local childNode = build(indexer.readresult, false, depth + 1)
 					indexerSpec = {
 						index = indexer.index,
 						readresult = childNode,
@@ -176,7 +198,7 @@ export type function ValueType(T)
 		return ts.newtable(props, indexerSpec, nil)
 	end
 
-	return build(T, true)
+	return build(T, true, 0)
 end
 
 -- Union of every static numeric leaf path in the template, dot-joined
@@ -479,6 +501,11 @@ export type Timed<T> = { __scribeTimed: T }
 
 export type NumberMeta = { Min: number?, Max: number? }
 export type StringMeta = { MaxLength: number? }
+-- Container declarator options. Deliberately NOT generic in the element type: an
+-- element-typed field here (a seed default, say) would let Luau infer the element
+-- type from the option instead of from `shape`, silently redefining the field.
+export type ArrayOpts = { MaxItems: number? }
+export type DictOpts = { MaxKeys: number?, MaxKeyLength: number? }
 
 -- Template-aware config types. Annotate a config local with these to get
 -- autocomplete and compile-time validation: `Stat`/`Cost.Path` become the
@@ -981,6 +1008,144 @@ end
 -- params typecheck when passed directly, e.g. `Scribe.Dynamic(os.time)`.
 function Scribe.Dynamic<T>(factory: (...any) -> T): T
 	return Marker.make("Dynamic", factory(), { Factory = factory :: any }) :: any
+end
+
+--[=[
+	@within Scribe
+	@tag Field Types
+	@function Optional
+	@param inner T
+	@return T?
+	Declares a field that may legitimately be **absent**, wrapping another
+	declarator for its type and bounds:
+
+	```lua
+	Pets = Scribe.DictOf({
+	    Species  = Scribe.String("", { MaxLength = 32 }),
+	    Nickname = Scribe.Optional(Scribe.String("", { MaxLength = 20 })),
+	}),
+	```
+
+	The inner declarator's default is dropped: an optional field has **no** default,
+	so it is not seeded into a new profile and not filled in when an element write
+	omits it. `Get()` returns `nil` until something writes it, and `Set(nil)` takes
+	it back to absent.
+
+	This is mainly what makes closed [`ArrayOf`](#ArrayOf) / [`DictOf`](#DictOf)
+	element shapes practical: without it, every element field would need a sentinel
+	value standing in for "not set", and `""` or `0` is usually a real value too.
+
+	It only wraps leaves, and it cannot wrap `Scribe.Timed` (a lapsed timer restores
+	a default, which an optional field does not have), `Scribe.Dynamic` (a factory
+	exists to seed a value), or a container declarator (an empty container is
+	already the absent case).
+]=]
+function Scribe.Optional<T>(inner: T): T?
+	return Marker.make("Optional", inner) :: any
+end
+
+--[=[
+	@within Scribe
+	@tag Field Types
+	@function ArrayOf
+	@param shape T
+	@param opts { MaxItems: number? }?
+	@return { T }
+	Declares an array whose **elements have a schema**. Everything a declared field
+	gets (type checking, bounds, enum members, and automatic datatype packing) then
+	applies per element:
+
+	```lua
+	PlacedFurniture = Scribe.ArrayOf({
+	    Cf       = Scribe.CFrame(CFrame.new()),
+	    ItemId   = Scribe.String("", { MaxLength = 64 }),
+	}, { MaxItems = 200 }),
+	```
+
+	```lua
+	data.PlacedFurniture.Insert({ Cf = CFrame.new(0, 5, 0), ItemId = "OakChair" })
+	local cf = data.PlacedFurniture[1].Cf.Get() -- a real CFrame, unpacked for you
+	```
+
+	This is the only way to store a Roblox datatype inside a container. A plain
+	array literal stores its entries as opaque data, so a `Scribe.CFrame` inside one
+	is a template error: with no schema for the entries, Scribe cannot tell a packed
+	CFrame from a buffer you stored yourself when reading it back.
+
+	The element shape may be a single leaf declarator (`Scribe.ArrayOf(Scribe.CFrame(CFrame.new()))`
+	is an array of CFrames) and nests freely: an element field may itself be an
+	`ArrayOf` or a `DictOf`.
+
+	Element records are **closed**. Writing a field the shape does not declare is an
+	error rather than a silently stored extra field, which is what makes a typo like
+	`data.PlacedFurniture[1].Colour.Set(...)` fail loudly. An `Insert` that omits a
+	declared field fills it from that field's default.
+
+	`MaxItems` caps the entry count; exceeding it is a write error. Elements may not
+	use `Scribe.Timed`, `Scribe.Dynamic`, `Scribe.Shared` or `Scribe.Session`.
+]=]
+function Scribe.ArrayOf<T>(shape: T, opts: ArrayOpts?): { T }
+	if opts ~= nil then
+		for key in opts :: any do
+			-- A silently dropped option (MaxKeys on an ArrayOf, say) leaves the
+			-- container uncapped while reading as protected; refuse it.
+			if key ~= "MaxItems" then
+				error(`Scribe.ArrayOf: unknown option "{tostring(key)}" (ArrayOf takes MaxItems)`, 2)
+			end
+		end
+	end
+	return Marker.make("ArrayOf", nil, {
+		Element = shape,
+		MaxItems = if opts then opts.MaxItems else nil,
+	}) :: any
+end
+
+--[=[
+	@within Scribe
+	@tag Field Types
+	@function DictOf
+	@param shape V
+	@param opts { MaxKeys: number?, MaxKeyLength: number? }?
+	@return { [string]: V }
+	Declares a string-keyed dictionary whose **values have a schema**, the
+	dictionary counterpart of [`ArrayOf`](#ArrayOf):
+
+	```lua
+	Resources = Scribe.DictOf(Scribe.Int(0, { Min = 0 }), { MaxKeys = 500 }),
+	Pets      = Scribe.DictOf({
+	    Level = Scribe.Int(1, { Min = 1, Max = 100 }),
+	    Home  = Scribe.CFrame(CFrame.new()),
+	}),
+	```
+
+	```lua
+	data.Resources.Wood.Increment(5) -- a fresh key starts at the declared default
+	data.Pets.Dragon.Level.Set(12)
+	```
+
+	Writing to a key that does not exist yet materializes it from the element
+	defaults, which is what a `{ [string]: V }` type promises. Keys are strings
+	only; `MaxKeys` caps how many there may be and `MaxKeyLength` caps each key's
+	byte length. Both are write errors when exceeded, and `MaxKeyLength` rejects
+	rather than truncates, since a truncated key writes to the wrong slot.
+
+	The same element rules as `ArrayOf` apply: records are closed, missing fields
+	fill from their defaults, and `Scribe.Timed` / `Scribe.Dynamic` / `Scribe.Shared`
+	/ `Scribe.Session` are rejected inside the shape.
+]=]
+function Scribe.DictOf<V>(shape: V, opts: DictOpts?): { [string]: V }
+	if opts ~= nil then
+		for key in opts :: any do
+			if key ~= "MaxKeys" and key ~= "MaxKeyLength" then
+				error(`Scribe.DictOf: unknown option "{tostring(key)}" (DictOf takes MaxKeys and MaxKeyLength)`, 2)
+			end
+		end
+	end
+	return Marker.make("DictOf", nil, {
+		Element = shape,
+		MaxKeys = if opts then opts.MaxKeys else nil,
+		MaxKeyLength = if opts then opts.MaxKeyLength else nil,
+	}) :: any
 end
 
 -- Roblox datatype fields (opt-in serialization): stored and replicated as a

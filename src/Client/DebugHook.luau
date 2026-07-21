@@ -20,6 +20,7 @@ local Internal = script.Parent.Parent.Internal
 local StudioCodec = require(Internal.StudioCodec)
 local Util = require(Internal.Util)
 local Template = require(Internal.Template)
+local Datatypes = require(Internal.Datatypes)
 local Health = require(Internal.Health)
 local Log = require(Internal.Log)
 
@@ -201,9 +202,18 @@ function ClientDebugHook.Attach(deps: any)
 	end)
 
 	-- Paged tree pages, same shape as the server hook's ReadTree.
-	local function describeValue(value: any, depth: number, budget: { n: number }): any
+	local function describeValue(value: any, depth: number, budget: { n: number }, schema: any): any
 		budget.n -= 1
 		if type(value) ~= "table" then
+			-- Packed datatype leaves read as their datatype, mirroring the server
+			-- hook (StudioCodec cannot carry Roblox datatypes, so a display string).
+			if type(value) == "buffer" and schema and schema.ValueType == "datatype" then
+				local name = schema.Datatype :: string
+				local ok, unpacked = pcall(Datatypes.Unpack, name, value)
+				if ok then
+					return { Leaf = true, Value = `{name}({tostring(unpacked)})`, Datatype = name }
+				end
+			end
 			return { Leaf = true, Value = value }
 		end
 		local count = Util.count(value)
@@ -215,7 +225,8 @@ function ClientDebugHook.Attach(deps: any)
 			if budget.n <= 0 then
 				return { Table = true, Count = count, Truncated = true, Children = children }
 			end
-			children[k] = describeValue(v, depth - 1, budget)
+			local childSchema = if schema then Template.ChildSchema(schema, k) else nil
+			children[k] = describeValue(v, depth - 1, budget, childSchema)
 		end
 		return { Table = true, Count = count, Children = children }
 	end
@@ -312,7 +323,11 @@ function ClientDebugHook.Attach(deps: any)
 		local path: { string | number } = args.Path or {}
 		local depth = math.clamp(tonumber(args.Depth) or 2, 1, 6)
 		local budget = { n = math.clamp(tonumber(args.MaxNodes) or MAX_TREE_NODES, 50, MAX_TREE_NODES) }
-		local page = describeValue(readPath(deps.Mirror, path), depth, budget)
+		local schema: any, dynStart = Template.Resolve(compiled, path)
+		for i = dynStart, #path do
+			schema = if schema then Template.ChildSchema(schema, path[i]) else nil
+		end
+		local page = describeValue(readPath(deps.Mirror, path), depth, budget, schema)
 		return { Ok = true, Path = path, Node = page }
 	end
 

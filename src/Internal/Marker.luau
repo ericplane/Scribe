@@ -13,6 +13,9 @@ export type MarkerKind =
 	| "Timed"
 	| "Datatype"
 	| "Dynamic"
+	| "Optional"
+	| "ArrayOf"
+	| "DictOf"
 	| "ServerOnly"
 	| "Shared"
 	| "Session"
@@ -24,6 +27,10 @@ export type Meta = {
 	Members: { string }?,
 	Datatype: string?, -- typeof() name for Datatype markers (e.g. "Vector3")
 	Factory: (() -> any)?, -- Dynamic markers: produces the per-new-profile default
+	Element: any?, -- ArrayOf/DictOf markers: the raw element shape, compiled into AnyChild
+	MaxItems: number?, -- ArrayOf: cardinality cap
+	MaxKeys: number?, -- DictOf: cardinality cap
+	MaxKeyLength: number?, -- DictOf: per-key byte cap
 }
 
 local Marker = {}

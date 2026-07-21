@@ -111,7 +111,15 @@ function Leaderboards.new(ctx: any)
 		local walkNode: any = ctx.Compiled.Root
 		for i, segment in statPath do
 			if walkNode == nil then
-				break
+				-- ChildSchema only returns nil for an undeclared field of a closed
+				-- element shape (open containers synthesize a generic child), so this
+				-- Stat can never resolve: fail at boot instead of throwing on every
+				-- player load.
+				error(
+					`Scribe: leaderboard "{name}" Stat "{config.Stat}": `
+						.. `"{tostring(statPath[i - 1])}" has no declared field "{tostring(segment)}"`,
+					0
+				)
 			end
 			if walkNode.Kind == "leaf" then
 				error(
@@ -119,7 +127,16 @@ function Leaderboards.new(ctx: any)
 					0
 				)
 			end
-			walkNode = if i < #statPath then Template.ChildSchema(walkNode, segment) else nil
+			walkNode = Template.ChildSchema(walkNode, segment)
+		end
+		if walkNode == nil then
+			-- Final-segment miss: the leaf itself is an undeclared field of a closed
+			-- element shape.
+			error(
+				`Scribe: leaderboard "{name}" Stat "{config.Stat}": `
+					.. `no declared field "{tostring(statPath[#statPath])}"`,
+				0
+			)
 		end
 		-- Scale multiplies into the stored integer and divides back out on read, so a
 		-- zero divides by zero (NaN scores served to every client), a negative one
@@ -180,7 +197,7 @@ function Leaderboards.new(ctx: any)
 		-- Changed and again on unload, so it becomes a permanent failure stream.
 		-- Drop it here, loudly and once per (board, user), instead of queueing a write
 		-- that cannot succeed.
-		if scaled ~= scaled or math.abs(scaled) > 9223372036854775807 then
+		if scaled ~= scaled or math.abs(scaled) >= 9223372036854775808 then
 			Metrics.Add("LbScoreOutOfRange")
 			Log.Warn(
 				"Leaderboards",
@@ -485,22 +502,34 @@ function Leaderboards.new(ctx: any)
 	function self.OnLoad(entry: any)
 		local disconnects = {}
 		for _, board in boards do
-			local accessor = entry.Tree.Accessor
-			for _, segment in board.StatPath do
-				accessor = accessor[segment]
+			-- Per-board isolation: one board's path failing at runtime must not kill
+			-- the wiring of every remaining board for the whole session.
+			local ok, err = pcall(function()
+				local accessor = entry.Tree.Accessor
+				for _, segment in board.StatPath do
+					accessor = accessor[segment]
+				end
+				local value = accessor.Get()
+				if type(value) == "number" then
+					self.Enqueue(board, entry.UserId, value)
+				end
+				table.insert(
+					disconnects,
+					accessor.Changed(function(newValue: any)
+						if type(newValue) == "number" then
+							self.Enqueue(board, entry.UserId, newValue)
+						end
+					end)
+				)
+			end)
+			if not ok then
+				Log.Warn(
+					"Leaderboards",
+					"LB_STAT_RESOLVE_FAIL",
+					`board "{board.Name}" stat did not resolve for this player: {tostring(err)}`,
+					{ Board = board.Name, UserId = entry.UserId }
+				)
 			end
-			local value = accessor.Get()
-			if type(value) == "number" then
-				self.Enqueue(board, entry.UserId, value)
-			end
-			table.insert(
-				disconnects,
-				accessor.Changed(function(newValue: any)
-					if type(newValue) == "number" then
-						self.Enqueue(board, entry.UserId, newValue)
-					end
-				end)
-			)
 		end
 		statDisconnects[entry] = disconnects
 	end

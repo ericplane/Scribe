@@ -1373,11 +1373,31 @@ function Monetization.new(ctx: any)
 			return false, "invalid Cost amount"
 		end
 		local costPath = Util.parsePath(cost.Path)
-		local costAccessor = entry.Tree.Accessor
-		for _, segment in costPath do
-			costAccessor = costAccessor[segment]
+		-- The index walk can THROW for a path that typos a closed element field (the
+		-- accessor rejects undeclared fields at the index site); a bad cost path must
+		-- come back as (false, err) like every other Purchase refusal, not an error.
+		local walked, costAccessor = pcall(function()
+			local acc = entry.Tree.Accessor
+			for _, segment in costPath do
+				acc = acc[segment]
+			end
+			return acc
+		end)
+		if not walked then
+			return false, "invalid cost path"
 		end
-		local costSchema = Template.Resolve(compiled, costPath)
+		-- Follow the schema the way the accessor above does. Template.Resolve descends
+		-- node.Children only, so a Scribe.DictOf/ArrayOf (whose element hangs off
+		-- AnyChild) would stop the walk at the CONTAINER, silently disabling the
+		-- fractional-amount guard and defaulting the Min floor to 0.
+		local costSchema, dynStart = Template.Resolve(compiled, costPath)
+		for i = dynStart, #costPath do
+			local next_ = Template.ChildSchema(costSchema, costPath[i])
+			if next_ == nil then
+				break
+			end
+			costSchema = next_
+		end
 		-- A fractional amount on an int currency rounds the debit toward zero
 		-- (or to no debit at all) while the grant still runs — reject it.
 		if costSchema.ValueType == "int" and amount % 1 ~= 0 then
@@ -1385,7 +1405,29 @@ function Monetization.new(ctx: any)
 		end
 		local floor: number = costSchema.Min or 0
 
-		local current = costAccessor.Get()
+		-- A DictOf currency key the player never touched reads nil, but the declared
+		-- element default is its true balance (the entry materializes on first
+		-- write). Without this, a player could never spend a starting balance.
+		local isElementLeaf = false
+		do
+			local cursor: any = costSchema
+			while cursor do
+				if cursor.IsElement then
+					isElementLeaf = true
+					break
+				end
+				cursor = cursor.Parent
+			end
+		end
+		local function readBalance(): any
+			local value = costAccessor.Get()
+			if value == nil and isElementLeaf and type(costSchema.Default) == "number" then
+				return costSchema.Default
+			end
+			return value
+		end
+
+		local current = readBalance()
 		if type(current) ~= "number" then
 			return false, "invalid cost path"
 		end
@@ -1394,7 +1436,7 @@ function Monetization.new(ctx: any)
 		end
 
 		local ok, err = entry.Tree:RunTransaction(function()
-			local balance = costAccessor.Get()
+			local balance = readBalance()
 			if balance - amount < floor then
 				error("insufficient funds")
 			end

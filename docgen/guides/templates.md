@@ -130,3 +130,78 @@ Tint       = Scribe.Color3(Color3.fromRGB(255, 120, 0)),
 All 17 are supported: `Vector3`, `Vector2`, `Vector3int16`, `Vector2int16`, `CFrame`, `Color3`, `BrickColor`, `UDim`, `UDim2`, `Rect`, `NumberRange`, `NumberSequence`, `ColorSequence`, `DateTime`, `EnumItem`, `Font`, `PhysicalProperties`.
 
 `buffer` values are also first-class template fields, ideal for games that save large placed-structure or inventory blobs.
+
+## Typed containers
+
+A plain `{}` field is an **untyped** container: Scribe stores whatever you put in it, but the entries have no schema, so they get no type checking, no bounds, and no datatype packing. Putting a declarator inside one is a template error, because there is nothing for it to compile into.
+
+Declare the element shape instead:
+
+```lua
+PlacedFurniture = Scribe.ArrayOf({
+    Cf     = Scribe.CFrame(CFrame.new()),
+    ItemId = Scribe.String("", { MaxLength = 64 }),
+}, { MaxItems = 200 }),
+
+Resources = Scribe.DictOf(Scribe.Int(0, { Min = 0 }), { MaxKeys = 64 }),
+```
+
+Now every entry is validated like a declared field, and `data.PlacedFurniture[1].Cf` is a typed accessor returning a real `CFrame`:
+
+```lua
+data.PlacedFurniture.Insert({ Cf = CFrame.new(0, 5, 0), ItemId = "OakChair" })
+local cf = data.PlacedFurniture[1].Cf.Get()  -- a CFrame, unpacked for you
+
+data.Resources.Wood.Increment(5)  -- a fresh key starts from the declared default
+```
+
+This is the **only** way to store a Roblox datatype inside a container. Packing is driven by the schema, so without one Scribe could not tell a packed CFrame from a buffer you stored yourself when reading it back.
+
+`ArrayOf` is for lists (contiguous integer indices, created with `Insert`), `DictOf` is for string-keyed maps (a key materializes on first write). They nest freely, in any combination and to any depth:
+
+```lua
+Plots = Scribe.ArrayOf({
+    Name  = Scribe.String("", { MaxLength = 32 }),
+    Rooms = Scribe.ArrayOf({
+        Origin    = Scribe.CFrame(CFrame.new()),
+        Furniture = Scribe.DictOf({ Cf = Scribe.CFrame(CFrame.new()) }, { MaxKeys = 200 }),
+    }, { MaxItems = 16 }),
+}, { MaxItems = 4 }),
+```
+
+The element shape can also be a single declarator rather than a record: `Scribe.ArrayOf(Scribe.CFrame(CFrame.new()))` is an array of CFrames.
+
+### Element rules
+
+**Records are closed.** Writing a field the shape does not declare is an error, not a silently stored extra field, so a typo like `data.PlacedFurniture[1].Colour.Set("red")` fails loudly instead of persisting forever.
+
+**Omitted fields fill from their defaults.** `Insert({ ItemId = "chair" })` stores the declared `Cf` default too, because the element type says the field is always present. Note the **typed** surface still asks for every non-Optional field (the element type makes them required, and the type level cannot know the runtime fills them), so in strict Luau either pass the full element or mark the omittable fields `Scribe.Optional`; the fill mainly benefits untyped call sites and dynamic writes. Use [`Scribe.Optional`](/api/Scribe#Optional) for a field that may legitimately be absent:
+
+```lua
+Note = Scribe.Optional(Scribe.String("", { MaxLength = 64 })),
+```
+
+An optional field has no default, so it is neither seeded nor filled, and `Get()` returns `nil` until something writes it.
+
+**Caps are enforced at the write site.** `MaxItems`, `MaxKeys`, and `MaxKeyLength` reject rather than truncate or evict. This matters because an unbounded container is the usual way a profile grows until it can no longer save, and a cap turns that into an error naming the field instead of a save failure much later.
+
+**Removals go through `Remove`.** `data.Plots[2].Set(nil)` on a middle index is refused, because an array with a hole splits `#arr` from `Count()` and shifts every replicated index below it. Use `Remove(2)`.
+
+**Array indices are positional.** `data.Plots[2]` addresses whatever is at index 2 *right now*, so a per-element `Observe` reports the wrong element after an insert or removal shifts the list. Watch the container with `OnInsert` / `OnRemove` (or a container-level `Observe`) instead. For the same reason, `Scribe.Timed` is rejected inside an element shape: a running timer would resolve to the wrong element after a shift. `Scribe.Dynamic` is rejected too, since its factory seeds a field once per new profile and elements do not exist then.
+
+**Searching compares by value.** `Has`, `Find`, and `RemoveValue` compare declared elements structurally, so the value `Get()` just handed you matches the stored one:
+
+```lua
+local item = data.PlacedFurniture.Get()[2]
+data.PlacedFurniture.RemoveValue(item)  -- removes index 2
+```
+
+Untyped containers keep comparing by identity, which is what existing code expects.
+
+### Untyped containers still work
+
+Nothing about a plain `{}` field changed. If you genuinely want a free-form blob, keep it, and reach for [`Scribe.Datatypes.Pack`](/api/Scribe#Datatypes) if you need a datatype in one:
+
+```lua
+Loose = {},  -- anything goes, no per-entry schema
+```

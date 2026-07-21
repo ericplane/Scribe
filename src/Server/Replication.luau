@@ -170,6 +170,26 @@ function Replication.new(ctx: any)
 					descendantSupersede[k] = true
 				elseif op.Kind == "Set" and (op.Value == nil or type(op.Value) == "table") then
 					supersede[k] = true
+				elseif op.Kind == "Insert" or op.Kind == "Remove" then
+					-- Index-shift barrier: an Insert/Remove rebinds which element every
+					-- numeric path under this container denotes, so a "later" table-Set
+					-- at arr[i] does NOT supersede an earlier op that targeted the
+					-- element occupying i before the shift. Clear needs no barrier (it
+					-- wipes all pre-Clear descendant state), but supersession must not
+					-- cross a shift. Walking backward, this op precedes everything
+					-- already marked, so drop every descendant mark under it.
+					local prefix = k .. "\31"
+					local prefixLen = #prefix
+					for marked in supersede do
+						if string.sub(marked, 1, prefixLen) == prefix then
+							supersede[marked] = nil
+						end
+					end
+					for marked in descendantSupersede do
+						if string.sub(marked, 1, prefixLen) == prefix then
+							descendantSupersede[marked] = nil
+						end
+					end
 				end
 			end
 		end

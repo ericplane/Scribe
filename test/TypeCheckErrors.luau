@@ -4,7 +4,7 @@
 -- exactly EXPECTED_ERRORS diagnostics — if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
--- EXPECTED_ERRORS: 12
+-- EXPECTED_ERRORS: 15
 
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -13,6 +13,11 @@ local template = {
 	Stats = { Kills = 0 },
 	Nick = "",
 	Quests = {} :: { number },
+	Bag = Scribe.ArrayOf(Scribe.Int(0)),
+	Furniture = Scribe.ArrayOf({
+		Cf = Scribe.CFrame(CFrame.identity),
+		Note = Scribe.Optional(Scribe.String("")),
+	}),
 }
 
 type T = typeof(template)
@@ -83,4 +88,27 @@ local function badTypedApis(player: Player)
 	Data.SendMessage("not-a-number", {}) -- TypeError: string vs number
 end
 
-return { badBoards, badStat, badProducts, rootAndRemove, badOption, badEnum, missingStore, badLog, badTypedApis }
+local function badContainers(player: Player)
+	-- 13) An ArrayOf element is typed, so Insert rejects the wrong element type.
+	Data[player].Bag.Insert("x") -- TypeError: string vs number element
+
+	-- 14) A declared element FIELD is typed too, reached by numeric index.
+	Data[player].Furniture[1].Cf.Set("nope") -- TypeError: string vs CFrame
+
+	-- 15) Scribe.Optional makes the field nilable; assigning to a non-optional errors.
+	local note: string = Data[player].Furniture[1].Note.Get() -- TypeError: string? vs string
+	return note
+end
+
+return {
+	badBoards,
+	badStat,
+	badProducts,
+	rootAndRemove,
+	badOption,
+	badEnum,
+	missingStore,
+	badLog,
+	badTypedApis,
+	badContainers,
+}
