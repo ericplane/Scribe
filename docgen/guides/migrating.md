@@ -16,7 +16,7 @@ Scribe sits directly on ProfileStore, so a game already using ProfileStore adopt
 
 1. Set `ProfileStoreIndex` and `ProfileKeyPrefix` to match your current store name and key prefix.
 2. Existing profiles load unchanged. `Data` is the template root, and the ProfileStore envelope (session metadata, `UserIds`, `GlobalUpdates`) is untouched.
-3. `Reconcile` fills any newly added **static** template field; use `Migrations` to reshape anything whose structure changed. Fields you later add to a [`Scribe.ArrayOf` or `Scribe.DictOf` element shape](./templates#typed-containers) are a separate pass: ProfileStore's `Reconcile` walks the static template only, so Scribe backfills stored entries itself on load, **after** your migrations run. That order is deliberate: a guarded rename step like `item.New = item.New or item.Old` has to see the raw stored entry before any default lands on it. `Scribe.Optional` element fields have no default and are left absent.
+3. New template fields fill in on load; `Migrations` reshape anything whose structure changed.
 
 ```lua
 return Scribe({
@@ -27,6 +27,10 @@ return Scribe({
 ```
 
 Your template's field names must match the keys already in the stored data (or a migration bridges the difference). **Validate against real data first** with `ViewedUserId` (loads that user's real profile read-only, never writes) before you point a live game at it. Note that `DontSave = true` is NOT a dry-run against real data: it swaps in a full in-memory mock store, so every profile loads as blank template defaults and validates nothing about your stored shapes.
+
+:::note Adding a field to a container element later
+Add a field to an existing [`Scribe.ArrayOf` or `Scribe.DictOf`](./templates#typed-containers) element shape and Scribe fills it into every stored entry on load, just as it fills a new top-level field. This runs **after** your `Migrations`, so a rename migration still sees the old entry before any default lands. `Scribe.Optional` fields have no default, so they stay absent.
+:::
 
 ### Coming from ProfileService
 
@@ -85,6 +89,35 @@ end
 
 :::
 
+### Seeding into a typed container
+
+Importing into a [`Scribe.ArrayOf` or `Scribe.DictOf`](./templates#typed-containers) works the same way, with one rule: `OnPlayerInit` hands you the raw profile table, which does **not** pack datatypes for you. Write a datatype element as a packed buffer with [`Scribe.Datatypes.Pack`](/api/Scribe#Datatypes):
+
+```lua
+Placed = Scribe.ArrayOf({
+    Cf = Scribe.CFrame(CFrame.new()),
+    Id = Scribe.String("", { MaxLength = 32 }),
+}),
+
+OnPlayerInit = function(player, data)
+    if data.LegacyImported then return end
+    local old = MyOldStore:Get(player)
+    if old then
+        local placed = {}
+        for _, o in old.placedObjects do
+            table.insert(placed, {
+                Cf = Scribe.Datatypes.Pack("CFrame", CFrame.new(o.x, o.y, o.z)),
+                Id = o.itemId,
+            })
+        end
+        data.Placed = placed
+    end
+    data.LegacyImported = true
+end,
+```
+
+Forget the `Pack` and the raw `CFrame` is flagged `PROFILE_UNPERSISTABLE` at load, and would fail the profile's next save. Once imported, `data.Placed[1].Cf.Get()` is a real `CFrame`, packed and unpacked for you from then on. Writing through the accessor tree instead of the raw table (as normal gameplay does) packs automatically, so this only comes up on the import path.
+
 ## Backfilling offline players
 
 Most migrations never need this. With the read-and-seed approach above, every player is imported automatically the next time they log in, so you can leave the old store in place and let it drain on its own.
@@ -116,5 +149,5 @@ end
 
 - **Keep the legacy store readable** until you're confident. Don't delete old data the moment you cut over. The guard flag means a re-run is harmless.
 - **Convert shapes explicitly**: copy field by field into your Scribe template rather than assigning the whole old table, so the result matches your declarators. Nothing on the raw import path checks that for you: `OnPlayerInit` and [`Data.UpdateOffline`](/api/Server#UpdateOffline) mutate the profile table directly, so bounds, enum members, `MaxLength`, and `ArrayOf` / `DictOf` element shapes are all unenforced there, and a mismatch surfaces as a wrong-typed read later rather than an error at the write.
-- **Storability *is* checked**, so seed datatypes packed: invalid UTF-8, a NaN/inf number, a table mixing array indices with string keys, or a raw Roblox datatype is reported as `PROFILE_UNPERSISTABLE` on load and refused outright by `UpdateOffline`. [Typed container](./templates#typed-containers) datatype fields store a *packed buffer*, so seed them with `Scribe.Datatypes.Pack("CFrame", cf)` or write them through the accessor tree, which packs for you.
+- **Storability *is* checked.** Invalid UTF-8, a NaN/inf number, a table mixing array indices with string keys, or a raw Roblox datatype (see [above](#seeding-into-a-typed-container)) is reported as `PROFILE_UNPERSISTABLE` on load and refused outright by `UpdateOffline`.
 - **Dry-run first** with `ViewedUserId`, or against a throwaway `ProfileStoreIndex` seeded with copies, before touching production. `DontSave = true` is not a dry-run: it swaps in an in-memory mock store, so nothing you see there came from real data.
