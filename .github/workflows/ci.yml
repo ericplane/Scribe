@@ -87,7 +87,7 @@ jobs:
             -o globalTypes.d.luau
         env:
           # Keep in sync with rokit.toml's luau-lsp pin.
-          LUAU_LSP_VER: "1.68.1"
+          LUAU_LSP_VER: "1.69.0"
       # Positive gate: the typed accessor API and the Scribe() entry point must
       # type-check clean under the NEW solver (--settings mirrors the editor's
       # enableNewSolver). `src` itself is intentionally NOT gated here: the new
