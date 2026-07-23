@@ -39,10 +39,18 @@ theme:
     - navigation.tabs.sticky
     - navigation.sections
     - navigation.top
+    # The guides are an ordered path (Getting Started -> Configuration -> ...),
+    # so prev/next links at the foot of a page carry the reader onward.
+    - navigation.footer
+    # SPA-style page loads. The site is small and heavily cross-linked between
+    # guides and API pages, so this removes a full reload on every hop.
+    - navigation.instant
+    - navigation.instant.prefetch
     - toc.follow
     - content.code.copy
     - search.suggest
     - search.highlight
+    - search.share
 
 extra_css:
   - stylesheets/extra.css
@@ -90,4 +98,8 @@ nav:
       - Value: api/value.md
 
 plugins:
-  - search
+  - search:
+      # Most searches here are API names. The default separator does not split
+      # `Data.WaitForData`, so "wait" would never match it; this splits on dots
+      # and at camelCase boundaries as well as the usual punctuation.
+      separator: '[\s\-,:!=\[\]()"`/]+|\.(?!\d)|(?!\b)(?=[A-Z][a-z])'

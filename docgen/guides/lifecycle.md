@@ -14,7 +14,7 @@ Always wait for data before reading it:
 Players.PlayerAdded:Connect(function(player)
     local data, reason = Data.WaitForData(player)
     if not data then
-        -- reason says why: "left" (the usual one), "timeout", "load-failed", "session-end"...
+        -- reason says why; see the table below
         return
     end
     -- ...use data...
@@ -25,6 +25,25 @@ end)
 | ------------------------------------------------ | ---------------------------------------------------------------------------- |
 | [`WaitForData(player)`](/api/Server#WaitForData) | Yields until Ready; returns `(accessor?, reason?)`. Handle the `nil` branch. |
 | [`GetState(player)`](/api/Server#GetState)       | `"Loading" \| "Ready" \| "SessionEnded"`, without yielding.                  |
+
+### Why data was unavailable
+
+When `WaitForData` returns no tree, `reason` is one of exactly six values, also available as the `Scribe.LifecycleReason` type and the `Scribe.Reason` constants table. The `SessionEnded` signal carries the same set.
+
+| Reason | Meaning |
+| --- | --- |
+| `player-left` | The player left. By far the most common, and usually not an error. |
+| `timeout` | The wait elapsed before the profile reached Ready. |
+| `load-failed` | The profile could not be loaded. |
+| `migration-failed` | A migration errored, so the profile was released unmigrated. |
+| `session-ended` | The session ended while the player was still in game. |
+| `shutdown` | The server is closing. |
+
+```lua
+if reason == Scribe.Reason.PlayerLeft then
+    return -- routine
+end
+```
 
 `Data[player]` and `Data.Get(player)` **error** while a profile is Loading. Use them only after `WaitForData`, or inside a [`Command`](/api/Server#Command) handler (which only runs once the caller is Ready).
 

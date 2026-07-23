@@ -17,6 +17,7 @@ local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
 local Signal = require(Internal.Signal)
+local Config = require(Internal.Config)
 
 local Persistence = {}
 
@@ -124,7 +125,63 @@ function Persistence.new(ctx: any)
 	local ProfileStore = findProfileStoreModule(options.ProfileStore)
 	local persistentDefaults = Template.BuildDefaults(compiled, "Persistent")
 	local baseStore = ProfileStore.New(storeIndex, persistentDefaults)
-	local store = if options.UseMock or options.DontSave then baseStore.Mock else baseStore
+	-- Persistence mode. One value answers three questions that used to be spread
+	-- across four independent flags: which store to read, whether to hold a
+	-- session, and whether anything saves.
+	--
+	--   Live    real store, exclusive session, saves           (the default)
+	--   Mock    ProfileStore's mock store, saves only there
+	--   NoSave  real profile read as a snapshot, no session, never saves
+	--
+	-- Mode WINS over the legacy flags whenever it is set. When it is absent they
+	-- still resolve to the equivalent mode, so existing configs are untouched.
+	local VALID_MODES = { Live = true, Mock = true, NoSave = true }
+	local mode: string
+	local useMockStore: boolean
+	local targetUserId: number? = options.TargetUserId
+
+	if options.Mode ~= nil then
+		if type(options.Mode) ~= "string" or not VALID_MODES[options.Mode] then
+			error(`Scribe: Mode must be "Live", "Mock" or "NoSave", got {tostring(options.Mode)}`, 0)
+		end
+		mode = options.Mode
+		useMockStore = mode == "Mock"
+		local legacy = {}
+		for _, name in { "UseMock", "DontSave", "ViewedUserId", "OverriddenUserId" } do
+			if (options :: any)[name] ~= nil then
+				table.insert(legacy, name)
+			end
+		end
+		if #legacy > 0 then
+			Log.Warn(
+				"Persistence",
+				"MODE_OVERRIDES_LEGACY",
+				`Mode = "{mode}" is set, so the legacy flag(s) {table.concat(legacy, ", ")} are ignored`,
+				{ Mode = mode, Ignored = table.concat(legacy, ", ") }
+			)
+		end
+	else
+		-- Legacy resolution. The old flags controlled two INDEPENDENT axes: the
+		-- store came from UseMock/DontSave, and the view branch came from
+		-- ViewedUserId, so setting both meant "view, out of the mock store". Keep
+		-- them independent here, because collapsing them either way silently
+		-- changes which store an existing config reads.
+		useMockStore = (options.UseMock or options.DontSave) == true
+		if options.ViewedUserId ~= nil then
+			mode = "NoSave"
+			targetUserId = options.ViewedUserId
+		elseif useMockStore then
+			mode = "Mock"
+		else
+			mode = "Live"
+			targetUserId = targetUserId or options.OverriddenUserId
+		end
+	end
+
+	self.Mode = mode
+	self.TargetUserId = targetUserId
+
+	local store = if useMockStore then baseStore.Mock else baseStore
 
 	-- Autosave cadence. ProfileStore autosaves each profile once per
 	-- AUTO_SAVE_PERIOD (default 300s); SaveInterval lowers it so less progress
@@ -134,28 +191,57 @@ function Persistence.new(ctx: any)
 	-- Scribe bundle and any direct ProfileStore use in the game; the last
 	-- configured value wins. Floored at 15s because Roblox throttles per-key
 	-- writes (~1 per 6s), and saving faster than that just produces failures.
+	local function applyAutoSaveInterval(interval: number, source: string)
+		if interval < MIN_SAVE_INTERVAL then
+			Log.Warn(
+				"Persistence",
+				"SAVE_INTERVAL_CLAMPED",
+				`autosave interval below the {MIN_SAVE_INTERVAL}s floor (DataStore write throttling); clamping`,
+				{ Requested = interval, Applied = MIN_SAVE_INTERVAL }
+			)
+			interval = MIN_SAVE_INTERVAL
+		end
+		-- AUTO_SAVE_PERIOD is a ProfileStore GLOBAL, so two bundles asking for
+		-- different cadences is a real conflict that used to resolve as a silent
+		-- last-writer-wins, with the winner decided by require order. Say so.
+		if Config.AutoSaveInterval ~= nil and Config.AutoSaveInterval ~= interval then
+			Log.Warn(
+				"Persistence",
+				"SAVE_INTERVAL_CONFLICT",
+				"autosave interval is a ProfileStore process global and was already set to a different value; "
+					.. "the later value wins. Set it once with Scribe.Configure instead.",
+				{ Existing = Config.AutoSaveInterval, Requested = interval, Source = source }
+			)
+		end
+		if type(ProfileStore.SetConstant) == "function" then
+			local ok, err = pcall(ProfileStore.SetConstant, "AUTO_SAVE_PERIOD", interval)
+			if ok then
+				Config.AutoSaveInterval = interval
+				Config.AutoSaveSource = source
+				Log.Info("Persistence", "SAVE_INTERVAL_SET", "autosave interval configured", {
+					Seconds = interval,
+					Source = source,
+				})
+			else
+				Log.Warn("Persistence", "SAVE_INTERVAL_FAIL", tostring(err), {})
+			end
+		end
+	end
+
+	-- Scribe.Configure runs before any bundle exists, so apply its value here,
+	-- where ProfileStore has been resolved.
+	if Config.AutoSaveSource == "Configure" and Config.AutoSaveInterval ~= nil then
+		local pending = Config.AutoSaveInterval
+		Config.AutoSaveInterval = nil -- let applyAutoSaveInterval own the record
+		applyAutoSaveInterval(pending, "Configure")
+	end
+
 	if options.SaveInterval ~= nil then
 		local interval = options.SaveInterval
 		if type(interval) ~= "number" or interval ~= interval or interval <= 0 then
 			error("Scribe: SaveInterval must be a positive number of seconds", 0)
 		end
-		if interval < MIN_SAVE_INTERVAL then
-			Log.Warn(
-				"Persistence",
-				"SAVE_INTERVAL_CLAMPED",
-				`SaveInterval below the {MIN_SAVE_INTERVAL}s floor (DataStore write throttling); clamping`,
-				{ Requested = interval, Applied = MIN_SAVE_INTERVAL }
-			)
-			interval = MIN_SAVE_INTERVAL
-		end
-		if type(ProfileStore.SetConstant) == "function" then
-			local ok, err = pcall(ProfileStore.SetConstant, "AUTO_SAVE_PERIOD", interval)
-			if ok then
-				Log.Info("Persistence", "SAVE_INTERVAL_SET", "autosave interval configured", { Seconds = interval })
-			else
-				Log.Warn("Persistence", "SAVE_INTERVAL_FAIL", tostring(err), {})
-			end
-		end
+		applyAutoSaveInterval(interval, "SaveInterval")
 	end
 
 	self.Store = store
@@ -683,11 +769,16 @@ function Persistence.new(ctx: any)
 			return
 		end
 		entry.TornDown = true
-		self.EndReasons[entry.Player] = reason or "session-ended"
+		-- One canonical reason reaches every consumer: the SessionEnded signal, the
+		-- stored end reason, and WaitForData's second return (see
+		-- Types.LifecycleReason). The signal used to fire the raw, possibly nil
+		-- reason while EndReasons defaulted it, so the two could disagree.
+		local canonical: string = reason or "session-ended"
+		self.EndReasons[entry.Player] = canonical
 
 		-- SessionEnded fires before the (default-on) kick.
-		ctx.Signals.SessionEnded:Fire(entry.Player, reason)
-		setState(entry, "SessionEnded", reason)
+		ctx.Signals.SessionEnded:Fire(entry.Player, canonical)
+		setState(entry, "SessionEnded", canonical)
 
 		ctx.Replication.OnEntryRemoved(entry)
 		ctx.Leaderboards.OnUnload(entry)
@@ -702,7 +793,7 @@ function Persistence.new(ctx: any)
 		if
 			options.KickOnSessionEnd ~= false
 			and not self.Closing
-			and reason ~= "left"
+			and canonical ~= "player-left"
 			and entry.Player.Parent == Players
 		then
 			entry.Player:Kick(options.SessionEndMessage or "Your data session has ended. Please rejoin!")
@@ -916,7 +1007,7 @@ function Persistence.new(ctx: any)
 			-- external steal: its final save persists nothing locally, so save
 			-- bookkeeping must not report success for it (onProfileSaved checks this).
 			entry.SessionStolen = not entry.LocalSessionEnd and not self.Closing
-			teardown(entry, if player.Parent == Players then "session-end" else "left")
+			teardown(entry, if player.Parent == Players then "session-ended" else "player-left")
 		end)
 
 		-- If the player left (or the session was stolen) during the yielding
@@ -924,8 +1015,11 @@ function Persistence.new(ctx: any)
 		-- listener attached. IsActive() is reliably false by now (EndSession
 		-- deactivates synchronously), so tear down instead of finishing a Ready
 		-- session for a departed player that would leak forever.
-		if not profile:IsActive() then
-			teardown(entry, if player.Parent == Players then "session-end" else "left")
+		-- A NoSave load holds a VIEW, which is never IsActive() by design, so this
+		-- guard must not apply to it (it would tear every view down as
+		-- "session-ended" before it ever reached Ready).
+		if mode ~= "NoSave" and not profile:IsActive() then
+			teardown(entry, if player.Parent == Players then "session-ended" else "player-left")
 			return
 		end
 
@@ -972,16 +1066,22 @@ function Persistence.new(ctx: any)
 	local function loadProfile(entry: Entry)
 		local player = entry.Player
 
-		if options.ViewedUserId then
-			-- View mode (testing): read someone's profile, never save.
+		if mode == "NoSave" then
+			-- Snapshot of the real profile with NO session: nothing is saved, because
+			-- a view is never IsActive() and every save path checks that first.
 			local ok, profile = pcall(function()
-				return store:GetAsync(self.KeyFor(options.ViewedUserId))
+				return store:GetAsync(entry.Key)
 			end)
 			if ok and profile then
 				entry.Profile = profile
 				finishLoad(entry)
 			else
-				Log.Error("Persistence", "PROFILE_LOAD_FAIL", "ViewedUserId profile not found", { Player = player })
+				Log.Error(
+					"Persistence",
+					"PROFILE_LOAD_FAIL",
+					`Mode = "NoSave": no stored profile to read for this key`,
+					{ Player = player, UserId = entry.UserId }
+				)
 				teardown(entry, "load-failed")
 			end
 			return
@@ -1012,7 +1112,7 @@ function Persistence.new(ctx: any)
 				if ok and profile then
 					profile:EndSession()
 				end
-				teardown(entry, "left")
+				teardown(entry, "player-left")
 				return
 			end
 
@@ -1060,7 +1160,7 @@ function Persistence.new(ctx: any)
 			return
 		end
 		self.EndReasons[player] = nil
-		local userId = options.OverriddenUserId or player.UserId
+		local userId = self.TargetUserId or player.UserId
 		local entry: Entry = {
 			Player = player,
 			UserId = userId,
@@ -1107,7 +1207,7 @@ function Persistence.new(ctx: any)
 			entry.Profile:EndSession() -- final save; OnSessionEnd triggers teardown
 		elseif entry.State ~= "Loading" then
 			-- (Loading sessions abort via the StartSessionAsync Cancel guard.)
-			teardown(entry, "left")
+			teardown(entry, "player-left")
 		end
 	end
 
@@ -1248,32 +1348,55 @@ function Persistence.new(ctx: any)
 		end
 	end
 
+	-- Applies `mutate` to an offline profile and saves it.
+	--
+	-- The active-session check is a pure read, and that is deliberate. Taking a
+	-- real session with StartSessionAsync would give true exclusive ownership, but
+	-- ProfileStore has no non-stealing acquire: the first attempt unconditionally
+	-- writes MetaData.ForceLoadSession and publishes a session-end message to the
+	-- owning server (ProfileStore.luau:1485 and 1585, `request_force_load` is
+	-- hardcoded true), which would kick an online player off another server. It
+	-- would also cost durability: Profile:SetAsync saves synchronously, while
+	-- Profile:EndSession only task.spawns the save, so this function could no
+	-- longer promise the write landed -- and Monetization grants offline receipts
+	-- on exactly that promise. So the read-then-write race stays open by choice:
+	-- losing it costs one clobbered write, while closing it this way costs evicted
+	-- players and eaten Robux.
+	--
+	-- `mutate` runs against a CLONE, so a callback that errors partway commits
+	-- nothing (the same fail-closed shape migrations use).
+	local function updateOfflineProfile(userId: number, mutate: (data: { [string]: any }) -> ())
+		local profile = store:GetAsync(self.KeyFor(userId))
+		if not profile then
+			error("profile does not exist")
+		end
+		if profile.Session then
+			error("profile has an active session on another server")
+		end
+
+		local draft = Util.deepClone(profile.Data)
+		mutate(draft)
+		-- The callback mutates raw data, bypassing Node.validateWrite, so
+		-- unpersistable data (invalid UTF-8, a userdata/Instance value) would fail
+		-- the whole profile save opaquely. Reject before committing.
+		local bad = Util.findUnpersistable(draft)
+		if bad ~= nil then
+			error(`unpersistable data ({bad.Detail}) at "{Util.pathString(bad.Path)}"`)
+		end
+
+		table.clear(profile.Data)
+		for key, value in draft do
+			profile.Data[key] = value
+		end
+		profile:SetAsync()
+	end
+
 	function self.UpdateOffline(userId: number, fn: (data: { [string]: any }) -> ()): (boolean, string?)
 		if self.EntryForUserId(userId) then
 			return false, "user has an active session on this server"
 		end
 		acquireOffline(userId)
-		local ok, err = pcall(function()
-			local profile = store:GetAsync(self.KeyFor(userId))
-			if not profile then
-				error("profile does not exist")
-			end
-			-- Fail closed if the user is active on another server: SetAsync
-			-- overwrites through the session lock and would clobber live data
-			-- (same guard as RestoreVersion).
-			if profile.Session then
-				error("profile has an active session on another server")
-			end
-			fn(profile.Data)
-			-- The callback mutates profile.Data raw, bypassing Node.validateWrite, so
-			-- unpersistable data (invalid UTF-8, or a userdata/Instance value) would
-			-- make SetAsync fail the whole profile opaquely. Reject before writing.
-			local bad = Util.findUnpersistable(profile.Data)
-			if bad ~= nil then
-				error(`unpersistable data ({bad.Detail}) at "{Util.pathString(bad.Path)}"`)
-			end
-			profile:SetAsync()
-		end)
+		local ok, err = pcall(updateOfflineProfile, userId, fn)
 		releaseOffline(userId)
 		if not ok then
 			Health.ReportFailure("OfflineWrite")

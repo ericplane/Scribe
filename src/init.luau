@@ -20,6 +20,7 @@ local Template = require(script.Internal.Template)
 local Log = require(script.Internal.Log)
 local Metrics = require(script.Internal.Metrics)
 local Health = require(script.Internal.Health)
+local Config = require(script.Internal.Config)
 
 export type ScribeTransport = Types.ScribeTransport
 export type Op = Types.Op
@@ -29,6 +30,7 @@ export type LogLevel = Types.LogLevel
 export type LogCategory = Types.LogCategory
 export type Status = Types.Status
 export type SaveInfo = Types.SaveInfo
+export type LifecycleReason = Types.LifecycleReason
 export type LeaderboardEntry = Types.LeaderboardEntry
 export type PassConfig = Types.PassConfig
 export type PurchaseFilter = Types.PurchaseFilter
@@ -406,13 +408,24 @@ export type function ServerDataType(T, P)
 	flushOptsProps[ts.singleton("Force")] = optional(ts.boolean)
 	local flushOpts = optional(ts.newtable(flushOptsProps, nil, nil))
 
+	-- Keep in sync with Types.LifecycleReason. Spelled out here because a type
+	-- function cannot reference an exported type alias.
+	local reasonUnion = ts.unionof(
+		ts.singleton("load-failed"),
+		ts.singleton("migration-failed"),
+		ts.singleton("session-ended"),
+		ts.singleton("player-left"),
+		ts.singleton("shutdown"),
+		ts.singleton("timeout")
+	)
+
 	local props: { [type]: type } = {}
 	local function add(name: string, ty: type)
 		props[ts.singleton(name)] = ty
 	end
 
 	add("Get", fn({ P }, { node }))
-	add("WaitForData", fn({ P }, { optional(node), optional(ts.string) }))
+	add("WaitForData", fn({ P }, { optional(node), optional(reasonUnion) }))
 	add(
 		"GetState",
 		fn({ P }, { ts.unionof(ts.singleton("Loading"), ts.singleton("Ready"), ts.singleton("SessionEnded")) })
@@ -444,6 +457,7 @@ export type function ServerDataType(T, P)
 	add("PromptGift", fn({ P, ts.string, ts.number }, boolAndReason))
 	add("GetGiftCredits", fn({ P }, { stringToNumber }))
 	add("HandleReceipt", fn({ ts.any }, { ts.any }))
+	add("TryHandleReceipt", fn({ ts.any }, { optional(ts.any) }))
 	add("Owns", fn({ P, ts.string }, { ts.boolean }))
 	add("OwnsAsync", fn({ P, ts.string, optional(ts.number) }, { ts.boolean }))
 	add("ObserveOwned", fn({ P, ts.string, fn({ ts.boolean }, {}) }, { fn({}, {}) }))
@@ -591,6 +605,10 @@ export type ScribeOptions<T> = {
 	ProfileKeyPrefix: string, -- REQUIRED: prefix for per-player keys (e.g. "PLAYER_")
 	SaveInterval: number?, -- seconds between autosaves per profile (default 300, floor 15)
 	ProfileStore: any?, -- explicit ProfileStore module (module table or ModuleScript)
+	Mode: ("Live" | "Mock" | "NoSave")?, -- persistence mode (default "Live"); overrides the legacy flags below
+	TargetUserId: number?, -- load this user's profile instead of the joining player's
+	-- Legacy persistence flags, superseded by Mode. Still honoured when Mode is
+	-- absent; ignored (with a startup warning) when it is present.
 	UseMock: boolean?,
 	ViewedUserId: number?,
 	OverriddenUserId: number?,
@@ -702,6 +720,8 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	ProfileKeyPrefix = true,
 	SaveInterval = true,
 	ProfileStore = true,
+	Mode = true,
+	TargetUserId = true,
 	UseMock = true,
 	ViewedUserId = true,
 	OverriddenUserId = true,
@@ -739,6 +759,9 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 	if type(options) ~= "table" then
 		error("Scribe: options must be a table", 2)
 	end
+	-- Scribe.Configure refuses to run past this point: the process-wide values it
+	-- sets are applied during construction, so a later change would be ignored.
+	Config.BundleConstructed = true
 	if type((options :: any).Template) ~= "table" then
 		error("Scribe: options.Template is required and must be a table", 2)
 	end
@@ -1273,6 +1296,95 @@ end
 	convert legacy representations to the packed form.
 ]=]
 Scribe.Datatypes = require(script.Internal.Datatypes)
+
+--[=[
+	@within Scribe
+	@tag Lifecycle
+	@prop Reason { [string]: LifecycleReason }
+	Every value [Server.WaitForData] and the
+	`SessionEnded` signal can report, as a frozen table, so you can branch on a
+	constant instead of a hand-typed string:
+
+	```lua
+	local data, reason = Data.WaitForData(player)
+	if not data then
+	    if reason == Scribe.Reason.PlayerLeft then
+	        return -- routine, not an error
+	    end
+	    warn("data unavailable:", reason)
+	end
+	```
+
+	The matching `Scribe.LifecycleReason` type is the same set as a string union,
+	so a comparison against a typo fails to type-check.
+]=]
+--[=[
+	@within Scribe
+	@tag Configuration
+	@function Configure
+	@param config { AutoSaveInterval: number? }
+	Sets configuration that belongs to the **process**, not to one bundle. Call it
+	once, before constructing any bundle:
+
+	```lua
+	Scribe.Configure({ AutoSaveInterval = 60 })
+	```
+
+	`AutoSaveInterval` is the autosave cadence. It lives here because ProfileStore's
+	`AUTO_SAVE_PERIOD` is a module-wide constant: it applies to every Scribe bundle
+	AND to any direct ProfileStore use in the same game. The per-bundle
+	`SaveInterval` option still works and still wins if it is set, but two bundles
+	asking for different cadences is a conflict Scribe can only resolve as
+	last-writer-wins, so it now logs `SAVE_INTERVAL_CONFLICT` when that happens.
+
+	Values below 15 seconds clamp up to it, since Roblox throttles per-key writes
+	to roughly one per 6 seconds and saving faster just produces failures.
+
+	Calling this twice with different values, or after a bundle exists, is an
+	error: the value may already have been applied, so a late change would be
+	silently ignored.
+]=]
+function Scribe.Configure(config: { AutoSaveInterval: number? })
+	if type(config) ~= "table" then
+		error("Scribe.Configure: config must be a table", 2)
+	end
+	for key in config :: { [string]: any } do
+		if key ~= "AutoSaveInterval" then
+			error(`Scribe.Configure: unknown key "{tostring(key)}" (Configure takes AutoSaveInterval)`, 2)
+		end
+	end
+	if Config.BundleConstructed then
+		error("Scribe.Configure must be called before any Scribe bundle is constructed", 2)
+	end
+	local interval = config.AutoSaveInterval
+	if interval ~= nil then
+		if type(interval) ~= "number" or interval ~= interval or interval <= 0 then
+			error("Scribe.Configure: AutoSaveInterval must be a positive number of seconds", 2)
+		end
+		if
+			Config.AutoSaveSource == "Configure"
+			and Config.AutoSaveInterval ~= nil
+			and Config.AutoSaveInterval ~= interval
+		then
+			error(
+				`Scribe.Configure: AutoSaveInterval was already set to {Config.AutoSaveInterval}; `
+					.. "it is a process-wide setting, so configure it once",
+				2
+			)
+		end
+		Config.AutoSaveInterval = interval
+		Config.AutoSaveSource = "Configure"
+	end
+end
+
+Scribe.Reason = table.freeze({
+	LoadFailed = "load-failed" :: Types.LifecycleReason,
+	MigrationFailed = "migration-failed" :: Types.LifecycleReason,
+	SessionEnded = "session-ended" :: Types.LifecycleReason,
+	PlayerLeft = "player-left" :: Types.LifecycleReason,
+	Shutdown = "shutdown" :: Types.LifecycleReason,
+	Timeout = "timeout" :: Types.LifecycleReason,
+})
 
 --[=[
 	@within Scribe

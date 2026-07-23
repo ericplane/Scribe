@@ -122,7 +122,7 @@ Forget the `Pack` and the raw `CFrame` is flagged `PROFILE_UNPERSISTABLE` at loa
 
 Most migrations never need this. With the read-and-seed approach above, every player is imported automatically the next time they log in, so you can leave the old store in place and let it drain on its own.
 
-[`Data.UpdateOffline`](/api/Server#UpdateOffline) edits a profile that has no active session, and **fails closed** if the user is online elsewhere, so it can never clobber a live game. Always check its return value:
+[`Data.UpdateOffline`](/api/Server#UpdateOffline) edits a profile that has no active session, and **fails closed** if the user is online elsewhere, so it can never clobber a live game. Your callback runs against a copy, so one that errors partway commits nothing. Always check its return value:
 
 ```lua
 for _, userId in userIdsToImport do

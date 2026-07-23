@@ -23,7 +23,19 @@ Scribe binds `MarketplaceService.ProcessReceipt` automatically and runs everythi
 Roblox allows exactly **one** `ProcessReceipt` callback. By default Scribe installs its own, which **silently overrides any receipt handler your game already has** (a second Scribe bundle instead errors loudly at startup). If your game already handles receipts, pick one of these:
 
 - **Let Scribe take over (recommended).** Move your developer products into `Products`, passes into `Passes`, and gifting into [`PromptGift`](/api/Server#PromptGift). Scribe's receipt path survives cross-server hops and offline recipients, which is genuinely hard to get right by hand.
-- **Keep your own handler.** Set `OwnReceipts = false`, then route exactly Scribe's product IDs, no more and no fewer, to [`Data.HandleReceipt(receiptInfo)`](/api/Server#HandleReceipt) from your `ProcessReceipt` and return its `Enum.ProductPurchaseDecision`. It returns `NotProcessedYet` for a product it doesn't know, which would stall one of your own purchases in a retry loop.
+- **Keep your own handler.** Set `OwnReceipts = false`, then call [`Data.TryHandleReceipt(receiptInfo)`](/api/Server#TryHandleReceipt) from your `ProcessReceipt`. It returns a decision for a Scribe product and `nil` for anything else, so you can fall through to your own handling without maintaining a second list of product IDs:
+
+    ```lua
+    MarketplaceService.ProcessReceipt = function(receiptInfo)
+        local decision = Data.TryHandleReceipt(receiptInfo)
+        if decision then
+            return decision
+        end
+        return myOwnHandler(receiptInfo)
+    end
+    ```
+
+    [`HandleReceipt`](/api/Server#HandleReceipt) is the stricter variant: it answers `NotProcessedYet` for an unknown product, which is right when Scribe owns `ProcessReceipt` but would stall one of **your** purchases in a permanent retry loop if you routed everything through it.
 
 If you set `OwnReceipts = false` and **don't** wire up `HandleReceipt`, everything on the receipt path goes dark: **developer-product grants, `PromptGift` delivery, and the Robux purchase log never fire.** Perk ownership and soft-currency [`Purchase`](/api/Server#Purchase) keep working, since those never touch receipts.
 :::

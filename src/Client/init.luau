@@ -763,10 +763,14 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@within Client
 		@tag Monetization
 		@client
-		@param filter { Kind: ("Robux" | "InGame")?, Category: string?, ItemId: string?, Since: number?, Limit: number? }?
+		@param filter PurchaseFilter?
 		@return { table }
 		The local player's purchase history for history UI. Only returned if the
 		game opts into replicating purchase logs (`PurchaseLog.ReplicateRobux`).
+
+		`PurchaseFilter` is `{ Kind: ("Robux" | "InGame")?, Category: string?,
+		ItemId: string?, Since: number?, Limit: number? }`, exported as
+		`Scribe.PurchaseFilter`.
 	]=]
 	function Data.GetPurchases(filter: { [string]: any }?): { { [string]: any } }
 		if not editMode then
@@ -838,10 +842,14 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@within Client
 		@tag Edit Mode
 		@client
-		@param values { [string]: any }? -- template fields to seed (deep-merged)
+		@param values { [string]: any }?
 		@param scribeState { Perks: { string }?, GiftCredits: { [string]: number }?, Leaderboards: { [string]: { LeaderboardEntry } }? }?
 		Seeds mock data for a storybook / edit mode. **Errors outside edit mode.**
 		Use it to render Scribe-backed components with realistic state.
+
+		`values` holds template fields to seed and is deep-merged into the mirror,
+		so you only pass the fields your component reads. `scribeState` seeds the
+		monetization and leaderboard state those APIs read.
 	]=]
 	function Data.Mock(values: { [string]: any }?, scribeState: { [string]: any }?)
 		assertEditMode("Data.Mock")
@@ -897,20 +905,26 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		mockCommands[name] = handler
 	end
 
-	-- Dev-mode misuse guard: a root field named like a client Data API/signal
-	-- is silently shadowed by that real key (a real key always wins over
-	-- __index), so warn instead of leaving it mysteriously unreadable.
-	if RunService:IsStudio() then
-		local rootChildren = compiled.Root.Children :: { [string]: any }
-		for key in Data do
-			if type(key) == "string" and rootChildren[key] then
-				Log.Warn(
-					"Lifecycle",
-					"API_NAME_COLLISION",
-					`template root field "{key}" collides with a client Data API name and is unreachable on the client`,
-					{}
-				)
-			end
+	-- A root field named like a client Data API/signal is silently shadowed by
+	-- that real key (a real key always wins over __index), so the field is
+	-- unreachable through `Data.<name>` on the client.
+	--
+	-- Reported ALWAYS, not just in Studio, and at Error level so it reaches
+	-- Scribe.OnIssue. The case worth catching is not someone authoring a template
+	-- (they would notice), it is a shipped game upgrading into a collision because
+	-- a newer Scribe added a method matching a field they already store: their
+	-- `Data.<name>` silently turns from an accessor into a function, in
+	-- production, where nobody is watching a Studio-only warning.
+	local rootChildren = compiled.Root.Children :: { [string]: any }
+	for key in Data do
+		if type(key) == "string" and rootChildren[key] then
+			Log.Error(
+				"Lifecycle",
+				"API_NAME_COLLISION",
+				`template root field "{key}" collides with a client Data API name, so it is unreachable as `
+					.. `Data.{key} on the client. Rename the field, or read it through the accessor tree.`,
+				{ Field = key }
+			)
 		end
 	end
 

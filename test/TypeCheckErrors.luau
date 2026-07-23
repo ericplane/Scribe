@@ -4,7 +4,7 @@
 -- exactly EXPECTED_ERRORS diagnostics — if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
--- EXPECTED_ERRORS: 15
+-- EXPECTED_ERRORS: 16
 
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -88,6 +88,12 @@ local function badTypedApis(player: Player)
 	Data.SendMessage("not-a-number", {}) -- TypeError: string vs number
 end
 
+local function badLifecycleReason()
+	-- 16) The reason is a typed union, so an old/misspelled value does not fit.
+	local typed: Scribe.LifecycleReason = "session-end" -- TypeError: not a member
+	return typed
+end
+
 local function badContainers(player: Player)
 	-- 13) An ArrayOf element is typed, so Insert rejects the wrong element type.
 	Data[player].Bag.Insert("x") -- TypeError: string vs number element
@@ -111,4 +117,5 @@ return {
 	badLog,
 	badTypedApis,
 	badContainers,
+	badLifecycleReason,
 }

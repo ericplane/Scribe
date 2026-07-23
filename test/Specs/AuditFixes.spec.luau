@@ -32,6 +32,177 @@ return function()
 
 			harness.Cleanup()
 		end)
+
+		it("commits nothing when the offline callback errors", function()
+			local harness = TestCtx.make()
+			local key = "Default/PLAYER_50003"
+			harness.Fake.Persisted[key] = { Coins = 5 }
+
+			local ok, reason = harness.Data.UpdateOffline(50003, function(data)
+				data.Coins = 9999
+				error("callback blew up")
+			end)
+			expect(ok).to.equal(false)
+			expect(string.find(tostring(reason), "callback blew up") ~= nil).to.equal(true)
+			-- Fail-closed: the half-applied draft is discarded, not saved.
+			expect(harness.Fake.Persisted[key].Coins).to.equal(5)
+			-- A later write still proceeds normally.
+			expect(harness.Data.UpdateOffline(50003, function(data)
+				data.Coins = 7
+			end)).to.equal(true)
+			expect(harness.Fake.Persisted[key].Coins).to.equal(7)
+			harness.Cleanup()
+		end)
+	end)
+
+	describe("client API name collision", function()
+		it("reports a shadowed root field at Error level, outside Studio too", function()
+			-- A root field named like a client method is unreachable as Data.<name>,
+			-- because a real key always beats __index. The report must not be
+			-- Studio-only: the case that matters is a shipped game upgrading into a
+			-- collision, where nobody is watching a Studio warning.
+			local Client = require(Root.Scribe.Client)
+			local template = TestCtx.defaultTemplate()
+			template.Owns = 0 -- collides with Client.Owns
+
+			local codes, levels = {}, {}
+			local unsubscribe = Scribe.AddLogSink(function(entry)
+				if entry.Code == "API_NAME_COLLISION" then
+					table.insert(codes, entry.Context and entry.Context.Field)
+					table.insert(levels, entry.Level)
+				end
+			end)
+
+			local harness = TestCtx.make({ Template = template })
+			local player = harness.Join()
+			harness.Transport.LocalPlayer = player
+			Client.new(harness.Options, harness.Compiled)
+
+			expect(table.find(codes, "Owns") ~= nil).to.equal(true)
+			expect(table.find(levels, "Error") ~= nil).to.equal(true)
+
+			if unsubscribe then
+				unsubscribe()
+			end
+			harness.Cleanup()
+		end)
+	end)
+
+	describe("persistence Mode", function()
+		local function modeOf(opts)
+			local h = TestCtx.make({ Options = opts })
+			local mode, target = h.Ctx.Persistence.Mode, h.Ctx.Persistence.TargetUserId
+			h.Cleanup()
+			return mode, target
+		end
+
+		it("defaults to Live", function()
+			-- TestCtx passes UseMock for its own reasons, so ask with it cleared.
+			expect(modeOf({ UseMock = false })).to.equal("Live")
+		end)
+
+		it("maps every legacy flag to its equivalent mode", function()
+			expect(modeOf({ UseMock = true })).to.equal("Mock")
+			expect(modeOf({ UseMock = false, DontSave = true })).to.equal("Mock")
+
+			local mode, target = modeOf({ UseMock = false, ViewedUserId = 909 })
+			expect(mode).to.equal("NoSave")
+			expect(target).to.equal(909)
+
+			mode, target = modeOf({ UseMock = false, OverriddenUserId = 777 })
+			expect(mode).to.equal("Live")
+			expect(target).to.equal(777)
+		end)
+
+		it("keeps the legacy store and view axes independent", function()
+			-- UseMock chose the store, ViewedUserId chose the view; setting both
+			-- meant "view, out of the mock store". Collapsing them would silently
+			-- change which store an existing config reads.
+			local h = TestCtx.make({ Options = { UseMock = true, ViewedUserId = 909 } })
+			expect(h.Ctx.Persistence.Mode).to.equal("NoSave")
+			expect(h.Fake.Constants).to.be.ok() -- store came from the mock
+			h.Cleanup()
+		end)
+
+		it("lets Mode override the legacy flags", function()
+			expect(modeOf({ Mode = "Live", UseMock = true })).to.equal("Live")
+			expect(modeOf({ Mode = "Mock", ViewedUserId = 909 })).to.equal("Mock")
+			local _, target = modeOf({ Mode = "NoSave", TargetUserId = 555 })
+			expect(target).to.equal(555)
+		end)
+
+		it("rejects an unknown mode at startup", function()
+			local ok, err = pcall(TestCtx.make, { Options = { Mode = "Nope" } })
+			expect(ok).to.equal(false)
+			expect(string.find(tostring(err), "Mode must be", 1, true) ~= nil).to.equal(true)
+		end)
+
+		it("NoSave reads the real profile and never writes it back", function()
+			local h = TestCtx.make({ Options = { UseMock = false, Mode = "NoSave", TargetUserId = 8080 } })
+			h.Fake.Persisted["Default/PLAYER_8080"] = { Coins = 1234 }
+			local player, _, data = h.Join(4242)
+			-- read the TARGET's stored data, not the joining player's
+			expect(data.Coins.Get()).to.equal(1234)
+			data.Coins.Set(99)
+			h.Data.Flush(player)
+			-- the snapshot has no session, so nothing is persisted
+			expect(h.Fake.Persisted["Default/PLAYER_8080"].Coins).to.equal(1234)
+			h.Cleanup()
+		end)
+	end)
+
+	describe("process-global autosave config", function()
+		local Config = require(Root.Scribe.Internal.Config)
+
+		local function reset()
+			Config.AutoSaveInterval = nil
+			Config.AutoSaveSource = nil
+			Config.BundleConstructed = false
+		end
+
+		it("applies Scribe.Configure's interval to ProfileStore", function()
+			reset()
+			Scribe.Configure({ AutoSaveInterval = 60 })
+			local harness = TestCtx.make()
+			expect(harness.Fake.Constants.AUTO_SAVE_PERIOD).to.equal(60)
+			harness.Cleanup()
+			reset()
+		end)
+
+		it("lets a per-bundle SaveInterval still win, and flags the conflict", function()
+			reset()
+			Scribe.Configure({ AutoSaveInterval = 60 })
+			local codes = {}
+			Scribe.AddLogSink(function(entry)
+				table.insert(codes, entry.Code)
+			end)
+			local harness = TestCtx.make({ Options = { SaveInterval = 90, LogLevel = "Debug" } })
+			-- SaveInterval is applied last, so it wins, exactly as before.
+			expect(harness.Fake.Constants.AUTO_SAVE_PERIOD).to.equal(90)
+			expect(table.find(codes, "SAVE_INTERVAL_CONFLICT") ~= nil).to.equal(true)
+			harness.Cleanup()
+			reset()
+		end)
+
+		it("rejects a conflicting or late Configure", function()
+			reset()
+			Scribe.Configure({ AutoSaveInterval = 60 })
+			expect(function()
+				Scribe.Configure({ AutoSaveInterval = 60 })
+			end).never.to.throw() -- repeating the same value is harmless
+
+			local ok = pcall(Scribe.Configure, { AutoSaveInterval = 120 })
+			expect(ok).to.equal(false)
+
+			expect(pcall(Scribe.Configure, { Nope = 1 })).to.equal(false)
+
+			-- Once a bundle exists the value may already be applied, so a later
+			-- change would be silently ignored. Scribe(options) sets this flag;
+			-- TestCtx builds a context directly, so set it the same way here.
+			Config.BundleConstructed = true
+			expect(pcall(Scribe.Configure, { AutoSaveInterval = 60 })).to.equal(false)
+			reset()
+		end)
 	end)
 
 	describe("ServerOnly visibility leak", function()

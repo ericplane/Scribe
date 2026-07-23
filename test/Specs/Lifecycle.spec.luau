@@ -109,7 +109,7 @@ return function()
 		end)
 		harness.Leave(player)
 		task.wait() -- signal handlers run on their own threads
-		expect(seenReason).to.equal("left")
+		expect(seenReason).to.equal("player-left")
 		expect(harness.Ctx.Persistence.GetState(player)).to.equal("SessionEnded")
 	end)
 

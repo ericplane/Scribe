@@ -42,6 +42,10 @@ A plain value (`Wins = 0`, `Settings = { ... }`) is the simplest way to declare 
 
 Don't conflate the three things a declarator carries: the **default value**, the **Luau type** (what your code sees), and the **runtime metadata** (validation/packing). A plain `0` gives you a number field with no bounds; `Scribe.Int(0, { Min = 0 })` gives you a non-negative integer field that clamps.
 
+:::note Root field names the client reserves
+On the client you read data as `Data.Coins`, so a **root** field sharing a name with a client method is unreachable that way (the method wins). The names to avoid are `Owns`, `Request`, `Mock`, and `Raw`; the rest of the client surface is `Verb...` or `On...` shaped (`GetPurchases`, `WaitForData`, `OnSharedChanged`), which no data field is likely to collide with. Scribe logs `API_NAME_COLLISION` at startup if it happens, on live servers as well as in Studio. This applies to root fields only: nested fields are reached through their parent and never collide.
+:::
+
 Declaring an absent field as `nil :: string?` looks like it works, but a `nil` value puts no key in the table literal at all, so the compiler never sees the field: it gets no type metadata, no bounds, and no packing. Use [`Scribe.Optional`](/api/Scribe#optional) instead.
 
 ## Dynamic (per-profile) defaults
@@ -207,7 +211,7 @@ data.PlacedFurniture.RemoveValue(item)  -- removes index 2
 
 **Remove entries with `Remove`.** `data.Plots[2].Set(nil)` is refused except on the last entry, since a hole would split `#arr` from `Count()`.
 
-**Method names are reserved.** A field named `Count`, `Get`, `Set`, `Insert`, and so on is shadowed by the accessor method and unreachable through the typed API. Dev mode logs `API_NAME_COLLISION` naming it.
+**Method names are reserved.** A field named `Count`, `Get`, `Set`, `Insert`, and so on is shadowed by the accessor method and unreachable through the typed API. Scribe logs `API_NAME_COLLISION` naming it.
 
 ### Untyped containers
 

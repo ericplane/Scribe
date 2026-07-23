@@ -108,11 +108,23 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@server
 		@yields
 		@param player Player
-		@return (Value?, string?)
+		@return (Value?, LifecycleReason?)
 		Yields until the player's profile is Ready, then returns their accessor
-		tree. On failure returns `(nil, reason)` where reason is `"load-failed"`,
-		`"timeout"`, or `"session-end"`. Always handle the `nil` branch. This is
-		the safe way to get data in `Players.PlayerAdded`.
+		tree. On failure returns `(nil, reason)`. Always handle the `nil` branch.
+		This is the safe way to get data in `Players.PlayerAdded`.
+
+		`reason` is one of six values, exported as the `Scribe.LifecycleReason`
+		type and the `Scribe.Reason` table so you can branch on them without
+		guessing at spellings:
+
+		| Reason | Meaning |
+		| --- | --- |
+		| `player-left` | The player left. By far the most common. |
+		| `timeout` | The wait elapsed before the profile reached Ready. |
+		| `load-failed` | The profile could not be loaded. |
+		| `migration-failed` | A migration errored, so the profile was released unmigrated. |
+		| `session-ended` | The session ended while the player was still in game. |
+		| `shutdown` | The server is closing. |
 	]=]
 	function Data.WaitForData(player: Player)
 		return ctx.Persistence.WaitForData(player)
@@ -389,6 +401,38 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	function Data.HandleReceipt(receiptInfo: any)
 		return ctx.Monetization.HandleReceipt(receiptInfo)
 	end
+
+	--[=[
+		@within Server
+		@tag Monetization
+		@server
+		@param receiptInfo table
+		@return Enum.ProductPurchaseDecision?
+		Like [Server.HandleReceipt], but returns `nil` for a product Scribe does
+		not know, so your own `ProcessReceipt` can fall through to its own
+		handling. Use this one when you route **every** receipt through Scribe:
+
+		```lua
+		MarketplaceService.ProcessReceipt = function(receiptInfo)
+		    local decision = Data.TryHandleReceipt(receiptInfo)
+		    if decision then
+		        return decision -- a Scribe product; already granted and saved
+		    end
+		    return myOwnHandler(receiptInfo)
+		end
+		```
+
+		`HandleReceipt` answers `NotProcessedYet` for an unknown product, which is
+		correct when Scribe owns `ProcessReceipt` (an unregistered product is a
+		config mistake, and retrying is what stops Robux being eaten). Routed
+		through an external handler, that same answer would stall **your** product
+		in a permanent retry loop, which is why this variant exists. It also logs
+		nothing for an unknown product, since there it is normal rather than a
+		misconfiguration.
+	]=]
+	function Data.TryHandleReceipt(receiptInfo: any)
+		return ctx.Monetization.TryHandleReceipt(receiptInfo)
+	end
 	--[=[
 		@within Server
 		@tag Monetization
@@ -511,10 +555,14 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@tag Monetization
 		@server
 		@param player Player
-		@param filter { Kind: ("Robux" | "InGame")?, Category: string?, ItemId: string?, Since: number?, Limit: number? }?
+		@param filter PurchaseFilter?
 		@return { table }
 		The player's purchase history (Robux receipts and in-game purchases),
 		newest first, optionally filtered.
+
+		`PurchaseFilter` is `{ Kind: ("Robux" | "InGame")?, Category: string?,
+		ItemId: string?, Since: number?, Limit: number? }`, exported as
+		`Scribe.PurchaseFilter`.
 	]=]
 	function Data.GetPurchases(player: Player, filter: any?)
 		return ctx.Monetization.GetPurchases(player, filter)

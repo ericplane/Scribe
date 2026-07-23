@@ -10,11 +10,12 @@ A handful of options let you play-test without touching (or corrupting) live dat
 
 | Option | Effect |
 | --- | --- |
-| `UseMock = true` | Full in-memory mock store: profiles AND leaderboards. Nothing is read from or written to real DataStores; every profile loads as fresh template defaults. |
-| `DontSave = true` | Same as `UseMock` for profiles: a full in-memory mock. It does **not** load real data -- to inspect real profiles without writing, use `ViewedUserId`. |
+| `Mode = "Mock"` | Full in-memory mock store: profiles AND leaderboards. Nothing is read from or written to real DataStores; every profile loads as fresh template defaults. |
+| `Mode = "NoSave"` | Load the REAL profile as a snapshot and never save it. This is the option for validating real data safely. Add `TargetUserId = <id>` to inspect one specific player. |
 | `ResetData = true` | **Destructive**: every profile loads as template defaults. Development only. |
-| `ViewedUserId = <id>` | Load that user's REAL profile read-only (never saves). This is the option for validating real data safely. |
 | `Banner = false` | Silence the one-line load banner. |
+
+The older `UseMock` / `DontSave` / `ViewedUserId` flags still work and map onto these modes; see [configuration](./configuration#persistence-mode).
 
 ## Edit mode & storybooks
 

@@ -2,6 +2,11 @@
    Scribe docs — navy + mint, layered surfaces, gold-class polish
    ============================================================================ */
 :root {
+  /* Mirrors Material's own `.md-typeset pre>code` horizontal padding. Kept as a
+     token because the API-signature hanging indent has to add to it, and a
+     mismatch here shows up as signatures misaligned against every other code
+     block. Re-check it if Material's stylesheet changes. */
+  --scribe-code-pad-x: 1.1764705882em;
   --scribe-green: #34d399;
   --scribe-green-light: #6ee7b7;
   --scribe-green-dark: #2ea87a;
@@ -276,4 +281,24 @@
 }
 .md-typeset .grid.cards > ul > li:hover {
   border-color: var(--scribe-green-dark);
+}
+
+/* ===================== API signatures ===================== */
+/* The signature is the most important line on an API page, and the longest run
+   past 150 characters, so behind a horizontal scrollbar you cannot read the one
+   thing you came for. Let signatures SOFT-WRAP at the commas they already have,
+   with a hanging indent so continuation lines read as continuations. Only
+   `.api-signature` blocks are affected: guide code examples keep horizontal
+   scrolling, because wrapping real Lua would mangle it. */
+.md-typeset .api-signature pre {
+  overflow-x: auto; /* still scrolls if a single token really is too wide */
+}
+.md-typeset .api-signature code {
+  white-space: pre-wrap;
+  /* Hanging indent, ADDED to Material's own left padding rather than replacing
+     it. Replacing it makes the first line sit flush against the box edge, so
+     every signature loses the gutter that every other code block has, which is
+     visible on the ~90% of signatures that never wrap at all. */
+  padding-left: calc(var(--scribe-code-pad-x) + 1.5em);
+  text-indent: -1.5em;
 }

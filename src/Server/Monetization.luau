@@ -1121,13 +1121,24 @@ function Monetization.new(ctx: any)
 		return NOT_PROCESSED
 	end
 
-	function self.HandleReceipt(receiptInfo: any): Enum.ProductPurchaseDecision
+	-- Shared receipt path. `strict` decides what an UNREGISTERED product means:
+	--  * true  (Scribe owns ProcessReceipt): there is no other handler, so an
+	--    unknown product is a configuration mistake. Log it and return
+	--    NotProcessedYet, so Roblox retries and the Robux are never eaten.
+	--  * false (an external router owns ProcessReceipt): an unknown product is
+	--    simply not ours. Return nil with no log so the caller falls through to
+	--    its own handler; answering NotProcessedYet there would stall the
+	--    caller's own purchase in a permanent retry loop.
+	local function handleReceipt(receiptInfo: any, strict: boolean): Enum.ProductPurchaseDecision?
 		local userId = tonumber(receiptInfo.PlayerId) or 0
 		local productId = tonumber(receiptInfo.ProductId) or 0
 		local product = productsById[productId]
-		Metrics.Add("ReceiptsReceived")
 
 		if not product then
+			if not strict then
+				return nil
+			end
+			Metrics.Add("ReceiptsReceived")
 			Log.Error(
 				"Monetization",
 				"RECEIPT_UNKNOWN_PRODUCT",
@@ -1139,6 +1150,7 @@ function Monetization.new(ctx: any)
 			)
 			return NOT_PROCESSED
 		end
+		Metrics.Add("ReceiptsReceived")
 
 		local entry = ctx.Persistence.EntryForUserId(userId)
 		if entry and entry.State == "Ready" and isProcessed(entry, tostring(receiptInfo.PurchaseId)) then
@@ -1166,6 +1178,14 @@ function Monetization.new(ctx: any)
 			return handleOnlineReceipt(entry, product, receiptInfo)
 		end
 		return handleOfflineReceipt(userId, product, receiptInfo)
+	end
+
+	function self.HandleReceipt(receiptInfo: any): Enum.ProductPurchaseDecision
+		return handleReceipt(receiptInfo, true) :: Enum.ProductPurchaseDecision
+	end
+
+	function self.TryHandleReceipt(receiptInfo: any): Enum.ProductPurchaseDecision?
+		return handleReceipt(receiptInfo, false)
 	end
 
 	-- Gifting flow --------------------------------------------------------------------

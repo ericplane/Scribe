@@ -139,6 +139,13 @@ local function serverUsage(player: Player)
 		return true
 	end)
 
+	-- The lifecycle reason is a typed union, not a bare string.
+	local _tree, waitReason = Data.WaitForData(player)
+	local lifecycleReason: Scribe.LifecycleReason? = waitReason
+	if lifecycleReason == Scribe.Reason.PlayerLeft then
+		lifecycleReason = nil
+	end
+
 	local owns: boolean = Data.Owns(player, "VIP")
 	local ownsAsync: boolean = Data.OwnsAsync(player, "VIP")
 	local ok, err = Data.PromptGift(player, "GiftVIP", 12345)
@@ -179,6 +186,7 @@ local function serverUsage(player: Player)
 		coinDefault,
 		spawnDefault,
 		createdAt,
+		lifecycleReason,
 		placedCf,
 		note,
 		placedCount,

@@ -47,6 +47,31 @@ return function()
 		}
 	end
 
+	it("TryHandleReceipt falls through on an unknown product, HandleReceipt does not", function()
+		local harness = makeHarness({ OwnReceipts = false })
+		local _, entry, data = harness.Join(77001)
+		local uid = entry.UserId
+
+		-- An UNREGISTERED product. HandleReceipt is for the case where Scribe owns
+		-- ProcessReceipt, so an unknown product is a config error: it answers
+		-- NotProcessedYet, which makes Roblox retry rather than eat the Robux.
+		expect(harness.Data.HandleReceipt(receipt(uid, 999, "p-unknown-1"))).to.equal(NOT_PROCESSED)
+
+		-- TryHandleReceipt is for an external router, where an unknown product just
+		-- is not ours. Returning nil lets the router fall through to its own
+		-- handler; NotProcessedYet there would stall the router's own purchase in a
+		-- permanent retry loop.
+		expect(harness.Data.TryHandleReceipt(receipt(uid, 999, "p-unknown-2"))).to.equal(nil)
+
+		-- A REGISTERED product behaves identically through both entry points.
+		expect(harness.Data.TryHandleReceipt(receipt(uid, 111, "p-known-1"))).to.equal(GRANTED)
+		expect(data.Coins.Get()).to.equal(1000)
+		expect(harness.Data.HandleReceipt(receipt(uid, 111, "p-known-2"))).to.equal(GRANTED)
+		expect(data.Coins.Get()).to.equal(2000)
+
+		harness.Cleanup()
+	end)
+
 	it("grants, logs, dedupes, and auto-flushes a consumable purchase", function()
 		local harness = makeHarness()
 		local player, entry, data = harness.Join()

@@ -227,11 +227,24 @@ function FakeProfileStore.new()
 				return nil
 			end
 
-			local view = {} :: any
-			view.Key = profileKey
+			-- Real ProfileStore builds a view with Profile.New(...) then sets
+			-- view_mode = true, so a view carries every signal and method a session
+			-- profile does; only saving differs (SetAsync instead of Save, and
+			-- IsActive() is false so no save path fires). Build it the same way, or
+			-- a view-mode load (Mode = "NoSave", legacy ViewedUserId) hits a missing
+			-- member the moment it reaches finishLoad.
+			local view = newProfile(profileKey)
 			view.Data = data
 			view.KeyInfo = keyInfo
+			view.view_mode = true
 			view.Session = if fake.ActiveProfiles[key] then { PlaceId = 0, JobId = "mock" } else nil
+			function view.IsActive(_self: any): boolean
+				return false
+			end
+			function view.Save(_self: any)
+				error("Can't save profile in view mode; Should you be calling :SetAsync() instead?")
+			end
+			function view.EndSession(_self: any) end
 			function view.SetAsync(_view: any)
 				if fake.FailSaves then
 					error("mock save failure")

@@ -167,6 +167,19 @@ def slug(s): return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 
 def convert_xref(text):
+    # Doc-comments cross-reference with the Moonwave autolink form, [Class] or
+    # [Class.member]. The guide-style `](/api/Server#WaitForData)` is NOT rewritten
+    # here (that is convert_guide's job), so it would ship as a site-absolute path
+    # that resolves nowhere, and with the wrong anchor case besides. mkdocs only
+    # mentions it at INFO level, so catch it here instead.
+    bad = re.search(r"\]\((/api/[^)]*)\)", text)
+    if bad:
+        raise SystemExit(
+            f"[docgen] doc-comment contains the guide-style link {bad.group(1)}, which is not rewritten in "
+            f"doc-comments and would ship as a dead absolute path.\n"
+            f"          Use the Moonwave autolink form instead, e.g. [Server.WaitForData]."
+        )
+
     # [Class.member] / [Class] Moonwave autolinks -> Material links
     def repl(m):
         cls, _, mem = m.group(1).partition(".")
@@ -220,10 +233,36 @@ def md(text):
 def signature(e, cls):
     if e["kind"] == "prop":
         return f'{cls}.{e["name"]}: {e["ptype"]}'
-    ps = ", ".join(p.replace(" ", ": ", 1) for p in e["params"])
+    # A @param may carry a trailing `-- note` for the reader. It must not reach the
+    # signature: inside a ```lua fence `--` comments out the REST of the line, so
+    # every parameter after it renders as a grey comment and the signature reads as
+    # something that would not even parse. Strip it here; the prose belongs in the
+    # description, not in the signature line.
+    def strip_note(param):
+        return re.split(r"\s+--\s", param, maxsplit=1)[0].rstrip()
+
+    ps = ", ".join(strip_note(p).replace(" ", ": ", 1) for p in e["params"])
+    # Signatures render in a ```lua block, and Pygments' Lua lexer desyncs on a
+    # quoted literal inside the PARAMETER list: it emits Error for the opening
+    # quote, then reads the closing one as an opening quote, so the last quote
+    # starts a string that swallows the rest of the line (it renders as one wall
+    # of string colour). Quotes in the RETURN type are fine, since the lexer is
+    # past the parameter context by then. Name the exported type instead of
+    # inlining a shape with string literals, e.g. `@param filter PurchaseFilter?`.
+    if '"' in ps:
+        raise SystemExit(
+            f'[docgen] {cls}.{e["name"]}: a @param type contains a string literal, which breaks '
+            f"Lua syntax highlighting for the whole signature. Reference the exported type by "
+            f"name instead.\n          {ps}"
+        )
     sig = f'{cls}.{e["name"]}({ps})'
     if e["returns"]:
-        sig += " → " + " ".join(e["returns"])
+        sig += " → " + " ".join(" ".join(strip_note(r).split()) for r in e["returns"])
+    if "--" in sig:
+        raise SystemExit(
+            f'[docgen] {cls}.{e["name"]}: signature still contains "--", which comments out the rest '
+            f"of the line in the rendered lua block.\n          {sig}"
+        )
     return sig
 
 
@@ -236,7 +275,9 @@ def render_member(e, cls):
         pills = "".join(f'<span class="badge badge--{b}">{b}</span>' for b in raw)
         out.append(f'<div class="badges">{pills}</div>')
         out.append("")
-    out.append("```lua")
+    # Tagged so extra.css can let ONLY signatures wrap. Guide code examples keep
+    # horizontal scrolling, where wrapping would mangle real Lua.
+    out.append("``` { .lua .api-signature }")
     out.append(signature(e, cls))
     out.append("```")
     out.append("")
@@ -296,7 +337,32 @@ def render_class(name, data):
     return "\n".join(out)
 
 
-def convert_guide(text):
+def check_grid_cards(text, source):
+    # A Material "grid cards" card is a list item, so every line of its body must
+    # stay indented under it. Lose the indent on one line and that card ends
+    # early: the rest of its body renders as page text outside the grid, and the
+    # following indented link becomes a code block. It still builds, so nothing
+    # catches it but a human looking at the page.
+    ingrid = False
+    for n, line in enumerate(text.split("\n"), 1):
+        if "grid cards" in line:
+            ingrid = True
+            continue
+        if not ingrid or not line.strip():
+            continue
+        if line.startswith("-   ") or line.startswith("    "):
+            continue
+        if line.startswith("</div>"):
+            ingrid = False
+            continue
+        raise SystemExit(
+            f"[docgen] {source}:{n}: line is inside a `grid cards` list but is not indented, so it "
+            f"breaks out of its card.\n          Indent it 4 spaces:\n          {line[:90]}"
+        )
+
+
+def convert_guide(text, source="guide"):
+    check_grid_cards(text, source)
     text = re.sub(r"^---\n.*?\n---\n", "", text, flags=re.S)  # strip frontmatter
     text = convert_admonitions(text)
     text = re.sub(r"\]\(\./([\w-]+)(#[\w-]+)?\)", lambda m: f"]({m.group(1)}.md{m.group(2) or ''})", text)
@@ -335,13 +401,20 @@ def main():
     guides = sorted(DOCS.glob("*.md"))
     for path in guides:
         name = "getting-started.md" if path.stem == "intro" else path.name
-        (OUT / name).write_text(convert_guide(path.read_text(encoding="utf-8")), encoding="utf-8")
+        (OUT / name).write_text(
+            convert_guide(path.read_text(encoding="utf-8"), f"guides/{path.name}"), encoding="utf-8"
+        )
     print(f"[docgen] guides: {len(guides)} converted")
 
     # the landing page keeps its Material syntax and frontmatter; it is the home page
     home = HERE / "home.md"
     if home.exists():
-        (OUT / "index.md").write_text(home.read_text(encoding="utf-8").replace("{{version}}", VERSION), encoding="utf-8")
+        home_text = home.read_text(encoding="utf-8")
+        # home.md is copied verbatim rather than run through convert_guide, so it
+        # needs the grid check applied explicitly. It is also the file most likely
+        # to have one: it is the only page built entirely out of cards.
+        check_grid_cards(home_text, "home.md")
+        (OUT / "index.md").write_text(home_text.replace("{{version}}", VERSION), encoding="utf-8")
         print("[docgen] home: home.md -> index.md")
 
     copy_theme()

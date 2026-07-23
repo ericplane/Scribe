@@ -43,6 +43,7 @@ export type LogCode =
 	| "EXPORT_ENCODE_FAIL"
 	| "MIGRATED"
 	| "MIGRATION_FAIL"
+	| "MODE_OVERRIDES_LEGACY"
 	| "OFFLINE_READ_FAIL"
 	| "PROFILE_ERASED"
 	| "PROFILE_LOADED"
@@ -56,6 +57,7 @@ export type LogCode =
 	| "PROFILE_UNPERSISTABLE"
 	| "PROFILE_VERSION_AHEAD"
 	| "SAVE_INTERVAL_CLAMPED"
+	| "SAVE_INTERVAL_CONFLICT"
 	| "SAVE_INTERVAL_FAIL"
 	| "SAVE_INTERVAL_SET"
 	| "SHUTDOWN_DONE"
@@ -166,6 +168,18 @@ export type LogEntry = {
 export type Status = "Healthy" | "Degraded" | "Outage"
 
 export type SessionState = "Loading" | "Ready" | "SessionEnded"
+
+-- Why a data session ended, or why waiting for data did not produce a tree. One
+-- value per state, so a caller can branch exhaustively: `WaitForData`'s second
+-- return, the `SessionEnded` signal, and `GetState`'s stored reason all use this
+-- exact set.
+export type LifecycleReason =
+	"load-failed" -- the profile could not be loaded (DataStore failure, or the session could not be acquired)
+	| "migration-failed" -- a migration step errored, so the profile was released unmigrated (fail-closed)
+	| "session-ended" -- the session ended while the player was still in the game (usually stolen by another server)
+	| "player-left" -- the player left; the most common reason by far
+	| "shutdown" -- the server is closing
+	| "timeout" -- the wait elapsed before the profile reached Ready
 
 export type SaveInfo = {
 	LastSaveAt: number?,

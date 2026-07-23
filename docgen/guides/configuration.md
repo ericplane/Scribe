@@ -6,6 +6,45 @@ sidebar_position: 5
 
 Everything you can pass to `Scribe({ … })`. `Template`, `ProfileStoreIndex`, and `ProfileKeyPrefix` are required; every other option is optional with a sensible default. The whole table is typed as `ScribeOptions<T>`, so your editor autocompletes the field names and flags a wrong type. It does **not** flag a misspelled key, because Luau does not reject unknown table keys, so a typo is silently ignored. Scribe warns about one at startup in Studio (`UNKNOWN_OPTION`); on a live server it passes unnoticed, so check the output once after editing your options.
 
+## Persistence mode
+
+`Mode` is one value that says where data comes from, whether a session is held, and whether anything saves. It defaults to `"Live"`.
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix = "PLAYER_",
+    Mode = "Live",
+})
+```
+
+| Mode | Reads | Session | Saves |
+| --- | --- | --- | --- |
+| `Live` (default) | The real profile | Exclusive | Yes |
+| `Mock` | ProfileStore's in-memory mock | Mock | To the mock only |
+| `NoSave` | A snapshot of the real profile | None | Never |
+
+`TargetUserId` pairs with any mode and loads that user's profile instead of the joining player's. `Mode = "NoSave", TargetUserId = 123` is the safe way to inspect a real profile: you see genuine stored data and nothing can write it back.
+
+`Mode` **replaces** the older `UseMock`, `DontSave`, `ViewedUserId`, and `OverriddenUserId` flags. Those still work when `Mode` is absent, so no existing config changes; set `Mode` and they are ignored with a `MODE_OVERRIDES_LEGACY` warning at startup. The equivalents:
+
+| Legacy | Mode |
+| --- | --- |
+| `UseMock = true` or `DontSave = true` | `Mode = "Mock"` |
+| `ViewedUserId = id` | `Mode = "NoSave", TargetUserId = id` |
+| `OverriddenUserId = id` | `Mode = "Live", TargetUserId = id` |
+
+## Process-wide settings
+
+A few settings belong to the whole game rather than to one bundle, because they configure ProfileStore itself. Set them once, before constructing any bundle:
+
+```lua
+Scribe.Configure({ AutoSaveInterval = 60 })
+```
+
+`AutoSaveInterval` is the autosave cadence. The per-bundle `SaveInterval` option still works and still wins where it is set, but ProfileStore's `AUTO_SAVE_PERIOD` is a module-wide constant: it applies to every Scribe bundle and to any direct ProfileStore use in the same game. If two bundles ask for different cadences, only one can win (the later one) and Scribe logs `SAVE_INTERVAL_CONFLICT`. Values under 15 seconds clamp up, since Roblox throttles per-key writes to about one per 6 seconds.
+
 For the day-one essentials and a runnable example, see the [quick start](./intro). The feature guides go deeper on the options they use (monetization, leaderboards, testing, and so on); this page is the complete list in one place.
 
 ## Core
@@ -26,10 +65,10 @@ For the day-one essentials and a runnable example, see the [quick start](./intro
 | `ProfileKeyPrefix` **(required)** | `string` | Required, no default | A per-player key prefix (for example "PLAYER_") that is concatenated with the user id to form each profile key. It is required and errors if missing or empty; change it only when you deliberately want a fresh, isolated key namespace. |
 | `SaveInterval` | `number?` | 300 (ProfileStore's autosave period is left unchanged; values below 15 are clamped to 15) | Seconds between automatic profile saves. Set it to lose less progress on an unclean exit; note it configures ProfileStore's global AUTO_SAVE_PERIOD so it affects every bundle, must be a positive number, and is clamped up to the 15s floor because of DataStore write throttling. |
 | `ProfileStore` | `any?` | Auto-discovered (Scribe locates the ProfileStore package in the usual Wally/Packages folders) | An explicit ProfileStore module, given as the module table itself or as a ModuleScript instance to require. Provide it when Scribe can't auto-find the package or you want to inject a specific build; otherwise it searches the common package roots and errors if none is found. |
-| `UseMock` | `boolean?` | off (uses the real DataStore-backed store) | When true, routes all reads and writes through ProfileStore's in-memory Mock store so nothing touches live DataStores. Turn it on for tests and local experiments where you don't want to persist real data. |
-| `ViewedUserId` | `number?` | nil (each player loads their own live profile with a normal session) | Loads another user's stored profile read-only via GetAsync instead of starting a session, and never saves. Set it for inspection or testing to view a specific player's data; if that profile isn't found the entry tears down. |
-| `OverriddenUserId` | `number?` | nil (uses the joining player's real UserId) | Forces every joining player to load and save under this user id instead of their own. Useful in testing to pin all sessions to one known key; leave it unset in production so each player uses their real id. |
-| `DontSave` | `boolean?` | off (writes persist normally) | When true, swaps in ProfileStore's Mock store just like UseMock so changes are held in memory and never written back to DataStores. Enable it when you want a normal session but with all persistence suppressed. |
+| `UseMock` | `boolean?` | off (uses the real DataStore-backed store) | **Superseded by `Mode = "Mock"`.** When true, routes all reads and writes through ProfileStore's in-memory Mock store so nothing touches live DataStores. Turn it on for tests and local experiments where you don't want to persist real data. |
+| `ViewedUserId` | `number?` | nil (each player loads their own live profile with a normal session) | **Superseded by `Mode = "NoSave", TargetUserId = id`.** Loads another user's stored profile read-only via GetAsync instead of starting a session, and never saves. Set it for inspection or testing to view a specific player's data; if that profile isn't found the entry tears down. |
+| `OverriddenUserId` | `number?` | nil (uses the joining player's real UserId) | **Superseded by `Mode = "Live", TargetUserId = id`.** Forces every joining player to load and save under this user id instead of their own. Useful in testing to pin all sessions to one known key; leave it unset in production so each player uses their real id. |
+| `DontSave` | `boolean?` | off (writes persist normally) | **Superseded by `Mode = "Mock"`.** When true, swaps in ProfileStore's Mock store just like UseMock so changes are held in memory and never written back to DataStores. Enable it when you want a normal session but with all persistence suppressed. |
 | `ResetData` | `boolean?` | off (existing saved data is loaded as-is) | When true, wipes each loaded profile back to the template's persistent defaults on load and logs a reset warning. Use it deliberately to clear saved progress; leave it off so returning players keep their data. |
 | `LoadFailurePolicy` | `("Kick" \| "Wait")?` | "Kick" | What to do when a player's profile repeatedly fails to load. "Kick" removes the player with the load-failure message, while "Wait" keeps them in a loading state and retries with backoff rather than ever falling back to template data. |
 | `VersionAheadPolicy` | `("Kick" \| "Allow")?` | "Kick" | How to handle a stored profile whose migration version is newer than this server's code (a staged-deploy hazard). "Kick" fails closed and refuses the session, while "Allow" runs the older code against the newer data and only logs a warning. |
