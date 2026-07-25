@@ -406,6 +406,7 @@ export type function ServerDataType(T, P)
 
 	local flushOptsProps: { [type]: type } = {}
 	flushOptsProps[ts.singleton("Force")] = optional(ts.boolean)
+	flushOptsProps[ts.singleton("Timeout")] = optional(ts.number)
 	local flushOpts = optional(ts.newtable(flushOptsProps, nil, nil))
 
 	-- Keep in sync with Types.LifecycleReason. Spelled out here because a type
@@ -425,7 +426,7 @@ export type function ServerDataType(T, P)
 	end
 
 	add("Get", fn({ P }, { node }))
-	add("WaitForData", fn({ P }, { optional(node), optional(reasonUnion) }))
+	add("WaitForData", fn({ P, optional(ts.number) }, { optional(node), optional(reasonUnion) }))
 	add(
 		"GetState",
 		fn({ P }, { ts.unionof(ts.singleton("Loading"), ts.singleton("Ready"), ts.singleton("SessionEnded")) })

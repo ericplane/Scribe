@@ -132,6 +132,50 @@ return function()
 		expect(data.Coins.Get()).to.equal(0)
 	end)
 
+	it("Data.WaitForData with a timeout still returns immediately when Ready", function()
+		local player = harness.Join()
+		local data, reason = harness.Data.WaitForData(player, 0.05)
+		expect(data).to.be.ok()
+		expect(reason).to.equal(nil)
+	end)
+
+	it("WaitForData honors its timeout for a player with no session", function()
+		local FakePlayer = require(Root.Test.Helpers.FakePlayer)
+		local player = FakePlayer.new() -- never passed to OnPlayerAdded: no entry
+		local startedAt = os.clock()
+		local data, reason = harness.Ctx.Persistence.WaitForData(player, 0.25)
+		expect(data).to.equal(nil)
+		expect(reason).to.equal("timeout")
+		expect(os.clock() - startedAt < 5).to.equal(true)
+	end)
+
+	it("WaitForData honors its timeout while an entry is stuck Loading (Wait policy)", function()
+		local waitHarness = TestCtx.make({ Options = { LoadFailurePolicy = "Wait" } })
+		waitHarness.Fake.FailNextLoad = true
+		local FakePlayer = require(Root.Test.Helpers.FakePlayer)
+		local player = FakePlayer.new()
+		waitHarness.Ctx.Persistence.OnPlayerAdded(player)
+		-- The failed first attempt parks the loader in a retry backoff: the entry
+		-- sits in Loading with no state transition to wake a waiter, so only the
+		-- timeout can end the wait.
+		expect(waitHarness.Ctx.Persistence.GetState(player)).to.equal("Loading")
+		local startedAt = os.clock()
+		local data, reason = waitHarness.Ctx.Persistence.WaitForData(player, 0.25)
+		expect(data).to.equal(nil)
+		expect(reason).to.equal("timeout")
+		expect(os.clock() - startedAt < 5).to.equal(true)
+		FakePlayer.leave(player) -- the retry tears the entry down when it wakes
+	end)
+
+	it("Flush honors a custom Timeout when the save never confirms", function()
+		local player, entry = harness.Join()
+		-- A save that neither confirms nor errors: AwaitSave can only time out.
+		entry.Profile.Save = function() end
+		local startedAt = os.clock()
+		expect(harness.Data.Flush(player, { Timeout = 0.2 })).to.equal(false)
+		expect(os.clock() - startedAt < 5).to.equal(true)
+	end)
+
 	it("rejects non-persistable value types at the write site", function()
 		local _, _, data = harness.Join()
 		expect(function()
