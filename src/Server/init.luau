@@ -108,10 +108,12 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@server
 		@yields
 		@param player Player
+		@param timeout number?
 		@return (Value?, LifecycleReason?)
 		Yields until the player's profile is Ready, then returns their accessor
-		tree. On failure returns `(nil, reason)`. Always handle the `nil` branch.
-		This is the safe way to get data in `Players.PlayerAdded`.
+		tree, waiting up to `timeout` seconds (default 60). On failure returns
+		`(nil, reason)`. Always handle the `nil` branch. This is the safe way to
+		get data in `Players.PlayerAdded`.
 
 		`reason` is one of six values, exported as the `Scribe.LifecycleReason`
 		type and the `Scribe.Reason` table so you can branch on them without
@@ -126,8 +128,8 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		| `session-ended` | The session ended while the player was still in game. |
 		| `shutdown` | The server is closing. |
 	]=]
-	function Data.WaitForData(player: Player)
-		return ctx.Persistence.WaitForData(player)
+	function Data.WaitForData(player: Player, timeout: number?)
+		return ctx.Persistence.WaitForData(player, timeout)
 	end
 	--[=[
 		@within Server
@@ -193,13 +195,15 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@server
 		@yields
 		@param player Player
-		@param opts { Force: boolean? }?
+		@param opts { Force: boolean?, Timeout: number? }?
 		@return boolean
 		Forces a save now instead of waiting for the next autosave. Call it right
 		after a grant or purchase. `Force = true` also pushes through a blocked
-		wipe-guard save.
+		wipe-guard save. `Timeout` bounds the wait for save confirmation in
+		seconds (default 15); on timeout Flush returns `false`, though the save
+		may still complete afterwards.
 	]=]
-	function Data.Flush(player: Player, opts: { Force: boolean? }?)
+	function Data.Flush(player: Player, opts: { Force: boolean?, Timeout: number? }?)
 		return ctx.Persistence.Flush(player, opts)
 	end
 	--[=[

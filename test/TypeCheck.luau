@@ -140,12 +140,13 @@ local function serverUsage(player: Player)
 	end)
 
 	-- The lifecycle reason is a typed union, not a bare string.
-	local _tree, waitReason = Data.WaitForData(player)
+	local _tree, waitReason = Data.WaitForData(player, 30)
 	local lifecycleReason: Scribe.LifecycleReason? = waitReason
 	if lifecycleReason == Scribe.Reason.PlayerLeft then
 		lifecycleReason = nil
 	end
 
+	local _flushed: boolean = Data.Flush(player, { Force = true, Timeout = 5 })
 	local owns: boolean = Data.Owns(player, "VIP")
 	local ownsAsync: boolean = Data.OwnsAsync(player, "VIP")
 	local ok, err = Data.PromptGift(player, "GiftVIP", 12345)

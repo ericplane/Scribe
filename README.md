@@ -39,7 +39,7 @@ return Scribe({
 local Data = require(game:GetService("ReplicatedStorage").Shared.Data).Server
 
 game:GetService("Players").PlayerAdded:Connect(function(player)
-    local data = Data.WaitForData(player) -- yields until Ready (or ~60s timeout)
+    local data = Data.WaitForData(player) -- yields until Ready (default 60s timeout)
     if data then
         data.Coins.Increment(50)
     end
