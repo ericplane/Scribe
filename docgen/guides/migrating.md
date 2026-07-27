@@ -14,7 +14,7 @@ This page is about bringing an **existing game's data into Scribe**. It is _not_
 
 Scribe sits directly on ProfileStore, so a game already using ProfileStore adopts Scribe **in place** with no data copy and no conversion. Point Scribe at the same store and your existing profiles load exactly as they are:
 
-1. Set `ProfileStoreIndex` and `ProfileKeyPrefix` to match your current store name and key prefix.
+1. Set `ProfileStoreIndex` and `ProfileKeyPrefix` to match your current store name and key prefix. If your keys were the bare user id with no prefix at all, set `ProfileKeyPrefix = ""`.
 2. Existing profiles load unchanged. `Data` is the template root, and the ProfileStore envelope (session metadata, `UserIds`, `GlobalUpdates`) is untouched.
 3. New template fields fill in on load; `Migrations` reshape anything whose structure changed.
 
@@ -22,11 +22,27 @@ Scribe sits directly on ProfileStore, so a game already using ProfileStore adopt
 return Scribe({
     Template = template,
     ProfileStoreIndex = "PlayerData", -- your existing store name
-    ProfileKeyPrefix = "Player_",      -- your existing key prefix
+    ProfileKeyPrefix = "Player_",      -- your existing key prefix ("" if there was none)
 })
 ```
 
+The prefix must match your existing keys exactly, because it is concatenated with the user id to form the key. Point Scribe at `"Player_"` when your stored keys are bare user ids and every player loads a blank profile, since `Player_123` is simply a different key from `123`.
+
+:::danger Never build the ProfileStore envelope yourself
+Do not copy old data in by writing DataStore values directly, for example `SetAsync(key, { Data = old, MetaData = {}, GlobalUpdates = {0, {} } })`. ProfileStore treats any value whose `Data`, `MetaData` and `GlobalUpdates` are all tables as a real profile and leaves that `MetaData` untouched, so the fields it would otherwise fill in are never added. Missing `MetaData.SessionLoadCount` is the one that bites: the next load throws `attempt to perform arithmetic (add) on nil and number` from `EditProfile`.
+
+**The key does not heal itself.** The error is raised inside the DataStore transform, so nothing is ever written back, every retry reads the same broken value, and the player is stuck in a join loop. Scribe reports this as a `PROFILE_STORE_ERROR` with an opaque message, because Roblox traps transform errors before ProfileStore can see them.
+
+Neither `UpdateOffline` nor `RestoreVersion` can repair such a key. Both write through a path that never sets `SessionLoadCount`, so they report success and the key still fails on the next join. Use [`Erase(userId)`](/api/Server#Erase), which deletes the key outright so the next join builds a correct profile, and re-import from your old store. Let ProfileStore create the profile and write your old data into `Data` afterwards, or adopt the existing keys in place as above.
+:::
+
 Your template's field names must match the keys already in the stored data (or a migration bridges the difference). **Validate against real data first** with `ViewedUserId` (loads that user's real profile read-only, never writes) before you point a live game at it. Note that `DontSave = true` is NOT a dry-run against real data: it swaps in a full in-memory mock store, so every profile loads as blank template defaults and validates nothing about your stored shapes.
+
+A `ViewedUserId` dry-run checks your **template** against real stored data, not the **envelope** around it. It reads through `GetAsync`, which skips the session-start code that a normal join runs, so a malformed envelope like the one above reads back perfectly clean and only fails once a real player joins. A clean dry-run means your field names and shapes line up; it is not evidence that the profiles are loadable.
+
+:::caution Adopting in place while you already have `Migrations`
+Scribe stores its migration version under the reserved `_Scribe` root. Data written before you adopted Scribe has no such key, so it reads as **version 1** and every migration step from 2 upward then runs against your pre-Scribe shape on first load. Migration failure is fail-closed, so a step that throws kicks the player rather than loading them with half-migrated data. If you adopt in place while already carrying a `Migrations` table, make sure step 2 tolerates legacy input, or bridge the old shape in step 1 first.
+:::
 
 :::note Adding a field to a container element later
 Add a field to an existing [`Scribe.ArrayOf` or `Scribe.DictOf`](./templates#typed-containers) element shape and Scribe fills it into every stored entry on load, just as it fills a new top-level field. This runs **after** your `Migrations`, so a rename migration still sees the old entry before any default lands. `Scribe.Optional` fields have no default, so they stay absent.

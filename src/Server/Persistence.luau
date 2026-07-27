@@ -118,8 +118,13 @@ function Persistence.new(ctx: any)
 	if type(storeIndex) ~= "string" or storeIndex == "" then
 		error("Scribe: ProfileStoreIndex is required — name your game's DataStore explicitly", 0)
 	end
-	if type(options.ProfileKeyPrefix) ~= "string" or options.ProfileKeyPrefix == "" then
-		error('Scribe: ProfileKeyPrefix is required — set a per-player key prefix (e.g. "PLAYER_")', 0)
+	-- "" is allowed and means bare user-id keys (see the Scribe() guard); only an
+	-- absent or non-string prefix is an error.
+	if type(options.ProfileKeyPrefix) ~= "string" then
+		error(
+			'Scribe: ProfileKeyPrefix is required — set a per-player key prefix (e.g. "PLAYER_"), or "" for bare user-id keys',
+			0
+		)
 	end
 
 	local ProfileStore = findProfileStoreModule(options.ProfileStore)
@@ -1462,6 +1467,15 @@ function Persistence.new(ctx: any)
 			local live = store:GetAsync(self.KeyFor(userId))
 			if live and live.Session then
 				error("profile has an active session on another server")
+			end
+			if not live then
+				-- No live key to restore over. Profile:SetAsync onto an empty key
+				-- throws inside ProfileStore's own transform (the save path has no
+				-- MissingProfileHandle, so MetaData stays nil and its EditProfile
+				-- indexes it), and that error is swallowed, so we would report a
+				-- successful restore for a write that never landed. Restoring after
+				-- an Erase is exactly the recovery flow that hits this.
+				error("no live profile exists for this user to restore over (was it erased?)")
 			end
 			local versionProfile = store:GetAsync(self.KeyFor(userId), versionId)
 			if not versionProfile then

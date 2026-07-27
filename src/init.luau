@@ -602,7 +602,7 @@ export type ScribeOptions<T> = {
 
 	-- persistence
 	ProfileStoreIndex: string, -- REQUIRED: the DataStore name (each game must name its own store)
-	ProfileKeyPrefix: string, -- REQUIRED: prefix for per-player keys (e.g. "PLAYER_")
+	ProfileKeyPrefix: string, -- REQUIRED: prefix for per-player keys (e.g. "PLAYER_"); "" means bare user-id keys
 	SaveInterval: number?, -- seconds between autosaves per profile (default 300, floor 15)
 	ProfileStore: any?, -- explicit ProfileStore module (module table or ModuleScript)
 	Mode: ("Live" | "Mock" | "NoSave")?, -- persistence mode (default "Live"); overrides the legacy flags below
@@ -684,7 +684,7 @@ export type Bundle<T> = {
 	@interface ScribeOptions
 	.Template T -- your data shape, built from plain values and declarators (required)
 	.ProfileStoreIndex string -- the DataStore name (required, no default)
-	.ProfileKeyPrefix string -- per-player key prefix, e.g. "PLAYER_" (required)
+	.ProfileKeyPrefix string -- per-player key prefix, e.g. "PLAYER_" (required; "" means bare user-id keys)
 	.Transport ("Default" | ScribeTransport)? -- replication channel; "Default" uses two RemoteEvents
 	.SaveInterval number? -- seconds between autosaves per profile (default 300, floor 15)
 	.Migrations { [number]: (data) -> () }? -- versioned, fail-closed data reshapers
@@ -759,9 +759,6 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 	if type(options) ~= "table" then
 		error("Scribe: options must be a table", 2)
 	end
-	-- Scribe.Configure refuses to run past this point: the process-wide values it
-	-- sets are applied during construction, so a later change would be ignored.
-	Config.BundleConstructed = true
 	if type((options :: any).Template) ~= "table" then
 		error("Scribe: options.Template is required and must be a table", 2)
 	end
@@ -771,9 +768,22 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 	if type(anyOpts.ProfileStoreIndex) ~= "string" or anyOpts.ProfileStoreIndex == "" then
 		error("Scribe: options.ProfileStoreIndex is required — name your game's DataStore explicitly", 2)
 	end
-	if type(anyOpts.ProfileKeyPrefix) ~= "string" or anyOpts.ProfileKeyPrefix == "" then
-		error('Scribe: options.ProfileKeyPrefix is required — set a per-player key prefix (e.g. "PLAYER_")', 2)
+	-- Still required, but "" is a legitimate value: it means bare user-id keys,
+	-- which is what a game adopting a database whose keys were only the user id
+	-- needs. Absent or non-string is still an error, so the choice stays explicit.
+	if type(anyOpts.ProfileKeyPrefix) ~= "string" then
+		error(
+			'Scribe: options.ProfileKeyPrefix is required — set a per-player key prefix (e.g. "PLAYER_"), or "" for bare user-id keys',
+			2
+		)
 	end
+
+	-- Scribe.Configure refuses to run past this point: the process-wide values it
+	-- sets are applied during construction, so a later change would be ignored.
+	-- Set AFTER the option guards, not before: a call that merely fails a guard
+	-- constructs nothing, and poisoning the flag there made a later Configure
+	-- report "a bundle was already constructed" when none ever was.
+	Config.BundleConstructed = true
 
 	-- The type checker enforces the TYPE of every option, but the Luau solver
 	-- does not reject unknown table keys, so a misspelled option name would be

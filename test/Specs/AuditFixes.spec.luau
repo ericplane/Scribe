@@ -743,9 +743,24 @@ return function()
 			expect(function()
 				TestCtx.make({ Options = { ProfileStoreIndex = "" } })
 			end).to.throw()
+			-- A non-string prefix is still rejected; only the TYPE is enforced, so
+			-- an absent prefix (nil) fails the same guard.
 			expect(function()
-				TestCtx.make({ Options = { ProfileKeyPrefix = "" } })
+				TestCtx.make({ Options = { ProfileKeyPrefix = 5 } })
 			end).to.throw()
+		end)
+
+		it('accepts ProfileKeyPrefix = "" and adopts bare user-id keys in place', function()
+			local harness = TestCtx.make({ Options = { ProfileKeyPrefix = "" } })
+			expect(harness.Ctx.Persistence.KeyFor(1445103418)).to.equal("1445103418")
+
+			-- A database whose keys were only the user id is read in place: no
+			-- prefix, no copy, no conversion.
+			harness.Fake.Persisted["Default/1445103418"] = { Coins = 5 }
+			local _player, _entry, data = harness.Join(1445103418)
+			expect(data.Coins.Get()).to.equal(5)
+
+			harness.Cleanup()
 		end)
 
 		it("gift retry after a failed buyer commit does not mint a duplicate credit", function()

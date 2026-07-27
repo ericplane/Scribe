@@ -1,0 +1,81 @@
+--!nonstrict
+-- The Scribe(options) entry point itself: the option guards that run before any
+-- server context exists. Every other spec builds through Server.build (TestCtx),
+-- so without these the guards in src/init.luau are never executed.
+return function()
+	local Root = script.Parent.Parent.Parent
+	local Scribe = require(Root.Scribe) :: any
+	local Config = require(Root.Scribe.Internal.Config)
+
+	-- Every guard below errors before the bundle is built, and
+	-- Config.BundleConstructed is only set once they all pass, so a failed call
+	-- leaves no process-global trace (see the Configure case at the bottom).
+	local function callGuard(options: any): (boolean, string)
+		local ok, err = pcall(Scribe, options)
+		return ok, tostring(err)
+	end
+
+	it("rejects a non-table options argument", function()
+		local ok, err = callGuard("nope" :: any)
+		expect(ok).to.equal(false)
+		expect(string.find(err, "options must be a table", 1, true) ~= nil).to.equal(true)
+	end)
+
+	it("requires a table Template", function()
+		local ok, err = callGuard({ ProfileStoreIndex = "D", ProfileKeyPrefix = "P_" })
+		expect(ok).to.equal(false)
+		expect(string.find(err, "options.Template is required", 1, true) ~= nil).to.equal(true)
+	end)
+
+	it("requires a non-empty ProfileStoreIndex", function()
+		local ok, err = callGuard({ Template = {}, ProfileKeyPrefix = "P_" })
+		expect(ok).to.equal(false)
+		expect(string.find(err, "options.ProfileStoreIndex is required", 1, true) ~= nil).to.equal(true)
+
+		local ok2, err2 = callGuard({ Template = {}, ProfileStoreIndex = "", ProfileKeyPrefix = "P_" })
+		expect(ok2).to.equal(false)
+		expect(string.find(err2, "options.ProfileStoreIndex is required", 1, true) ~= nil).to.equal(true)
+	end)
+
+	it('requires a string ProfileKeyPrefix but accepts ""', function()
+		local ok, err = callGuard({ Template = {}, ProfileStoreIndex = "D" })
+		expect(ok).to.equal(false)
+		expect(string.find(err, "options.ProfileKeyPrefix is required", 1, true) ~= nil).to.equal(true)
+
+		local ok2, err2 = callGuard({ Template = {}, ProfileStoreIndex = "D", ProfileKeyPrefix = 5 })
+		expect(ok2).to.equal(false)
+		expect(string.find(err2, "options.ProfileKeyPrefix is required", 1, true) ~= nil).to.equal(true)
+
+		-- "" is a legitimate prefix (bare user-id keys), so it must get PAST this
+		-- guard. The template deliberately fails to compile on the next step, so
+		-- the call still errors and no bundle is built; the point is only that the
+		-- failure is no longer about the prefix. This is the assertion that fails
+		-- if the "" rejection is ever reintroduced here.
+		local ok3, err3 = callGuard({
+			Template = { Bad = function() end },
+			ProfileStoreIndex = "D",
+			ProfileKeyPrefix = "",
+		})
+		expect(ok3).to.equal(false)
+		expect(string.find(err3, "ProfileKeyPrefix", 1, true)).to.equal(nil)
+	end)
+
+	it("a call that fails a guard does not block a later Scribe.Configure", function()
+		Config.AutoSaveInterval = nil
+		Config.AutoSaveSource = nil
+		Config.BundleConstructed = false
+
+		-- No bundle was constructed, so Configure must still be allowed. The flag
+		-- used to be set above these guards, which made this report that a bundle
+		-- already existed. It must be a table that fails a LATER guard: a non-table
+		-- argument errors before the flag was ever reached, even in the old order.
+		callGuard({ ProfileStoreIndex = "D", ProfileKeyPrefix = "P_" })
+		expect(function()
+			Scribe.Configure({ AutoSaveInterval = 30 })
+		end).never.to.throw()
+
+		Config.AutoSaveInterval = nil
+		Config.AutoSaveSource = nil
+		Config.BundleConstructed = false
+	end)
+end

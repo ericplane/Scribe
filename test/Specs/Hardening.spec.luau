@@ -69,6 +69,25 @@ return function()
 			expect((harness.Data.RestoreVersion(95001, vid))).to.equal(true)
 			harness.Cleanup()
 		end)
+
+		it("refuses to restore over a key that no longer exists", function()
+			local harness = TestCtx.make()
+			local player, _, data = harness.Join(95002)
+			data.Coins.Set(111)
+			harness.Data.Flush(player)
+			local vid = harness.Data.ListVersions(95002)[1].VersionId
+			harness.Leave(player)
+
+			-- Restoring after an Erase writes onto an empty key, which throws inside
+			-- ProfileStore's transform and is swallowed, so this used to report a
+			-- successful restore for a write that never landed.
+			expect(harness.Data.Erase(95002)).to.equal(true)
+			local ok, reason = harness.Data.RestoreVersion(95002, vid)
+			expect(ok).to.equal(false)
+			expect(string.find(tostring(reason), "no live profile", 1, true) ~= nil).to.equal(true)
+
+			harness.Cleanup()
+		end)
 	end)
 
 	describe("late-joiner Shared snapshot", function()
