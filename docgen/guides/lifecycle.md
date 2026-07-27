@@ -23,7 +23,7 @@ end)
 
 | API                                              | Purpose                                                                      |
 | ------------------------------------------------ | ---------------------------------------------------------------------------- |
-| [`WaitForData(player)`](/api/Server#WaitForData) | Yields until Ready; returns `(accessor?, reason?)`. Handle the `nil` branch. |
+| [`WaitForData(player, timeout?)`](/api/Server#WaitForData) | Yields until Ready (up to `timeout` seconds, default 60); returns `(accessor?, reason?)`. Handle the `nil` branch. |
 | [`GetState(player)`](/api/Server#GetState)       | `"Loading" \| "Ready" \| "SessionEnded"`, without yielding.                  |
 
 ### Why data was unavailable

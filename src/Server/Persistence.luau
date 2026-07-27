@@ -1213,8 +1213,28 @@ function Persistence.new(ctx: any)
 
 	-- Public API ------------------------------------------------------------------
 
-	function self.WaitForData(player: Player): (any?, string?)
-		for _ = 1, 600 do
+	-- Wait for the next StateChanged fire, resuming anyway once the deadline
+	-- passes: under LoadFailurePolicy = "Wait" an entry can sit in Loading for
+	-- an entire DataStore outage without a state transition, and WaitForData
+	-- must still honor its timeout rather than hang.
+	local function waitStateChangedUntil(entry: Entry, deadline: number)
+		local thread = coroutine.running()
+		local settled = false
+		local function resume()
+			if not settled then
+				settled = true
+				task.spawn(thread)
+			end
+		end
+		local connection = entry.StateChanged:Connect(resume)
+		task.delay(math.max(deadline - os.clock(), 0), resume)
+		coroutine.yield()
+		connection:Disconnect()
+	end
+
+	function self.WaitForData(player: Player, timeout: number?): (any?, string?)
+		local deadline = os.clock() + (timeout or 60)
+		while true do
 			local entry = self.Entries[player]
 			if entry then
 				if entry.State == "Ready" then
@@ -1222,7 +1242,10 @@ function Persistence.new(ctx: any)
 				elseif entry.State == "SessionEnded" then
 					return nil, entry.FailReason or "session-ended"
 				end
-				entry.StateChanged:Wait()
+				if os.clock() >= deadline then
+					return nil, "timeout"
+				end
+				waitStateChangedUntil(entry, deadline)
 			else
 				local endedReason = self.EndReasons[player]
 				if endedReason then
@@ -1231,10 +1254,12 @@ function Persistence.new(ctx: any)
 				if player.Parent ~= Players then
 					return nil, "player-left"
 				end
+				if os.clock() >= deadline then
+					return nil, "timeout"
+				end
 				task.wait(0.1)
 			end
 		end
-		return nil, "timeout"
 	end
 
 	function self.GetState(player: Player): string
@@ -1243,7 +1268,7 @@ function Persistence.new(ctx: any)
 	end
 
 	-- Force an immediate save. Returns true once the save is confirmed.
-	function self.Flush(player: Player, opts: { Force: boolean? }?): boolean
+	function self.Flush(player: Player, opts: { Force: boolean?, Timeout: number? }?): boolean
 		local entry = self.Entries[player]
 		if not entry or not entry.Profile or entry.State ~= "Ready" then
 			return false
@@ -1251,7 +1276,7 @@ function Persistence.new(ctx: any)
 		if opts and opts.Force then
 			entry.ForceSaveOnce = true
 		end
-		return self.AwaitSave(entry, 15)
+		return self.AwaitSave(entry, (opts and opts.Timeout) or 15)
 	end
 
 	-- Trigger profile:Save() and yield until OnAfterSave/OnError/timeout.
