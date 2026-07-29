@@ -1,27 +1,30 @@
 {
-	"name": "ScribeTest",
-	"tree": {
-		"$className": "DataModel",
-		"ReplicatedStorage": {
-			"$className": "ReplicatedStorage",
-			"ScribeDev": {
-				"$className": "Folder",
-				"Scribe": {
-					"$path": "src"
-				},
-				"Test": {
-					"$path": "test"
-				},
-				"DevPackages": {
-					"$path": "DevPackages"
-				}
-			}
-		},
-		"ServerScriptService": {
-			"$className": "ServerScriptService",
-			"RunScribeTests": {
-				"$path": "test/RunTests.server.luau"
-			}
-		}
-	}
+  "name": "ScribeTest",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "ScribeDev": {
+        "$className": "Folder",
+        "Scribe": {
+          "$path": "src"
+        },
+        "Test": {
+          "$path": "test"
+        },
+        "DevPackages": {
+          "$path": "DevPackages"
+        },
+        "ServerPackages": {
+          "$path": "ServerPackages"
+        }
+      }
+    },
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "RunScribeTests": {
+        "$path": "test/RunTests.server.luau"
+      }
+    }
+  }
 }

@@ -9,11 +9,24 @@ return function()
 	local Template = require(Root.Scribe.Internal.Template)
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
 
+	-- Ownership is injected through the UserOwnsGamePassAsync seam rather than by
+	-- patching MarketplaceService, which a real service Instance rejects and which
+	-- made every spec in this file unrunnable in Studio. `owned` is read live on
+	-- each call, so a test can flip it mid-run to simulate a purchase.
+	local ownedPasses: { [number]: boolean } = {}
+	-- When true the seam yields, so the join-time refresh has not resolved yet.
+	local yieldOwns = false
 	local function withPasses()
 		return TestCtx.make({
 			Options = {
 				Passes = { ["Air Traffic Controller"] = { Id = 14966357 } },
 				Perks = { "VIP" },
+				UserOwnsGamePassAsync = function(_userId: number, passId: number): boolean
+					if yieldOwns then
+						task.wait()
+					end
+					return ownedPasses[passId] == true
+				end,
 			},
 		})
 	end
@@ -105,16 +118,15 @@ return function()
 	end)
 
 	describe("gamepass ownership", function()
-		local mps = game:GetService("MarketplaceService")
 		local AIR_TRAFFIC_ID = 14966357
 
 		afterEach(function()
-			mps.OwnedGamePasses = {}
-			mps.OwnsYield = false
+			table.clear(ownedPasses)
+			yieldOwns = false
 		end)
 
 		it("Owns and OwnsAsync return true for an owned gamepass (warm cache)", function()
-			mps.OwnedGamePasses = { [AIR_TRAFFIC_ID] = true }
+			ownedPasses[AIR_TRAFFIC_ID] = true
 			local harness = withPasses()
 			local player = harness.Join()
 			-- refreshOwnership ran synchronously at load (OwnsYield is false).
@@ -124,8 +136,8 @@ return function()
 		end)
 
 		it("OwnsAsync verifies live and returns true even before the background refresh finishes", function()
-			mps.OwnedGamePasses = { [AIR_TRAFFIC_ID] = true }
-			mps.OwnsYield = true -- the gamepass check yields, so the cache is not warm at join
+			ownedPasses[AIR_TRAFFIC_ID] = true
+			yieldOwns = true -- the gamepass check yields, so the cache is not warm at join
 			local harness = withPasses()
 			local player, entry = harness.Join()
 			expect(entry.OwnershipReady).never.to.equal(true)
@@ -141,7 +153,7 @@ return function()
 			-- Not owned yet.
 			expect(harness.Data.OwnsAsync(player, "Air Traffic Controller")).to.equal(false)
 			-- The player buys the pass; the very next OwnsAsync must reflect it (no TTL).
-			mps.OwnedGamePasses = { [AIR_TRAFFIC_ID] = true }
+			ownedPasses[AIR_TRAFFIC_ID] = true
 			expect(harness.Data.OwnsAsync(player, "Air Traffic Controller")).to.equal(true)
 			harness.Cleanup()
 		end)

@@ -48,6 +48,10 @@ function FakeProfileStore.new()
 	-- Persisted state shared by every store the module creates, keyed
 	-- "<storeName>/<profileKey>".
 	fake.Persisted = {} :: { [string]: AnyTable }
+	-- UserIds as the datastore would hold them, plus an opt-in for "persisted but
+	-- never actually saved" (a first session that crashed before its first save).
+	fake.PersistedUserIds = {} :: { [string]: { number } }
+	fake.NeverSaved = {} :: { [string]: boolean }
 	fake.Versions = {} :: { [string]: { { VersionId: string, Data: AnyTable, CreatedTime: number } } }
 	fake.Mailboxes = {} :: { [string]: { any } }
 	fake.ActiveProfiles = {} :: { [string]: any }
@@ -97,7 +101,16 @@ function FakeProfileStore.new()
 			-- (already-persisted) profile is >1.
 			profile.SessionLoadCount = if persisted then 2 else 1
 			profile.RobloxMetaData = {}
-			profile.UserIds = {}
+			-- Mirror ProfileStore: UserIds reaches the datastore only as part of a
+			-- COMPLETED save, and neither key-minting path seeds it. Scribe uses a
+			-- non-empty list to prove a prior save happened, so a hand-seeded
+			-- fake.Persisted entry must look like "a returning player who saved" or
+			-- roughly thirty existing specs would silently reclassify. Opt into the
+			-- crashed-first-session shape with fake.NeverSaved[key] = true.
+			profile.UserIds = if fake.PersistedUserIds[key]
+				then Util.deepClone(fake.PersistedUserIds[key])
+				elseif persisted and not fake.NeverSaved[key] then { 1 }
+				else {}
 			profile.KeyInfo = { Version = "live", CreatedTime = os.time() * 1000 }
 			profile.OnSave = Signal.new()
 			profile.OnLastSave = Signal.new()
@@ -130,32 +143,75 @@ function FakeProfileStore.new()
 
 			-- Synchronous save. Ordering matches the real module: OnSave fires
 			-- first, then profile.Data is read for serialization.
-			function profile.Save(_self: any)
-				if not active then
+			-- Deliver any queued cross-server messages. Real ProfileStore keeps an
+			-- acked update in the file with a Locked flag and only sweeps it on a LATER
+			-- save, so delivery is at-least-once; an unacked message is redelivered.
+			local function drainMailbox()
+				local mailbox = fake.Mailboxes[key]
+				if not mailbox or #mailbox == 0 then
 					return
 				end
-				profile.OnSave:Fire()
+				local remaining = {}
+				for _, message in mailbox do
+					local consumed = false
+					for _, handler in messageHandlers do
+						handler(Util.deepClone(message), function()
+							consumed = true
+						end)
+						if consumed then
+							break
+						end
+					end
+					if not consumed then
+						table.insert(remaining, message)
+					end
+				end
+				fake.Mailboxes[key] = if #remaining > 0 then remaining else nil
+			end
+
+			-- The write itself, without the surrounding signal order, so EndSession can
+			-- run it at the point the real library does.
+			local function persist()
 				if fake.FailSaves then
 					fake.OnError:Fire("mock save failure", storeName, profileKey)
 					return
 				end
 				local snapshot = Util.deepClone(profile.Data)
 				fake.Persisted[key] = snapshot
+				-- A completed save is what puts UserIds in the datastore.
+				fake.PersistedUserIds[key] = Util.deepClone(profile.UserIds)
 				fake.SaveCounts[key] = (fake.SaveCounts[key] or 0) + 1
 				recordVersion(profileKey, snapshot)
 				profile.LastSavedData = snapshot
+				-- Real delivery runs inside the save (ProfileStore.luau:885-908), so a
+				-- handler observes a save already in flight.
+				drainMailbox()
 				profile.OnAfterSave:Fire(profile.LastSavedData)
+			end
+
+			function profile.Save(_self: any)
+				if not active then
+					return
+				end
+				profile.OnSave:Fire()
+				persist()
 			end
 
 			function profile.EndSession(_self: any)
 				if not active then
 					return
 				end
+				-- Real order (ProfileStore.luau:715-741, :924): OnSave, OnLastSave, the
+				-- session is dropped so IsActive() is already FALSE, OnSessionEnd, and
+				-- only THEN the write, with OnAfterSave last. The fake used to save
+				-- first and tear down after, so every save-completion handler ran
+				-- against a live entry that in production is already torn down.
+				profile.OnSave:Fire()
 				profile.OnLastSave:Fire("Manual")
-				profile:Save()
 				active = false
 				fake.ActiveProfiles[key] = nil
 				profile.OnSessionEnd:Fire()
+				persist()
 			end
 
 			local function deliver(message: any): boolean
@@ -236,6 +292,11 @@ function FakeProfileStore.new()
 			local view = newProfile(profileKey)
 			view.Data = data
 			view.KeyInfo = keyInfo
+			-- Real GetAsync reports the RAW stored count: it passes EditProfile = nil,
+			-- so the session-start increment never runs. newProfile models a LIVE load
+			-- (2 for stored data), which is one too high for a view and hides the
+			-- new-vs-returning divergence entirely.
+			view.SessionLoadCount = if fake.Persisted[key] then 1 else 0
 			view.view_mode = true
 			view.Session = if fake.ActiveProfiles[key] then { PlaceId = 0, JobId = "mock" } else nil
 			function view.IsActive(_self: any): boolean
@@ -246,12 +307,19 @@ function FakeProfileStore.new()
 			end
 			function view.EndSession(_self: any) end
 			function view.SetAsync(_view: any)
+				-- Real SetAsync returns NOTHING and cannot throw for an infrastructure
+				-- failure: the DataStore fault is swallowed by ProfileStore's own pcall,
+				-- routed to RegisterError (which fires OnError), and the call returns
+				-- normally having written nothing. Throwing here let every offline-write
+				-- spec take a branch production can never reach, hiding the fact that
+				-- Scribe reported those unwritten saves as successful commits.
 				if fake.FailSaves then
-					error("mock save failure")
+					fake.OnError:Fire("mock save failure", storeName, profileKey)
+					return
 				end
 				fake.Persisted[key] = Util.deepClone(view.Data)
+				fake.PersistedUserIds[key] = Util.deepClone(view.UserIds)
 				recordVersion(profileKey, view.Data)
-				fake.OnOverwrite:Fire(storeName, profileKey)
 			end
 			return view
 		end
@@ -260,11 +328,12 @@ function FakeProfileStore.new()
 			if fake.FailMessages then
 				return false
 			end
+			-- Real MessageAsync only COMMITS the message to GlobalUpdates; it never
+			-- delivers (ProfileStore.luau:1633-1730). Delivery happens later, inside a
+			-- save, or at MessageHandler registration. Delivering inline here meant a
+			-- cross-server gift never arrived while a save was in flight, which is the
+			-- exact condition the SaveGen waiter gate exists to handle.
 			local key = fullKey(profileKey)
-			local active = fake.ActiveProfiles[key]
-			if active and active._deliver(Util.deepClone(message)) then
-				return true
-			end
 			local mailbox = fake.Mailboxes[key]
 			if not mailbox then
 				mailbox = {}
@@ -277,6 +346,7 @@ function FakeProfileStore.new()
 		function store.RemoveAsync(_self: any, profileKey: string): boolean
 			local key = fullKey(profileKey)
 			fake.Persisted[key] = nil
+			fake.PersistedUserIds[key] = nil
 			fake.Versions[key] = nil
 			fake.Mailboxes[key] = nil
 			return true

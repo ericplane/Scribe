@@ -110,6 +110,25 @@ function Commands.new(ctx: any)
 		return false
 	end
 
+	-- Same reasoning as the throttled COMMAND_RATE_LIMITED log below: these fire on
+	-- client-controlled input that sits UNDER the rate limit, so an exploiter can
+	-- drive them at the full allowance and evict the whole diagnostic ring, erasing
+	-- the evidence of everything else. One entry per interval per player per code
+	-- is enough to see the pattern.
+	local function throttledWarn(entry: any, code: any, message: string, context: { [string]: any })
+		local now = os.clock()
+		local seen = entry.LastCommandWarnAt
+		if not seen then
+			seen = {}
+			entry.LastCommandWarnAt = seen
+		end
+		if now - (seen[code] or -math.huge) < RATE_LOG_INTERVAL then
+			return
+		end
+		seen[code] = now
+		Log.Warn("Commands", code, message, context)
+	end
+
 	local function typeMatches(expected: string, value: any): boolean
 		local optional = string.sub(expected, -1) == "?"
 		local base = if optional then string.sub(expected, 1, -2) else expected
@@ -170,7 +189,7 @@ function Commands.new(ctx: any)
 		local registered = registry[name]
 		if not registered then
 			Metrics.Add("CommandsRejected")
-			Log.Warn("Commands", "COMMAND_UNKNOWN", `unknown command "{name}"`, { Player = entry.Player })
+			throttledWarn(entry, "COMMAND_UNKNOWN", `unknown command "{name}"`, { Player = entry.Player })
 			reply(entry, correlation, false, { "unknown-command" })
 			return
 		end
@@ -191,7 +210,7 @@ function Commands.new(ctx: any)
 			for i, expected in registered.Args do
 				if not typeMatches(expected, args[i]) then
 					Metrics.Add("CommandsRejected")
-					Log.Warn("Commands", "COMMAND_BAD_ARGS", `argument {i} of "{name}" is not {expected}`, {
+					throttledWarn(entry, "COMMAND_BAD_ARGS", `argument {i} of "{name}" is not {expected}`, {
 						Player = entry.Player,
 					})
 					reply(entry, correlation, false, { "bad-args" })

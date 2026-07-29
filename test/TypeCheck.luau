@@ -281,10 +281,30 @@ local function economyUsage(): Scribe.EconomyConfig
 	}
 end
 
+-- Scribe.PlayerData<T> names one player's accessor tree, which consumers need to
+-- store a profile in their own class. Gated here because `ValueType` is a type
+-- FUNCTION and cannot be invoked across a module boundary: `Scribe.ValueType<T>`
+-- silently resolves to `any` instead of erroring, so a regression is invisible.
+local function playerDataAlias(player: Player): number
+	local d: Scribe.PlayerData<T> = Data[player]
+	d.Stats.Kills.Increment(1)
+	return d.Coins.Get()
+end
+
+-- Every signal exposed on Data must also be declared in ServerDataType, or a
+-- strict consumer cannot connect to it. The runtime table and the type surface
+-- are edited in separate files, so this is what keeps them in sync.
+local function signalSurface()
+	Data.OnCooldownEnded:Connect(function(_player: Player, _key: string) end)
+	Data.OnOwnershipChanged:Connect(function(_player: Player, _key: string, _owned: boolean) end)
+end
+
 return {
 	serverUsage = serverUsage,
 	clientUsage = clientUsage,
 	diagnosticsUsage = diagnosticsUsage,
 	typedApis = typedApis,
 	economyUsage = economyUsage,
+	playerDataAlias = playerDataAlias,
+	signalSurface = signalSurface,
 }

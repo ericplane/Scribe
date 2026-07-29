@@ -458,6 +458,13 @@ function Replication.new(ctx: any)
 				broadcastBuffer(bytes, entry)
 			end
 		end
+		-- Anything queued before this snapshot is already IN the snapshot, and the
+		-- next flush would broadcast it again as a SharedDiff to the same recipients
+		-- (both pass exceptEntry = entry). For a non-idempotent op such as Insert
+		-- that permanently doubles the entry in every other client's mirror. Clear
+		-- unconditionally, mirroring what sendInit does with entry.Queue above: the
+		-- snapshot is authoritative whether or not it had any ops to send.
+		entry.SharedQueue = {}
 		task.delay(HANDSHAKE_TIMEOUT, function()
 			if not entry.TornDown and not entry.HandshakeReady then
 				Log.Warn(
@@ -510,9 +517,21 @@ function Replication.new(ctx: any)
 		end
 		if buffer.len(bytes) > maxInbound then
 			Metrics.Add("InboundOversize")
-			Log.Warn("Transport", "INBOUND_OVERSIZE", `dropped oversized inbound frame ({buffer.len(bytes)} bytes)`, {
-				Player = player,
-			})
+			-- Throttle the LOG, on its own clock. This frame is dropped before decode
+			-- and deliberately does NOT count toward the malformed budget, but it is
+			-- attacker-controlled and was previously logged unthrottled, which made it
+			-- the cheapest way to evict the whole diagnostic ring and erase the
+			-- evidence of everything else. The metric above still counts every one.
+			local now = os.clock()
+			if now - (entry.LastOversizeLog or -math.huge) >= MALFORMED_LOG_INTERVAL then
+				entry.LastOversizeLog = now
+				Log.Warn(
+					"Transport",
+					"INBOUND_OVERSIZE",
+					`dropped oversized inbound frame ({buffer.len(bytes)} bytes)`,
+					{ Player = player }
+				)
+			end
 			return
 		end
 		local ok, err = pcall(function()

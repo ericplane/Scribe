@@ -14,7 +14,7 @@ return function()
 	local SLOT2 = Enum.AnalyticsCustomFieldKeys.CustomField02.Name
 	local SLOT3 = Enum.AnalyticsCustomFieldKeys.CustomField03.Name
 
-	local function makeHarness(economy)
+	local function makeHarness(economy, devMode)
 		local events = {}
 		economy.LogEconomyEvent = function(player, flowType, currency, amount, balance, txn, itemSku, customFields)
 			table.insert(events, {
@@ -34,7 +34,7 @@ return function()
 				Gems = Scribe.Int(0, { Min = 0 }),
 				Tickets = Scribe.Int(0, { Min = 0 }),
 			},
-			Options = { Economy = economy },
+			Options = { Economy = economy, DevMode = devMode },
 		})
 		return harness, events
 	end
@@ -318,19 +318,15 @@ return function()
 	end)
 
 	it("warns in DevMode on an undeclared per-call field and on field overflow", function()
-		-- The two config warnings are DevMode-gated; force Studio like Server.new does.
-		local RunService = game:GetService("RunService")
-		local origIsStudio = RunService.IsStudio
-		RunService.IsStudio = function()
-			return true
-		end
+		-- The two config warnings are DevMode-gated. Use the DevMode option rather
+		-- than patching RunService, which is illegal on a real service Instance and
+		-- so made this spec unrunnable in Studio.
 		local harness, _ = makeHarness({
 			Currencies = {
 				Coins = { Fields = { "Location" } }, -- only "Location" declared
 				Gems = { Fields = { "A", "B", "C", "D" } }, -- 4 > 3 slots -> overflow at build
 			},
-		})
-		RunService.IsStudio = origIsStudio
+		}, true)
 
 		-- Overflow warning fires at build time (Analytics.new).
 		expect(#Scribe.GetRecentLogs({ Code = "ECONOMY_FIELDS_OVERFLOW", Limit = 5 }) > 0).to.equal(true)

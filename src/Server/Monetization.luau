@@ -10,6 +10,7 @@ local Players = game:GetService("Players")
 
 local Internal = script.Parent.Parent.Internal
 local Util = require(Internal.Util)
+local Node = require(Internal.Node)
 local Template = require(Internal.Template)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
@@ -61,6 +62,14 @@ function Monetization.new(ctx: any)
 			MarketplaceService:PromptProductPurchase(player, productId)
 		end
 
+	-- Same reasoning as the prompt seam above. Patching MarketplaceService itself
+	-- works on a mock table but is illegal on a real service Instance, so without
+	-- this no ownership spec can run in Studio.
+	local userOwnsGamePass: (userId: number, passId: number) -> boolean = options.UserOwnsGamePassAsync
+		or function(userId: number, passId: number): boolean
+			return MarketplaceService:UserOwnsGamePassAsync(userId, passId)
+		end
+
 	-- Registry ----------------------------------------------------------------
 
 	type Product = { Name: string, Id: number, Category: string?, Grant: ((data: any) -> ())?, Grants: string? }
@@ -76,6 +85,18 @@ function Monetization.new(ctx: any)
 		end
 		if type(config.Id) ~= "number" then
 			error(`Scribe: product "{name}" must declare a numeric Id`, 0)
+		end
+		-- Grants names a perk key, persisted under the reserved Perks record and
+		-- answered by Owns. It was accepted unchecked, so a wrong TYPE only surfaced
+		-- when someone actually bought the product, and invalid UTF-8 would fail the
+		-- profile save. Reject at registration like Name and Category.
+		if config.Grants ~= nil then
+			if type(config.Grants) ~= "string" or config.Grants == "" then
+				error(`Scribe: product "{name}" Grants must be a non-empty string naming a perk`, 0)
+			end
+			if not Util.isUtf8(config.Grants) then
+				error(`Scribe: product "{name}" Grants contains invalid UTF-8 bytes`, 0)
+			end
 		end
 		if config.Category ~= nil and not Util.isUtf8(config.Category) then
 			error(`Scribe: product "{name}" Category contains invalid UTF-8 bytes`, 0)
@@ -136,6 +157,17 @@ function Monetization.new(ctx: any)
 	for _, product in productsByName do
 		if product.Grants then
 			knownOwnsKeys[product.Grants] = true
+			-- A typo here used to surface only when a player actually bought the
+			-- product: the perk landed under the wrong key and Owns kept answering
+			-- false, with the Robux already spent. Say it at startup instead.
+			if ctx.DevMode and declaredPerks and not declaredPerks[product.Grants] then
+				Log.Warn(
+					"Monetization",
+					"UNDECLARED_PERK",
+					`product "{product.Name}" grants perk "{product.Grants}", which is not in the Perks registry (typo?)`,
+					{ Product = product.Name, Perk = product.Grants }
+				)
+			end
 		end
 	end
 	local warnedOwnsKeys: { [string]: boolean } = {}
@@ -429,7 +461,7 @@ function Monetization.new(ctx: any)
 		for name, pass in passesByName do
 			task.spawn(function()
 				local ok, owned = pcall(function()
-					return MarketplaceService:UserOwnsGamePassAsync(entry.UserId, pass.Id)
+					return userOwnsGamePass(entry.UserId, pass.Id)
 				end)
 				if ok and not entry.TornDown then
 					setOwnsCache(entry, name, owned == true)
@@ -484,7 +516,7 @@ function Monetization.new(ctx: any)
 		local pass = passesByName[key]
 		if pass and not entry.TornDown then
 			local ok, owned = pcall(function()
-				return MarketplaceService:UserOwnsGamePassAsync(entry.UserId, pass.Id)
+				return userOwnsGamePass(entry.UserId, pass.Id)
 			end)
 			if ok then
 				if not entry.TornDown then
@@ -508,24 +540,68 @@ function Monetization.new(ctx: any)
 	-- Applies a product's effects to a Ready entry. Returns false if a Grant
 	-- callback threw (fail-closed: caller returns NotProcessedYet).
 	local function applyProductGrant(entry: any, product: Product): boolean
-		if product.Grant then
-			local ok, err = xpcall(function()
+		if not product.Grant and not product.Grants then
+			return true
+		end
+		-- Atomic, because a receipt is retried. A Grant that wrote part-way and then
+		-- threw used to leave those writes in the profile while `markProcessed` never
+		-- ran, so Roblox re-invoked the callback on the next ProcessReceipt and
+		-- re-applied them: credit 1000 then throw gave 1000, 2000, 3000 across
+		-- retries, persisted. Reachable through Scribe's own write guards (a closed
+		-- element's undeclared key, MaxItems/MaxKeys), so a player can trigger it by
+		-- filling an inventory to its cap. The soft-currency Purchase path has always
+		-- been transactional; this is the receipt path catching up.
+		--
+		-- Note the Grant now runs inside a transaction, so it must not yield. That is
+		-- refused loudly rather than silently rolled back.
+		local function apply()
+			if product.Grant then
 				(product.Grant :: (any) -> ())(entry.Tree.Accessor)
-			end, function(e)
+			end
+			if product.Grants then
+				checkPerkName(product.Grants)
+				reservedAcc(entry).Perks[product.Grants].Set(true)
+			end
+		end
+
+		local ok, err = entry.Tree:RunTransaction(apply)
+		if ok then
+			return true
+		end
+
+		if err == Node.YIELD_ERROR then
+			-- The Grant yielded, so it cannot be made atomic: a rollback across a
+			-- yield would revert unrelated writes that landed meanwhile, which on the
+			-- receipt path means destroying paid currency. Refusing outright would be
+			-- worse still: the receipt answers NotProcessedYet and Roblox retries it
+			-- forever, so a product that worked before this version would take the
+			-- player's Robux and never deliver. Run it the old, non-atomic way and say
+			-- so loudly instead.
+			Log.Error(
+				"Monetization",
+				"GRANT_FAIL",
+				`product "{product.Name}" Grant yields, so it cannot be applied atomically. `
+					.. "It ran WITHOUT rollback: if it throws part-way, its partial writes stay "
+					.. "and Roblox re-applies them on every receipt retry. Move the async work "
+					.. "outside Grant (do it before the prompt, or after via OnSave).",
+				{ Player = entry.Player, Product = product.Name }
+			)
+			local ranOk, ranErr = xpcall(apply, function(e)
 				return debug.traceback(tostring(e), 2)
 			end)
-			if not ok then
-				Log.Error("Monetization", "GRANT_FAIL", `product "{product.Name}" Grant threw: {err}`, {
+			if not ranOk then
+				Log.Error("Monetization", "GRANT_FAIL", `product "{product.Name}" Grant threw: {ranErr}`, {
 					Player = entry.Player,
 				})
 				return false
 			end
+			return true
 		end
-		if product.Grants then
-			checkPerkName(product.Grants)
-			reservedAcc(entry).Perks[product.Grants].Set(true)
-		end
-		return true
+
+		Log.Error("Monetization", "GRANT_FAIL", `product "{product.Name}" Grant failed: {err}`, {
+			Player = entry.Player,
+		})
+		return false
 	end
 
 	-- Gift delivery to a Ready entry on this server. Returns (applied, durable):

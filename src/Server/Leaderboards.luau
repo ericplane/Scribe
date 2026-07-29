@@ -671,6 +671,11 @@ function Leaderboards.new(ctx: any)
 					table.insert(signatureParts, `{item.UserId}:{item.Score}`)
 				end
 				board.Signature = table.concat(signatureParts, "|")
+				-- Recomputing the signature only makes the change ELIGIBLE to send;
+				-- broadcastBoard is what actually sends it, and refreshBoard was its
+				-- only caller. Without this, connected clients kept rendering the
+				-- erased user until the next 60s refresh.
+				broadcastBoard(board)
 			end
 		end
 		-- Evict the resolved name so it is neither re-served nor re-broadcast.

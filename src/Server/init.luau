@@ -34,7 +34,10 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	local ctx = {} :: any
 	ctx.Options = options
 	ctx.Compiled = compiled
-	ctx.DevMode = RunService:IsStudio()
+	-- Studio by default. Overridable because the alternative for tests is patching
+	-- RunService itself, which works on a mock table but is illegal on a real
+	-- service Instance, so any spec that needs DevMode cannot run in Studio.
+	ctx.DevMode = if options.DevMode ~= nil then options.DevMode == true else RunService:IsStudio()
 	ctx.Signals = {
 		OnSave = Signal.new(), -- { Player, Ok, Duration, At }
 		SessionEnded = Signal.new(), -- (player, reason)
@@ -43,6 +46,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		OnGiftCredit = Signal.new(), -- (player, productName)
 		OnMessage = Signal.new(), -- (player, message)
 		OnOwnershipChanged = Signal.new(), -- (player, key, owned)
+		OnCooldownEnded = Signal.new(), -- (player, key)
 	}
 
 	if options.LogLevel then
@@ -664,6 +668,32 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		detected until the player rejoins (a cached `true` is never re-verified).
 	]=]
 	Data.OnOwnershipChanged = ctx.Signals.OnOwnershipChanged
+	--[=[
+		@within Server
+		@tag Signals
+		@server
+		@prop OnCooldownEnded Signal
+		Fires with `(player, key)` when a cooldown lapses, within about a second of
+		its expiry. A cooldown holds no value, so unlike a [Scribe.Timed] field it
+		fires no `Changed`; this is its only expiry notification.
+
+		One signal covers every cooldown, because cooldown keys are arbitrary
+		strings rather than declared fields, so there is no set to subscribe to.
+		Filter inside the handler for a specific one:
+
+		```lua
+		Data.OnCooldownEnded:Connect(function(player, key)
+		    if key ~= "DailyReward" then
+		        return
+		    end
+		    -- ...
+		end)
+		```
+
+		Cooldowns that lapsed while the player was offline do **not** fire on join.
+		Read the current state with [Server.PeekCooldown] instead.
+	]=]
+	Data.OnCooldownEnded = ctx.Signals.OnCooldownEnded
 	Data.OnGiftReceived = ctx.Signals.OnGiftReceived
 	--[=[
 		@within Server
@@ -704,7 +734,21 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 				Data = message,
 			})
 		end)
-		return ok and delivered == true
+		if ok and delivered == true then
+			Health.ReportSuccess("SendMessage")
+			return true
+		end
+		-- This was the only DataStore boundary in the library that reported nothing:
+		-- a thrown error and a plain `false` both collapsed into the same bare
+		-- return, with no log, no metric and no Health signal, so a MessageAsync
+		-- outage was invisible. Mirrors deliverGift's handling.
+		Health.ReportFailure("SendMessage")
+		Log.Warn("Persistence", "MESSAGE_SEND_FAIL", "MessageAsync failed; the message was not delivered", {
+			UserId = userId,
+			Threw = not ok,
+			Error = if ok then nil else tostring(delivered),
+		})
+		return false
 	end
 
 	--[=[

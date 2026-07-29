@@ -183,7 +183,11 @@ function Timed.new(ctx: any)
 	-- Clear lapsed entries; timed fields reset to their template default,
 	-- which fires Changed and replicates — client Observe covers "booster
 	-- ended" with no separate expiry event.
-	local function sweepEntry(entry: any)
+	-- `notify` gates the OnCooldownEnded signal. The load sweep passes false: those
+	-- cooldowns lapsed while the player was away, so "ended" would be misleading,
+	-- the entry is not Ready yet so listeners may not be attached, and a joining
+	-- client reads PeekCooldown for its initial state anyway.
+	local function sweepEntry(entry: any, notify: boolean?)
 		local store = timedStore(entry)
 		if not store or not entry.Tree or entry.Tree.Dead then
 			return
@@ -217,12 +221,22 @@ function Timed.new(ctx: any)
 				if not ok then
 					Log.Warn("Integrity", "TIMED_SWEEP_FAIL", tostring(err), { Player = entry.Player })
 				end
+			elseif notify then
+				-- A cooldown holds no value, so clearing it fires no Changed. This
+				-- signal is the only expiry notification cooldowns get.
+				ctx.Signals.OnCooldownEnded:Fire(entry.Player, string.sub(pathKey, #COOLDOWN_PREFIX + 1))
 			end
 		end
 	end
 
 	function self.OnLoad(entry: any)
 		sweepEntry(entry)
+	end
+
+	-- One pass of the periodic sweep, including the OnCooldownEnded signal. Named
+	-- so the 1 Hz loop below and the tests drive the same code path.
+	function self.Sweep(entry: any)
+		sweepEntry(entry, true)
 	end
 
 	function self.OnUnload(_entry: any) end
@@ -237,7 +251,7 @@ function Timed.new(ctx: any)
 				if persistence then
 					for _, entry in persistence.Entries do
 						if entry.State == "Ready" then
-							sweepEntry(entry)
+							self.Sweep(entry)
 						end
 					end
 				end

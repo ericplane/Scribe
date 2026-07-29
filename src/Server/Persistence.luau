@@ -464,6 +464,85 @@ function Persistence.new(ctx: any)
 		return templateEquals(data, persistentDefaults, nil)
 	end
 
+	-- Profile:SetAsync reports NOTHING on failure. It returns no value, and its only
+	-- error() paths are misuse guards (view-mode, non-table Data); a DataStore fault
+	-- is swallowed by ProfileStore's own pcall, routed to RegisterError, and the call
+	-- returns normally having written nothing. pcall around it therefore always
+	-- succeeds, which made every offline write report success even when the write
+	-- never landed, and the offline receipt path turns that into PurchaseGranted:
+	-- a throttled DataStore silently consumed real Robux.
+	--
+	-- RegisterError fires OnError synchronously before UpdateAsync returns, so a
+	-- connection held across the call is the only available failure signal.
+	local function commitViewProfile(profile: any, key: string): (boolean, string?)
+		local failure: string? = nil
+		local ok, conn = pcall(function()
+			return ProfileStore.OnError:Connect(function(message: string, _storeName: string, profileKey: string)
+				if profileKey == key and failure == nil then
+					failure = tostring(message)
+				end
+			end)
+		end)
+		local setOk, setErr = pcall(function()
+			profile:SetAsync()
+		end)
+		if ok and conn then
+			pcall(function()
+				conn:Disconnect()
+			end)
+		end
+		if not setOk then
+			return false, tostring(setErr) -- a real misuse error, not infrastructure
+		end
+		if failure ~= nil then
+			return false, `DataStore error during save: {failure}`
+		end
+		if not ok then
+			-- Could not observe OnError at all, so success here is unverified. Say so
+			-- rather than reporting a commit we cannot stand behind.
+			return false, "could not observe ProfileStore.OnError; save result unverifiable"
+		end
+		return true, nil
+	end
+
+	-- Asymmetric diff for the DevMode migration shadow in finishLoad. Reports a path
+	-- when it exists on both sides with different values, or only on the shadow side.
+	-- Keys present only on the REAL side are exactly Reconcile's backfill, and
+	-- reporting those would fire for every legacy profile. RESERVED_ROOT is skipped
+	-- whole because runMigrations stamps its Version and the shadow loop never does.
+	local function divergences(shadow: any, real: any, path: { string }, out: { string })
+		if #out >= 5 then
+			return
+		end
+		if type(shadow) == "buffer" and type(real) == "buffer" then
+			if buffer.tostring(shadow) ~= buffer.tostring(real) then
+				table.insert(out, Util.pathString(path))
+			end
+			return
+		end
+		if type(shadow) ~= type(real) then
+			table.insert(out, Util.pathString(path))
+			return
+		end
+		if type(shadow) ~= "table" then
+			if shadow ~= real then
+				table.insert(out, Util.pathString(path))
+			end
+			return
+		end
+		for k, v in shadow do
+			if #path == 0 and k == Template.RESERVED_ROOT then
+				continue
+			end
+			table.insert(path, tostring(k))
+			divergences(v, (real :: any)[k], path, out)
+			table.remove(path)
+			if #out >= 5 then
+				return
+			end
+		end
+	end
+
 	-- Wipe guard: compare against the last successful save.
 	local function wipeGuardCheck(entry: Entry): (boolean, string?)
 		local profile = entry.Profile
@@ -815,7 +894,15 @@ function Persistence.new(ctx: any)
 		-- A brand-new profile's very first session ever. In-place ProfileStore/
 		-- ProfileService adoption keeps the SessionLoadCount from the old game, so
 		-- returning/legacy players are NOT flagged new and still migrate normally.
-		local isNew = profile.SessionLoadCount == 1
+		-- A view (Mode = "NoSave") is fetched with GetAsync, which passes
+		-- EditProfile = nil, so ProfileStore's session-start increment never runs and
+		-- the count sits exactly one BELOW what a live join of the same profile
+		-- reports. Normalize before comparing, or a dry run of a profile that has
+		-- been loaded once is judged brand new: it stamps the current version below,
+		-- runMigrations then early-returns, and every migration is skipped. That is
+		-- precisely what a dry run exists to exercise.
+		local loadCount = if mode == "NoSave" then profile.SessionLoadCount + 1 else profile.SessionLoadCount
+		local isNew = loadCount == 1
 
 		-- Decide which Scribe.Dynamic fields to seed, BEFORE Reconcile backfills
 		-- their baseline: all of them on a brand-new profile, plus any the STORED
@@ -844,7 +931,30 @@ function Persistence.new(ctx: any)
 			end
 		end
 
+		-- Snapshot BEFORE AddUserId mutates the in-memory list. ProfileStore writes
+		-- UserIds to the datastore only as part of a completed save, and neither
+		-- key-minting path seeds it, so a non-empty list PROVES at least one save
+		-- committed for this profile. That is the discriminator the template-fresh
+		-- check below needs: without it, a returning player who simply never earned
+		-- anything is indistinguishable from a crashed first session, and their
+		-- migrations are skipped. Negative ids are excluded because AddUserId no-ops
+		-- for them outside mock, so the signal could never accumulate there.
+		local hadPriorSave = entry.UserId >= 0 and #profile.UserIds > 0
+
 		profile:AddUserId(entry.UserId)
+
+		-- DevMode only: keep the RAW pre-Reconcile bytes so the shadow run below can
+		-- show what the migrations would have seen without the backfill.
+		-- Opt-in, NOT DevMode-automatic. The shadow re-EXECUTES your migration bodies
+		-- against a clone, so any side effect in them (analytics, an external write, a
+		-- counter) fires a second time. Turning that on for every Studio session
+		-- unannounced is not acceptable, so it is a switch you flip while auditing.
+		local rawStored: { [string]: any }? = if options.MigrationShadow == true
+				and not isNew
+				and not options.ResetData
+			then Util.deepClone(profile.Data)
+			else nil
+
 		profile:Reconcile()
 
 		-- A hard crash inside the very first session persists template-shaped data
@@ -854,20 +964,26 @@ function Persistence.new(ctx: any)
 		-- -- and treat the profile as fresh, or every migration would run against
 		-- effectively new-player defaults (the double-apply hazard the stamp
 		-- prevents). Gated to migrating profiles only, so the deep compare is rare.
+		-- Hoisted to function scope: the fail-closed carve-out further down needs it,
+		-- and re-reading it there would yield currentVersion because the stamp below
+		-- has already run.
+		local storedReserved = profile.Data[Template.RESERVED_ROOT]
+		local storedVersion = if type(storedReserved) == "table" and type(storedReserved.Version) == "number"
+			then storedReserved.Version
+			else 1
+
 		local freshAsTemplate = false
 		if not isNew and not options.ResetData then
-			local storedReserved = profile.Data[Template.RESERVED_ROOT]
-			local storedVersion = if type(storedReserved) == "table"
-					and type(storedReserved.Version) == "number"
-				then storedReserved.Version
-				else 1
 			if storedVersion < currentVersion then
-				freshAsTemplate = equalsTemplateDefaults(profile.Data)
+				-- Only claim "template-fresh" when no completed save is on record. A
+				-- returning player who never earned anything has identical bytes, and
+				-- treating them as new skipped every migration for them.
+				freshAsTemplate = not hadPriorSave and equalsTemplateDefaults(profile.Data)
 				if freshAsTemplate then
 					Log.Info(
 						"Persistence",
 						"PROFILE_LOADED",
-						"stored data is template-fresh (first session crashed before saving); treating as new",
+						"stored data is template-fresh and no completed save is recorded; treating as new",
 						{ Player = player }
 					)
 					-- Effectively a brand-new player: re-seed every Dynamic field too
@@ -904,16 +1020,84 @@ function Persistence.new(ctx: any)
 		end
 
 		if not runMigrations(entry, profile.Data) then
-			-- Fail-closed: never persist a half-migrated profile. Migrations ran
-			-- on a clone, so profile.Data is untouched; ending the session saves
-			-- the unmodified original.
-			entry.LocalSessionEnd = true
-			profile:EndSession()
-			if player.Parent == Players then
-				player:Kick(options.LoadFailureMessage or "We couldn't load your data. Please rejoin!")
+			-- Carve-out for the cohort the hadPriorSave discriminator newly routes
+			-- INTO migrations: a returning player whose stored data is still nothing
+			-- but current-template defaults. Fail-closed exists to protect real stored
+			-- bytes, and this profile has none, so kicking would manufacture a
+			-- permanent outage for players who load fine today (anyone who joined,
+			-- bounced off a first-join gate and left, whose defaults a later migration
+			-- step then indexes through). Load them, but do NOT stamp the version, so
+			-- the chain retries every join and lands as soon as the migration is fixed.
+			-- runMigrations already logged MIGRATION_FAIL at Error.
+			local allDefaults = not freshAsTemplate
+				and storedVersion < currentVersion
+				and equalsTemplateDefaults(profile.Data)
+			if allDefaults then
+				Log.Warn(
+					"Persistence",
+					"MIGRATION_FAIL",
+					"migration failed against an all-default returning profile; loading it un-migrated "
+						.. "and UNSTAMPED (nothing but template defaults is at risk). It retries on every "
+						.. "join until the migration is fixed.",
+					{ Player = player }
+				)
+			else
+				-- Fail-closed: never persist a half-migrated profile. Migrations ran
+				-- on a clone, so profile.Data is untouched; ending the session saves
+				-- the unmodified original.
+				entry.LocalSessionEnd = true
+				profile:EndSession()
+				if player.Parent == Players then
+					player:Kick(options.LoadFailureMessage or "We couldn't load your data. Please rejoin!")
+				end
+				teardown(entry, "migration-failed")
+				return
 			end
-			teardown(entry, "migration-failed")
-			return
+		end
+
+		-- DevMode only, zero behavior change. Reconcile runs BEFORE migrations, so a
+		-- migration body reaching through a static sub-record, a container root or a
+		-- scalar default reads a value Reconcile manufactured rather than one the
+		-- player stored: `if data.Tutorial == nil` and `data.Gold or data.Coins`, the
+		-- two commonest shapes, both silently no-op. Reordering is not the fix (it
+		-- nil-indexes against raw data and fail-closed kicks every legacy player), so
+		-- re-run the same chain against the raw bytes and tell the developer when the
+		-- two disagree, in Studio, before they ship.
+		if rawStored ~= nil and not freshAsTemplate and storedVersion < currentVersion then
+			local shadowOk = true
+			for version = storedVersion + 1, currentVersion do
+				local step = migrations[version]
+				if step then
+					local ok, err = xpcall(step, function(e)
+						return debug.traceback(tostring(e), 2)
+					end, rawStored)
+					if not ok then
+						shadowOk = false
+						Log.Warn(
+							"Persistence",
+							"MIGRATION_RECONCILE_DEPENDENT",
+							`migration step {version} succeeds only because Reconcile backfilled a template `
+								.. `key before it ran. Against the raw stored data it throws: {err}`,
+							{ Player = player, Step = version }
+						)
+						break
+					end
+				end
+			end
+			if shadowOk then
+				local diffs = {}
+				divergences(rawStored, profile.Data, {}, diffs)
+				if #diffs > 0 then
+					Log.Warn(
+						"Persistence",
+						"MIGRATION_RECONCILE_DEPENDENT",
+						"migrations produce a different result against the raw stored data (a guarded step "
+							.. "saw a Reconcile-backfilled default instead of nil): "
+							.. table.concat(diffs, ", "),
+						{ Player = player }
+					)
+				end
+			end
 		end
 
 		-- Reconcile only fills STATIC template keys; ArrayOf/DictOf element fields
@@ -1395,30 +1579,50 @@ function Persistence.new(ctx: any)
 	--
 	-- `mutate` runs against a CLONE, so a callback that errors partway commits
 	-- nothing (the same fail-closed shape migrations use).
-	local function updateOfflineProfile(userId: number, mutate: (data: { [string]: any }) -> ())
-		local profile = store:GetAsync(self.KeyFor(userId))
+	-- Returns (ok, reason, dataStoreFailed). The third value matters: only a failing
+	-- GetAsync/SetAsync is an infrastructure failure. A precondition refusal or a
+	-- throwing caller callback is a LOGIC error, and reporting those to Health would
+	-- let six ordinary fail-closed refusals in 60s flip the server to Outage, which
+	-- in turn refuses Robux grants. Routine refusals must not degrade health.
+	local function updateOfflineProfile(
+		userId: number,
+		mutate: (data: { [string]: any }) -> ()
+	): (boolean, string?, boolean)
+		local readOk, profile = pcall(function()
+			return store:GetAsync(self.KeyFor(userId))
+		end)
+		if not readOk then
+			return false, tostring(profile), true
+		end
 		if not profile then
-			error("profile does not exist")
+			return false, "profile does not exist", false
 		end
 		if profile.Session then
-			error("profile has an active session on another server")
+			return false, "profile has an active session on another server", false
 		end
 
 		local draft = Util.deepClone(profile.Data)
-		mutate(draft)
+		local mutateOk, mutateErr = pcall(mutate, draft)
+		if not mutateOk then
+			return false, tostring(mutateErr), false
+		end
 		-- The callback mutates raw data, bypassing Node.validateWrite, so
 		-- unpersistable data (invalid UTF-8, a userdata/Instance value) would fail
 		-- the whole profile save opaquely. Reject before committing.
 		local bad = Util.findUnpersistable(draft)
 		if bad ~= nil then
-			error(`unpersistable data ({bad.Detail}) at "{Util.pathString(bad.Path)}"`)
+			return false, `unpersistable data ({bad.Detail}) at "{Util.pathString(bad.Path)}"`, false
 		end
 
 		table.clear(profile.Data)
 		for key, value in draft do
 			profile.Data[key] = value
 		end
-		profile:SetAsync()
+		local saveOk, saveErr = commitViewProfile(profile, self.KeyFor(userId))
+		if not saveOk then
+			return false, saveErr, true
+		end
+		return true, nil, false
 	end
 
 	function self.UpdateOffline(userId: number, fn: (data: { [string]: any }) -> ()): (boolean, string?)
@@ -1426,11 +1630,18 @@ function Persistence.new(ctx: any)
 			return false, "user has an active session on this server"
 		end
 		acquireOffline(userId)
-		local ok, err = pcall(updateOfflineProfile, userId, fn)
+		-- Still pcalled so an unexpected internal error cannot skip releaseOffline;
+		-- such an error is not a DataStore failure either, so it does not report.
+		local callOk, ok, reason, dataStoreFailed = pcall(updateOfflineProfile, userId, fn)
 		releaseOffline(userId)
+		if not callOk then
+			return false, tostring(ok)
+		end
 		if not ok then
-			Health.ReportFailure("OfflineWrite")
-			return false, tostring(err)
+			if dataStoreFailed then
+				Health.ReportFailure("OfflineWrite")
+			end
+			return false, reason
 		end
 		Health.ReportSuccess("OfflineWrite")
 		return true, nil
@@ -1511,7 +1722,10 @@ function Persistence.new(ctx: any)
 				data[Template.RESERVED_ROOT] = {}
 			end
 			data[Template.RESERVED_ROOT].RestoredFrom = { VersionId = versionId, At = os.time() }
-			versionProfile:SetAsync()
+			local committed, commitErr = commitViewProfile(versionProfile, self.KeyFor(userId))
+			if not committed then
+				error(commitErr)
+			end
 		end)
 		if not ok then
 			Health.ReportFailure("Restore")

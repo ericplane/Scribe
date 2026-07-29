@@ -42,6 +42,14 @@ export type TreeParams = {
 
 local Node = {}
 
+-- The exact message RunTransaction returns when `fn` yielded. Exported so a caller
+-- can tell "your callback yielded" apart from "your callback threw" without
+-- string-matching a literal; Monetization needs that distinction to keep a legacy
+-- yielding product Grant working instead of turning it into a receipt retry loop.
+local YIELD_ERROR =
+	"Scribe: a transaction function must not yield (no task.wait, DataStore, or MarketplaceService calls inside Data.Transaction; do async work before or after it)"
+Node.YIELD_ERROR = YIELD_ERROR
+
 local ACCESSOR_MT: any -- forward declaration
 
 -- Tree ------------------------------------------------------------------------
@@ -418,6 +426,55 @@ local function fireAncestors(tree: Tree, path: { string | number })
 			local value = readValue(tree, prefix)
 			fire(tree, pathKey, "Changed", value, value, path[depth + 1])
 		end
+	end
+end
+
+-- A whole-table write at one path silently changes every leaf beneath it, but
+-- `fire` only touches that exact pathKey and `fireAncestors` only walks upward,
+-- so a listener bound to a descendant would never hear about it: `Get()` returns
+-- the new value while a bound `Observe` renders the old one forever. These two
+-- helpers snapshot the observed descendants before the write and fire whichever
+-- actually changed after it, matching what `Tree.ReplayFire` already does for
+-- the Init path. Scoped to STRICT descendants: the written path itself is fired
+-- by the caller, and `leafEquals` is false for tables, so including it would
+-- double-fire the container's own observer.
+local function snapshotDescendants(tree: Tree, pathKey: string): { [string]: any }?
+	if next(tree._listeners) == nil then
+		return nil
+	end
+	-- Root writes are rejected upstream, so pathKey is never "" here; a non-empty
+	-- prefix plus the separator cannot match the written path itself.
+	local prefix = pathKey .. "\31"
+	local olds: { [string]: any }? = nil
+	for key, path in tree._paths do
+		if #key > #prefix and string.sub(key, 1, #prefix) == prefix then
+			local byEvent = tree._listeners[key]
+			if byEvent and byEvent.Changed then
+				olds = olds or {}
+				(olds :: { [string]: any })[key] = readValue(tree, path)
+			end
+		end
+	end
+	return olds
+end
+
+local function fireDescendants(tree: Tree, olds: { [string]: any }?)
+	if not olds then
+		return
+	end
+	-- Collect before firing: a fired listener may add or remove listeners.
+	local pending: { { Key: string, New: any, Old: any } } = {}
+	for key, old in olds do
+		local path = tree._paths[key]
+		if path then
+			local current = readValue(tree, path)
+			if not Util.leafEquals(current, old) then
+				table.insert(pending, { Key = key, New = current, Old = old })
+			end
+		end
+	end
+	for _, item in pending do
+		fire(tree, item.Key, "Changed", item.New, item.Old)
 	end
 end
 
@@ -1047,11 +1104,17 @@ function applySet(tree: Tree, path: { string | number }, schema: SchemaNode?, va
 
 	local pathKey = Util.pathKey(path)
 	snapshotForTxn(tree, path, pathKey, old)
+	-- Snapshot observed descendants BEFORE the write; a whole-table Set changes
+	-- every leaf beneath this path and only this pass can report it.
+	local descendantOlds = if type(newValue) == "table" or type(old) == "table"
+		then snapshotDescendants(tree, pathKey)
+		else nil
 	container[key] = newValue
 
 	emitOp(tree, { Kind = "Set", Path = table.clone(path), Value = newValue }, schema, opts)
 
 	fire(tree, pathKey, "Changed", newValue, old)
+	fireDescendants(tree, descendantOlds)
 	-- Dictionary key events on the parent (dynamic keys only).
 	if #path >= 1 then
 		local parentPath = table.move(path, 1, #path - 1, 1, table.create(#path - 1)) :: { string | number }
@@ -1172,7 +1235,19 @@ local function applyArrayRemove(
 	if type(arr) ~= "table" or #arr == 0 then
 		return nil
 	end
-	local index = math.clamp(pos or #arr, 1, #arr)
+	-- No argument means "the last element". An EXPLICIT index outside the array is
+	-- a no-op, not a clamp: clamping made Remove(99) on a 3-element array delete
+	-- element 3, and Remove(0) delete element 1, silently destroying real data on
+	-- what is almost always an off-by-one or a stale index.
+	local index: number
+	if pos == nil then
+		index = #arr
+	else
+		if pos ~= math.floor(pos) or pos < 1 or pos > #arr then
+			return nil
+		end
+		index = pos
+	end
 
 	local pathKey = Util.pathKey(path)
 	snapshotForTxn(tree, path, pathKey, arr)
@@ -1201,11 +1276,15 @@ local function applyClear(tree: Tree, path: { string | number }, schema: SchemaN
 	end
 	local pathKey = Util.pathKey(path)
 	snapshotForTxn(tree, path, pathKey, value)
+	local descendantOlds = snapshotDescendants(tree, pathKey)
 	table.clear(value)
 
 	emitOp(tree, { Kind = "Clear", Path = table.clone(path) }, schema, opts)
-	-- Bulk semantics: parent Changed fires once; per-entry events don't.
+	-- Bulk semantics: parent Changed fires once; per-entry key events don't. A
+	-- descendant leaf listener is NOT a per-entry event though: its value really
+	-- did change, and it has no other way to learn that.
 	fire(tree, pathKey, "Changed", value, value)
+	fireDescendants(tree, descendantOlds)
 	fireAncestors(tree, path)
 end
 
@@ -1338,9 +1417,7 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 	local ok, err
 	if coroutine.status(co) ~= "dead" then
 		coroutine.close(co) -- cancel it so the scheduler never resumes it after rollback
-		ok, err =
-			false,
-			"Scribe: a transaction function must not yield (no task.wait, DataStore, or MarketplaceService calls inside Data.Transaction; do async work before or after it)"
+		ok, err = false, YIELD_ERROR
 	elseif not resumed then
 		ok, err = false, tostring(innerOk) -- coroutine itself errored (should not happen)
 	else

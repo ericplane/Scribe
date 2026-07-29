@@ -69,7 +69,11 @@ local function applyPlainOp(root: { [any]: any }, op: Wire.Op)
 end
 
 function Client.new(options: any, compiled: Template.Compiled): any
-	local isRunning = RunService:IsRunning()
+	-- Advanced/test seams. Patching RunService itself works on a mock table but is
+	-- illegal on a real service Instance, so without these no spec that needs edit
+	-- mode or the Studio hook can run in Studio at all.
+	local isRunning = if options.IsRunning ~= nil then options.IsRunning == true else RunService:IsRunning()
+	local devMode = if options.DevMode ~= nil then options.DevMode == true else RunService:IsStudio()
 	local editMode = not isRunning
 
 	if options.LogLevel then
@@ -88,7 +92,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		OnOp = nil, -- client writes are local-only
 		OnAnomaly = nil,
 		BoundsPolicy = options.BoundsPolicy or "Clamp",
-		DevMode = RunService:IsStudio(),
+		DevMode = devMode,
 		TimedHooks = {
 			-- Timed internals are server-only; the client sees the value.
 			SetTimed = function()
@@ -259,7 +263,10 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				cache.MyScore = Wire.RF64(reader)
 			end
 			leaderboardCache[name] = cache
-			OnLeaderboard:Fire(name)
+			-- The prop doc and the leaderboards guide both promise (boardName,
+			-- entries), and the entries were decoded immediately above, so passing
+			-- only the name forced every listener into a redundant GetLeaderboard.
+			OnLeaderboard:Fire(name, entries)
 		end
 	end
 
@@ -267,7 +274,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	-- view. Attached before the transport connects so the Init snapshot
 	-- application is captured too. Read-only by construction; outside Studio
 	-- the branch is never taken and the hook does not exist.
-	if isRunning and RunService:IsStudio() and RunService:IsClient() then
+	if isRunning and devMode and (options.IsClient == true or RunService:IsClient()) then
 		local hookOk, hookErr = pcall(function()
 			(require(script.DebugHook) :: any).Attach({
 				Compiled = compiled,

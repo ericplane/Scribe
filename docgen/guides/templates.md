@@ -95,6 +95,22 @@ Separately, values that simply cannot be stored are always rejected outright:
 
 Data written through raw paths that bypass the accessor, such as migrations or `OnPlayerInit`, is scanned for the same problems at load and reported as `PROFILE_UNPERSISTABLE`.
 
+### Naming the accessor type
+
+To store a profile in your own class or table you need a name for the accessor's type. That is `Scribe.PlayerData<T>`, the type of `Data[player]`, `Data.Get(player)`, and the client's `Data.Get()`:
+
+```lua
+export type Template = typeof(template) -- from the module that calls Scribe()
+
+type PlayerData = Scribe.PlayerData<Template>
+
+local function new(player: Player, data: PlayerData)
+    return { player = player, joinedAt = os.time(), data = data }
+end
+```
+
+Use `Scribe.ServerData<T>` and `Scribe.ClientData<T>` for the whole `Data` object, and `Scribe.PlayerData<T>` for one player's tree.
+
 ## Timed fields
 
 A `Scribe.Timed` field auto-clears back to its default when its timer lapses, firing `Changed`. A client `Observe` already covers "the booster ended":
@@ -130,6 +146,19 @@ Data.ClearCooldown(player, "DailyReward") -- support / testing reset
 ```
 
 Cooldowns are stored server-side in the profile, so they survive rejoins and cross-server hops and never replicate to the client. The rule of thumb: `Timed` is for a **field that expires** (a booster you read and display), while a cooldown answers **"can this happen again yet"** and holds no value of its own.
+
+To react the moment one lapses, connect [`OnCooldownEnded`](/api/Server#OnCooldownEnded). A cooldown holds no value, so unlike a lapsing `Timed` field it fires no `Changed`, and this signal is its only expiry notification:
+
+```lua
+Data.OnCooldownEnded:Connect(function(player, key)
+    if key ~= "DailyReward" then
+        return
+    end
+    -- the daily reward is claimable again
+end)
+```
+
+One signal covers every cooldown, because keys are arbitrary strings rather than declared fields, so there is no set to subscribe to. It fires within about a second of expiry, and **not** for cooldowns that lapsed while the player was offline; read those with `PeekCooldown` at join.
 
 ## Roblox datatype fields
 

@@ -157,14 +157,9 @@ return function()
 	itRunning("Mock fires nested observers registered before the Mock call (edit mode)", function()
 		-- Same whole-root-Set root cause as Init, on the edit-mode path.
 		local harness = TestCtx.make()
-		-- Reuse the module-level RunService singleton (same object) rather than
-		-- redeclaring it here, which would shadow it.
-		local origIsRunning = RunService.IsRunning
-		RunService.IsRunning = function() -- edit mode at construction
-			return false
-		end
-		local clientData = Client.new({}, harness.Compiled)
-		RunService.IsRunning = origIsRunning
+		-- Edit mode at construction, via the option seam. Patching RunService is
+		-- illegal on a real service Instance and made this unrunnable in Studio.
+		local clientData = Client.new({ IsRunning = false }, harness.Compiled)
 
 		local dictVal, music = {}, {}
 		clientData.Inventory.Test.Observe(function(v) -- nested dict key, BEFORE Mock

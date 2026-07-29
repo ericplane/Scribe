@@ -497,6 +497,7 @@ export type function ServerDataType(T, P)
 
 	add("OnSave", ts.any)
 	add("SessionEnded", ts.any)
+	add("OnCooldownEnded", ts.any)
 	add("OnAnomaly", ts.any)
 	add("OnGiftReceived", ts.any)
 	add("OnGiftCredit", ts.any)
@@ -599,6 +600,9 @@ export type ScribeOptions<T> = {
 	Transport: (Types.ScribeTransport | "Default")?,
 
 	Migrations: { [number]: (data: { [string]: any }) -> () }?,
+	UserOwnsGamePassAsync: ((userId: number, passId: number) -> boolean)?, -- advanced/test seam
+	DevMode: boolean?, -- advanced/test seam: overrides the RunService:IsStudio() default
+	MigrationShadow: boolean?, -- audit aid: re-runs migrations against raw pre-Reconcile data and warns on divergence (re-executes your migration bodies)
 	OnPlayerInit: ((player: Player, rawData: { [string]: any }, isNewProfile: boolean) -> ())?,
 
 	-- persistence
@@ -666,6 +670,13 @@ export type ServerData<T> = ServerDataType<T, Player>
 
 export type ClientData<T> = ClientDataType<T>
 
+-- One player's typed accessor tree: the type of `Data[player]`, `Data.Get(player)`
+-- and the client's `Data.Get()`. Exported as a plain alias because `ValueType` is
+-- a type FUNCTION, and a type function cannot be invoked across a module boundary
+-- (`Scribe.ValueType<T>` silently resolves to `any` rather than erroring), so this
+-- is the only way a consumer can name the accessor type.
+export type PlayerData<T> = ValueType<T>
+
 export type Bundle<T> = {
 	Server: ServerData<T>,
 	Client: ClientData<T>,
@@ -716,6 +727,9 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	Transport = true,
 	TransportChannel = true,
 	Migrations = true,
+	UserOwnsGamePassAsync = true,
+	DevMode = true,
+	MigrationShadow = true,
 	OnPlayerInit = true,
 	ProfileStoreIndex = true,
 	ProfileKeyPrefix = true,

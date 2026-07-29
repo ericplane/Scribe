@@ -12,18 +12,13 @@ return function()
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
 
 	it("boot-attached hook leaves handshake, diffs, and broadcasts intact", function()
-		-- Attach exactly like Server.new: Studio-gated, after Server.build.
-		local RunService = game:GetService("RunService")
-		local origIsStudio = RunService.IsStudio
-		RunService.IsStudio = function()
-			return true
-		end
-
-		local harness = TestCtx.make()
+		-- Attach exactly like Server.new does after Server.build. DebugHook.Attach is
+		-- called directly here, so no RunService gate needs faking; patching the real
+		-- service Instance is illegal and made this spec unrunnable in Studio.
+		local harness = TestCtx.make({ Options = { DevMode = true } })
 		local attachOk, attachErr = pcall(function()
 			(require(ScribeRoot.Server.DebugHook) :: any).Attach(harness.Data, harness.Ctx)
 		end)
-		RunService.IsStudio = origIsStudio
 		if not attachOk then
 			error(`DebugHook.Attach failed at boot: {tostring(attachErr)}`)
 		end
@@ -74,23 +69,15 @@ return function()
 		-- The client hook attaches when IsStudio + IsClient; it wraps
 		-- tree.ApplyOp to record received ops. Diff application must be
 		-- byte-identical with the wrap installed.
-		local RunService = game:GetService("RunService")
-		local origIsStudio = RunService.IsStudio
-		local origIsClient = RunService.IsClient
-		RunService.IsStudio = function()
-			return true
-		end
-		RunService.IsClient = function()
-			return true
-		end
-
 		local harness = TestCtx.make({ AutoPump = true, Options = { RequestTimeout = 0.25 } })
 		local player, entry, serverData = harness.Join()
 		harness.Transport.LocalPlayer = player
-		local clientOk, clientDataOrErr = pcall(Client.new, harness.Options, harness.Compiled)
-
-		RunService.IsStudio = origIsStudio
-		RunService.IsClient = origIsClient
+		-- Force the Studio client-hook branch via the option seams rather than
+		-- patching RunService, which a real service Instance rejects.
+		local clientOptions = table.clone(harness.Options)
+		clientOptions.DevMode = true
+		clientOptions.IsClient = true
+		local clientOk, clientDataOrErr = pcall(Client.new, clientOptions, harness.Compiled)
 		if not clientOk then
 			error(`Client.new failed with the client hook attached: {tostring(clientDataOrErr)}`)
 		end

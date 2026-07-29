@@ -19,6 +19,14 @@ return function()
 		expect(ok).to.equal(true)
 		task.wait() -- OnMessage fires via task.spawn; let it run
 
+		-- Delivery is NOT immediate. MessageAsync only commits the message to the
+		-- recipient's GlobalUpdates; ProfileStore hands it to the handler inside the
+		-- recipient's next save (or at MessageHandler registration). The harness used
+		-- to deliver inline, which hid that entirely.
+		expect(received).to.equal(nil)
+		harness.Data.Flush(player)
+		task.wait()
+
 		expect(received).to.be.ok()
 		expect(received.Player).to.equal(player)
 		expect(received.Message.Kind).to.equal("Hello")
