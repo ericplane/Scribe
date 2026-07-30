@@ -1563,6 +1563,20 @@ end
 	no validation and no replication, so treat it as read-only and use [Value.Clone]
 	when you intend to mutate.
 
+	That applies to entries you reach through it too, which is the usual way this
+	bites: an entry from `Get` is a plain table with no [Value.Set] of its own, so
+	write through the accessor at that index instead.
+
+	```lua
+	local daily = data.Gifts.Daily
+	for i, entry in daily.Get() do          -- read from the snapshot
+	    if entry.GiftId == day then
+	        daily[i].Claimed.Set(true)      -- write through the accessor
+	        break
+	    end
+	end
+	```
+
 	A value that has not materialized yet reads `nil`: a field of a `Scribe.DictOf`
 	key nothing has written, or a [Scribe.Optional] field. On a fresh key that `nil`
 	is not the whole story, since [Value.Increment] and [Value.Toggle] start from the
