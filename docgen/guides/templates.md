@@ -84,6 +84,32 @@ data.Inventory.Sword.Level.Set(4)  -- a fresh key starts from the element defaul
 data.Coins.Observe(function(v) print("coins:", v) end)
 ```
 
+:::caution `Get()` on a table is read-only
+For a **table** field, `Get()` hands you the stored table itself, not a copy. Mutating it writes straight into authoritative state behind Scribe's back: no validation, no replication op, and no `Changed`. The value changes on the server and even persists, but the client never hears about it.
+
+```lua
+-- WRONG: edits real state silently, and never replicates
+for _, entry in data.Gifts.Daily.Get() do
+    if entry.GiftId == day then
+        entry.Claimed = true
+    end
+end
+
+-- RIGHT: find the index, then write through the accessor
+local daily = data.Gifts.Daily
+for i, entry in daily.Get() do
+    if entry.GiftId == day then
+        daily[i].Claimed.Set(true)
+        break
+    end
+end
+```
+
+`daily[i]` is a real [`Value`](/api/Value), so `.Set` validates, replicates, and fires listeners like any other write. This works for a plain array and for a [`Scribe.ArrayOf`](#typed-containers) alike. The entry you got from `Get()` is a plain Lua table, so it has no `.Set` of its own.
+
+The inconsistency is the reason for the blanket rule: a subtree containing packed datatypes **is** rebuilt on the way out, so mutating that one is silently discarded instead of silently applied. Two different silent failures depending on the shape of your template. Treat everything `Get()` returns as read-only, and use [`Clone()`](/api/Value#Clone) when you want a detached table you can edit freely.
+:::
+
 Writes are validated against the declarator: out-of-range numbers clamp (or reject, under `BoundsPolicy = "Reject"`), enum values outside the set are refused, and a string past a field's `MaxLength` is truncated on a character boundary (so a multi-byte character is never split), or rejected under `BoundsPolicy = "Reject"`. Note `MaxLength` counts **bytes**, not characters, so budget for multi-byte text.
 
 Separately, values that simply cannot be stored are always rejected outright:
