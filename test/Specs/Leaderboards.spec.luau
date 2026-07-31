@@ -188,4 +188,100 @@ return function()
 
 		harness.Cleanup()
 	end)
+
+	it("warns once in DevMode when a board name is not declared", function()
+		local harness = TestCtx.make({
+			Options = {
+				DevMode = true,
+				Leaderboards = { TopCoins = { Stat = "Coins" } },
+			},
+		})
+		local player = harness.Join()
+		local function warnings()
+			return #Scribe.GetRecentLogs({ Code = "LB_UNKNOWN_BOARD", Limit = 50 })
+		end
+		local before = warnings()
+
+		-- Case-sensitive: this is the mistake the warning exists for.
+		expect(#harness.Data.GetLeaderboard("topcoins", 10)).to.equal(0)
+		expect(warnings()).to.equal(before + 1)
+
+		-- Once per name, not once per call.
+		harness.Data.GetLeaderboard("topcoins", 10)
+		harness.Data.GetMyRank(player, "topcoins")
+		expect(warnings()).to.equal(before + 1)
+
+		-- A declared board stays silent.
+		harness.Data.GetLeaderboard("TopCoins", 10)
+		expect(warnings()).to.equal(before + 1)
+
+		harness.Cleanup()
+	end)
+
+	it("clamps a sub-60s RefreshInterval up and says so", function()
+		local harness = TestCtx.make({
+			Options = {
+				DevMode = true,
+				Leaderboards = { Fast = { Stat = "Coins", RefreshInterval = 5 } },
+			},
+		})
+		local logs = Scribe.GetRecentLogs({ Code = "LB_INTERVAL_CLAMPED", Limit = 10 })
+		expect(#logs > 0).to.equal(true)
+		expect(string.find(logs[1].Message, "clamped", 1, true) ~= nil).to.equal(true)
+		harness.Cleanup()
+	end)
+
+	it("accepts a slower RefreshInterval without complaint", function()
+		local before = #Scribe.GetRecentLogs({ Code = "LB_INTERVAL_CLAMPED", Limit = 50 })
+		local harness = TestCtx.make({
+			Options = { Leaderboards = { Slow = { Stat = "Coins", RefreshInterval = 600 } } },
+		})
+		expect(#Scribe.GetRecentLogs({ Code = "LB_INTERVAL_CLAMPED", Limit = 50 })).to.equal(before)
+		harness.Cleanup()
+	end)
+
+	it("rejects a board set whose aggregate read rate is too high", function()
+		-- The floor alone permits this: every board is at the 60s minimum, but the
+		-- TOTAL is what burns the GetSortedAsync budget.
+		local many = {}
+		for i = 1, 20 do
+			many[`Board{i}`] = { Stat = "Coins" }
+		end
+		expect(function()
+			TestCtx.make({ Options = { Leaderboards = many } })
+		end).to.throw()
+
+		-- A sane count still boots.
+		local harness = TestCtx.make({
+			Options = { Leaderboards = { A = { Stat = "Coins" }, B = { Stat = "Gems" } } },
+		})
+		harness.Cleanup()
+	end)
+
+	it("fires OnLeaderboard on the server when a board changes, even without Replicate", function()
+		local harness = TestCtx.make({
+			Options = { Leaderboards = { TopCoins = { Stat = "Coins" } } }, -- server-only
+		})
+		local fired = {}
+		harness.Data.OnLeaderboard:Connect(function(boardName, entries)
+			table.insert(fired, { Board = boardName, Count = #entries })
+		end)
+
+		local player, _e, data = harness.Join(96001)
+		data.Coins.Set(500)
+		harness.Ctx.Leaderboards.FlushAllBlocking(1)
+		harness.Ctx.Leaderboards.RefreshNow("TopCoins")
+
+		expect(#fired >= 1).to.equal(true)
+		expect(fired[1].Board).to.equal("TopCoins")
+		expect(fired[1].Count >= 1).to.equal(true)
+
+		-- An unchanged board must not re-fire.
+		local afterFirst = #fired
+		harness.Ctx.Leaderboards.RefreshNow("TopCoins")
+		expect(#fired).to.equal(afterFirst)
+
+		harness.Leave(player)
+		harness.Cleanup()
+	end)
 end

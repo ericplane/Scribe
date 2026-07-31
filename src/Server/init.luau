@@ -47,6 +47,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		OnMessage = Signal.new(), -- (player, message)
 		OnOwnershipChanged = Signal.new(), -- (player, key, owned)
 		OnCooldownEnded = Signal.new(), -- (player, key)
+		OnLeaderboard = Signal.new(), -- (boardName, entries)
 	}
 
 	if options.LogLevel then
@@ -693,6 +694,34 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		Cooldowns that lapsed while the player was offline do **not** fire on join.
 		Read the current state with [Server.PeekCooldown] instead.
 	]=]
+	--[=[
+		@within Server
+		@tag Signals
+		@server
+		@prop OnLeaderboard Signal
+		Fires with `(boardName, entries)` when a board's contents actually change,
+		once per refresh cycle. `entries` is a fresh copy, safe to keep or mutate.
+
+		This is the server-side counterpart to the client signal of the same name,
+		and unlike that one it fires for **every** board, not just `Replicate` ones.
+		A server-only board is the default, so without this the only way to notice a
+		refresh is polling, which cannot align with the per-board schedule and so
+		reads a cache that is anywhere from fresh to a full interval stale.
+
+		```lua
+		Data.OnLeaderboard:Connect(function(boardName, entries)
+		    if boardName ~= "TopCoins" then
+		        return
+		    end
+		    for _, entry in entries do
+		        print(entry.Rank, entry.Name, entry.Score)
+		    end
+		end)
+		```
+
+		An unchanged board does not re-fire, so this is quiet on an idle board.
+	]=]
+	Data.OnLeaderboard = ctx.Signals.OnLeaderboard
 	Data.OnCooldownEnded = ctx.Signals.OnCooldownEnded
 	Data.OnGiftReceived = ctx.Signals.OnGiftReceived
 	--[=[

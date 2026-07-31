@@ -498,6 +498,7 @@ export type function ServerDataType(T, P)
 	add("OnSave", ts.any)
 	add("SessionEnded", ts.any)
 	add("OnCooldownEnded", ts.any)
+	add("OnLeaderboard", ts.any)
 	add("OnAnomaly", ts.any)
 	add("OnGiftReceived", ts.any)
 	add("OnGiftCredit", ts.any)
@@ -542,6 +543,7 @@ export type LeaderboardConfig<T = any> = {
 	Limit: number?,
 	Scale: number?,
 	Replicate: boolean?, -- default false: server-only (Data.GetLeaderboard on the server); true streams the board to clients
+	RefreshInterval: number?, -- seconds between reads of this board (default 60; values below 60 are clamped up)
 	StoreName: string?, -- override the OrderedDataStore name (default "LB_<board>")
 }
 
@@ -569,6 +571,7 @@ type LeaderboardConfigLoose = {
 	read Limit: number?,
 	read Scale: number?,
 	read Replicate: boolean?,
+	read RefreshInterval: number?,
 }
 
 type ProductConfigLoose = {

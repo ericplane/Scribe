@@ -296,6 +296,7 @@ end
 -- are edited in separate files, so this is what keeps them in sync.
 local function signalSurface()
 	Data.OnCooldownEnded:Connect(function(_player: Player, _key: string) end)
+	Data.OnLeaderboard:Connect(function(_board: string, _entries: { any }) end)
 	Data.OnOwnershipChanged:Connect(function(_player: Player, _key: string, _owned: boolean) end)
 end
 

@@ -18,6 +18,18 @@ local Leaderboards = {}
 
 local WRITE_INTERVAL = 1.5
 local REFRESH_INTERVAL = 60
+-- Floor on a per-board RefreshInterval. GetSortedAsync's request budget scales with
+-- player count, so the worst case is a near-empty server: it has the smallest budget
+-- while still refreshing every board on the same schedule. Going FASTER than the
+-- default is also usually the wrong tool. A sub-minute board is almost always an
+-- in-server live scoreboard, which belongs in Scribe.Shared at zero DataStore cost;
+-- these boards are global and all-time. So the option exists to go slower.
+local MIN_REFRESH_INTERVAL = 60
+-- Boot guard on the AGGREGATE rate, which is what actually burns budget: ten boards
+-- at 60s costs more than one board at 15s, and a flat floor permits the former while
+-- blocking the latter. Conservative enough to stay inside a low-population server's
+-- allowance with headroom for the write pacer.
+local MAX_REFRESH_PER_MINUTE = 12
 local QUEUE_CAP = 1000
 local NAME_TTL = 900
 local NAME_NEGATIVE_TTL = 120
@@ -28,6 +40,7 @@ type Board = {
 	StatPath: { string },
 	Limit: number,
 	Scale: number,
+	RefreshInterval: number,
 	Replicate: boolean, -- default false: server-only, no client mirror
 	StoreName: string,
 	Cache: { Entries: { any }, At: number },
@@ -149,8 +162,29 @@ function Leaderboards.new(ctx: any)
 				error(`Scribe: leaderboard "{name}" Scale must be a finite number greater than 0`, 0)
 			end
 		end
+		-- Opt-in slower refresh. Clamped up rather than rejected so an existing config
+		-- keeps working, but the clamp is reported: silently running 6x slower than
+		-- asked would be its own bug.
+		local refreshInterval = REFRESH_INTERVAL
+		if config.RefreshInterval ~= nil then
+			local requested = config.RefreshInterval
+			if type(requested) ~= "number" or requested ~= requested or requested <= 0 then
+				error(`Scribe: leaderboard "{name}" RefreshInterval must be a positive number of seconds`, 0)
+			end
+			refreshInterval = math.max(requested, MIN_REFRESH_INTERVAL)
+			if refreshInterval ~= requested then
+				Log.Warn(
+					"Leaderboards",
+					"LB_INTERVAL_CLAMPED",
+					`leaderboard "{name}" RefreshInterval {requested}s is below the {MIN_REFRESH_INTERVAL}s floor and was clamped. `
+						.. "A sub-minute board is usually an in-server scoreboard, which belongs in Scribe.Shared (no DataStore cost).",
+					{ Board = name, Requested = requested, Applied = refreshInterval }
+				)
+			end
+		end
 		boards[name] = {
 			Name = name,
+			RefreshInterval = refreshInterval,
 			StatPath = Util.parsePath(config.Stat),
 			Limit = math.clamp(config.Limit or 100, 1, 100),
 			Scale = config.Scale or 1,
@@ -162,6 +196,25 @@ function Leaderboards.new(ctx: any)
 			MyScores = {},
 			SentState = {},
 		}
+	end
+
+	-- Aggregate budget guard. A flat per-board floor permits ten boards at 60s (10
+	-- reads/min) while blocking one board at 15s (4 reads/min), so the floor alone
+	-- controls the wrong thing. Fail at boot like Stat/Scale/Period rather than
+	-- surfacing as mystery throttling in production.
+	do
+		local perMinute = 0
+		for _, board in boards do
+			perMinute += 60 / board.RefreshInterval
+		end
+		if perMinute > MAX_REFRESH_PER_MINUTE then
+			error(
+				`Scribe: leaderboards would issue {string.format("%.1f", perMinute)} GetSortedAsync reads per minute `
+					.. `across {Util.count(boards)} board(s), over the {MAX_REFRESH_PER_MINUTE}/min guard. `
+					.. "Raise RefreshInterval on some boards, or declare fewer of them.",
+				0
+			)
+		end
 	end
 
 	local function orderedStore(name: string): any
@@ -435,7 +488,21 @@ function Leaderboards.new(ctx: any)
 			table.insert(signatureParts, `{userId}:{score}`)
 		end
 		board.Cache = { Entries = entries, At = os.clock() }
+		local previousSignature = board.Signature
 		board.Signature = table.concat(signatureParts, "|")
+
+		-- Fire BEFORE broadcastBoard, which returns immediately for a board without
+		-- Replicate. Server-only is the default, so those boards otherwise have no way
+		-- at all to observe a refresh and the only option is polling on a timer that
+		-- cannot align with this schedule. Entries are cloned: handing over the live
+		-- cache would let a listener mutate what every later read serves.
+		if board.Signature ~= previousSignature then
+			local snapshot = table.create(#board.Cache.Entries)
+			for _, item in board.Cache.Entries do
+				table.insert(snapshot, table.clone(item))
+			end
+			ctx.Signals.OnLeaderboard:Fire(board.Name, snapshot)
+		end
 
 		-- Each online player's own rank/score, computed on the refresh cycle.
 		for _, entry in ctx.Persistence.Entries do
@@ -452,16 +519,28 @@ function Leaderboards.new(ctx: any)
 		broadcastBoard(board)
 	end
 
+	-- Each board is now on its own cadence, so the single shared cycle is replaced by
+	-- a due-time scheduler. Initial due times are staggered across the first cycle so
+	-- boot does not fire every board in the same instant.
 	local function refreshLoop()
 		task.wait(5)
+		local dueAt: { [string]: number } = {}
+		local index = 0
+		local count = math.max(Util.count(boards), 1)
+		for boardName, board in boards do
+			dueAt[boardName] = os.clock() + (board.RefreshInterval * index) / count
+			index += 1
+		end
 		while true do
-			for _, board in boards do
-				task.spawn(refreshBoard, board)
-				task.wait(REFRESH_INTERVAL / math.max(Util.count(boards), 1))
+			local now = os.clock()
+			for boardName, board in boards do
+				local due = dueAt[boardName]
+				if due == nil or now >= due then
+					dueAt[boardName] = now + board.RefreshInterval
+					task.spawn(refreshBoard, board)
+				end
 			end
-			if next(boards) == nil then
-				task.wait(REFRESH_INTERVAL)
-			end
+			task.wait(1)
 		end
 	end
 
@@ -563,9 +642,26 @@ function Leaderboards.new(ctx: any)
 
 	-- Public API --------------------------------------------------------------------------
 
+	-- An unknown board name returns empty/nil with no other signal, and the names are
+	-- case-sensitive, so a typo looks exactly like a board that has not refreshed yet.
+	-- Warn once per name in Studio, matching checkOwnsKey in Monetization.
+	local warnedBoardNames: { [string]: boolean } = {}
+	local function checkBoardName(name: string, caller: string)
+		if ctx.DevMode and not boards[name] and not warnedBoardNames[name] then
+			warnedBoardNames[name] = true
+			Log.Warn(
+				"Leaderboards",
+				"LB_UNKNOWN_BOARD",
+				`{caller}("{name}") — no board named "{name}" is declared in the Leaderboards option (names are case-sensitive); this always returns nothing`,
+				{ Board = name }
+			)
+		end
+	end
+
 	function self.GetLeaderboard(name: string, limit: number?): { any }
 		local board = boards[name]
 		if not board then
+			checkBoardName(name, "GetLeaderboard")
 			return {}
 		end
 		local out = {}
@@ -578,6 +674,9 @@ function Leaderboards.new(ctx: any)
 	function self.GetMyRank(player: Player, name: string): number?
 		local board = boards[name]
 		local entry = ctx.Persistence.Entries[player]
+		if not board then
+			checkBoardName(name, "GetMyRank")
+		end
 		if not board or not entry then
 			return nil
 		end

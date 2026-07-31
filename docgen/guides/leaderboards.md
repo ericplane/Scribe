@@ -54,3 +54,33 @@ return Scribe({ Template = template, Leaderboards = boards, --[[ ...required fie
 ```
 
 The annotation is what enables strict checking: inside a single `Scribe({ ... })` literal Luau widens the string before the template type is known, so the annotated-local pattern is how you get autocomplete for `Stat` and `Cost.Path`.
+
+## Refresh cadence
+
+Each board re-reads its OrderedDataStore every 60 seconds by default. Set `RefreshInterval` per board to go **slower**, which is what most games want: a top-100 all-time board rarely needs minute-freshness, and every refresh spends from a `GetSortedAsync` budget that scales with player count.
+
+```lua
+Leaderboards = {
+    TopCoins = { Stat = "Coins" },                          -- default 60s
+    AllTimeDonors = { Stat = "Robux", RefreshInterval = 600 }, -- once every 10 minutes
+}
+```
+
+Values below 60 seconds are clamped up and reported as `LB_INTERVAL_CLAMPED`. Going faster is nearly always the wrong tool: a sub-minute board is an *in-server* live scoreboard, and that should be a [`Scribe.Shared`](./visibility) root, which updates instantly and costs no DataStore requests at all. These boards are global and all-time.
+
+Scribe also refuses at startup if the boards you declare would collectively read too often, because the total is what actually burns budget: ten boards at 60s costs more than one board at 15s, so a per-board floor alone controls the wrong thing.
+
+### Reacting to an update
+
+Connect [`OnLeaderboard`](/api/Server#OnLeaderboard) instead of polling. It fires with `(boardName, entries)` when a board's contents actually change, and unlike the client signal it fires for **every** board, including server-only ones:
+
+```lua
+Data.OnLeaderboard:Connect(function(boardName, entries)
+    if boardName ~= "TopCoins" then
+        return
+    end
+    updateDisplay(entries)
+end)
+```
+
+A polling loop cannot align with the schedule (boards are staggered across their cycle), so it reads a cache anywhere from fresh to a full interval stale. `entries` is a fresh copy, so you can keep or mutate it freely.
