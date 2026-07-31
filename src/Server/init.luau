@@ -702,6 +702,9 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		Fires with `(boardName, entries)` when a board's contents actually change,
 		once per refresh cycle. `entries` is a fresh copy, safe to keep or mutate.
 
+		Entries are **rank-ordered**: `entries[1]` is rank 1, highest score first,
+		the same order and shape [Server.GetLeaderboard] returns.
+
 		This is the server-side counterpart to the client signal of the same name,
 		and unlike that one it fires for **every** board, not just `Replicate` ones.
 		A server-only board is the default, so without this the only way to notice a

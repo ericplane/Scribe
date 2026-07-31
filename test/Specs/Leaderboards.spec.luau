@@ -284,4 +284,40 @@ return function()
 		harness.Leave(player)
 		harness.Cleanup()
 	end)
+
+	it("hands OnLeaderboard entries rank-ordered, matching GetLeaderboard", function()
+		local harness = TestCtx.make({ Options = { Leaderboards = { Top = { Stat = "Coins" } } } })
+		local entries
+		harness.Data.OnLeaderboard:Connect(function(_boardName, received)
+			entries = received
+		end)
+
+		-- Joined deliberately out of score order: the ordering must come from the
+		-- board, not from join order or table iteration.
+		for _, pair in { { 1, 50 }, { 2, 900 }, { 3, 300 } } do
+			local _p, _e, data = harness.Join(97000 + pair[1])
+			data.Coins.Set(pair[2])
+		end
+		harness.Ctx.Leaderboards.FlushAllBlocking(1)
+		harness.Ctx.Leaderboards.RefreshNow("Top")
+
+		expect(entries).to.be.ok()
+		expect(#entries).to.equal(3)
+		-- entries[i] is rank i, highest score first.
+		expect(entries[1].Rank).to.equal(1)
+		expect(entries[1].Score).to.equal(900)
+		expect(entries[2].Rank).to.equal(2)
+		expect(entries[2].Score).to.equal(300)
+		expect(entries[3].Rank).to.equal(3)
+		expect(entries[3].Score).to.equal(50)
+
+		-- Same order GetLeaderboard serves, so the two are interchangeable.
+		local fromGetter = harness.Data.GetLeaderboard("Top", 10)
+		for i, entry in entries do
+			expect(fromGetter[i].UserId).to.equal(entry.UserId)
+			expect(fromGetter[i].Rank).to.equal(entry.Rank)
+		end
+
+		harness.Cleanup()
+	end)
 end

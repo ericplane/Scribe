@@ -83,4 +83,4 @@ Data.OnLeaderboard:Connect(function(boardName, entries)
 end)
 ```
 
-A polling loop cannot align with the schedule (boards are staggered across their cycle), so it reads a cache anywhere from fresh to a full interval stale. `entries` is a fresh copy, so you can keep or mutate it freely.
+`entries` is rank-ordered, so `entries[1]` is rank 1 with the highest score, exactly what `GetLeaderboard` returns. A polling loop cannot align with the schedule (boards are staggered across their cycle), so it reads a cache anywhere from fresh to a full interval stale. `entries` is a fresh copy, so you can keep or mutate it freely.
