@@ -1563,6 +1563,18 @@ end
 	no validation and no replication, so treat it as read-only and use [Value.Clone]
 	when you intend to mutate.
 
+	:::note The root is a special case
+	`Data[player].Get()` is the one read that does not hand back the store. It
+	returns a **frozen** table holding exactly the roots your template declares, so
+	`Get().Coins = 1` raises at that line instead of quietly editing authoritative
+	state. Scribe's own `_Scribe` and `_ScribeSession` roots are left out, which is
+	what the accessor type has always said, and `Scribe.Session` roots are included,
+	which it also said but the runtime used to omit. The freeze is shallow: nested
+	containers are still the live tables described above. Use [Value.Clone] for a
+	copy you can edit, and [Server.Export] when you want the profile including
+	Scribe's internals.
+	:::
+
 	That applies to entries you reach through it too, which is the usual way this
 	bites: an entry from `Get` is a plain table with no [Value.Set] of its own, so
 	write through the accessor at that index instead.
@@ -1626,6 +1638,14 @@ end
 	@tag Core
 	@return T
 	A deep copy of the value (for tables/buffers you intend to mutate locally).
+
+	On the root accessor the copy holds exactly your declared template roots, the
+	same shape [Value.Get] returns, and unlike `Get` it is not frozen. Scribe's
+	`_Scribe` root is left out on purpose, because it is the copy that tends to
+	leave the profile it came from. Carrying it into another profile grants that
+	player every perk and gift credit the first one owned, and stamps them with a
+	migration `Version` they never ran, which makes Scribe skip those migrations
+	permanently.
 ]=]
 
 --[=[
@@ -2075,13 +2095,63 @@ local function cloneUnpack(schema: SchemaNode?, value: any): any
 	return out
 end
 
+-- The whole-data value the ROOT accessor reads. Reading the store directly is
+-- wrong in both directions: the store carries Scribe's library-owned roots, which
+-- the declared type has never had, and it is only ONE of the two stores, so the
+-- Session roots the declared type DOES have go missing on the server (readValue
+-- short-circuits the empty path to Stores.Persist, while every deeper read routes
+-- through storeFor). Building the shell from the DECLARED roots instead means the
+-- snapshot carries exactly the keys the template promises, and nothing else.
+--
+-- Scribe's own internals stay reachable by indexing the accessor
+-- (`data._Scribe.Perks`), which is how the server layers read them; this only
+-- changes what a whole-data read hands back.
+local function rootShell(tree: Tree, clone: boolean): { [string]: any }
+	local out: { [string]: any } = {}
+	local children = tree.Compiled.Root.Children
+	if children == nil then
+		return out
+	end
+	for key, childSchema in children do
+		if key == Template.RESERVED_ROOT or key == Template.SESSION_ROOT then
+			continue
+		end
+		local value = storeFor(tree, key)[key]
+		if value == nil then
+			continue
+		end
+		if not clone then
+			out[key] = unpackRead(childSchema, value)
+		elseif childSchema.ValueType == "datatype" or childSchema.HasDatatype then
+			out[key] = cloneUnpack(childSchema, value)
+		else
+			out[key] = Util.deepClone(value)
+		end
+	end
+	return out
+end
+
+-- Every root read hands back the same frozen shell shape, so Get, Observe, and
+-- Changed cannot disagree about what "all of the data" means.
+local function frozenRootShell(tree: Tree): { [string]: any }
+	return table.freeze(rootShell(tree, false))
+end
+
 local METHOD_FACTORIES: { [string]: (Accessor) -> any } = {}
 
 METHOD_FACTORIES.Get = function(accessor)
 	return function()
 		local tree = accessorTree(accessor)
 		assertAlive(tree)
-		return unpackRead(accessorSchema(accessor), readValue(tree, accessorPath(accessor)))
+		local path = accessorPath(accessor)
+		if #path == 0 then
+			-- Frozen so `Get().Coins = 1` raises at the offending line. Unfrozen it
+			-- either edited authoritative state with no validation and no
+			-- replication, or was silently discarded, depending only on whether the
+			-- template happened to declare a datatype field somewhere.
+			return frozenRootShell(tree)
+		end
+		return unpackRead(accessorSchema(accessor), readValue(tree, path))
 	end
 end
 
@@ -2110,13 +2180,19 @@ METHOD_FACTORIES.Clone = function(accessor)
 	return function()
 		local tree = accessorTree(accessor)
 		assertAlive(tree)
+		local path = accessorPath(accessor)
+		if #path == 0 then
+			-- Deliberately NOT frozen: a copy you can edit is the whole point of
+			-- Clone, and it is already detached from the store.
+			return rootShell(tree, true)
+		end
 		local schema = accessorSchema(accessor)
 		if schema and (schema.ValueType == "datatype" or schema.HasDatatype) then
 			-- Leaf datatype or a container with datatype descendants: deep-clone
 			-- and unpack together so the copy is independent AND buffer-free.
-			return cloneUnpack(schema, readValue(tree, accessorPath(accessor)))
+			return cloneUnpack(schema, readValue(tree, path))
 		end
-		return Util.deepClone(readValue(tree, accessorPath(accessor)))
+		return Util.deepClone(readValue(tree, path))
 	end
 end
 
@@ -2245,6 +2321,20 @@ METHOD_FACTORIES.Changed = function(accessor)
 	return function(fn: (any, any, any?) -> ())
 		local tree = accessorTree(accessor)
 		local schema = accessorSchema(accessor)
+		local path = accessorPath(accessor)
+		if #path == 0 then
+			-- Match what Get hands back. A root Changed only ever arrives from
+			-- fireAncestors, which passes the SAME store reference for new and old
+			-- (the root has no Set or Update to fire a real transition), so one
+			-- shell serves both and a listener's `if new == old then return` guard
+			-- still holds.
+			local inner = fn
+			fn = function(_newValue, _oldValue, key)
+				local shell = frozenRootShell(tree)
+				inner(shell, shell, key)
+			end
+			return connect(tree, path, "Changed", fn)
+		end
 		if schema and (schema.ValueType == "datatype" or schema.HasDatatype) then
 			local inner = fn
 			fn = function(newValue, oldValue, key)
@@ -2265,11 +2355,13 @@ METHOD_FACTORIES.Observe = function(accessor)
 		local tree = accessorTree(accessor)
 		assertAlive(tree)
 		local schema = accessorSchema(accessor)
-		local disconnect = connect(tree, accessorPath(accessor), "Changed", function(newValue)
-			fn(unpackRead(schema, newValue))
+		local path = accessorPath(accessor)
+		local isRoot = #path == 0
+		local disconnect = connect(tree, path, "Changed", function(newValue)
+			fn(if isRoot then frozenRootShell(tree) else unpackRead(schema, newValue))
 		end)
 		local ok, err = xpcall(function()
-			fn(unpackRead(schema, readValue(tree, accessorPath(accessor))))
+			fn(if isRoot then frozenRootShell(tree) else unpackRead(schema, readValue(tree, path)))
 		end, function(e)
 			return debug.traceback(tostring(e), 2)
 		end)

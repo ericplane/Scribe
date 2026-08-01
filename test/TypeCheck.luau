@@ -206,11 +206,16 @@ local function clientUsage()
 	ClientData.Coins.Observe(function(coins)
 		local _: number = coins
 	end)
+	-- Replicated table field and a Scribe.Session root both stay in the client
+	-- tree. Only Scribe.ServerOnly is stripped from it, so an over-broad strip
+	-- breaks these two lines rather than passing silently.
+	local music: boolean = ClientData.Settings.Music.Get()
+	local inCombat: boolean = ClientData.Runtime.InCombat.Get()
 	local rank: number? = ClientData.GetMyRank("TopCoins")
 	local owns: boolean = ClientData.Owns("VIP")
 	local ownsAsync: boolean = ClientData.OwnsAsync("VIP")
 	local requestOk = ClientData.Request("EquipItem", "Sword_001")
-	return rank, owns, ownsAsync, requestOk, ready
+	return rank, owns, ownsAsync, requestOk, ready, music, inCombat
 end
 
 local function diagnosticsUsage()

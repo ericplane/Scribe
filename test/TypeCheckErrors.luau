@@ -4,7 +4,7 @@
 -- exactly EXPECTED_ERRORS diagnostics — if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
--- EXPECTED_ERRORS: 16
+-- EXPECTED_ERRORS: 17
 
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -14,6 +14,7 @@ local template = {
 	Nick = "",
 	Quests = {} :: { number },
 	Bag = Scribe.ArrayOf(Scribe.Int(0)),
+	Secret = Scribe.ServerOnly({ Flagged = false }),
 	Furniture = Scribe.ArrayOf({
 		Cf = Scribe.CFrame(CFrame.identity),
 		Note = Scribe.Optional(Scribe.String("")),
@@ -106,6 +107,19 @@ local function badContainers(player: Player)
 	return note
 end
 
+local function serverOnlyOnClient(player: Player)
+	local Client = bundle.Client
+	-- 16) A Scribe.ServerOnly field is never replicated, so it must not appear in
+	-- the CLIENT accessor type. It reads nil at runtime; before the marker type it
+	-- typechecked clean, which is the worst shape a defect can take.
+	local flagged: boolean = Client.Secret.Flagged.Get() -- TypeError: Secret is not a member of the client tree
+	-- The server still reads it normally, so this line must stay CLEAN. Its
+	-- absence would mean the strip leaked into ValueType and broke every
+	-- ServerOnly field everywhere.
+	local onServer: boolean = Data[player].Secret.Flagged.Get()
+	return flagged, onServer
+end
+
 return {
 	badBoards,
 	badStat,
@@ -118,4 +132,5 @@ return {
 	badTypedApis,
 	badContainers,
 	badLifecycleReason,
+	serverOnlyOnClient,
 }

@@ -107,6 +107,17 @@ export type function ValueType(T)
 			end
 		end
 
+		-- Scribe.ServerOnly carries a { __scribeServerOnly: V } marker. The SERVER
+		-- reads these normally, so unwrap to the value type and build as usual;
+		-- the marker exists so ClientDataType can drop them via StripServerOnly,
+		-- since they are never replicated and read nil on the client.
+		if t:is("table") then
+			local inner = t:readproperty(ts.singleton("__scribeServerOnly"))
+			if inner ~= nil then
+				t = widen(inner)
+			end
+		end
+
 		local props: { [type]: type } = {}
 		local indexerSpec: { index: type, readresult: type, writeresult: type }? = nil
 
@@ -238,6 +249,14 @@ export type function StatPathsType(T)
 				t = widen(inner)
 			end
 		end
+		if t:is("table") then
+			-- Same for Scribe.ServerOnly: the server is what reads leaderboard
+			-- stats, so a server-only number is still a valid stat path.
+			local serverOnly = t:readproperty(ts.singleton("__scribeServerOnly"))
+			if serverOnly ~= nil then
+				t = widen(serverOnly)
+			end
+		end
 		if t:is("number") then
 			if prefix ~= "" then
 				table.insert(paths, ts.singleton(prefix))
@@ -266,6 +285,43 @@ export type function StatPathsType(T)
 		return paths[1]
 	end
 	return ts.unionof(table.unpack(paths))
+end
+
+-- T with every Scribe.ServerOnly subtree removed, at any depth. The client never
+-- receives those fields, so leaving them in the client's accessor type made
+-- `Data.Secret.Flagged.Get()` typecheck clean and return nil at runtime. Applied
+-- to the raw template BEFORE ValueType, because ValueType unwraps the marker and
+-- the information is gone by then.
+-- selene: allow(undefined_variable)
+type function StripServerOnly(T)
+	local ts = types
+	local MARKER = ts.singleton("__scribeServerOnly")
+	-- Matches ValueType's budget: a cyclic template must not blow the stack.
+	local MAX_DEPTH = 25
+
+	local function isServerOnly(t: type): boolean
+		return t:is("table") and t:readproperty(MARKER) ~= nil
+	end
+
+	local function strip(t: type, depth: number): type
+		if depth > MAX_DEPTH or not t:is("table") then
+			return t
+		end
+		local out = ts.copy(t)
+		for key, prop in t:properties() do
+			local childType = prop.read or prop.write
+			if childType ~= nil then
+				if isServerOnly(childType) then
+					out:setproperty(key, nil) -- the whole subtree leaves the client type
+				else
+					out:setproperty(key, strip(childType, depth + 1))
+				end
+			end
+		end
+		return out
+	end
+
+	return strip(T, 0)
 end
 
 -- Grant callbacks receive the typed accessor tree when a template type is
@@ -317,7 +373,7 @@ export type function ClientDataType(T)
 	saveInfoProps[ts.singleton("Size")] = optional(ts.number)
 	local saveInfo = ts.newtable(saveInfoProps, nil, nil)
 
-	local out = ts.copy(ValueType(T))
+	local out = ts.copy(ValueType(StripServerOnly(T)))
 	local function add(name: string, ty: type)
 		out:setproperty(ts.singleton(name), ty)
 	end
@@ -515,6 +571,7 @@ end
 --------------------------------------------------------------------------------
 
 export type Timed<T> = { __scribeTimed: T }
+export type ServerOnly<T> = { __scribeServerOnly: T }
 
 export type NumberMeta = { Min: number?, Max: number? }
 export type StringMeta = { MaxLength: number? }
@@ -919,12 +976,16 @@ Scribe.Version = require(script.Internal.Version)
 	@tag Visibility
 	@function ServerOnly
 	@param value T
-	@return T
+	@return ServerOnly<T>
 	Marks a **root** field server-only: it persists and is readable on the
 	server, but is never replicated to any client. May also wrap a nested field
 	to keep just that subtree server-side.
+
+	The field is absent from the **client's** accessor type, so reading it there
+	is a type error rather than a `nil` at runtime. On the server it reads like
+	any other field.
 ]=]
-function Scribe.ServerOnly<T>(value: T): T
+function Scribe.ServerOnly<T>(value: T): ServerOnly<T>
 	return Marker.make("ServerOnly", value) :: any
 end
 

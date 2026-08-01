@@ -110,6 +110,20 @@ end
 The inconsistency is the reason for the blanket rule: a subtree containing packed datatypes **is** rebuilt on the way out, so mutating that one is silently discarded instead of silently applied. Two different silent failures depending on the shape of your template. Treat everything `Get()` returns as read-only, and use [`Clone()`](/api/Value#Clone) when you want a detached table you can edit freely.
 :::
 
+### The root read is frozen
+
+`Data[player].Get()` with no field in front of it is the one read that does not hand back the store. It returns a **frozen** table of exactly the roots your template declares, so the mistake above fails loudly there:
+
+```lua
+local whole = Data[player].Get()
+whole.Coins = 999          --> error: attempt to modify a readonly table
+Data[player].Coins.Set(999) -- the spelling that validates and replicates
+```
+
+Two things are no longer in that table that used to be. Scribe's internal `_Scribe` root (and `_ScribeSession` on the client) is gone, which is what `Scribe.PlayerData<T>` has always declared, so typed code never saw it anyway. In exchange, [`Scribe.Session`](/api/Scribe#Session) roots are now present on the server, where the type promised them but the runtime left them out.
+
+The freeze is shallow. Nested containers reached through it are still the live tables described above, so the blanket read-only rule still applies to everything below the first level. `Clone()` returns the same shape unfrozen when you want a copy you can edit, and [`Data.Export`](/api/Server#Export) is the full profile dump including Scribe's internals.
+
 Writes are validated against the declarator: out-of-range numbers clamp (or reject, under `BoundsPolicy = "Reject"`), enum values outside the set are refused, and a string past a field's `MaxLength` is truncated on a character boundary (so a multi-byte character is never split), or rejected under `BoundsPolicy = "Reject"`. Note `MaxLength` counts **bytes**, not characters, so budget for multi-byte text.
 
 Separately, values that simply cannot be stored are always rejected outright:
