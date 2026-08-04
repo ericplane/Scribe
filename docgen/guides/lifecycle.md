@@ -105,7 +105,7 @@ When a session ends (leave, or a session stolen by another server), [`SessionEnd
 
 By default each write replicates on the next frame. Two server helpers change that for a burst of writes:
 
-- **`Batch`** coalesces every write inside it into a **single replication flush**, so the client gets one update instead of many. Server-side `Changed` listeners still fire once per write; it is the replication that batches. Reach for it on bulk updates.
+- **`Batch`** coalesces every write inside it into a **single replication flush**, so the client gets one update instead of many, and collapses each **container** `Changed` to one fire carrying the batch's end state. Leaf `Changed`, `OnChildChanged`, `OnInsert` and `OnRemove` are transitions and still fire once per write. Reach for it on bulk updates.
 - **`Transaction`** runs writes **atomically**: if the function throws, every write inside is rolled back and it returns `(false, error)`; on success, `(true, nil)`. It also batches, so it is already a single flush. The function **must not yield** (no `task.wait`, DataStore, or MarketplaceService calls inside it): a yield is refused with `(false, error)` and rolled back, because a concurrent write landing during the yield could be pulled into the transaction. Do any async work before or after. A rollback also drops the economy events a tagged `Increment` / `Decrement` inside it would have logged, so a reverted transaction never reaches your analytics. A plain `Batch` gives you none of that: it defers the replication flush, but a throw inside it leaves every write that already ran in place.
 
 ```lua
@@ -170,3 +170,28 @@ During a rolling deploy, a player whose data a new server already migrated can l
 ## Coming from another data library?
 
 If you're moving an existing game onto Scribe (from ProfileService, DataStore2, or a custom store), see [Migrating to Scribe](./migrating).
+
+## Writing on the way out
+
+`OnPlayerLeaving` is the counterpart to [`OnPlayerInit`](#). It runs **before the final save**, so whatever it writes persists. This is where the accumulate-on-exit pattern belongs:
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix = "PLAYER_",
+
+    OnPlayerLeaving = function(player, data, reason)
+        local joined = joinedAt[player.UserId]
+        if joined then
+            data.Playtime.Increment(os.time() - joined)
+        end
+    end,
+})
+```
+
+You get the same typed accessor as anywhere else, so writes are validated and bounded rather than dropped raw into the profile. `reason` is the usual [`LifecycleReason`](/api/Scribe#LifecycleReason), so you can skip expensive work on `shutdown` when the deadline is short.
+
+Doing this from your own `Players.PlayerRemoving` handler instead is a race against Scribe's, decided by connection order, and a write that lands after teardown is silently lost.
+
+If the hook throws, the error is logged and the save continues. It costs you that hook's remaining writes, not the whole session.

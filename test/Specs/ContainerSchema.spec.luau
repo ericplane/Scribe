@@ -1,7 +1,7 @@
 --!nonstrict
 -- Compile-time coverage for the Scribe.ArrayOf / Scribe.DictOf container
 -- declarators: the shape of the compiled node, the element subtree hanging off
--- AnyChild, HasDatatype bubbling, schema-hash sensitivity to element metadata,
+-- AnyChild, HasPacked bubbling, schema-hash sensitivity to element metadata,
 -- and every compile rejection.
 return function()
 	local Root = script.Parent.Parent.Parent
@@ -102,22 +102,22 @@ return function()
 		end)
 	end)
 
-	describe("HasDatatype bubbling", function()
+	describe("HasPacked bubbling", function()
 		it("bubbles an element datatype to the container and the root", function()
 			local compiled = compile({ Furniture = Scribe.ArrayOf({ Cf = Scribe.CFrame(CFrame.new()) }) })
-			expect(field(compiled, "Furniture").HasDatatype).to.equal(true)
-			expect(compiled.Root.HasDatatype).to.equal(true)
+			expect(field(compiled, "Furniture").HasPacked).to.equal(true)
+			expect(compiled.Root.HasPacked).to.equal(true)
 		end)
 
 		it("bubbles a datatype-typed leaf element", function()
 			local compiled = compile({ Spots = Scribe.ArrayOf(Scribe.Vector3(Vector3.zero)) })
-			expect(field(compiled, "Spots").HasDatatype).to.equal(true)
+			expect(field(compiled, "Spots").HasPacked).to.equal(true)
 		end)
 
-		it("leaves HasDatatype false when no element field is a datatype", function()
+		it("leaves HasPacked false when no element field is a datatype", function()
 			local compiled = compile({ Bag = Scribe.ArrayOf({ N = Scribe.Int(0) }) })
-			expect(field(compiled, "Bag").HasDatatype).to.equal(false)
-			expect(compiled.Root.HasDatatype).to.equal(false)
+			expect(field(compiled, "Bag").HasPacked).to.equal(false)
+			expect(compiled.Root.HasPacked).to.equal(false)
 		end)
 	end)
 
@@ -153,9 +153,9 @@ return function()
 			-- the synthetic "[]" segment keeps element paths visibly non-addressable
 			expect(table.concat(item.Path, ".")).to.equal("Plots.[].Rooms.[].Furniture.[]")
 			-- and the datatype flag reaches all the way up
-			expect(rooms.HasDatatype).to.equal(true)
-			expect(plots.HasDatatype).to.equal(true)
-			expect(compiled.Root.HasDatatype).to.equal(true)
+			expect(rooms.HasPacked).to.equal(true)
+			expect(plots.HasPacked).to.equal(true)
+			expect(compiled.Root.HasPacked).to.equal(true)
 		end)
 
 		it("inherits container visibility into the element subtree", function()

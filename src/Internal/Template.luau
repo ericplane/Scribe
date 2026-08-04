@@ -7,6 +7,7 @@
 
 local Util = require(script.Parent.Util)
 local Marker = require(script.Parent.Marker)
+local Big = require(script.Parent.Big)
 local Datatypes = require(script.Parent.Datatypes)
 
 export type Visibility = "Replicated" | "ServerOnly" | "Shared" | "Session"
@@ -16,7 +17,17 @@ export type SchemaNode = {
 	Name: string?,
 	Path: { string },
 	Kind: "leaf" | "table" | "any",
-	ValueType: "number" | "int" | "boolean" | "string" | "enum" | "buffer" | "datatype" | "table" | "any",
+	ValueType: "number"
+		| "int"
+		| "boolean"
+		| "string"
+		| "enum"
+		| "flags"
+		| "big"
+		| "buffer"
+		| "datatype"
+		| "table"
+		| "any",
 	Datatype: string?, -- typeof() name when ValueType == "datatype"
 	Visibility: Visibility,
 	Timed: boolean,
@@ -34,8 +45,10 @@ export type SchemaNode = {
 	AnyChild: SchemaNode?, -- dynamic-key child: the compiled element schema on an
 	-- ArrayOf/DictOf node (set at compile time), otherwise a generic pseudo-node
 	-- synthesized lazily on first access
-	HasDatatype: boolean?, -- true if any declared descendant is a packed datatype;
-	-- lets container reads skip the deep-unpack walk when there is nothing to convert
+	HasPacked: boolean?, -- true if any declared descendant STORES a different shape
+	-- than it reads (a packed datatype buffer, or a Scribe.Big { mantissa, exponent }
+	-- pair); lets container reads skip the deep-unpack walk when there is nothing to
+	-- convert
 	-- Scribe.ArrayOf / Scribe.DictOf container declarators. `Container` is the
 	-- discriminator (nil on every other node, including untyped dynamic containers);
 	-- `IsElement` marks the compiled element root hanging off AnyChild; `Closed`
@@ -51,6 +64,9 @@ export type SchemaNode = {
 	-- materializes a fresh entry (see Node.resolveContainer).
 	ClientDefault: any,
 	MaxItems: number?,
+	Evict: string?,
+	Unique: boolean?,
+	KeyType: string?,
 	MaxKeys: number?,
 	MaxKeyLength: number?,
 }
@@ -76,11 +92,16 @@ local SESSION_ROOT = "_ScribeSession"
 -- are namespaced by this prefix. Owned here (not in Server/Timed) so Compile can
 -- reject a root field that would alias a cooldown slot.
 local COOLDOWN_PREFIX = "@cd|"
+-- Online-only cooldowns share the flat _Scribe.Timed dict but hold REMAINING
+-- seconds rather than a deadline. The prefixes differ at byte 4 ("|" vs "o"), so
+-- no wall-clock key text can ever spell an online slot.
+local ONLINE_COOLDOWN_PREFIX = "@cdo|"
 
 local Template = {}
 Template.RESERVED_ROOT = RESERVED_ROOT
 Template.SESSION_ROOT = SESSION_ROOT
 Template.COOLDOWN_PREFIX = COOLDOWN_PREFIX
+Template.ONLINE_COOLDOWN_PREFIX = ONLINE_COOLDOWN_PREFIX
 
 local function compileError(path: { string }, message: string): never
 	error(`Scribe: template error at "{table.concat(path, ".")}": {message}`, 0)
@@ -136,7 +157,7 @@ local function rejectInElementShape(path: { string }, shape: any)
 			if reason then
 				compileError(path, `Scribe.{kind} is not supported inside an element shape: {reason}`)
 			end
-			if kind == "ArrayOf" or kind == "DictOf" then
+			if kind == "ArrayOf" or kind == "DictOf" or kind == "SetOf" or kind == "MapOf" then
 				-- A nested container hides its shape in Meta.Element, not in Default.
 				walk(if meta then meta.Element else nil)
 			else
@@ -149,6 +170,14 @@ local function rejectInElementShape(path: { string }, shape: any)
 		end
 	end
 	walk(shape)
+end
+
+-- Whether reading this node (or anything below it) has to convert a stored shape
+-- back to its read shape: a datatype packs to a buffer and a Scribe.Big stores a
+-- { mantissa, exponent } pair. One predicate, so adding a third such type cannot
+-- reach some of the read paths and miss the others.
+local function isPacked(node: SchemaNode): boolean
+	return node.ValueType == "datatype" or node.ValueType == "big" or node.HasPacked == true
 end
 
 local function checkContainerCap(path: { string }, label: string, value: any)
@@ -272,6 +301,7 @@ local function buildNode(
 	local meta: Marker.Meta? = nil
 	local valueType: string? = nil
 	local containerKind: ("Array" | "Dict")? = nil
+	local containerDeclarator: string? = nil
 	local nullable = false
 	local value = rawValue
 
@@ -295,11 +325,17 @@ local function buildNode(
 		elseif kind == "Number" then
 			valueType = "number"
 			meta = markerMeta
+		elseif kind == "Big" then
+			valueType = "big"
+			meta = markerMeta
 		elseif kind == "String" then
 			valueType = "string"
 			meta = markerMeta
 		elseif kind == "Enum" then
 			valueType = "enum"
+			meta = markerMeta
+		elseif kind == "Flags" then
+			valueType = "flags"
 			meta = markerMeta
 		elseif kind == "Datatype" then
 			valueType = "datatype"
@@ -308,10 +344,16 @@ local function buildNode(
 			-- Wraps another declarator: keep unwrapping so the inner type and bounds
 			-- still compile, and drop the default to nil at the end of buildNode.
 			nullable = true
-		elseif kind == "ArrayOf" or kind == "DictOf" then
+		elseif kind == "ArrayOf" or kind == "DictOf" or kind == "SetOf" or kind == "MapOf" then
 			-- The element shape lives in Meta.Element, and the marker's Default is
 			-- nil, so the `value = default` below ends the unwrap loop here.
-			containerKind = if kind == "ArrayOf" then "Array" else "Dict"
+			-- A SetOf is an Array container with a uniqueness invariant on top, so it
+			-- reuses the whole element schema, wire, and validation path.
+			containerKind = if kind == "DictOf" or kind == "MapOf" then "Dict" else "Array"
+			-- Keep the declarator the USER wrote. containerKind collapses SetOf into
+			-- Array and MapOf into Dict, so error text built from it told a SetOf
+			-- author about Scribe.ArrayOf, a declarator they never used.
+			containerDeclarator = `Scribe.{kind}`
 			meta = markerMeta
 		elseif kind == "Dynamic" then
 			-- `default` is the sample (the factory ran once at declaration). Infer
@@ -351,7 +393,7 @@ local function buildNode(
 	-- element shape is compiled once and hung off AnyChild, which is the node every
 	-- dynamic key already resolves through (see Template.ChildSchema).
 	if containerKind ~= nil then
-		local declarator = `Scribe.{containerKind}Of`
+		local declarator = containerDeclarator or `Scribe.{containerKind}Of`
 		local elementShape = if meta then meta.Element else nil
 		if elementShape == nil then
 			compileError(path, `{declarator} requires an element shape`)
@@ -369,6 +411,17 @@ local function buildNode(
 		checkContainerCap(path, "MaxItems", meta and meta.MaxItems)
 		checkContainerCap(path, "MaxKeys", meta and meta.MaxKeys)
 		checkContainerCap(path, "MaxKeyLength", meta and meta.MaxKeyLength)
+		local evict = meta and meta.Evict
+		if evict ~= nil then
+			if evict ~= "Front" and evict ~= "Back" then
+				compileError(path, `Scribe.ArrayOf Evict must be "Front" or "Back", got {tostring(evict)}`)
+			end
+			-- Evict has nothing to drop from without a cap, so a bare Evict is a
+			-- config mistake rather than a no-op.
+			if not (meta and meta.MaxItems) then
+				compileError(path, "Scribe.ArrayOf Evict requires MaxItems")
+			end
+		end
 
 		local node: SchemaNode = {
 			Id = state.NextId,
@@ -380,6 +433,9 @@ local function buildNode(
 			Timed = false,
 			Container = containerKind :: "Array" | "Dict",
 			MaxItems = meta and meta.MaxItems,
+			Evict = meta and meta.Evict,
+			Unique = meta and meta.Unique,
+			KeyType = meta and meta.KeyType,
 			MaxKeys = meta and meta.MaxKeys,
 			MaxKeyLength = meta and meta.MaxKeyLength,
 			Default = {},
@@ -422,9 +478,36 @@ local function buildNode(
 			end
 		end
 		closeRecords(element)
+		-- A set stores its members deduplicated and sorted, so membership is by VALUE
+		-- and the element has to be orderable. Anything else compiles clean, accepts
+		-- the first Add (one element never reaches a comparison), then throws a bare
+		-- "attempt to compare table < table" on the second, naming neither Scribe nor
+		-- the field. Refuse it here, where the message can say what to do instead.
+		if node.Unique then
+			local vt = element.ValueType
+			if not (vt == "int" or vt == "number" or vt == "string" or vt == "enum") then
+				-- A Flags element carries Children = {}, so "has children" alone called
+				-- it a record. Name the declarator's own value type first and only fall
+				-- back to "record" for an actual declared record shape.
+				local kind
+				if vt == "table" and element.Container ~= nil then
+					kind = "nested container"
+				elseif vt == "table" then
+					kind = "record"
+				else
+					kind = vt
+				end
+				compileError(
+					path,
+					`Scribe.SetOf element must be an Int, Number, String or Enum, got a {kind}: members are `
+						.. "compared by value and stored in a sorted canonical order. Use Scribe.ArrayOf, or "
+						.. "hold a scalar identity field"
+				)
+			end
+		end
 		element.ClientDefault = buildClientDefault(element)
 		node.AnyChild = element
-		node.HasDatatype = element.ValueType == "datatype" or element.HasDatatype == true
+		node.HasPacked = isPacked(element)
 
 		local deepest = #path + declaredDepth(element)
 		if deepest > Util.MAX_VALUE_DEPTH then
@@ -536,12 +619,73 @@ local function buildNode(
 		if not node.MemberIndex or node.MemberIndex[value] == nil then
 			compileError(path, "enum default must be one of its members")
 		end
+	elseif node.ValueType == "big" then
+		local parsed = Big.from(value)
+		if parsed == nil then
+			compileError(path, `Scribe.Big default must be a number or a numeric string, got {tostring(value)}`)
+		end
+		if node.Min ~= nil and Big.from(node.Min) == nil then
+			compileError(path, "Scribe.Big Min must be a number or a numeric string")
+		end
+		if node.Max ~= nil and Big.from(node.Max) == nil then
+			compileError(path, "Scribe.Big Max must be a number or a numeric string")
+		end
+	elseif node.ValueType == "flags" then
+		-- bit32 is 32 bits wide, so a 33rd member would silently fall off the wire
+		-- packing rather than round-tripping.
+		if #(node.Members :: { string }) > 32 then
+			compileError(path, `Scribe.Flags takes at most 32 members, got {#(node.Members :: { string })}`)
+		end
+		-- A member NAME is persisted verbatim (the stored form is the list of enabled
+		-- names) and is the one persisted string with no write-path guard, because it
+		-- comes from the template rather than from a Set. Invalid UTF-8 in one fails
+		-- the whole profile save, opaquely, the first time that flag is enabled.
+		-- A duplicate is refused for a different reason: MemberIndex keeps only the
+		-- last, so the bit for the earlier one is unreachable and the flag can never
+		-- be read back.
+		local seenMember: { [string]: boolean } = {}
+		for _, member in node.Members :: { string } do
+			if type(member) ~= "string" then
+				compileError(path, `Scribe.Flags member names must be strings, got a {typeof(member)}`)
+			end
+			if not Util.isUtf8(member) then
+				compileError(
+					path,
+					`Scribe.Flags member "{member}" contains invalid UTF-8, which would fail the profile save`
+				)
+			end
+			if seenMember[member] then
+				compileError(path, `Scribe.Flags declares "{member}" twice; member names must be unique`)
+			end
+			seenMember[member] = true
+		end
+		if type(value) ~= "table" then
+			compileError(path, "Scribe.Flags default must be a table of member names")
+		end
+		for _, member in value :: { any } do
+			if not node.MemberIndex or node.MemberIndex[member] == nil then
+				compileError(path, `Scribe.Flags default contains "{tostring(member)}", which is not a member`)
+			end
+		end
 	elseif node.ValueType == "string" and type(value) ~= "string" then
 		compileError(path, "Scribe.String default must be a string")
 	elseif node.ValueType == "number" and type(value) ~= "number" then
 		compileError(path, "Scribe.Number default must be a number")
 	end
-	if node.Min and node.Max and node.Min > node.Max then
+	if node.ValueType == "big" then
+		-- A big bound past 1.8e308 can only be written as a numeric string (a bigger
+		-- literal is math.huge), so the pair has to be ordered by Big.compare. A raw
+		-- `>` either throws "attempt to compare string < number" on a mixed pair or
+		-- orders two strings lexically, which both rejects "2" < "1e50" and accepts
+		-- the inverted "1e50" > "2" this guard exists to catch.
+		if node.Min ~= nil and node.Max ~= nil then
+			local minBig = Big.from(node.Min) :: any
+			local maxBig = Big.from(node.Max) :: any
+			if Big.compare(minBig, maxBig) > 0 then
+				compileError(path, "Min > Max")
+			end
+		end
+	elseif node.Min and node.Max and node.Min > node.Max then
 		compileError(path, "Min > Max")
 	end
 	if timed and type(value) == "table" then
@@ -566,7 +710,7 @@ local function buildNode(
 			local order = Util.sortedKeys(value)
 			local ordinal: { [string]: number } = {}
 			local default = {}
-			local hasDatatype = false
+			local hasPacked = false
 			for i, key in order do
 				local childPath = table.clone(path)
 				table.insert(childPath, key)
@@ -574,17 +718,21 @@ local function buildNode(
 				children[key] = child
 				ordinal[key] = i
 				default[key] = child.Default
-				-- Bubble the datatype marker up (post-order: child is fully built).
-				if child.ValueType == "datatype" or child.HasDatatype then
-					hasDatatype = true
+				-- Bubble the packed marker up (post-order: child is fully built).
+				if isPacked(child) then
+					hasPacked = true
 				end
 			end
 			node.Children = children
 			node.ChildOrder = order
 			node.ChildOrdinal = ordinal
 			node.Default = default
-			node.HasDatatype = hasDatatype
+			node.HasPacked = hasPacked
 		end
+	elseif node.ValueType == "big" then
+		-- The canonical { mantissa, exponent } form, so the schema default matches
+		-- what every write produces rather than the raw declarator argument.
+		node.Default = Big.toStored(Big.from(value) :: any)
 	else
 		node.Default = value
 	end
@@ -662,6 +810,62 @@ local function buildInternalRoots(state: any, root: SchemaNode, config: CompileC
 	return scribeNode, sessionNode
 end
 
+-- A DataStore serializes every object key to a JSON string, so a Scribe.MapOf with
+-- integer keys comes back holding "123" where it stored 123. The DECLARED key type
+-- is what makes converting them back unambiguous: without it, "123" on disk could
+-- equally have been the number 123 or the string "123". Runs on raw stored data
+-- before Reconcile, so every later read sees the keys the template promised.
+function Template.CoerceMapKeys(compiled: Compiled, data: any)
+	local function walk(node: SchemaNode, value: any, depth: number)
+		if type(value) ~= "table" or depth > 32 then
+			return
+		end
+		if node.Container == "Dict" and node.KeyType == "integer" then
+			local rename: { [string]: number }? = nil
+			local blocked = false
+			for key in value do
+				if type(key) == "string" then
+					local asNumber = tonumber(key)
+					-- Only a canonical integer spelling converts. A key like "07" or
+					-- "1.5" was never written by this map, so leaving it alone keeps
+					-- foreign data intact rather than silently relocating it.
+					if asNumber ~= nil and asNumber % 1 == 0 and tostring(asNumber) == key then
+						rename = rename or {}
+						(rename :: { [string]: number })[key] = asNumber
+					else
+						blocked = true
+					end
+				end
+			end
+			-- ALL of them or none. Converting only the canonical ones leaves the
+			-- container holding a number key and a string key at once, which is a
+			-- mixed table that no DataStore will store: the map was readable but
+			-- every save for that profile would fail. Unreadable-but-saveable is the
+			-- better failure, and the foreign key stays exactly where it was.
+			if rename and not blocked then
+				for from, to in rename do
+					value[to] = value[from]
+					value[from] = nil
+				end
+			end
+		end
+		local children = node.Children
+		if children then
+			for name, child in children do
+				walk(child, value[name], depth + 1)
+			end
+		elseif node.Container ~= nil then
+			for key in value do
+				local element = Template.ChildSchema(node, key)
+				if element then
+					walk(element, value[key], depth + 1)
+				end
+			end
+		end
+	end
+	walk(compiled.Root, data, 0)
+end
+
 function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 	local cfg: CompileConfig = config or {}
 	if type(userTemplate) ~= "table" then
@@ -675,7 +879,7 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		-- would collide with the cooldown slot of the same name in the flat
 		-- _Scribe.Timed dict. Nested fields are safe: their pathKeys always contain
 		-- the \31 separator, which a cooldown key never has.
-		if string.sub(key, 1, #COOLDOWN_PREFIX) == COOLDOWN_PREFIX then
+		if string.sub(key, 1, 3) == "@cd" then
 			error(
 				`Scribe: template may not declare a "{key}" key: the "{COOLDOWN_PREFIX}" prefix is reserved for cooldown slots`,
 				0
@@ -723,16 +927,16 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 	root.ChildOrder = order
 	root.ChildOrdinal = ordinal
 	-- The root node is hand-built here rather than by buildNode, so bubble its
-	-- HasDatatype flag the same way (else a whole-data Get()/Clone() on the root
+	-- HasPacked flag the same way (else a whole-data Get()/Clone() on the root
 	-- accessor would leak packed buffers for a ROOT-level datatype field).
-	local rootHasDatatype = false
+	local rootHasPacked = false
 	for _, child in children do
-		if child.ValueType == "datatype" or child.HasDatatype then
-			rootHasDatatype = true
+		if isPacked(child) then
+			rootHasPacked = true
 			break
 		end
 	end
-	root.HasDatatype = rootHasDatatype
+	root.HasPacked = rootHasPacked
 
 	-- The hash must fold every field that affects the wire byte layout, or a
 	-- server/client schema drift decodes silently wrong. Min/Max drive int
@@ -753,7 +957,7 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 				`{id}:{node.Name or ""}:{node.ValueType}:{node.Visibility}`
 					.. `:{node.Min or "nil"}:{node.Max or "nil"}:{node.MaxLength or "nil"}`
 					.. `:{node.Datatype or "nil"}:{members}:{node.Container or "nil"}`
-					.. `:{node.MaxItems or "nil"}:{node.MaxKeys or "nil"}:{node.MaxKeyLength or "nil"}`
+					.. `:{node.MaxItems or "nil"}:{node.Evict or "nil"}:{if node.Unique then "u" else "nil"}:{node.KeyType or "nil"}:{node.MaxKeys or "nil"}:{node.MaxKeyLength or "nil"}`
 					.. `:{node.Nullable == true}:{if node.ChildOrder then #node.ChildOrder else -1}`,
 				hash
 			)
@@ -789,12 +993,17 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 			dflt = string.format("%.17g", d)
 		elseif dt == "buffer" then
 			dflt = buffer.tostring(d)
+		elseif n.ValueType == "big" and dt == "table" then
+			-- A big's default is the stored { mantissa, exponent } pair, not a scalar,
+			-- so the branches above skip it and a drift in a big ELEMENT default used
+			-- to hash identically on both realms and sail through the Hello guard.
+			dflt = string.format("%.17g:%.17g", (d :: any)[1], (d :: any)[2])
 		end
 		hash = Util.fnv32(
 			`@{elementOrdinal}:{n.Name or ""}:{n.ValueType}:{n.Visibility}`
 				.. `:{n.Min or "nil"}:{n.Max or "nil"}:{n.MaxLength or "nil"}`
 				.. `:{n.Datatype or "nil"}:{members}:{n.Container or "nil"}`
-				.. `:{n.MaxItems or "nil"}:{n.MaxKeys or "nil"}:{n.MaxKeyLength or "nil"}`
+				.. `:{n.MaxItems or "nil"}:{n.Evict or "nil"}:{if n.Unique then "u" else "nil"}:{n.KeyType or "nil"}:{n.MaxKeys or "nil"}:{n.MaxKeyLength or "nil"}`
 				.. `:{n.Nullable == true}:{if n.ChildOrder then #n.ChildOrder else -1}`
 				.. `:{#dflt}:{dflt}`,
 			hash
@@ -851,6 +1060,12 @@ end
 -- Schema node for a child key: the static child when one exists, otherwise a
 -- (cached) dynamic pseudo-node inheriting the parent's visibility. Returns nil
 -- for children of leaves.
+-- Shared with Node, whose read paths all have to agree on which nodes need an
+-- unpack. See the local definition above.
+function Template.IsPacked(node: SchemaNode?): boolean
+	return node ~= nil and isPacked(node)
+end
+
 function Template.ChildSchema(node: SchemaNode, key: string | number): SchemaNode?
 	if node.Kind == "leaf" then
 		return nil

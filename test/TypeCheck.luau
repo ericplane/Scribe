@@ -130,6 +130,15 @@ local function serverUsage(player: Player)
 	local flagged: boolean = data.Secret.Flagged.Get()
 	local inCombat: boolean = data.Runtime.InCombat.Toggle()
 
+	-- A WHOLE-SUBTREE read must not show a declarator's internal label. Scribe.Timed
+	-- and Scribe.ServerOnly read back as a bare T, which may be a scalar, so unlike
+	-- the other declarators they cannot carry a metatable brand; their label is
+	-- stripped on the way out instead. These used to type as
+	-- `{ __scribeTimed: boolean }` and `{ __scribeServerOnly: ... }`.
+	local everything = data.Get()
+	local wholeBooster: boolean = everything.XPBooster
+	local wholeSecret: boolean = everything.Secret.Flagged
+
 	local tree, reason = Data.WaitForData(player)
 	if tree then
 		tree.Wins.Increment(1)
@@ -163,6 +172,8 @@ local function serverUsage(player: Player)
 	})
 
 	return coins,
+		wholeBooster,
+		wholeSecret,
 		dmg,
 		has,
 		active,
@@ -197,7 +208,225 @@ local function serverUsage(player: Player)
 end
 
 local ClientData = bundle.Client
+-- The container declarators get their OWN small template. The template above is
+-- already close to the new solver's complexity budget, and adding four more roots
+-- to it tips the whole file into "Code is too complex to typecheck", which would
+-- silently stop checking everything else here.
+local containerTemplate = {
+	Unlocked = Scribe.SetOf(Scribe.String("", { MaxLength = 32 })),
+	Tutorial = Scribe.Flags({ "Move", "Combat", "Trade" }),
+	History = Scribe.ArrayOf(Scribe.Int(0), { MaxItems = 5, Evict = "Front" }),
+	Recent = Scribe.ArrayOf(Scribe.Int(0), { MaxItems = 5, Evict = "Back" }),
+	Friends = Scribe.MapOf("integer", Scribe.String("")),
+	Tags = Scribe.MapOf("string", Scribe.Int(0)),
+	Wealth = Scribe.Big(0, { Min = 0 }),
+}
 
+local containerBundle = Scribe({
+	Template = containerTemplate,
+	ProfileStoreIndex = "C",
+	ProfileKeyPrefix = "C_",
+	Banner = false,
+})
+
+local function containerDeclarators(player: Player)
+	local data = containerBundle.Server[player]
+
+	-- Scribe.SetOf: membership, no Insert and no index-based Remove.
+	local added: boolean = data.Unlocked.Add("Desert")
+	local hasIt: boolean = data.Unlocked.Has("Desert")
+	local dropped: boolean = data.Unlocked.Remove("Desert")
+	local members: { string } = data.Unlocked.Get()
+
+	-- Scribe.Flags: named booleans, no array surface.
+	data.Tutorial.Enable("Combat")
+	local onFlag: boolean = data.Tutorial.Has("Combat")
+	local flipped: boolean = data.Tutorial.Toggle("Trade")
+	local enabled: { string } = data.Tutorial.Get()
+
+	-- Both Evict spellings are in the template above, so the declared ArrayOpts type
+	-- can never drift from what the runtime accepts.
+	data.History.Insert(1)
+	data.Recent.Insert(2, 1)
+
+	-- Scribe.MapOf: the key type is declared, so an integer key needs no tostring
+	-- and the value is fully typed through it.
+	data.Friends[123456].Set("Ada")
+	local seen: string = data.Friends[123456].Get()
+	data.Tags.Alpha.Set(1)
+	local tag: number = data.Tags.Alpha.Get()
+	-- The CONTAINER node reads and writes the whole map, not one element. Without
+	-- these the fixture only ever exercised element access, so the map node could
+	-- be typed as its element with nothing noticing.
+	local allFriends: { [number]: string } = data.Friends.Get()
+	local allTags: { [string]: number } = data.Tags.Get()
+	data.Friends.Set({ [123456] = "Ada" })
+	local friendCount: number = data.Friends.Count()
+	local removedFriend: string? = data.Friends.Remove(123456)
+	-- A map node carries OnChildChanged at runtime, keyed by the declared key type
+	-- and carrying the ELEMENT on both sides. Nothing in either fixture pinned it.
+	data.Friends.OnChildChanged(function(_id: number, _new: string?, _old: string?) end)
+	data.Friends.OnKeyAdded(function(_id: number, _name: string) end)
+	data.Friends.OnKeyRemoved(function(_id: number, _name: string) end)
+
+	-- Scribe.Big takes a number, a numeric string, or another big value everywhere.
+	data.Wealth.Set("1.5e100")
+	data.Wealth.Increment("1e99")
+	data.Wealth.Decrement(5)
+	data.Wealth.Multiply(1.15)
+	data.Wealth.Divide(data.Wealth.Get())
+	local shown: string = data.Wealth.Get():Short()
+	local lossy: number = data.Wealth.Get():ToNumber()
+	-- FINDING 23, the other declarators: a WHOLE-SUBTREE read must show the values,
+	-- not the declarator's internal label. Each of these used to come back as
+	-- `{ __scribeFlags: { string } }`, `{ __scribeSet: { string } }` and
+	-- `{ __scribeMapKey: ..., __scribeMapValue: ... }`. Read off the ROOT so no new
+	-- template root is needed, which this template has no headroom for.
+	local whole = data.Get()
+	local wholeFlags: { string } = whole.Tutorial
+	local wholeSet: { string } = whole.Unlocked
+	local wholeTags: { [string]: number } = whole.Tags
+	local wholeNames: { [number]: string } = whole.Friends
+
+	-- The operators live in bigOperators() below, on their own template: this one is
+	-- already at the new solver's complexity budget.
+	local summed = data.Wealth.Get() + data.Wealth.Get()
+	local shownSum: string = summed:Short()
+	-- Clone and Default read as bigs too, not as the stored mantissa pair.
+	local clonedBig: string = data.Wealth.Clone():Short()
+	local defaultBig: string = data.Wealth.Default():Short()
+
+	return added,
+		hasIt,
+		dropped,
+		members,
+		onFlag,
+		flipped,
+		enabled,
+		seen,
+		tag,
+		allFriends,
+		allTags,
+		friendCount,
+		removedFriend,
+		wholeFlags,
+		wholeSet,
+		wholeTags,
+		wholeNames,
+		shown,
+		lossy,
+		shownSum,
+		clonedBig,
+		defaultBig
+end
+
+-- Every operator the Scribe.Big docstring promises, across TWO different big fields
+-- and against plain operands. Its own template because it needs a second big root
+-- and containerTemplate is already at the complexity budget.
+--
+-- Same-field-only coverage used to pass while `a + b` across fields, `a + 5`, and
+-- feeding a result back into Set were all type errors: the metamethods were typed
+-- over a metatable-less copy of the shape Get returns, and Luau resolves `<` by
+-- metatable IDENTITY, so every big field in a template has to share one.
+local bigOpsTemplate = { Wealth = Scribe.Big(0, { Min = 0 }), Other = Scribe.Big(0) }
+
+-- A Scribe.Big is a valid leaderboard stat: it packs exponent-major into the
+-- OrderedDataStore key. Its type is the marker table rather than `number`, so the
+-- stat-path walk needs its own case for it, and without this nothing here pairs a
+-- big field with LeaderboardConfig<T>. It rides this template rather than the
+-- container one because StatPathsType over seven marker roots is expensive enough
+-- to tip this FILE (three bundles in one module) past the solver's budget.
+local bigBoards: { [string]: Scribe.LeaderboardConfig<typeof(bigOpsTemplate)> } = {
+	TopWealth = { Stat = "Wealth" },
+	-- SigFigs splits the ranking key's budget between exponent range and resolution.
+	FineWealth = { Stat = "Wealth", SigFigs = 14, StoreName = "LB_FineWealth" },
+}
+
+local bigOpsBundle = Scribe({
+	Template = bigOpsTemplate,
+	ProfileStoreIndex = "B",
+	ProfileKeyPrefix = "B_",
+	Leaderboards = bigBoards,
+	Banner = false,
+})
+
+local function bigOperators(player: Player)
+	local data = bigOpsBundle.Server[player]
+	local summed = data.Wealth.Get() + data.Other.Get()
+	local subbed = data.Wealth.Get() - 5
+	local scaled = 2 * data.Wealth.Get()
+	local divided = data.Wealth.Get() / "1e10"
+	local negated = -data.Wealth.Get()
+	local ordered: boolean = data.Wealth.Get() < data.Other.Get()
+	local chained: boolean = summed <= data.Other.Get()
+	local same: boolean = data.Wealth.Get() == data.Other.Get()
+	local asText: string = tostring(data.Wealth.Get())
+	-- An arithmetic result has to satisfy the operand union it came from.
+	data.Wealth.Set(summed)
+	data.Wealth.Increment(subbed)
+	data.Wealth.Multiply(scaled)
+	local shown: string = summed:Short()
+	local lossy: number = negated:ToNumber()
+
+	-- A WHOLE-SUBTREE read must show the value, not the declarator's internal label.
+	-- Scribe.Big's label lives in its metatable rather than in its fields precisely
+	-- so this works: a label written as a field travels with the type into every
+	-- read, and these used to come back as `{ __scribeBig: true }`.
+	local whole = data.Get()
+	local viaRoot: string = whole.Wealth:Short()
+	local viaOther: number = whole.Other:ToNumber()
+	local viaClone: string = data.Clone().Wealth:Short()
+
+	-- A leaderboard entry's Score is `number | BigScore`, because which one it is
+	-- depends on the board named at runtime. A bare `number` blessed a read that
+	-- crashes on a big board; the union forces the narrow.
+	local entries = bigOpsBundle.Server.GetLeaderboard("Top", 10)
+	local rendered = ""
+	for _, entry in entries do
+		local score = entry.Score
+		rendered = if type(score) == "number" then tostring(score) else score:Short()
+	end
+
+	return divided, ordered, chained, same, asText, shown, lossy, rendered, viaRoot, viaOther, viaClone
+end
+
+-- Scribe.ServerOnly wrapping a declarator gets its own template, again for the
+-- complexity budget. Every marker check reads a property off the same type, so a
+-- ServerOnly wrapper left on hides ALL of them: the node loses its declarator
+-- surface entirely and Get() types as the raw marker. The runtime always supported
+-- these, so nothing but a type-level fixture can catch it.
+local wrappedTemplate = {
+	Unlocked = Scribe.ServerOnly(Scribe.SetOf(Scribe.String(""))),
+	Wealth = Scribe.ServerOnly(Scribe.Big(0)),
+	Tutorial = Scribe.ServerOnly(Scribe.Flags({ "Move", "Combat" })),
+	Booster = Scribe.ServerOnly(Scribe.Timed(false)),
+	Tags = Scribe.ServerOnly(Scribe.MapOf("string", Scribe.Int(0))),
+	-- The inverse nesting, which relies on the second unwrap.
+	Shield = Scribe.Timed(Scribe.ServerOnly(false)),
+}
+
+local wrappedBundle = Scribe({
+	Template = wrappedTemplate,
+	ProfileStoreIndex = "W",
+	ProfileKeyPrefix = "W_",
+	Banner = false,
+})
+
+local function serverOnlyWrappers(player: Player)
+	local data = wrappedBundle.Server[player]
+	data.Unlocked.Add("Desert")
+	local members: { string } = data.Unlocked.Get()
+	data.Wealth.Increment("1e40")
+	local wealth: string = data.Wealth.Get():Short()
+	data.Tutorial.Enable("Combat")
+	local flags: { string } = data.Tutorial.Get()
+	data.Booster.SetTimed(true, 60)
+	local boosted: boolean = data.Booster.Active()
+	data.Tags.Alpha.Set(1)
+	local tags: { [string]: number } = data.Tags.Get()
+	data.Shield.SetTimed(true, 30)
+	return members, wealth, flags, boosted, tags
+end
 local function clientUsage()
 	local ready: boolean = ClientData.IsReady()
 	if ClientData.WaitForData(10) then
@@ -312,5 +541,8 @@ return {
 	typedApis = typedApis,
 	economyUsage = economyUsage,
 	playerDataAlias = playerDataAlias,
+	containerDeclarators = containerDeclarators,
+	serverOnlyWrappers = serverOnlyWrappers,
+	bigOperators = bigOperators,
 	signalSurface = signalSurface,
 }

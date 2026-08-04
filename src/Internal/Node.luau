@@ -5,6 +5,7 @@
 -- server's authoritative tree and the client's mirror alike.
 
 local Util = require(script.Parent.Util)
+local Big = require(script.Parent.Big)
 local Template = require(script.Parent.Template)
 local Datatypes = require(script.Parent.Datatypes)
 
@@ -72,6 +73,13 @@ export type Tree = typeof(setmetatable(
 		_replaying: boolean,
 		_accessors: { [string]: any },
 		_batchDepth: number,
+		-- Ancestor Changed fires deferred to the end of a batch, keyed by pathKey
+		-- so N writes under one container collapse to one fire. Insertion-ordered
+		-- (deepest first, matching the unbatched order) via _pendingAncestorOrder.
+		-- Only the prefix is kept: Changed carries state, and WHICH child moved is
+		-- OnChildChanged's job.
+		_pendingAncestors: { [string]: { string | number } }?,
+		_pendingAncestorOrder: { string }?,
 		_txn: {
 			Snapshots: { [string]: { Path: { string | number }, Value: any } },
 			Ops: { { Op: Op, Schema: SchemaNode? } },
@@ -109,6 +117,8 @@ function Node.NewTree(params: TreeParams): Tree
 		_replaying = false,
 		_accessors = {},
 		_batchDepth = 0,
+		_pendingAncestors = nil,
+		_pendingAncestorOrder = nil,
 		_txn = nil,
 	}, Tree)
 	self.Accessor = newAccessor(self, {}, params.Compiled.Root)
@@ -203,9 +213,25 @@ local function checkContainerKey(
 			error(`Scribe: "{where}" is capped at MaxItems {schema.MaxItems}`, 0)
 		end
 	else
-		if type(key) ~= "string" then
+		-- Scribe.MapOf declares its key type; a plain Scribe.DictOf is string-keyed.
+		local keyType = schema.KeyType or "string"
+		if keyType == "integer" then
+			if type(key) ~= "number" then
+				error(
+					`Scribe: "{where}" is a Scribe.MapOf("integer") and takes integer keys, but the key `
+						.. `{tostring(key)} is a {type(key)}`,
+					0
+				)
+			end
+			-- A DataStore serializes object keys to JSON strings, and only a finite
+			-- integer survives that round trip unambiguously.
+			if key ~= key or key == math.huge or key == -math.huge or key % 1 ~= 0 then
+				error(`Scribe: "{where}" takes finite integer keys, got {tostring(key)}`, 0)
+			end
+		elseif type(key) ~= "string" then
+			local declarator = if schema.KeyType then `Scribe.MapOf("string")` else "Scribe.DictOf"
 			error(
-				`Scribe: "{where}" is a Scribe.DictOf and takes string keys, but the key {tostring(key)} `
+				`Scribe: "{where}" is a {declarator} and takes string keys, but the key {tostring(key)} `
 					.. `is a {type(key)}`,
 				0
 			)
@@ -213,7 +239,27 @@ local function checkContainerKey(
 		if removing then
 			return
 		end
-		local maxKeyLength = schema.MaxKeyLength
+		-- Creating a NEW integer key in a container that still holds a string one
+		-- would produce a table with both key types, which no DataStore will store:
+		-- the whole profile save then fails, not just this field. That state is
+		-- reachable when load-time coercion was blocked, which happens when a key is
+		-- not a canonical integer spelling ("07", "1.5") and the all-or-nothing rule
+		-- left the container alone rather than half-converting it. Refuse the write
+		-- and name the blocker instead of letting the profile become unsaveable.
+		if keyType == "integer" and container[key] == nil then
+			for existing in container do
+				if type(existing) == "string" then
+					error(
+						`Scribe: "{where}" is a Scribe.MapOf("integer") but still holds the string key `
+							.. `"{existing}", which load-time coercion could not convert. Writing an integer `
+							.. "key now would leave both key types in one table, which fails the whole "
+							.. "profile save. Remove or migrate that key first",
+						0
+					)
+				end
+			end
+		end
+		local maxKeyLength = if keyType == "string" then schema.MaxKeyLength else nil
 		if maxKeyLength and #(key :: string) > maxKeyLength then
 			-- Reject rather than truncate: a truncated key writes to the wrong slot.
 			error(`Scribe: key "{key}" at "{where}" is {#(key :: string)} bytes, over MaxKeyLength {maxKeyLength}`, 0)
@@ -412,20 +458,154 @@ local function fire(tree: Tree, pathKey: string, event: string, ...: any)
 	end
 end
 
--- Fires Changed on every ancestor of `path` that has listeners, passing the
--- immediate child key along the changed path.
-local function fireAncestors(tree: Tree, path: { string | number })
+-- Walks up from `path` firing two different KINDS of event on each ancestor.
+--
+-- OnChildChanged is a TRANSITION: "this direct child moved, here it is". It fires
+-- immediately, once per write, never deferred and never deduplicated, exactly like
+-- leaf Changed and like OnInsert / OnRemove / OnKeyAdded / OnKeyRemoved. Coalescing
+-- a transition would destroy it, which is the whole reason this event exists.
+--
+-- Changed is STATE: "this container is different, here is its current value". Its
+-- `old` is the same reference as `new` because Scribe never snapshots a container,
+-- so there is nothing in it that a batch can lose. That is what makes it safe to
+-- defer and collapse to one fire per batch or per received frame.
+-- `childOld` is the prior value of the DEEPEST ancestor's immediate child, passed
+-- only by applySet, where that child is the leaf that actually changed. It needs
+-- its own `known` flag because nil is a legitimate prior value (a key being
+-- added). Every shallower ancestor's child is a container mutated in place, so
+-- its old and new are one reference, exactly as a container's own Changed reports.
+local function fireAncestors(tree: Tree, path: { string | number }, childOld: any, childOldKnown: boolean?)
 	if next(tree._listeners) == nil then
 		return
 	end
+	local deferring = tree._batchDepth > 0
+	-- The child of the ancestor at `depth` is the prefix of length depth + 1, which
+	-- is the previous iteration's already-allocated prefix. Starts as `path` itself,
+	-- whose last segment is the leaf that actually changed.
+	local childPrefix: { string | number } = path
 	for depth = #path - 1, 0, -1 do
 		local prefix = table.move(path, 1, depth, 1, table.create(depth)) :: { string | number }
 		local pathKey = Util.pathKey(prefix)
+		local byEvent = tree._listeners[pathKey]
+		if byEvent ~= nil then
+			local childList = byEvent.OnChildChanged
+			if childList and next(childList) ~= nil then
+				-- Read the child on its OWN path rather than indexing the parent's
+				-- table: at the root, readValue short-circuits to Stores.Persist while
+				-- resolveContainer routes the first segment through storeFor, so
+				-- `parentValue[key]` would read nil for a Session root's child.
+				local childNew = readValue(tree, childPrefix)
+				local previous = if depth == #path - 1 and childOldKnown then childOld else childNew
+				fire(tree, pathKey, "OnChildChanged", path[depth + 1], childNew, previous)
+			end
+			local list = byEvent.Changed
+			if list and next(list) ~= nil then
+				if not deferring then
+					local value = readValue(tree, prefix)
+					fire(tree, pathKey, "Changed", value, value)
+				else
+					local pending = tree._pendingAncestors
+					if pending == nil then
+						pending = {}
+						tree._pendingAncestors = pending
+						tree._pendingAncestorOrder = {}
+					end
+					if (pending :: any)[pathKey] == nil then
+						(pending :: any)[pathKey] = prefix
+						local order = tree._pendingAncestorOrder :: { string }
+						order[#order + 1] = pathKey
+					end
+				end
+			end
+		end
+		childPrefix = prefix
+	end
+end
+
+-- A container's own STATE fire, routed through the same defer queue fireAncestors
+-- uses. Insert/Remove/Clear mutate at the container's OWN path rather than a child's,
+-- so they never reach fireAncestors for that node and fired N times inside a batch
+-- where every other container fires once. Deferring is safe for exactly the same
+-- reason it is there: the fire is (value, value), so there is no prior state a
+-- collapse can lose, and the per-entry transitions are already carried separately by
+-- OnInsert and OnRemove.
+local function deferSelfState(tree: Tree, pathKey: string, path: { string | number }): boolean
+	if tree._replaying then
+		-- Same suppression `fire` applies: ReplayFire fires every observed path
+		-- itself once the apply is done, so queuing here would double it.
+		return true
+	end
+	if tree._batchDepth == 0 then
+		return false
+	end
+	local list = listenersFor(tree, pathKey, "Changed", false)
+	if list == nil or next(list) == nil then
+		return true -- nothing listening: skip the fire either way
+	end
+	local pending = tree._pendingAncestors
+	if pending == nil then
+		pending = {}
+		tree._pendingAncestors = pending
+		tree._pendingAncestorOrder = {}
+	end
+	if (pending :: any)[pathKey] == nil then
+		(pending :: any)[pathKey] = table.clone(path)
+		local order = tree._pendingAncestorOrder :: { string }
+		order[#order + 1] = pathKey
+	end
+	return true
+end
+
+-- Fire the ancestor Changed events a batch deferred, one per container. Values are
+-- read NOW, so every listener sees the batch's end state.
+--
+-- Order is first-touch: each write queues its own ancestors deepest-first, and a
+-- container already queued keeps its original position. That reproduces the order
+-- the same writes would have fired unbatched, minus the duplicates, which is the
+-- property that matters. It is NOT globally deepest-first across writes, and
+-- sorting it that way would move fires relative to the unbatched order.
+local function flushPendingAncestors(tree: Tree)
+	local pending = tree._pendingAncestors
+	if pending == nil then
+		return
+	end
+	local order = tree._pendingAncestorOrder :: { string }
+	tree._pendingAncestors = nil
+	tree._pendingAncestorOrder = nil
+	for _, pathKey in order do
 		local list = listenersFor(tree, pathKey, "Changed", false)
 		if list and next(list) ~= nil then
-			local value = readValue(tree, prefix)
-			fire(tree, pathKey, "Changed", value, value, path[depth + 1])
+			local value = readValue(tree, pending[pathKey])
+			fire(tree, pathKey, "Changed", value, value)
 		end
+	end
+end
+
+-- Drop a rolled-back transaction's deferred fires. The writes that queued them no
+-- longer happened, and the restores below fire their own Changed with the
+-- pre-transaction values.
+--
+-- Scoped to what the TRANSACTION queued, via a mark taken when it opened. The queue
+-- is tree-wide, so a transaction nested in a Data.Batch shares it with the batch's
+-- own surviving writes: clearing it wholesale swallowed those too, and the batch
+-- ended with the data written but no container Changed on the server, while the
+-- client mirror fired one from the same frame. Anything the batch queued sits below
+-- the mark and survives; the dedupe in fireAncestors means a container both touched
+-- stays queued once, at its earlier position, which is correct because the batch's
+-- write to it still happened.
+local function discardPendingAncestors(tree: Tree, mark: number)
+	local order = tree._pendingAncestorOrder
+	if order == nil then
+		return
+	end
+	local pending = tree._pendingAncestors :: any
+	for i = #order, mark + 1, -1 do
+		pending[order[i]] = nil
+		order[i] = nil
+	end
+	if mark == 0 then
+		tree._pendingAncestors = nil
+		tree._pendingAncestorOrder = nil
 	end
 end
 
@@ -604,6 +784,62 @@ local function validateWrite(
 			v = math.clamp(v, min or -math.huge, max or math.huge)
 		end
 		return v
+	elseif vt == "big" then
+		local parsed = Big.from(value)
+		if parsed == nil then
+			validationError(path, `expected a number or a numeric string, got {t}`)
+		end
+		local big = parsed :: any
+		local min = schema and schema.Min
+		local max = schema and schema.Max
+		if min ~= nil then
+			local floor = Big.from(min) :: any
+			if Big.compare(big, floor) < 0 then
+				anomaly(tree, path, Big.toString(big), "OutOfBounds")
+				if policy == "Reject" then
+					validationError(path, `below Min {Big.toString(floor)}`)
+				end
+				big = floor
+			end
+		end
+		if max ~= nil then
+			local ceiling = Big.from(max) :: any
+			if Big.compare(big, ceiling) > 0 then
+				anomaly(tree, path, Big.toString(big), "OutOfBounds")
+				if policy == "Reject" then
+					validationError(path, `above Max {Big.toString(ceiling)}`)
+				end
+				big = ceiling
+			end
+		end
+		return Big.toStored(big)
+	elseif vt == "flags" then
+		if t ~= "table" then
+			validationError(path, `expected a table of member names, got {t}`)
+		end
+		-- Normalize to declaration order with duplicates dropped, so the stored value
+		-- is canonical. Without that, { "B", "A" } and { "A", "B" } would be
+		-- different tables meaning the same thing, and every diff and equality check
+		-- downstream would have to care about write order.
+		local index = (schema and schema.MemberIndex) :: { [string]: number }?
+		local enabled: { [string]: boolean } = {}
+		for _, name in value :: { any } do
+			if type(name) ~= "string" then
+				validationError(path, `flag names must be strings, got {type(name)}`)
+			end
+			if index == nil or index[name] == nil then
+				anomaly(tree, path, name, "NotAMember")
+				validationError(path, `"{tostring(name)}" is not a member of the flags`)
+			end
+			enabled[name] = true
+		end
+		local out = {}
+		for _, name in (schema and schema.Members) :: { string } do
+			if enabled[name] then
+				table.insert(out, name)
+			end
+		end
+		return out
 	elseif vt == "string" or vt == "enum" then
 		if t ~= "string" then
 			validationError(path, `expected string, got {t}`)
@@ -681,6 +917,21 @@ local function validateWrite(
 					if (k :: number) > maxIndex then
 						maxIndex = k :: number
 					end
+				elseif declared.KeyType == "integer" then
+					-- A Scribe.MapOf("integer") declares its key type, so a whole-table
+					-- write has to be judged against THAT, not against DictOf's string
+					-- assumption. Judging it wrongly refuses the map's own keys and
+					-- accepts the ones it cannot store.
+					if type(k) ~= "number" then
+						validationError(
+							path,
+							`Scribe.MapOf("integer") takes integer keys, but "{tostring(k)}" is a string key`
+						)
+					end
+					local n = k :: number
+					if n ~= n or n == math.huge or n == -math.huge or n % 1 ~= 0 then
+						validationError(path, `key {tostring(k)} is not a finite integer`)
+					end
 				else
 					if type(k) ~= "string" then
 						validationError(path, `Scribe.DictOf takes string keys, but {tostring(k)} is a number key`)
@@ -706,8 +957,24 @@ local function validateWrite(
 					validationError(path, "array entries must run contiguously from 1 (no holes)")
 				end
 				local maxItems = declared.MaxItems
-				if maxItems and count > maxItems and count > storedCount() then
-					validationError(path, `holds {count} entries, over MaxItems {maxItems}`)
+				if maxItems then
+					-- A set is stored deduplicated, so its cap is on MEMBERSHIP. Counting
+					-- the caller's raw array refused writes whose resulting set fits,
+					-- e.g. Set({1,1,1}) against MaxItems 2.
+					local effective = count
+					if declared.Unique then
+						local seen: { [any]: boolean } = {}
+						effective = 0
+						for _, item in value do
+							if not seen[item] then
+								seen[item] = true
+								effective += 1
+							end
+						end
+					end
+					if effective > maxItems and effective > storedCount() then
+						validationError(path, `holds {effective} entries, over MaxItems {maxItems}`)
+					end
 				end
 			else
 				local maxKeys = declared.MaxKeys
@@ -775,6 +1042,23 @@ local function validateWrite(
 					end
 				end
 			end
+		end
+		if schema and schema.Unique then
+			-- Deduplicate and sort, so the stored form of a set is canonical: two
+			-- profiles holding the same members hold the same table, and Add is
+			-- idempotent no matter what order things were written in. Sorting is
+			-- safe because Template refuses any set element that is not an
+			-- orderable scalar.
+			local seen: { [any]: boolean } = {}
+			local unique = {}
+			for _, item in out do
+				if not seen[item] then
+					seen[item] = true
+					table.insert(unique, item)
+				end
+			end
+			table.sort(unique)
+			return unique
 		end
 		return out
 	end
@@ -997,6 +1281,29 @@ local function seedMissingElements(tree: Tree, path: { string | number }, schema
 							seg,
 							Util.pathString(table.move(path, 1, i - 1, 1, {}))
 						)
+						-- And the same alias guard resolveContainer applies. Seeding
+						-- here reaches the container FIRST, so a numeric key
+						-- materializing next to its existing string form would leave
+						-- resolveContainer's own check looking at a key that already
+						-- exists, and it would never run. Both forms would persist, and
+						-- the load-time key coercion resolves such a pair by
+						-- overwriting one with the other, losing a saved write.
+						--
+						-- Defence in depth: checkContainerKey above rejects the
+						-- mismatched form for every DECLARED container, so no public
+						-- call reaches this today and no test can pin it. It is kept
+						-- because it is the cheap half of a pair whose other half is
+						-- load-bearing, and because "unreachable" here depends on a
+						-- guard in a different function.
+						local alias = aliasForm(seg)
+						if alias ~= nil and container[alias] ~= nil then
+							error(
+								`Scribe: key "{tostring(seg)}" at "{Util.pathString(path)}" collides with the `
+									.. `existing "{tostring(alias)}" key form (a numeric key and its string form `
+									.. "cannot coexist)",
+								0
+							)
+						end
 					end
 					local prefix = table.move(path, 1, i, 1, table.create(i))
 					applySet(tree, prefix, createdSchema, Util.deepClone(seed), {
@@ -1132,7 +1439,7 @@ function applySet(tree: Tree, path: { string | number }, schema: SchemaNode?, va
 			end
 		end
 	end
-	fireAncestors(tree, path)
+	fireAncestors(tree, path, old, true)
 	return newValue
 end
 
@@ -1151,6 +1458,45 @@ local function ensureContainerValue(tree: Tree, path: { string | number }, schem
 	return value
 end
 
+-- Forward declaration: applyInsert evicts through the real remove path so the
+-- client mirror receives a Remove op, rather than quietly shrinking the table.
+local applyArrayRemove: (Tree, { string | number }, SchemaNode?, number?, WriteOpts) -> any
+
+-- Scribe.Big and Scribe.Flags are LEAVES whose stored form happens to be a table (a
+-- { mantissa, exponent } pair, and the list of enabled member names). Every container
+-- mutation gates on the stored VALUE being a table, so they sailed through: Insert on
+-- a big rewrote the pair, turning a 1e100 balance into 50, and Clear left a
+-- non-Optional field reading nil. Both persisted and survived a rejoin.
+--
+-- A Scribe.SetOf is a real container, but its stored form is deduplicated and sorted
+-- by the whole-value write path, which Insert and a positional write bypass, so it is
+-- refused here too and callers are pointed at Add/Remove.
+local function refuseStructuralWrite(schema: SchemaNode?, path: { string | number }, method: string)
+	if schema == nil then
+		return
+	end
+	local vt = schema.ValueType
+	if vt == "big" then
+		error(
+			`Scribe: "{Util.pathString(path)}" is a Scribe.Big, not a container; {method} would rewrite its `
+				.. "stored mantissa/exponent pair. Use Set, Increment, Decrement, Multiply or Divide",
+			0
+		)
+	elseif vt == "flags" then
+		error(
+			`Scribe: "{Util.pathString(path)}" is a Scribe.Flags, not a container; {method} would corrupt its `
+				.. "member list. Use Enable, Disable, Toggle or Clear",
+			0
+		)
+	elseif schema.Unique then
+		error(
+			`Scribe: "{Util.pathString(path)}" is a Scribe.SetOf; {method} bypasses the dedupe and ordering `
+				.. "its stored form depends on. Use Add or Remove",
+			0
+		)
+	end
+end
+
 local function applyInsert(
 	tree: Tree,
 	path: { string | number },
@@ -1163,8 +1509,11 @@ local function applyInsert(
 	-- NoValidate, and a mirror whose length is momentarily ahead of the server must
 	-- not throw mid-frame (that drops the frame and desyncs permanently).
 	local validating = not opts.NoValidate and not opts.FromRemote
-	if validating and schema and schema.Container == "Dict" then
-		error(`Scribe: "{Util.pathString(path)}" is a Scribe.DictOf; write a key instead of calling Insert`, 0)
+	if validating then
+		refuseStructuralWrite(schema, path, "Insert")
+		if schema and schema.Container == "Dict" then
+			error(`Scribe: "{Util.pathString(path)}" is a Scribe.DictOf; write a key instead of calling Insert`, 0)
+		end
 	end
 
 	local pathKey = Util.pathKey(path)
@@ -1179,11 +1528,32 @@ local function applyInsert(
 	local index = math.clamp(pos or existingLength + 1, 1, existingLength + 1)
 
 	if validating and schema and schema.MaxItems and existingLength >= schema.MaxItems then
-		error(
-			`Scribe: "{Util.pathString(path)}" already holds {existingLength} entries, `
-				.. `at its MaxItems {schema.MaxItems}`,
-			0
-		)
+		if schema.Evict ~= "Front" and schema.Evict ~= "Back" then
+			error(
+				`Scribe: "{Util.pathString(path)}" already holds {existingLength} entries, `
+					.. `at its MaxItems {schema.MaxItems}`,
+				0
+			)
+		end
+		-- Make room at the named end. This goes through the real remove path on
+		-- purpose: a bare table.remove would shrink the server's array without
+		-- emitting a Remove op, leaving every client mirror one entry longer
+		-- forever. It also fires OnRemove, so a listener sees what was dropped.
+		-- The loop handles an array already over cap (a lowered MaxItems, or data
+		-- from before the cap existed) rather than trimming one entry per Insert.
+		local dropFront = schema.Evict == "Front"
+		for _ = 1, existingLength - schema.MaxItems + 1 do
+			-- Recompute the tail index each pass: the array shrinks under us.
+			local current = if type(preValue) == "table" then #(preValue :: any) else 0
+			applyArrayRemove(tree, path, schema, if dropFront then 1 else current, opts)
+		end
+		-- Everything shifted down, so re-read rather than trusting the stale index.
+		-- Rollback stays correct because applyArrayRemove already snapshotted the
+		-- pre-eviction array, and snapshotForTxn keeps the FIRST value per pathKey.
+		existingContainer, existingKey = resolveContainer(tree, path, false)
+		preValue = if existingContainer then existingContainer[existingKey] else nil
+		existingLength = if type(preValue) == "table" then #(preValue :: any) else 0
+		index = math.clamp(pos or existingLength + 1, 1, existingLength + 1)
 	end
 
 	if validating then
@@ -1219,17 +1589,22 @@ local function applyInsert(
 
 	emitOp(tree, { Kind = "Insert", Path = table.clone(path), Value = value, Index = index }, schema, opts)
 	fire(tree, pathKey, "OnInsert", value, index)
-	fire(tree, pathKey, "Changed", arr, arr, index)
+	if not deferSelfState(tree, pathKey, path) then
+		fire(tree, pathKey, "Changed", arr, arr)
+	end
 	fireAncestors(tree, path)
 end
 
-local function applyArrayRemove(
+function applyArrayRemove(
 	tree: Tree,
 	path: { string | number },
 	schema: SchemaNode?,
 	pos: number?,
 	opts: WriteOpts
 ): any
+	if not opts.NoValidate and not opts.FromRemote then
+		refuseStructuralWrite(schema, path, "Remove by index")
+	end
 	local container, key = resolveContainer(tree, path, false)
 	local arr = if container then container[key] else nil
 	if type(arr) ~= "table" or #arr == 0 then
@@ -1255,12 +1630,19 @@ local function applyArrayRemove(
 
 	emitOp(tree, { Kind = "Remove", Path = table.clone(path), Index = index }, schema, opts)
 	fire(tree, pathKey, "OnRemove", item, index)
-	fire(tree, pathKey, "Changed", arr, arr, index)
+	if not deferSelfState(tree, pathKey, path) then
+		fire(tree, pathKey, "Changed", arr, arr)
+	end
 	fireAncestors(tree, path)
 	return item
 end
 
 local function applyClear(tree: Tree, path: { string | number }, schema: SchemaNode?, opts: WriteOpts)
+	-- A Scribe.Flags legitimately clears to {} ("nothing enabled"), and so does a
+	-- Scribe.SetOf, so only the big is refused here.
+	if not opts.NoValidate and not opts.FromRemote and schema and schema.ValueType == "big" then
+		refuseStructuralWrite(schema, path, "Clear")
+	end
 	local container, key = resolveContainer(tree, path, opts.FromRemote == true, schema)
 	local value = if container then container[key] else nil
 	if type(value) ~= "table" then
@@ -1283,9 +1665,45 @@ local function applyClear(tree: Tree, path: { string | number }, schema: SchemaN
 	-- Bulk semantics: parent Changed fires once; per-entry key events don't. A
 	-- descendant leaf listener is NOT a per-entry event though: its value really
 	-- did change, and it has no other way to learn that.
-	fire(tree, pathKey, "Changed", value, value)
+	--
+	-- Descendants BEFORE the container's own state, which is the only order both
+	-- paths can share: inside a batch (and the client mirror is always batched) the
+	-- self fire is deferred to the flush and necessarily lands last, so firing it
+	-- first when unbatched made the same Clear deliver two different orders.
 	fireDescendants(tree, descendantOlds)
+	if not deferSelfState(tree, pathKey, path) then
+		fire(tree, pathKey, "Changed", value, value)
+	end
 	fireAncestors(tree, path)
+end
+
+-- Applies a whole frame's ops as ONE batch, so N ops landing under the same
+-- container produce a single container Changed rather than one per op. This is
+-- the receiving half of Server.Batch: the server already coalesces a batch into
+-- one frame, and without this the client would unpack that frame back into N
+-- separate fires, which is exactly what a listener on the container is trying to
+-- avoid. A frame is the unit of change as far as the client is concerned.
+--
+-- Leaf fires are untouched, so each field still reports its own transition.
+function Tree.ApplyOps(self: Tree, ops: { Op })
+	if self.Dead then
+		return
+	end
+	self._batchDepth += 1
+	local ok, err = pcall(function()
+		for _, op in ops do
+			self:ApplyOp(op)
+		end
+	end)
+	self._batchDepth -= 1
+	if self._batchDepth == 0 then
+		-- Flush even when an op threw: the ops before it did land, and a listener
+		-- that never hears about them is worse than one that hears late.
+		flushPendingAncestors(self)
+	end
+	if not ok then
+		error(err, 0)
+	end
 end
 
 -- Applies an op received over the wire (client mirror / gift delivery replays).
@@ -1372,8 +1790,12 @@ function Tree.RunBatch(self: Tree, fn: () -> ())
 	self._batchDepth += 1
 	local ok, err = pcall(fn :: any)
 	self._batchDepth -= 1
-	if self._batchDepth == 0 and self.Params.OnBatchEnd then
-		self.Params.OnBatchEnd()
+	if self._batchDepth == 0 then
+		-- Listeners before replication, matching the unbatched ordering.
+		flushPendingAncestors(self)
+		if self.Params.OnBatchEnd then
+			self.Params.OnBatchEnd()
+		end
 	end
 	if not ok then
 		error(err, 0)
@@ -1400,6 +1822,18 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 		error("Scribe: transactions do not nest", 2)
 	end
 	self._txn = { Snapshots = {}, Ops = {}, Created = {}, RawRestores = {}, Economy = {} }
+	-- Everything already queued belongs to an enclosing batch, not to this
+	-- transaction, so a rollback must leave it alone.
+	local outerOrder = self._pendingAncestorOrder
+	local pendingMark = if outerOrder then #outerOrder else 0
+	-- RESTORED, not decremented, at the end. A Data.Batch opened inside `fn` raises
+	-- the depth on `fn`'s own coroutine, and the yield path below closes that
+	-- coroutine, which in Luau does NOT unwind pending frames: RunBatch's matching
+	-- decrement dies with the stack. Decrementing only our own would leave the tree
+	-- permanently above zero, and flushPendingAncestors is only ever reached at
+	-- zero, so every container Changed and Observe on this player would go silently
+	-- dead for the rest of the session.
+	local depthBefore = self._batchDepth
 	self._batchDepth += 1
 	-- Run fn in its OWN coroutine so a yield can be detected. self._txn is set for
 	-- the whole of fn, and every write path absorbs into it while it is set; if fn
@@ -1425,7 +1859,10 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 	end
 	local txn = self._txn :: any
 	self._txn = nil
-	self._batchDepth -= 1
+	self._batchDepth = depthBefore
+	if not ok then
+		discardPendingAncestors(self, pendingMark)
+	end
 
 	if ok then
 		local onOp = self.Params.OnOp
@@ -1440,8 +1877,11 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 				onEconomy(event.Path, event.Delta, event.New, event.Tags)
 			end
 		end
-		if self._batchDepth == 0 and self.Params.OnBatchEnd then
-			self.Params.OnBatchEnd()
+		if self._batchDepth == 0 then
+			flushPendingAncestors(self)
+			if self.Params.OnBatchEnd then
+				self.Params.OnBatchEnd()
+			end
 		end
 		return true, nil
 	end
@@ -1673,16 +2113,70 @@ end
 	@function Changed
 	@within Value
 	@tag Core
-	@param callback (new: T, old: T, key: (string | number)?) -> ()
+	@param callback (new: T, old: T) -> ()
 	@return () -> ()
 	Like `Observe` but fires only on change (no initial call). Returns a disconnect
 	function.
 
-	On a **leaf** the callback gets the new and old values. On a **container** it
-	also gets the key that changed, and `old` is the same reference as `new`: the
-	fire happens after the write, and Scribe does not snapshot the container's prior
-	contents. Use `OnInsert` / `OnRemove` / `OnKeyAdded` / `OnKeyRemoved` when you
-	need to know what actually changed, or watch the specific leaf.
+	On a **leaf** the callback gets the new and old values, and fires once per write.
+
+	On a **container** it reports state rather than a transition: "something beneath
+	this changed, here is the current value". `old` is the same reference as `new`,
+	because the fire happens after the write and Scribe does not snapshot a
+	container's prior contents. Such a fire is **coalesced**: one per
+	[Server.Batch], and on the client one per replication frame, however many
+	children moved.
+
+	:::caution The container `key` argument was removed
+	A container `Changed` listener used to receive a third `key` argument. It cannot
+	any more, because a single fire now covers every child a batch or a frame
+	touched. Passing one of them would imply the others did not change. Scribe
+	**errors at connect time** on a container listener declaring a third parameter,
+	rather than handing it `nil` forever. Use [Value.OnChildChanged] instead.
+
+	A node beneath an untyped `{}` subtree has no schema to judge, so it is
+	classified by what is stored there right now. Connect after the container
+	exists and the check covers it too.
+	:::
+
+	```lua
+	-- before
+	data.Inventory.Changed(function(new, old, key) refresh(key) end)
+
+	-- after
+	data.Inventory.Changed(function(new, old) redrawTotals(new) end)
+	data.Inventory.OnChildChanged(function(key, new) refreshSlot(key, new) end)
+	```
+]=]
+
+--[=[
+	@function OnChildChanged
+	@within Value
+	@tag Containers
+	@param callback (key: K, new: V?, old: V?) -> ()
+	@return () -> ()
+	Fires once for every write to a **direct child** of this container, with that
+	child's key and both sides of the change. `new` is `nil` when the child was
+	removed, `old` is `nil` when it was just added.
+
+	`old` is a real prior value when the child is a **leaf**. When the child is
+	itself a **container**, `old` is the same reference as `new`, because Scribe
+	mutates containers in place and never snapshots them. That is the same caveat
+	[Value.Changed] carries on a container.
+
+	Unlike [Value.Changed], this is never coalesced: a batch that writes three
+	children fires it three times, and a child written twice fires it twice, because
+	each is a real transition and collapsing them would lose what happened. Every
+	ancestor of a write receives its **own** immediate child, so a write to
+	`State.Inner.A` reports `A` to `State.Inner` and `Inner` to `State`.
+
+	All of a container's `OnChildChanged` fires arrive **before** that container's
+	coalesced `Changed`, batched or not, so you can accumulate keys and act on them
+	once.
+
+	This is the only way to learn that an existing [Scribe.DictOf] key's **value**
+	moved. [Value.OnKeyAdded] and [Value.OnKeyRemoved] report a key appearing or
+	disappearing, never one changing.
 ]=]
 
 --[=[
@@ -1957,14 +2451,20 @@ local function unpackIfDatatype(schema: SchemaNode?, value: any): any
 end
 
 -- Read-boundary unpack that also handles CONTAINERS: a container whose schema has
--- datatype descendants (compile-time HasDatatype flag) is returned as a fresh table
--- with every packed buffer converted back to its datatype, so a container-level read
--- never leaks a buffer. Non-datatype subtrees are shared by reference (same as a
--- plain container read today) and containers with no datatypes below return unchanged
--- -- no walk, no allocation for the overwhelming common case.
+-- packed descendants (compile-time HasPacked flag) is returned as a fresh table with
+-- every packed buffer converted back to its datatype and every stored mantissa pair
+-- back to a Big, so a container-level read never leaks a stored shape. Unpacked
+-- subtrees are shared by reference (same as a plain container read today) and
+-- containers with nothing packed below return unchanged: no walk, no allocation for
+-- the overwhelming common case.
 local function unpackRead(schema: SchemaNode?, value: any): any
+	-- A big value is STORED as { mantissa, exponent } and READ as the object with
+	-- arithmetic on it, the same split datatype fields use.
+	if schema and schema.ValueType == "big" then
+		return if value == nil then nil else Big.from(value)
+	end
 	if type(value) == "table" then
-		if schema and schema.HasDatatype then
+		if Template.IsPacked(schema) then
 			local out: { [any]: any } = {}
 			for k, v in value do
 				out[k] = unpackRead(Template.ChildSchema(schema, k), v)
@@ -2023,8 +2523,16 @@ local function canonicalDatatype(name: string, value: any): buffer?
 end
 
 -- Structural equality between a STORED entry and a caller-supplied needle, resolved
--- through the element schema so packed datatype leaves compare by value.
+-- through the element schema so packed datatype and big leaves compare by value.
 local function entryEquals(schema: SchemaNode?, stored: any, needle: any): boolean
+	if schema and schema.ValueType == "big" then
+		-- The stored side is a { mantissa, exponent } pair and the needle is whatever
+		-- a read handed back, so both go through Big.from before comparing. Without
+		-- this the pair-vs-object table walk never matches and Has/Find/RemoveValue
+		-- silently no-op against the value Get() just returned.
+		local a, b = Big.from(stored), Big.from(needle)
+		return a ~= nil and b ~= nil and Big.compare(a, b) == 0
+	end
 	if schema and schema.ValueType == "datatype" then
 		local name = schema.Datatype :: string
 		local a = canonicalDatatype(name, stored)
@@ -2074,9 +2582,14 @@ local function findElement(schema: SchemaNode?, arr: { any }, item: any): number
 	return nil
 end
 
--- Clone counterpart: a full deep copy with datatype descendants unpacked, so
--- Clone() of a datatype-bearing container yields an independent, buffer-free value.
+-- Clone counterpart: a full deep copy with packed descendants unpacked, so Clone()
+-- of a datatype- or big-bearing container yields an independent value in its read
+-- shape rather than the stored one.
 local function cloneUnpack(schema: SchemaNode?, value: any): any
+	if schema and schema.ValueType == "big" then
+		-- A Big object is immutable and built fresh here, so it needs no extra copy.
+		return if value == nil then nil else Big.from(value)
+	end
 	if type(value) ~= "table" then
 		local unpacked = unpackIfDatatype(schema, value)
 		-- A raw (non-datatype) buffer leaf must be COPIED, not aliased: buffers are
@@ -2122,7 +2635,7 @@ local function rootShell(tree: Tree, clone: boolean): { [string]: any }
 		end
 		if not clone then
 			out[key] = unpackRead(childSchema, value)
-		elseif childSchema.ValueType == "datatype" or childSchema.HasDatatype then
+		elseif Template.IsPacked(childSchema) then
 			out[key] = cloneUnpack(childSchema, value)
 		else
 			out[key] = Util.deepClone(value)
@@ -2135,6 +2648,24 @@ end
 -- Changed cannot disagree about what "all of the data" means.
 local function frozenRootShell(tree: Tree): { [string]: any }
 	return table.freeze(rootShell(tree, false))
+end
+
+-- Whether this node holds children, and so receives coalesced ancestor fires
+-- rather than leaf transitions. The root always does. A schema-less (dynamic) node
+-- is judged by what is actually stored there right now, which is the best answer
+-- available at connect time.
+local function isContainerNode(tree: Tree, schema: SchemaNode?, path: { string | number }): boolean
+	if #path == 0 then
+		return true
+	end
+	-- Kind == "any" is the pseudo-node Template synthesizes for an undeclared key
+	-- under an untyped `{}` subtree. It is never nil, so testing `schema ~= nil`
+	-- alone classified every such node as a leaf and made the runtime check below
+	-- dead for the exact case it was written for.
+	if schema ~= nil and schema.Kind ~= "any" then
+		return schema.Kind == "table" or schema.Children ~= nil
+	end
+	return type(readValue(tree, path)) == "table"
 end
 
 local METHOD_FACTORIES: { [string]: (Accessor) -> any } = {}
@@ -2187,19 +2718,216 @@ METHOD_FACTORIES.Clone = function(accessor)
 			return rootShell(tree, true)
 		end
 		local schema = accessorSchema(accessor)
-		if schema and (schema.ValueType == "datatype" or schema.HasDatatype) then
-			-- Leaf datatype or a container with datatype descendants: deep-clone
-			-- and unpack together so the copy is independent AND buffer-free.
+		if Template.IsPacked(schema) then
+			-- Leaf datatype or big, or a container holding either: deep-clone and
+			-- unpack together so the copy is independent AND in its read shape.
 			return cloneUnpack(schema, readValue(tree, path))
 		end
 		return Util.deepClone(readValue(tree, path))
 	end
 end
 
-local function incrementImpl(accessor: Accessor, delta: number, tagsOrReplicate: any, defaultFlow: string): number
+-- Flags helpers. Each one reads the current set, edits it, and writes the whole
+-- field back, so a flag change is a single validated, replicated write that fires
+-- one Changed rather than N.
+local function flagsSchema(accessor: Accessor, method: string): SchemaNode
+	local schema = accessorSchema(accessor)
+	if not schema or schema.ValueType ~= "flags" then
+		error(`Scribe: "{Util.pathString(accessorPath(accessor))}" is not a Scribe.Flags field ({method})`, 3)
+	end
+	return schema
+end
+
+local function flagsSet(
+	tree: Tree,
+	accessor: Accessor,
+	schema: SchemaNode,
+	name: string,
+	on: boolean,
+	replicate: boolean?
+)
+	local index = schema.MemberIndex :: { [string]: number }
+	if index[name] == nil then
+		error(`Scribe: "{tostring(name)}" is not a member of "{Util.pathString(accessorPath(accessor))}"`, 3)
+	end
+	local current = readValue(tree, accessorPath(accessor))
+	local enabled: { [string]: boolean } = {}
+	if type(current) == "table" then
+		for _, member in current :: { string } do
+			enabled[member] = true
+		end
+	end
+	-- `or false` matters: an unset flag reads nil, and nil == false is false, so a
+	-- Disable on an already-off flag would otherwise write and fire Changed.
+	if (enabled[name] or false) == on then
+		return -- no transition, so no write, no Changed, no replication op
+	end
+	enabled[name] = on or nil
+	local out = {}
+	for _, member in schema.Members :: { string } do
+		if enabled[member] then
+			table.insert(out, member)
+		end
+	end
+	applySet(tree, accessorPath(accessor), schema, out, { Replicate = replicate })
+end
+
+METHOD_FACTORIES.Enable = function(accessor)
+	return function(name: string, replicate: boolean?)
+		local tree = accessorTree(accessor)
+		assertAlive(tree)
+		flagsSet(tree, accessor, flagsSchema(accessor, "Enable"), name, true, replicate)
+	end
+end
+
+METHOD_FACTORIES.Disable = function(accessor)
+	return function(name: string, replicate: boolean?)
+		local tree = accessorTree(accessor)
+		assertAlive(tree)
+		flagsSet(tree, accessor, flagsSchema(accessor, "Disable"), name, false, replicate)
+	end
+end
+
+-- Scribe.SetOf membership. Both go through the whole-value write path, so the
+-- dedupe-and-sort normalization in validateWrite is what actually maintains the
+-- invariant; these just decide whether a write is needed at all.
+local function setSchema(accessor: Accessor, method: string): SchemaNode
+	local schema = accessorSchema(accessor)
+	if not schema or not schema.Unique then
+		error(`Scribe: "{Util.pathString(accessorPath(accessor))}" is not a Scribe.SetOf field ({method})`, 3)
+	end
+	return schema
+end
+
+METHOD_FACTORIES.Add = function(accessor)
+	return function(item: any, replicate: boolean?)
+		local tree = accessorTree(accessor)
+		assertAlive(tree)
+		local schema = setSchema(accessor, "Add")
+		local path = accessorPath(accessor)
+		if item == nil then
+			error(`Scribe: cannot Add nil to "{Util.pathString(path)}"`, 3)
+		end
+		local current = readValue(tree, path)
+		local arr = if type(current) == "table" then current :: { any } else {}
+		if findElement(schema, arr, item) ~= nil then
+			return false -- already a member: no write, no op, no Changed
+		end
+		local next_ = table.clone(arr)
+		table.insert(next_, item)
+		applySet(tree, path, schema, next_, { Replicate = replicate })
+		return true
+	end
+end
+
+-- Scribe.Big arithmetic. Each reads the current value, applies the operation, and
+-- writes the whole field, so bounds, replication, and the economy event all run on
+-- the normal write path rather than a parallel one.
+local function bigSchema(accessor: Accessor, method: string): SchemaNode
+	local schema = accessorSchema(accessor)
+	if not schema or schema.ValueType ~= "big" then
+		error(`Scribe: "{Util.pathString(accessorPath(accessor))}" is not a Scribe.Big field ({method})`, 3)
+	end
+	return schema
+end
+
+local function bigOperand(accessor: Accessor, method: string, value: any): any
+	local parsed = Big.from(value)
+	if parsed == nil then
+		error(`Scribe: {method} on "{Util.pathString(accessorPath(accessor))}" needs a number or numeric string`, 3)
+	end
+	return parsed
+end
+
+local function bigApply(accessor: Accessor, method: string, value: any, replicate: boolean?, op: (any, any) -> any): any
+	local tree = accessorTree(accessor)
+	assertAlive(tree)
+	local schema = bigSchema(accessor, method)
+	local path = accessorPath(accessor)
+	local operand = bigOperand(accessor, method, value)
+	-- A Nullable leaf has no default and is legitimately absent, so there is nothing
+	-- to arithmetic against. Materializing it from 0 contradicted the contract every
+	-- other Scribe.Optional leaf keeps, where Increment on an absent value errors.
+	local current = Big.from(readValue(tree, path)) or Big.from(schema.Default)
+	if current == nil then
+		if schema.Nullable then
+			validationError(path, `{method} on an absent Scribe.Optional value`)
+		end
+		current = Big.from(0)
+	end
+	local result = op(current, operand)
+	if result == nil then
+		error(`Scribe: {method} on "{Util.pathString(path)}" divided by zero`, 3)
+	end
+	return unpackRead(schema, applySet(tree, path, schema, result, { Replicate = replicate }))
+end
+
+METHOD_FACTORIES.Multiply = function(accessor)
+	return function(factor: any, replicate: boolean?)
+		return bigApply(accessor, "Multiply", factor, replicate, Big.mul)
+	end
+end
+
+METHOD_FACTORIES.Divide = function(accessor)
+	return function(factor: any, replicate: boolean?)
+		return bigApply(accessor, "Divide", factor, replicate, Big.div)
+	end
+end
+
+local function incrementImpl(accessor: Accessor, delta: any, tagsOrReplicate: any, defaultFlow: string): any
 	local tree = accessorTree(accessor)
 	assertAlive(tree)
 	local path = accessorPath(accessor)
+	local bigNode = accessorSchema(accessor)
+	if not (bigNode and bigNode.ValueType == "big") and defaultFlow == "Sink" and type(delta) == "number" then
+		delta = -delta
+	end
+	if bigNode and bigNode.ValueType == "big" then
+		-- Same economy plumbing as a plain number, just with arithmetic that does not
+		-- lose the value at 2^53.
+		local method = if defaultFlow == "Source" then "Increment" else "Decrement"
+		local signed = bigOperand(accessor, method, delta)
+		if defaultFlow == "Sink" then
+			signed = Big.negate(signed)
+		end
+		local tags, replicate = parseIncrementArgs(tagsOrReplicate)
+		local before = Big.from(readValue(tree, path)) or Big.from(bigNode.Default)
+		if before == nil then
+			if bigNode.Nullable then
+				validationError(path, `{method} on an absent Scribe.Optional value`)
+			end
+			before = Big.from(0)
+		end
+		local result = bigApply(accessor, method, signed, replicate, Big.add)
+		if tags and tree.Params.OnEconomy then
+			local after = Big.from(result) or Big.from(0)
+			-- Report the EFFECTIVE change, as the plain path does, so a Min/Max clamp
+			-- does not over-report. The economy contract is (delta, newValue) as
+			-- numbers, and Roblox's LogEconomyEvent takes a double, so the conversion
+			-- has to happen at this boundary; Big.toNumber saturates past the double
+			-- range, which is lossy but reaches the log, unlike a table that would
+			-- throw inside Analytics' pcall and be swallowed.
+			local effective = Big.sub(after, before)
+			if Big.compare(effective, Big.from(0) :: any) ~= 0 then
+				local applied = table.clone(tags)
+				if applied.Flow == nil then
+					applied.Flow = defaultFlow
+				end
+				local effectiveDelta = Big.toNumber(effective)
+				local newValue = Big.toNumber(after)
+				local txn = tree._txn
+				if txn then
+					table.insert(
+						(txn :: any).Economy,
+						{ Path = path, Delta = effectiveDelta, New = newValue, Tags = applied }
+					)
+				else
+					tree.Params.OnEconomy(path, effectiveDelta, newValue, applied)
+				end
+			end
+		end
+		return result
+	end
 	if type(delta) ~= "number" or delta ~= delta then
 		validationError(path, "Increment delta must be a number")
 	end
@@ -2258,7 +2986,7 @@ METHOD_FACTORIES.Decrement = function(accessor)
 				)
 			end
 		end
-		return incrementImpl(accessor, -delta, tagsOrReplicate, "Sink")
+		return incrementImpl(accessor, delta, tagsOrReplicate, "Sink")
 	end
 end
 
@@ -2278,20 +3006,20 @@ METHOD_FACTORIES.Max = function(accessor)
 	end
 end
 
--- The declarator's default, straight off the (static) schema: a fresh datatype
--- for packed datatype fields, a deep copy for tables/buffers, the value itself
--- for scalars. Works on server and client and before data has loaded.
+-- The declarator's default, straight off the (static) schema: a fresh datatype for
+-- packed datatype fields, a Big for big ones, a deep copy for tables/buffers, the
+-- value itself for scalars. Works on server and client and before data has loaded.
 METHOD_FACTORIES.Default = function(accessor)
 	return function(): any
 		local schema = accessorSchema(accessor)
 		if schema == nil then
 			return nil
 		end
-		if schema.ValueType == "datatype" or schema.HasDatatype then
-			-- Leaf datatype or a container with datatype descendants: the stored
-			-- Default holds PACKED buffers (leaf datatype defaults are packed at
-			-- compile time), so deep-clone AND unpack, matching Clone(). A plain
-			-- deepClone would leak the buffer for a datatype-bearing container.
+		if Template.IsPacked(schema) then
+			-- The stored Default holds the PACKED form (a leaf datatype default is
+			-- packed at compile time, a big one is a mantissa pair), so deep-clone AND
+			-- unpack, matching Clone(). A plain deepClone would hand back the stored
+			-- shape for anything packed or holding something packed.
 			return cloneUnpack(schema, schema.Default)
 		end
 		return Util.deepClone(schema.Default)
@@ -2299,11 +3027,35 @@ METHOD_FACTORIES.Default = function(accessor)
 end
 
 METHOD_FACTORIES.Toggle = function(accessor)
-	return function(replicate: boolean?)
+	return function(nameOrReplicate: any, replicate: boolean?)
 		local tree = accessorTree(accessor)
 		assertAlive(tree)
 		local path = accessorPath(accessor)
 		local schema = accessorSchema(accessor)
+		if schema and schema.ValueType == "flags" then
+			-- On a Scribe.Flags field Toggle names the flag to flip, since the field
+			-- holds a set rather than one boolean.
+			if type(nameOrReplicate) ~= "string" then
+				error(`Scribe: Toggle on a Scribe.Flags field takes a member name`, 3)
+			end
+			local index = schema.MemberIndex :: { [string]: number }
+			if index[nameOrReplicate] == nil then
+				error(`Scribe: "{nameOrReplicate}" is not a member of "{Util.pathString(path)}"`, 3)
+			end
+			local current = readValue(tree, path)
+			local on = false
+			if type(current) == "table" then
+				for _, member in current :: { string } do
+					if member == nameOrReplicate then
+						on = true
+						break
+					end
+				end
+			end
+			flagsSet(tree, accessor, schema, nameOrReplicate, not on, replicate)
+			return not on
+		end
+		local replicateFlag = nameOrReplicate :: boolean?
 		local current = readValue(tree, path)
 		if current == nil and schema and type(schema.Default) == "boolean" and inElementSubtree(schema) then
 			-- Same fresh-element fallback as Increment: the entry materializes on
@@ -2313,40 +3065,57 @@ METHOD_FACTORIES.Toggle = function(accessor)
 		if type(current) ~= "boolean" then
 			validationError(path, `Toggle on non-boolean value ({typeof(current)})`)
 		end
-		return applySet(tree, path, schema, not current, { Replicate = replicate })
+		return applySet(tree, path, schema, not current, { Replicate = replicateFlag })
 	end
 end
 
 METHOD_FACTORIES.Changed = function(accessor)
-	return function(fn: (any, any, any?) -> ())
+	return function(fn: (any, any) -> ())
 		local tree = accessorTree(accessor)
 		local schema = accessorSchema(accessor)
 		local path = accessorPath(accessor)
+
+		-- A container Changed used to receive a third `key` argument. It cannot any
+		-- more: one fire now covers every child a batch or a replication frame
+		-- touched, so no single key describes it. Refuse the old shape at connect
+		-- time rather than handing it a nil forever, which would make
+		-- `if key == "Coins"` quietly stop matching in a shipped game. Arity is read
+		-- once per connect, never per fire.
+		if isContainerNode(tree, schema, path) then
+			local params, isVararg = debug.info(fn, "a")
+			if not isVararg and params > 2 then
+				error(
+					`Scribe: a container Changed listener takes (new, old). "{Util.pathString(path)}" declares `
+						.. `{params} parameters. The third key argument was removed because one fire can now cover `
+						.. `several children. Use OnChildChanged(key, value) to learn which child moved.`,
+					3
+				)
+			end
+		end
+
 		if #path == 0 then
-			-- Match what Get hands back. A root Changed only ever arrives from
-			-- fireAncestors, which passes the SAME store reference for new and old
-			-- (the root has no Set or Update to fire a real transition), so one
-			-- shell serves both and a listener's `if new == old then return` guard
-			-- still holds.
+			-- Match what Get hands back. The root has no Set or Update, so its only
+			-- fires are ancestor fires, where old and new are one reference; a single
+			-- shell serves both and a listener's `if new == old then return` holds.
 			local inner = fn
-			fn = function(_newValue, _oldValue, key)
+			fn = function()
 				local shell = frozenRootShell(tree)
-				inner(shell, shell, key)
+				inner(shell, shell)
 			end
 			return connect(tree, path, "Changed", fn)
 		end
-		if schema and (schema.ValueType == "datatype" or schema.HasDatatype) then
+		if Template.IsPacked(schema) then
 			local inner = fn
-			fn = function(newValue, oldValue, key)
+			fn = function(newValue, oldValue)
 				local newUnpacked = unpackRead(schema, newValue)
 				-- An ancestor container fire passes the SAME reference for new and old;
 				-- reuse the unpacked value to skip a second walk and to preserve
 				-- reference-equality for a listener's `if new == old then return` guard.
 				local oldUnpacked = if oldValue == newValue then newUnpacked else unpackRead(schema, oldValue)
-				inner(newUnpacked, oldUnpacked, key)
+				inner(newUnpacked, oldUnpacked)
 			end
 		end
-		return connect(tree, accessorPath(accessor), "Changed", fn)
+		return connect(tree, path, "Changed", fn)
 	end
 end
 
@@ -2384,7 +3153,26 @@ METHOD_FACTORIES.Remove = function(accessor)
 	return function(posOrKey: any, replicate: boolean?)
 		local tree = accessorTree(accessor)
 		assertAlive(tree)
-		if type(posOrKey) == "string" then
+		local setNode = accessorSchema(accessor)
+		if setNode and setNode.Unique then
+			-- A set has no indices, so Remove names the member to drop.
+			local path = accessorPath(accessor)
+			local current = readValue(tree, path)
+			local arr = if type(current) == "table" then current :: { any } else {}
+			local at = findElement(setNode, arr, posOrKey)
+			if at == nil then
+				return false -- not a member: nothing to do
+			end
+			local next_ = table.clone(arr)
+			table.remove(next_, at)
+			applySet(tree, path, setNode, next_, { Replicate = replicate })
+			return true
+		end
+		-- Branch on the SCHEMA, not on the Lua type of the argument: a
+		-- Scribe.MapOf("integer") takes number keys, and reading those as array
+		-- indices would silently remove the wrong entry. The type fallback keeps
+		-- untyped and dynamic nodes behaving as before.
+		if (setNode and setNode.Container == "Dict") or type(posOrKey) == "string" then
 			-- Dictionary removal: sugar for Set(nil) with a useful return.
 			local path = table.clone(accessorPath(accessor))
 			table.insert(path, posOrKey)
@@ -2468,11 +3256,11 @@ METHOD_FACTORIES.Count = function(accessor)
 	end
 end
 
--- Value handed to an entry-level listener. Packed datatypes are converted back, and
--- a table is copied: the fired value IS the stored one, so a listener mutating it
+-- Value handed to an entry-level listener. Packed values are converted back, and a
+-- table is copied: the fired value IS the stored one, so a listener mutating it
 -- would edit authoritative state with no validation and no replication.
 local function entryValueForListener(schema: SchemaNode?, value: any): any
-	if schema and (schema.ValueType == "datatype" or schema.HasDatatype) then
+	if Template.IsPacked(schema) then
 		return cloneUnpack(schema, value)
 	end
 	-- Only a DECLARED element is copied. An untyped container must keep handing out
@@ -2487,7 +3275,7 @@ end
 -- The four listener kinds that receive a container ENTRY rather than the container
 -- itself. Unlike Changed/Observe they had no datatype conversion, which an
 -- ArrayOf/DictOf element makes the primary case rather than an unreachable one.
-for _, event in { "OnInsert", "OnRemove", "OnKeyAdded", "OnKeyRemoved" } do
+for _, event in { "OnInsert", "OnRemove", "OnKeyAdded", "OnKeyRemoved", "OnChildChanged" } do
 	METHOD_FACTORIES[event] = function(accessor)
 		return function(fn: (...any) -> ())
 			local tree = accessorTree(accessor)
@@ -2498,6 +3286,18 @@ for _, event in { "OnInsert", "OnRemove", "OnKeyAdded", "OnKeyRemoved" } do
 				local element = elementSchemaOf(schema)
 				wrapped = function(value: any, index: any)
 					inner(entryValueForListener(element, value), index)
+				end
+			elseif event == "OnChildChanged" then
+				-- Carries a transition, so BOTH sides need unpacking. OnKeyAdded and
+				-- OnKeyRemoved below take a single value because an appearance has no
+				-- prior and a disappearance has no successor.
+				wrapped = function(key: any, newValue: any, oldValue: any)
+					local childSchema = if schema then Template.ChildSchema(schema, key) else nil
+					inner(
+						key,
+						entryValueForListener(childSchema, newValue),
+						entryValueForListener(childSchema, oldValue)
+					)
 				end
 			else
 				wrapped = function(key: any, value: any)
@@ -2585,7 +3385,11 @@ local function accessorIndex(accessor: Accessor, key: any): any
 	local child = children[key]
 	if child == nil then
 		local schema = accessorSchema(accessor)
-		if schema and schema.Kind == "leaf" then
+		-- Kind alone is not enough: Scribe.Big and Scribe.Flags compile as Kind
+		-- "table" because their stored form IS a table, so indexing them was allowed
+		-- and `Tutorial[1].Set(...)` overwrote an enabled flag in place. They are
+		-- leaves as far as a caller is concerned.
+		if schema and (schema.Kind == "leaf" or schema.ValueType == "big" or schema.ValueType == "flags") then
 			error(`Scribe: "{Util.pathString(accessorPath(accessor))}" is a leaf value and has no children`, 2)
 		end
 		local path = table.clone(accessorPath(accessor))

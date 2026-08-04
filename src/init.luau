@@ -91,11 +91,150 @@ export type function ValueType(T)
 	-- and only a cyclic type (which no write could satisfy either) is cut off.
 	local MAX_DEPTH = 25
 
+	-- ONE shared Scribe.Big type for the whole template. Luau decides `<` and `<=`
+	-- by metatable IDENTITY, not by shape, so building a fresh one per field made
+	-- two big fields in the same template incomparable ("do not have the same
+	-- metatable") even though their types printed identically.
+	local bigType: type? = nil
+	local function bigValueType(): type
+		if bigType ~= nil then
+			return bigType
+		end
+		-- The shape Get actually returns. Arithmetic goes through the metatable,
+		-- which the new solver honours for operator resolution.
+		local bigProps: { [type]: type } = {}
+		bigProps[ts.singleton("M")] = ts.number
+		bigProps[ts.singleton("E")] = ts.number
+		bigProps[ts.singleton("Short")] = ts.newfunction(
+			{ head = { ts.any, ts.unionof(ts.number, ts.singleton(nil)) } },
+			{ head = { ts.string } }
+		)
+		bigProps[ts.singleton("ToNumber")] = ts.newfunction({ head = { ts.any } }, { head = { ts.number } })
+
+		-- The metamethods have to be typed over THIS table, metatable included, so
+		-- the table is built first and the metatable attached afterwards. Typing them
+		-- over a metatable-less copy instead made every one of them a lie: the copy
+		-- is a different type from what Get returns, so `a + b` and `a < b` were type
+		-- errors, and the RESULT did not satisfy the operand union, so Set and
+		-- Increment refused to take it back.
+		--
+		-- Operands are widened to the same union those methods accept, because BIG_MT
+		-- resolves both sides through Big.from: `Get() + 5` and `5 + Get()` both work
+		-- at runtime, and Lua tries the metamethod of either operand.
+		local big = ts.newtable(bigProps, nil, nil)
+		local operand = ts.unionof(big, ts.number, ts.string)
+		local arith = ts.newfunction({ head = { operand, operand } }, { head = { big } })
+		local cmp = ts.newfunction({ head = { operand, operand } }, { head = { ts.boolean } })
+		local mtProps: { [type]: type } = {}
+		mtProps[ts.singleton("__add")] = arith
+		mtProps[ts.singleton("__sub")] = arith
+		mtProps[ts.singleton("__mul")] = arith
+		mtProps[ts.singleton("__div")] = arith
+		mtProps[ts.singleton("__unm")] = ts.newfunction({ head = { big } }, { head = { big } })
+		mtProps[ts.singleton("__lt")] = cmp
+		mtProps[ts.singleton("__le")] = cmp
+		-- __eq only ever runs with two tables, so it stays narrow.
+		mtProps[ts.singleton("__eq")] = ts.newfunction({ head = { big, big } }, { head = { ts.boolean } })
+		mtProps[ts.singleton("__tostring")] = ts.newfunction({ head = { big } }, { head = { ts.string } })
+		big:setmetatable(ts.newtable(mtProps, nil, nil))
+		bigType = big
+		return big
+	end
+
+	-- Big, Flags and SetOf are recognised by a label in their METATABLE rather than
+	-- in their fields, so each declarator's own type is already the read shape and a
+	-- whole-subtree read shows values instead of labels. See BigValue.
+	local function hasMarker(t: type, name: string): boolean
+		local mt = t:metatable()
+		return mt ~= nil and mt:readproperty(ts.singleton(name)) ~= nil
+	end
+
+	local function isBigMarker(t: type): boolean
+		return hasMarker(t, "__scribeBig")
+	end
+
+	-- Scribe.Timed and Scribe.ServerOnly read back as a bare T, which may be a
+	-- number or a string, and a metatable cannot attach to a non-table. So unlike
+	-- Big, Flags, SetOf and MapOf, their label has to stay an ordinary field, and a
+	-- whole-subtree read has to strip it instead.
+	--
+	-- This only ever REMOVES a wrapper, so the types it produces are strictly smaller
+	-- than the ones it consumes. That is what makes it affordable where a general
+	-- read-shape transform was not: that one had to BUILD the read shape for every
+	-- declarator, embedding a big's whole metatable type into every enclosing record.
+	local unwrapCache: { [type]: type } = {}
+	local function unwrapWrappers(t: type, depth: number): type
+		if depth > MAX_DEPTH or not t:is("table") then
+			return t
+		end
+		local cached = unwrapCache[t]
+		if cached ~= nil then
+			return cached
+		end
+		local function memo(result: type): type
+			unwrapCache[t] = result
+			return result
+		end
+		local timed = t:readproperty(ts.singleton("__scribeTimed"))
+		if timed ~= nil then
+			return memo(unwrapWrappers(widen(timed), depth + 1))
+		end
+		local serverOnly = t:readproperty(ts.singleton("__scribeServerOnly"))
+		if serverOnly ~= nil then
+			return memo(unwrapWrappers(widen(serverOnly), depth + 1))
+		end
+		-- A marker cannot hide under one of the branded declarators: their metatable
+		-- brand means the shape below them is already the read shape.
+		if hasMarker(t, "__scribeBig") or hasMarker(t, "__scribeFlags") or hasMarker(t, "__scribeSet") then
+			return memo(t)
+		end
+		local props: { [type]: type } = {}
+		local rebuilt = false
+		for key, prop in t:properties() do
+			local childType = prop.read or prop.write
+			if childType ~= nil then
+				local mapped = unwrapWrappers(childType, depth + 1)
+				props[key] = mapped
+				if mapped ~= childType then
+					rebuilt = true
+				end
+			end
+		end
+		local spec: { index: type, readresult: type, writeresult: type }? = nil
+		local indexer = t:indexer()
+		if indexer ~= nil then
+			local mapped = unwrapWrappers(indexer.readresult, depth + 1)
+			spec = { index = indexer.index, readresult = mapped, writeresult = mapped }
+			if mapped ~= indexer.readresult then
+				rebuilt = true
+			end
+		end
+		if not rebuilt then
+			return memo(t)
+		end
+		return memo(ts.newtable(props, spec, nil))
+	end
+
 	local function build(rawType: type, isRoot: boolean, depth: number): type
 		if depth > MAX_DEPTH then
 			return anyType
 		end
 		local t = widen(rawType)
+
+		-- Scribe.ServerOnly carries a { __scribeServerOnly: V } marker, and it has to
+		-- come off FIRST. Every declarator check below reads a marker property off
+		-- `t`, so with the wrapper still on, ServerOnly(SetOf/Big/Flags/Timed) matched
+		-- none of them: the node lost its whole declarator surface, Get() typed as the
+		-- raw marker table, and the static-children walk hung a phantom
+		-- `__scribeSet`-style child off it. The runtime supports all of these; only
+		-- the type surface did not. There is a second unwrap after the SetOf block for
+		-- the inverse nesting, e.g. Scribe.Timed(Scribe.ServerOnly(false)).
+		if t:is("table") then
+			local inner = t:readproperty(ts.singleton("__scribeServerOnly"))
+			if inner ~= nil then
+				t = widen(inner)
+			end
+		end
 
 		-- Scribe.Timed fields carry a { __scribeTimed: V } marker type.
 		local isTimed = false
@@ -107,10 +246,32 @@ export type function ValueType(T)
 			end
 		end
 
-		-- Scribe.ServerOnly carries a { __scribeServerOnly: V } marker. The SERVER
-		-- reads these normally, so unwrap to the value type and build as usual;
-		-- the marker exists so ClientDataType can drop them via StripServerOnly,
-		-- since they are never replicated and read nil on the client.
+		-- Scribe.Flags carries a { __scribeFlags: { string } } marker. Without it a
+		-- flags field is just {string} at the type level, so it would pick up Insert,
+		-- Remove and the rest of the array surface, none of which it supports.
+		-- `t` is already the { string } a read returns; the label is on the metatable.
+		local isFlags = t:is("table") and hasMarker(t, "__scribeFlags")
+
+		-- Scribe.Big carries a { __scribeBig: true } marker. Its VALUE is an object
+		-- with arithmetic metamethods rather than a number, so it gets its own method
+		-- surface and none of the table one.
+		local isBig = false
+		if t:is("table") and isBigMarker(t) then
+			isBig = true
+			t = bigValueType()
+		end
+
+		-- Scribe.SetOf carries a { __scribeSet: { T } } marker. Without it a set is
+		-- just {T} at the type level and would pick up Insert plus index-based
+		-- Remove, neither of which a set has.
+		-- Same for a set: `t` is already the { T } of members.
+		local isSet = t:is("table") and hasMarker(t, "__scribeSet")
+
+		-- Second ServerOnly unwrap, for a marker nested INSIDE another declarator
+		-- rather than wrapped around one. The SERVER reads these normally, so unwrap
+		-- to the value type and build as usual; the marker exists so ClientDataType
+		-- can drop them via StripServerOnly, since they are never replicated and read
+		-- nil on the client.
 		if t:is("table") then
 			local inner = t:readproperty(ts.singleton("__scribeServerOnly"))
 			if inner ~= nil then
@@ -118,10 +279,35 @@ export type function ValueType(T)
 			end
 		end
 
+		-- Scribe.MapOf carries its key type as a singleton, which is the only way the
+		-- accessor can know that {[number]: V} is a sparse map rather than an array:
+		-- at the Luau type level those are the same indexer. Last, so a map wrapped in
+		-- Scribe.ServerOnly is still seen as a map rather than as the raw marker.
+		--
+		-- `t` becomes the MAP, not its element. Collapsing it to the element made
+		-- Get() claim to return one entry, Set() demand one, and the element's own
+		-- method surface (Increment on a map of ints, the element record's fields)
+		-- hang off the container, none of which the runtime does.
+		-- `t` is already the map a read returns, indexer and all. Only the element is
+		-- pulled back out, for the key events and Remove.
+		local mapKey: type? = nil
+		local mapValue: type? = nil
+		local mapElement: type? = nil
+		if t:is("table") and hasMarker(t, "__scribeMapKey") then
+			local indexer = t:indexer()
+			if indexer ~= nil then
+				mapKey = indexer.index
+				mapValue = indexer.readresult
+				mapElement = widen(indexer.readresult)
+			end
+		end
+
 		local props: { [type]: type } = {}
 		local indexerSpec: { index: type, readresult: type, writeresult: type }? = nil
 
-		local valueType = t
+		-- Strips a nested Scribe.Timed / Scribe.ServerOnly label, which is the one
+		-- thing a read still shows that it should not.
+		local valueType = unwrapWrappers(t, depth)
 		local function add(name: string, ty: type)
 			props[ts.singleton(name)] = ty
 		end
@@ -129,11 +315,31 @@ export type function ValueType(T)
 		-- Static children and container methods first, so the common node
 		-- methods below take precedence on name collisions (documented: method
 		-- names are reserved words on containers).
-		if t:is("table") and not isTimed then
+		--
+		-- A map is excluded because its own block below builds the same surface with
+		-- the declared key type. Letting it through here would give an integer-keyed
+		-- map the ARRAY methods (Insert, Find, Has) and a string-keyed one a second,
+		-- duplicate Remove/OnKeyAdded/OnKeyRemoved rather than an override, since two
+		-- ts.singleton("Remove") calls are distinct keys.
+		if t:is("table") and mapKey == nil and not isTimed and not isFlags and not isSet and not isBig then
 			for key, prop in t:properties() do
 				local childType = prop.read or prop.write
 				if childType ~= nil then
 					props[key] = build(childType, false, depth + 1)
+				end
+			end
+
+			-- OnChildChanged: the TRANSITION half, and the only way to learn that an
+			-- existing child's value moved. Fires once per write, never coalesced,
+			-- unlike Changed above. OnKeyAdded and OnKeyRemoved report a key
+			-- appearing or disappearing; this reports one changing.
+			local childKeys: { type } = {}
+			local childValues: { type } = {}
+			for key, prop in t:properties() do
+				local childType = prop.read or prop.write
+				if childType ~= nil then
+					table.insert(childKeys, key)
+					table.insert(childValues, widen(childType))
 				end
 			end
 
@@ -172,7 +378,38 @@ export type function ValueType(T)
 				end
 				add("Clear", fn({ optBool }, {}))
 				add("Count", fn({}, { ts.number }))
+				-- A dynamic container's children are homogeneous, so the key and value
+				-- types here are exact rather than a union over declared fields.
+				table.insert(childKeys, indexer.index)
+				table.insert(childValues, widen(indexer.readresult))
 			end
+
+			if #childKeys > 0 then
+				-- (key, new, old), matching Changed's new-first order. Both values are
+				-- optional: a key being added has no old, a key being removed has no new.
+				-- On a heterogeneous static table they are a union Luau will not narrow
+				-- from the key, which is accepted, since that node kind already has exact
+				-- per-field leaf listeners and this event exists mainly for ArrayOf and
+				-- DictOf, where both types are precise.
+				local childKey = ts.unionof(table.unpack(childKeys))
+				local childValue = optional(ts.unionof(table.unpack(childValues)))
+				add("OnChildChanged", fn({ fn({ childKey, childValue, childValue }, {}) }, { disconnectType }))
+			end
+		end
+
+		if mapKey ~= nil then
+			-- A map's children are accessor nodes keyed by the declared type. The key
+			-- events and Remove carry the ELEMENT, not the whole map, which valueType
+			-- now correctly is.
+			local element = mapElement :: type
+			local childNode = build(mapValue :: type, false, depth + 1)
+			indexerSpec = { index = mapKey, readresult = childNode, writeresult = childNode }
+			add("Remove", fn({ mapKey, optBool }, { optional(element) }))
+			add("OnKeyAdded", fn({ fn({ mapKey, element }, {}) }, { disconnectType }))
+			add("OnKeyRemoved", fn({ fn({ mapKey, element }, {}) }, { disconnectType }))
+			add("OnChildChanged", fn({ fn({ mapKey, optional(element), optional(element) }, {}) }, { disconnectType }))
+			add("Clear", fn({ optBool }, {}))
+			add("Count", fn({}, { ts.number }))
 		end
 
 		-- Common node methods.
@@ -181,16 +418,28 @@ export type function ValueType(T)
 		-- calls always throw ("cannot write to \"\""). Omit them from the root
 		-- type so the typed API matches runtime and can't silently disable
 		-- module-level checking with a template-typed argument.
-		if not isRoot then
-			add("Set", fn({ valueType, optBool }, { valueType }))
-			add("Update", fn({ fn({ valueType }, { valueType }), optBool }, { valueType }))
+		-- A big field declares its own Set and Update below, taking the wider operand
+		-- union. Re-adding them here would leave two entries for the same name rather
+		-- than overriding, because two ts.singleton("Set") calls are distinct keys.
+		if not isRoot and not isBig then
+			-- Writes take the UNBRANDED shape. A map's type carries its declared key on
+			-- the metatable so the accessor can tell an integer map from a string one,
+			-- and a caller writing a plain table literal has no way to produce that
+			-- brand. Reads still hand back the branded type, which assigns freely to
+			-- the plain shape, so `Set(Get())` and `Set({ ... })` both work.
+			local writeType = if mapKey ~= nil and mapElement ~= nil
+				then ts.newtable(nil, { index = mapKey, readresult = mapElement, writeresult = mapElement }, nil)
+				else valueType
+			add("Set", fn({ writeType, optBool }, { valueType }))
+			add("Update", fn({ fn({ valueType }, { writeType }), optBool }, { valueType }))
 		end
 		add("Clone", fn({}, { valueType }))
 		add("Default", fn({}, { valueType }))
-		add(
-			"Changed",
-			fn({ fn({ valueType, valueType, optional(ts.unionof(ts.string, ts.number)) }, {}) }, { disconnectType })
-		)
+		-- (new, old) on every node. On a container this is STATE: "it is different,
+		-- here it is", coalesced to one fire per batch or per received frame. Which
+		-- child moved is OnChildChanged's job, so there is exactly one place to look
+		-- and no parameter that is conditionally nil.
+		add("Changed", fn({ fn({ valueType, valueType }, {}) }, { disconnectType }))
 		add("Observe", fn({ fn({ valueType }, {}) }, { disconnectType }))
 
 		if t:is("number") then
@@ -200,6 +449,44 @@ export type function ValueType(T)
 			add("Max", fn({}, { optNumber }))
 		elseif t:is("boolean") then
 			add("Toggle", fn({ optBool }, { ts.boolean }))
+		end
+
+		if isBig then
+			-- Every entry point, Set included, takes a number, a numeric string, or
+			-- another big value, so the operand type is the same union everywhere.
+			local operand = ts.unionof(ts.number, ts.string, valueType)
+			add("Set", fn({ operand, optBool }, { valueType }))
+			add("Update", fn({ fn({ valueType }, { operand }), optBool }, { valueType }))
+			add("Increment", fn({ operand, anyType }, { valueType }))
+			add("Decrement", fn({ operand, anyType }, { valueType }))
+			add("Multiply", fn({ operand, optBool }, { valueType }))
+			add("Divide", fn({ operand, optBool }, { valueType }))
+			-- These hand back the declared bound verbatim, and a big bound past the
+			-- double range is only expressible as a numeric string, so the return type
+			-- is the same union the declarator accepts.
+			local optBound = optional(ts.unionof(ts.number, ts.string))
+			add("Min", fn({}, { optBound }))
+			add("Max", fn({}, { optBound }))
+		end
+
+		if isSet then
+			-- Membership surface. Get/Set still take the whole { T }.
+			local setIndexer = t:indexer()
+			local element = if setIndexer ~= nil then widen(setIndexer.readresult) else anyType
+			add("Add", fn({ element, optBool }, { ts.boolean }))
+			add("Remove", fn({ element, optBool }, { ts.boolean }))
+			add("Has", fn({ element }, { ts.boolean }))
+			add("Count", fn({}, { ts.number }))
+			add("Clear", fn({ optBool }, {}))
+		end
+
+		if isFlags then
+			-- Named-member surface. Get/Set still take the whole { string } set.
+			add("Enable", fn({ ts.string, optBool }, {}))
+			add("Disable", fn({ ts.string, optBool }, {}))
+			add("Has", fn({ ts.string }, { ts.boolean }))
+			add("Toggle", fn({ ts.string, optBool }, { ts.boolean }))
+			add("Clear", fn({ optBool }, {}))
 		end
 
 		if isTimed then
@@ -214,14 +501,33 @@ export type function ValueType(T)
 	return build(T, true, 0)
 end
 
--- Union of every static numeric leaf path in the template, dot-joined
+-- Union of every static rankable leaf path in the template, dot-joined
 -- ("Coins", "Stats.Wins"), giving autocomplete and compile-time validation
 -- for leaderboard `Stat` and `Purchase` cost paths. Dynamic (dictionary or
--- array) segments cannot be enumerated at type level — cast those paths to
--- `any`. Falls back to plain `string` when the template has no numeric leaf.
+-- array) segments cannot be enumerated at type level, so cast those paths to
+-- `any`. Falls back to plain `string` when the template has no such leaf.
+--
+-- `IncludeBig` distinguishes the two callers. Leaderboards rank a Scribe.Big
+-- (packed into the OrderedDataStore key), so it passes true; a purchase cost path
+-- must be a plain number, which Monetization enforces at runtime, so it passes
+-- false and a big path is a type error rather than a runtime refusal.
 -- selene: allow(undefined_variable)
-export type function StatPathsType(T)
+export type function StatPathsType(T, IncludeBig)
 	local ts = types
+	local includeBig = IncludeBig ~= nil and IncludeBig:is("singleton") and IncludeBig:value() == true
+
+	local function hasMarker(t: type, name: string): boolean
+		local mt = t:metatable()
+		return mt ~= nil and mt:readproperty(ts.singleton(name)) ~= nil
+	end
+
+	local function isBigMarker(t: type): boolean
+		return hasMarker(t, "__scribeBig")
+	end
+
+	local function isMapMarker(t: type): boolean
+		return hasMarker(t, "__scribeMapKey")
+	end
 
 	local paths: { type } = {}
 
@@ -256,6 +562,25 @@ export type function StatPathsType(T)
 			if serverOnly ~= nil then
 				t = widen(serverOnly)
 			end
+		end
+		if t:is("table") and isMapMarker(t) then
+			-- A map's entries live under dynamic keys, which cannot be enumerated at
+			-- type level any more than a DictOf's can. Recursing into the marker's own
+			-- properties instead produced the literal path "Field.__scribeMapValue",
+			-- which is not addressable and crowded out the real ones.
+			return
+		end
+		if t:is("table") and isBigMarker(t) then
+			-- ALWAYS terminal, whether or not a big counts here. Now that a big's type
+			-- is its real shape, recursing would expose the object's own M and E as
+			-- numeric leaves and offer "Coins.M" as a stat path. When a big DOES
+			-- count, the field itself is the path: a template whose only rankable
+			-- field is big would otherwise produce an empty union, collapsing the
+			-- gate to plain `string`.
+			if includeBig and prefix ~= "" then
+				table.insert(paths, ts.singleton(prefix))
+			end
+			return
 		end
 		if t:is("number") then
 			if prefix ~= "" then
@@ -318,6 +643,14 @@ type function StripServerOnly(T)
 				end
 			end
 		end
+		-- Element shapes live behind the indexer, not in properties, so without this a
+		-- Scribe.ServerOnly field inside an ArrayOf or DictOf entry stayed in the
+		-- client type as non-nil while reading nil at runtime.
+		local indexer = t:indexer()
+		if indexer ~= nil then
+			local element = strip(indexer.readresult, depth + 1)
+			out:setindexer(indexer.index, element)
+		end
 		return out
 	end
 
@@ -358,7 +691,20 @@ export type function ClientDataType(T)
 	entryProps[ts.singleton("Rank")] = ts.number
 	entryProps[ts.singleton("UserId")] = ts.number
 	entryProps[ts.singleton("Name")] = ts.string
-	entryProps[ts.singleton("Score")] = ts.number
+	-- `number | BigScore`, not `number`. A Scribe.Big board hands back the big
+	-- itself, so a bare `number` silently blessed `local n: number = entry.Score`
+	-- and crashed on it, while the documented `entry.Score:Short()` was an error.
+	-- The board's kind is a runtime property of the name passed in, so the type
+	-- cannot pick one: a caller narrows, which is the honest contract.
+	local bigScoreProps: { [type]: type } = {}
+	bigScoreProps[ts.singleton("M")] = ts.number
+	bigScoreProps[ts.singleton("E")] = ts.number
+	bigScoreProps[ts.singleton("Short")] = ts.newfunction(
+		{ head = { ts.any, ts.unionof(ts.number, ts.singleton(nil)) } },
+		{ head = { ts.string } }
+	)
+	bigScoreProps[ts.singleton("ToNumber")] = ts.newfunction({ head = { ts.any } }, { head = { ts.number } })
+	entryProps[ts.singleton("Score")] = ts.unionof(ts.number, ts.newtable(bigScoreProps, nil, nil))
 	local leaderboardEntry = ts.newtable(entryProps, nil, nil)
 	local entryArray =
 		ts.newtable(nil, { index = ts.number, readresult = leaderboardEntry, writeresult = leaderboardEntry }, nil)
@@ -440,7 +786,20 @@ export type function ServerDataType(T, P)
 	entryProps[ts.singleton("Rank")] = ts.number
 	entryProps[ts.singleton("UserId")] = ts.number
 	entryProps[ts.singleton("Name")] = ts.string
-	entryProps[ts.singleton("Score")] = ts.number
+	-- `number | BigScore`, not `number`. A Scribe.Big board hands back the big
+	-- itself, so a bare `number` silently blessed `local n: number = entry.Score`
+	-- and crashed on it, while the documented `entry.Score:Short()` was an error.
+	-- The board's kind is a runtime property of the name passed in, so the type
+	-- cannot pick one: a caller narrows, which is the honest contract.
+	local bigScoreProps: { [type]: type } = {}
+	bigScoreProps[ts.singleton("M")] = ts.number
+	bigScoreProps[ts.singleton("E")] = ts.number
+	bigScoreProps[ts.singleton("Short")] = ts.newfunction(
+		{ head = { ts.any, ts.unionof(ts.number, ts.singleton(nil)) } },
+		{ head = { ts.string } }
+	)
+	bigScoreProps[ts.singleton("ToNumber")] = ts.newfunction({ head = { ts.any } }, { head = { ts.number } })
+	entryProps[ts.singleton("Score")] = ts.unionof(ts.number, ts.newtable(bigScoreProps, nil, nil))
 	local leaderboardEntry = ts.newtable(entryProps, nil, nil)
 	local entryArray =
 		ts.newtable(nil, { index = ts.number, readresult = leaderboardEntry, writeresult = leaderboardEntry }, nil)
@@ -525,7 +884,9 @@ export type function ServerDataType(T, P)
 	-- Purchase spec: Cost.Path is the template's numeric-leaf path union and
 	-- Grant receives the typed accessor tree.
 	local costProps: { [type]: type } = {}
-	costProps[ts.singleton("Path")] = StatPathsType(T)
+	-- false: a cost path must be a plain number balance. Monetization refuses a
+	-- non-number at runtime, so this rejects a Scribe.Big path at author time.
+	costProps[ts.singleton("Path")] = StatPathsType(T, ts.singleton(false))
 	costProps[ts.singleton("Amount")] = ts.number
 	local purchaseProps: { [type]: type } = {}
 	purchaseProps[ts.singleton("Cost")] = ts.newtable(costProps, nil, nil)
@@ -544,7 +905,10 @@ export type function ServerDataType(T, P)
 	local purchaseFilter = optional(ts.newtable(purchaseFilterProps, nil, nil))
 	add("GetPurchases", fn({ P, purchaseFilter }, { anyArray }))
 
-	add("OnCooldown", fn({ P, ts.string, ts.number }, { ts.boolean, ts.number }))
+	local cooldownOptsProps: { [type]: type } = {}
+	cooldownOptsProps[ts.singleton("IncludeOfflineTime")] = optional(ts.boolean)
+	local cooldownOpts = optional(ts.newtable(cooldownOptsProps, nil, nil))
+	add("OnCooldown", fn({ P, ts.string, ts.number, cooldownOpts }, { ts.boolean, ts.number }))
 	add("PeekCooldown", fn({ P, ts.string }, { ts.boolean, ts.number }))
 	add("ClearCooldown", fn({ P, ts.string }, {}))
 
@@ -571,14 +935,60 @@ end
 --------------------------------------------------------------------------------
 
 export type Timed<T> = { __scribeTimed: T }
+-- The value a Scribe.Flags field READS BACK: the list of enabled member names.
+-- The label sits in the METATABLE for the same reason Scribe.Big's does, so a
+-- whole-table read shows the members rather than `{ __scribeFlags: { string } }`.
+export type Flags = typeof(setmetatable({} :: { string }, {} :: { __scribeFlags: true }))
+-- A set READS BACK as its members. Label in the metatable, as above.
+export type SetOf<T> = typeof(setmetatable({} :: { T }, {} :: { __scribeSet: true }))
 export type ServerOnly<T> = { __scribeServerOnly: T }
 
 export type NumberMeta = { Min: number?, Max: number? }
+-- Scribe.Big only. A bound past 1.8e308 has to be written as a numeric string,
+-- because a larger literal is already math.huge, which the template validator
+-- rejects. Int and Number stay on NumberMeta: a string bound there is not accepted
+-- at compile and would crash comparing against a number at the first write.
+export type BigMeta = { Min: (number | string)?, Max: (number | string)? }
 export type StringMeta = { MaxLength: number? }
 -- Container declarator options. Deliberately NOT generic in the element type: an
 -- element-typed field here (a seed default, say) would let Luau infer the element
 -- type from the option instead of from `shape`, silently redefining the field.
-export type ArrayOpts = { MaxItems: number? }
+export type ArrayOpts = { MaxItems: number?, Evict: ("Front" | "Back")? }
+export type SetOpts = { MaxItems: number? }
+export type CooldownOptions = { IncludeOfflineTime: boolean? }
+export type MapKeyType = "integer" | "string"
+-- The value a Scribe.Big field READS BACK, which is also what the declarator
+-- returns, so a whole-table read shows the value rather than a label.
+--
+-- `__scribeBig` is how the type functions recognise the declarator. It lives in the
+-- METATABLE rather than in the fields on purpose: a label written as an ordinary
+-- field travels with the type into every read, so `data.Stats.Get().Wealth` typed as
+-- `{ __scribeBig: true }`, and `Get().Wealth.__scribeBig` typechecked as `true` while
+-- being nil at runtime. A metatable entry is visible to the type machinery and
+-- invisible to a read.
+type BigFields = {
+	M: number,
+	E: number,
+	Short: (self: any, decimals: number?) -> string,
+	ToNumber: (self: any) -> number,
+}
+type BigMt = { __scribeBig: true }
+export type BigValue = typeof(setmetatable({} :: BigFields, {} :: BigMt))
+-- The value a Scribe.MapOf field READS BACK: the whole map. The declared key is a
+-- singleton ("integer" or "string") that has to become a real indexer key type, so
+-- the shape goes through a small type function; the label and the declared key ride
+-- the metatable, as with Big, Flags and SetOf.
+-- selene: allow(undefined_variable)
+type function MapShape(K, V)
+	local ts = types
+	local key = if K:is("singleton") and K:value() == "integer" then ts.number else ts.string
+	local out = ts.newtable(nil, { index = key, readresult = V, writeresult = V }, nil)
+	local mt: { [type]: type } = {}
+	mt[ts.singleton("__scribeMapKey")] = K
+	out:setmetatable(ts.newtable(mt, nil, nil))
+	return out
+end
+export type MapOf<K, V> = MapShape<K, V>
 export type DictOpts = { MaxKeys: number?, MaxKeyLength: number? }
 
 -- Template-aware config types. Annotate a config local with these to get
@@ -596,9 +1006,13 @@ export type DictOpts = { MaxKeys: number?, MaxKeyLength: number? }
 -- string literals before the template type is known.) Without a type
 -- argument they default to the loose untyped shape.
 export type LeaderboardConfig<T = any> = {
-	Stat: StatPathsType<T>,
+	Stat: StatPathsType<T, true>,
 	Limit: number?,
 	Scale: number?,
+	-- Scribe.Big stats only: significant figures the ranking key carries, 1 to 15
+	-- (default 12). Every extra figure costs a factor of ten of exponent range,
+	-- because the two halves share one integer under 2^53.
+	SigFigs: number?,
 	Replicate: boolean?, -- default false: server-only (Data.GetLeaderboard on the server); true streams the board to clients
 	RefreshInterval: number?, -- seconds between reads of this board (default 60; values below 60 are clamped up)
 	StoreName: string?, -- override the OrderedDataStore name (default "LB_<board>")
@@ -612,7 +1026,7 @@ export type ProductConfig<T = any> = {
 }
 
 export type PurchaseSpec<T = any> = {
-	Cost: { Path: StatPathsType<T>, Amount: number },
+	Cost: { Path: StatPathsType<T, false>, Amount: number },
 	Category: string?,
 	ItemId: string,
 	Grant: ((data: GrantDataType<T>) -> ())?,
@@ -627,6 +1041,7 @@ type LeaderboardConfigLoose = {
 	read Stat: string,
 	read Limit: number?,
 	read Scale: number?,
+	read SigFigs: number?,
 	read Replicate: boolean?,
 	read RefreshInterval: number?,
 }
@@ -664,6 +1079,7 @@ export type ScribeOptions<T> = {
 	DevMode: boolean?, -- advanced/test seam: overrides the RunService:IsStudio() default
 	MigrationShadow: boolean?, -- audit aid: re-runs migrations against raw pre-Reconcile data and warns on divergence (re-executes your migration bodies)
 	OnPlayerInit: ((player: Player, rawData: { [string]: any }, isNewProfile: boolean) -> ())?,
+	OnPlayerLeaving: ((player: Player, data: any, reason: LifecycleReason) -> ())?,
 
 	-- persistence
 	ProfileStoreIndex: string, -- REQUIRED: the DataStore name (each game must name its own store)
@@ -761,6 +1177,7 @@ export type Bundle<T> = {
 	.SaveInterval number? -- seconds between autosaves per profile (default 300, floor 15)
 	.Migrations { [number]: (data) -> () }? -- versioned, fail-closed data reshapers
 	.OnPlayerInit ((player, rawData, isNewProfile) -> ())? -- runs after load, before Ready; isNewProfile is true on a brand-new/reset profile
+	.OnPlayerLeaving ((player, data, reason) -> ())? -- last chance to write; runs before the final save, so its writes persist
 	.Leaderboards { [string]: LeaderboardConfig }? -- all-time OrderedDataStore boards
 	.Products { [string]: ProductConfig }? -- developer products (receipts, grants, gifting)
 	.Passes { [string]: PassConfig }? -- game passes
@@ -791,6 +1208,7 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	DevMode = true,
 	MigrationShadow = true,
 	OnPlayerInit = true,
+	OnPlayerLeaving = true,
 	ProfileStoreIndex = true,
 	ProfileKeyPrefix = true,
 	SaveInterval = true,
@@ -1047,6 +1465,65 @@ end
 --[=[
 	@within Scribe
 	@tag Field Types
+	@function Big
+	@param default (number | string)?
+	@param meta BigMeta?
+	@return BigValue
+	A number with unlimited **range**, for an idle or simulator currency that runs
+	past 2^53 where a plain Luau number stops being exact, and past 1.8e308 where it
+	stops existing.
+
+	```lua
+	Coins = Scribe.Big(0, { Min = 0 }),
+
+	data.Coins.Set("1.5e100")
+	data.Coins.Increment("2e99", { Source = "Quest" })
+	data.Coins.Multiply(1.15)
+	data.Coins.Get():Short()          --> "1.95Dc"
+	tostring(data.Coins.Get())        --> "1.9550e100"
+	```
+
+	A bound past 1.8e308 has to be written as a numeric string, since a bigger
+	literal is already `math.huge`: `Scribe.Big(0, { Min = 0, Max = "1e600" })`.
+
+	This trades precision for range **on purpose**. A value carries exactly 15
+	significant digits at any magnitude, so `1e20 + 1 == 1e20`. That is the right
+	trade for a currency whose magnitude is the point, and the wrong one for anything
+	audited: use [Scribe.Int] when every digit has to be exact.
+
+	`Get()` returns a value supporting `+`, `-`, `*`, `/`, `<`, `<=`, `==`,
+	`tostring`, `:Short()` for display, and `:ToNumber()` (lossy, saturates to
+	infinity past the double range). `Set` and the arithmetic methods all accept a
+	plain number, a numeric string like `"1.5e100"`, or another big value.
+
+	`+`, `-`, `*`, `/` and the comparisons also accept a plain number or a numeric
+	string on either side, so `Get() + 5` and `5 + Get()` both work. `==` is the one
+	exception: Luau only consults it when BOTH sides are tables, so `Get() == 5` is
+	always false. Compare against another big, or against `:ToNumber()`.
+
+	A big field **can** be a leaderboard stat. Scribe packs it exponent-major into the
+	OrderedDataStore key, which preserves the ordering exactly and breaks ties on the
+	mantissa, so no separate rank field is needed and entries come back with a big
+	`Score`. Two limits follow from the key being an integer: the value must be
+	**non-negative**, since the packing has no room for a sign, and the exponent must
+	be within the board's cap (1e9006 by default). A score outside either is dropped
+	with `LB_SCORE_OUT_OF_RANGE` rather than ranked wrongly. `Scale` is refused on
+	such a board, because the packing already maps the value into the key space.
+
+	The exponent and the mantissa share one integer under 2^53, so a board's
+	`SigFigs` (1 to 15, default 12) decides how that budget is split: it is how many
+	significant figures the key keeps, and therefore how many the `Score` can show.
+	Each extra figure costs a factor of ten of exponent range, so a prestige currency
+	that has to separate near-identical scores sets it high and a counter spanning a
+	huge range sets it low. See the leaderboards guide.
+]=]
+function Scribe.Big(default: (number | string)?, meta: BigMeta?): BigValue
+	return Marker.make("Big", if default == nil then 0 else default, meta :: any) :: any
+end
+
+--[=[
+	@within Scribe
+	@tag Field Types
 	@function String
 	@param default string
 	@param meta { MaxLength: number? }?
@@ -1069,6 +1546,37 @@ end
 ]=]
 function Scribe.Enum(default: string, members: { string }): string
 	return Marker.make("Enum", default, { Members = members }) :: any
+end
+
+--[=[
+	@within Scribe
+	@tag Field Types
+	@function Flags
+	@param members { string }
+	@return Flags
+	A fixed set of named booleans stored as one field. Up to 32 members, addressed
+	by name:
+
+	```lua
+	Tutorial = Scribe.Flags({ "Movement", "Combat", "Trading" }),
+
+	data.Tutorial.Enable("Combat")
+	data.Tutorial.Has("Combat")   --> true
+	data.Tutorial.Get()           --> { "Combat" }
+	```
+
+	Prefer this over a table of sibling booleans when the set is fixed and you flip
+	several at once: it is one write and one `Changed` rather than one per flag, the
+	valid names are declared rather than implied by whatever strings the code passes,
+	and it packs to a bitmask on the wire.
+
+	The value is stored as the enabled member **names**, in declaration order, so
+	reordering or removing members later is safe. Only the wire packing is
+	positional, and both ends of a replication frame always come from the same build.
+	Enabling a name that is not a member is an error rather than a silent no-op.
+]=]
+function Scribe.Flags(members: { string }): Flags
+	return Marker.make("Flags", {}, { Members = members }) :: any
 end
 
 --[=[
@@ -1161,7 +1669,7 @@ end
 	@tag Field Types
 	@function ArrayOf
 	@param shape T
-	@param opts { MaxItems: number? }?
+	@param opts ArrayOpts?
 	@return { T }
 	Declares an array whose **elements have a schema**. Everything a declared field
 	gets (type checking, bounds, enum members, and automatic datatype packing) then
@@ -1200,7 +1708,28 @@ end
 	level cannot know the runtime fills them. Pass the whole element, or mark the
 	omittable fields [Scribe.Optional].
 
-	`MaxItems` caps the entry count; exceeding it is a write error, but only growth
+	`Evict` turns the cap into a rolling window: an `Insert` at the cap drops an
+	entry instead of erroring, which is what you want for a bounded history like
+	recent matches or a kill feed. The drop is a real removal, so it fires
+	[Value.OnRemove] and replicates, and it trims all the way down when the array is
+	already over cap (a lowered `MaxItems`, or data from before it existed). `Evict`
+	requires `MaxItems`.
+
+	It names the **end** to drop from, not an age, because which end is oldest
+	depends on how you insert. Append with `Insert(item)` and the oldest entry is at
+	the front, so you want `"Front"`. Prepend with `Insert(item, 1)` and the oldest
+	is at the back, so you want `"Back"`. Picking the end your inserts do not target
+	churns that end while the other freezes.
+
+	```lua
+	-- newest last, drop the oldest from the front
+	RecentMatches = Scribe.ArrayOf({
+	    MapId = Scribe.String(""),
+	    Score = Scribe.Int(0),
+	}, { MaxItems = 10, Evict = "Front" }),
+	```
+
+		`MaxItems` caps the entry count; exceeding it is a write error, but only growth
 	is refused, so a container a newer-template server already stored over cap stays
 	writable through a rolling deploy. Elements may not use `Scribe.Timed`,
 	`Scribe.Dynamic`, `Scribe.Shared` or `Scribe.Session`.
@@ -1212,14 +1741,117 @@ function Scribe.ArrayOf<T>(shape: T, opts: ArrayOpts?): { T }
 		for key in opts :: any do
 			-- A silently dropped option (MaxKeys on an ArrayOf, say) leaves the
 			-- container uncapped while reading as protected; refuse it.
-			if key ~= "MaxItems" then
-				error(`Scribe.ArrayOf: unknown option "{tostring(key)}" (ArrayOf takes MaxItems)`, 2)
+			if key ~= "MaxItems" and key ~= "Evict" then
+				error(`Scribe.ArrayOf: unknown option "{tostring(key)}" (ArrayOf takes MaxItems and Evict)`, 2)
 			end
 		end
 	end
 	return Marker.make("ArrayOf", nil, {
 		Element = shape,
 		MaxItems = if opts then opts.MaxItems else nil,
+		Evict = if opts then opts.Evict else nil,
+	}) :: any
+end
+
+--[=[
+	@within Scribe
+	@tag Field Types
+	@function SetOf
+	@param element T
+	@param opts SetOpts?
+	@return SetOf<T>
+	A collection of **unique** entries: membership, not order. Use it for the shape
+	that would otherwise be a dictionary of `true` values, such as owned items,
+	unlocked levels, completed quests, or claimed rewards.
+
+	```lua
+	Unlocked = Scribe.SetOf(Scribe.String("", { MaxLength = 32 })),
+
+	data.Unlocked.Add("Desert")
+	data.Unlocked.Has("Desert")     --> true
+	data.Unlocked.Remove("Desert")
+	data.Unlocked.Count()
+	```
+
+	`Add` on a value already present and `Remove` on one that is absent both do
+	nothing: no write, no replication, no `Changed`. Entries are kept deduplicated
+	and in sorted order, so two profiles holding the same set hold the same table.
+
+	Unlike [Scribe.ArrayOf] there is no `Insert` and no index-based `Remove`, and
+	`MaxItems` caps membership. `Evict` does not apply, because a set has no oldest
+	entry to drop.
+]=]
+function Scribe.SetOf<T>(element: T, opts: SetOpts?): SetOf<T>
+	if opts ~= nil then
+		for key in opts :: any do
+			if key ~= "MaxItems" then
+				error(`Scribe.SetOf: unknown option "{tostring(key)}" (SetOf takes MaxItems)`, 2)
+			end
+		end
+	end
+	-- A set is deduplicated and sorted, and neither is meaningful for a record: two
+	-- tables are never equal by value here, and table.sort on them throws a bare
+	-- Luau comparison error on the SECOND member. Refuse it where the mistake is,
+	-- rather than at the surprising second Add.
+	if type(element) == "table" and (element :: any).__scribeMarker == nil then
+		error("Scribe.SetOf takes a scalar element (Scribe.String, Scribe.Int, ...), not a record shape", 2)
+	end
+	return Marker.make("SetOf", nil, {
+		Element = element,
+		MaxItems = if opts then opts.MaxItems else nil,
+		Unique = true,
+	}) :: any
+end
+
+--[=[
+	@within Scribe
+	@tag Field Types
+	@function MapOf
+	@param keyType MapKeyType
+	@param value V
+	@param opts DictOpts?
+	@return MapOf<K, V>
+	A dictionary whose **keys have a declared type**. `Scribe.DictOf` is the
+	string-keyed shorthand; use this when the keys are user ids, item ids, or
+	anything else you would otherwise have to `tostring` at every write and
+	`tonumber` at every read.
+
+	```lua
+	Friends = Scribe.MapOf("integer", {
+	    Name = Scribe.String(""),
+	    LastSeen = Scribe.Int(0),
+	}),
+
+	data.Friends[player.UserId].Name.Set("Ada")   -- no tostring
+	```
+
+	`keyType` is `"integer"` or `"string"`. Integer keys are stored and reloaded as
+	numbers even though a DataStore serializes every object key to a string, because
+	the declared key type is what makes that round trip unambiguous: without it,
+	`"123"` on disk could equally have been the number `123` or the string `"123"`.
+
+	Non-integer, infinite, and NaN keys are refused, since none of them survive the
+	round trip.
+]=]
+function Scribe.MapOf<K, V>(keyType: K & MapKeyType, value: V, opts: DictOpts?): MapOf<K, V>
+	if keyType ~= "integer" and keyType ~= "string" then
+		error(`Scribe.MapOf: keyType must be "integer" or "string", got {tostring(keyType)}`, 2)
+	end
+	if opts ~= nil then
+		for key in opts :: any do
+			if key ~= "MaxKeys" and key ~= "MaxKeyLength" then
+				error(`Scribe.MapOf: unknown option "{tostring(key)}" (MapOf takes MaxKeys and MaxKeyLength)`, 2)
+			end
+		end
+	end
+	if keyType == "integer" and opts ~= nil and (opts :: any).MaxKeyLength ~= nil then
+		error("Scribe.MapOf: MaxKeyLength applies to string keys only", 2)
+	end
+	return Marker.make("MapOf", nil, {
+		Element = value,
+		KeyType = keyType,
+		MaxKeys = if opts then opts.MaxKeys else nil,
+		MaxKeyLength = if opts then opts.MaxKeyLength else nil,
 	}) :: any
 end
 

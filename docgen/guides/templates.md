@@ -35,9 +35,12 @@ A plain value (`Wins = 0`, `Settings = { ... }`) is the simplest way to declare 
 | [`Scribe.String(default, { MaxLength })`](/api/Scribe#String) | Strings, optionally length-capped |
 | [`Scribe.Enum(default, members)`](/api/Scribe#Enum) | A fixed set of string values (packs to one byte) |
 | [`Scribe.Timed(default)`](/api/Scribe#Timed) | Fields that expire (boosters, buffs) |
+| [`Scribe.Flags(members)`](/api/Scribe#Flags) | A fixed set of named booleans, up to 32, in one field |
 | [`Scribe.Dynamic(factory)`](/api/Scribe#Dynamic) | A default computed per profile (creation timestamps, seeds) |
 | [`Scribe.ArrayOf(shape, { MaxItems })`](/api/Scribe#ArrayOf) | A list whose entries have a schema ([typed containers](#typed-containers)) |
+| [`Scribe.SetOf(element, { MaxItems })`](/api/Scribe#SetOf) | A collection of unique entries: membership, not order |
 | [`Scribe.DictOf(shape, { MaxKeys, MaxKeyLength })`](/api/Scribe#DictOf) | A string-keyed map whose values have a schema |
+| [`Scribe.MapOf(keyType, value, opts)`](/api/Scribe#MapOf) | A map whose **key** type is declared (`"integer"` or `"string"`) |
 | [`Scribe.Optional(inner)`](/api/Scribe#Optional) | A field that may legitimately be absent |
 
 Don't conflate the three things a declarator carries: the **default value**, the **Luau type** (what your code sees), and the **runtime metadata** (validation/packing). A plain `0` gives you a number field with no bounds; `Scribe.Int(0, { Min = 0 })` gives you a non-negative integer field that clamps.
@@ -108,6 +111,85 @@ end
 `daily[i]` is a real [`Value`](/api/Value), so `.Set` validates, replicates, and fires listeners like any other write. This works for a plain array and for a [`Scribe.ArrayOf`](#typed-containers) alike. The entry you got from `Get()` is a plain Lua table, so it has no `.Set` of its own.
 
 The inconsistency is the reason for the blanket rule: a subtree containing packed datatypes **is** rebuilt on the way out, so mutating that one is silently discarded instead of silently applied. Two different silent failures depending on the shape of your template. Treat everything `Get()` returns as read-only, and use [`Clone()`](/api/Value#Clone) when you want a detached table you can edit freely.
+:::
+
+### Maps with typed keys
+
+`Scribe.DictOf` is string-keyed. When the keys are user ids, item ids, or anything else numeric, `Scribe.MapOf` declares the key type so you stop coercing at every boundary:
+
+```lua
+Friends = Scribe.MapOf("integer", {
+    Name = Scribe.String(""),
+    LastSeen = Scribe.Int(0),
+}),
+
+data.Friends[player.UserId].Name.Set("Ada")   -- no tostring, no tonumber
+```
+
+The declaration is not sugar. A DataStore serializes every object key to a JSON string, so an integer-keyed map comes back holding `"123"` where it stored `123`, and only the declared key type makes converting it back unambiguous: without it, `"123"` on disk could equally have been the number `123` or the string `"123"`. Scribe restores the keys on load, before anything reads them.
+
+Keys that could not have survived that round trip are refused at the write: fractional, infinite, and `NaN`. A key that is not a canonical integer spelling (`"07"`) is left exactly as it is on load rather than relocated, since this map never wrote it.
+
+`MaxKeys` caps the entry count. `MaxKeyLength` applies to string keys only and is refused on an integer map, where it would read as a cap that does nothing.
+
+### Sets of unique values
+
+`Scribe.SetOf` is for membership rather than order: owned items, unlocked levels, completed quests, claimed rewards. It is the shape people otherwise express as a dictionary of `true` values, storing a value nobody ever reads.
+
+```lua
+Unlocked = Scribe.SetOf(Scribe.String("", { MaxLength = 32 })),
+
+data.Unlocked.Add("Desert")      --> true  (false if already a member)
+data.Unlocked.Has("Desert")      --> true
+data.Unlocked.Remove("Desert")   --> true  (false if it was not a member)
+data.Unlocked.Count()
+```
+
+`Add` on a value already present and `Remove` on one that is absent both return `false` and do nothing: no write, no replication op, no `Changed`. Entries are kept deduplicated and in sorted order, so two profiles holding the same members hold the same table.
+
+Unlike [`Scribe.ArrayOf`](#typed-containers) there is no `Insert` and no index-based `Remove`, since a set has no positions. `MaxItems` caps membership; `Evict` does not apply, because there is no oldest entry to drop.
+
+### Sets of named booleans
+
+When a fixed set of booleans belongs together, `Scribe.Flags` holds them in one field addressed by name:
+
+```lua
+Tutorial = Scribe.Flags({ "Movement", "Combat", "Trading" }),
+
+data.Tutorial.Enable("Combat")
+data.Tutorial.Has("Combat")     --> true
+data.Tutorial.Toggle("Trading")
+data.Tutorial.Get()             --> { "Combat", "Trading" }
+```
+
+Compared with three sibling booleans it is one write and one `Changed` instead of one per flag, the valid names are declared rather than implied by whatever strings the code passes, and it packs to a bitmask on the wire. Enabling a name that is not a member is an error, not a silent no-op, and setting a flag to what it already is writes nothing at all.
+
+The value is stored as the enabled member **names**, in declaration order, so **reordering or removing members in a later release is safe**. Only the wire packing is positional, and both ends of a replication frame always come from the same build. The cap is 32 members, refused at compile time rather than silently dropping the 33rd.
+
+### Reacting to a container
+
+Two events cover a table field, and they answer different questions.
+
+`Changed` on a container reports **state**: something beneath this changed, here is the current value. It is coalesced, so a [`Data.Batch`](/api/Server#Batch) writing four fields fires it once, and on the client one replication frame fires it once however many children it carried. It takes `(new, old)`, where `old` is the same reference as `new` because Scribe does not snapshot a container.
+
+The `old == new` part holds for writes **beneath** the container. A write that REPLACES the container's own table (a whole-container `Set` or `Update`, and `Scribe.SetOf` `Add`/`Remove` or `Scribe.Flags` `Enable`/`Disable`/`Toggle`, which rewrite the whole value) carries a real prior table as `old`, and is not coalesced, because collapsing it would throw that prior value away.
+
+`OnChildChanged` reports a **transition**: this direct child moved, here is its key and both sides of the move. It takes `(key, new, old)`, matching `Changed`'s new-first order. It is never coalesced, so three writes fire it three times, and every ancestor receives its own immediate child. `old` is a real prior value when the child is a leaf; when the child is itself a container it is the same reference as `new`, for the same reason `Changed` carries that caveat.
+
+```lua
+data.Inventory.Changed(function(inv)
+    redrawTotals(inv)              -- once per batch, however many slots moved
+end)
+
+data.Inventory.OnChildChanged(function(key, new, old)
+    refreshSlot(key, new)          -- once per write
+end)
+```
+
+All of a container's `OnChildChanged` fires arrive before its `Changed`, so you can accumulate keys and act once. For a [`Scribe.DictOf`](#typed-containers), `OnChildChanged` is the only way to learn that an existing key's **value** changed: `OnKeyAdded` and `OnKeyRemoved` report a key appearing or disappearing, never one changing.
+
+:::caution The container `key` argument was removed in 1.3.0
+A container `Changed` listener used to take a third `key` argument. One fire can now cover several children, so naming one of them would imply the others did not change. Scribe errors at connect time on a container listener declaring a third parameter rather than passing `nil` forever. Move that logic to `OnChildChanged`. Leaf listeners are unchanged. A node under an untyped `{}` subtree has no schema to judge, so it is classified by what is stored there at connect time: connect after the container exists and the check covers it too.
 :::
 
 ### The root read is frozen
@@ -186,6 +268,14 @@ Data.ClearCooldown(player, "DailyReward") -- support / testing reset
 ```
 
 Cooldowns are stored server-side in the profile, so they survive rejoins and cross-server hops and never replicate to the client. The rule of thumb: `Timed` is for a **field that expires** (a booster you read and display), while a cooldown answers **"can this happen again yet"** and holds no value of its own.
+
+Cooldowns count wall-clock time by default, so one armed before logging off keeps running while the player is away. Pass `{ IncludeOfflineTime = false }` for one that only ticks down while they are playing:
+
+```lua
+Data.OnCooldown(player, "Boost", 3600, { IncludeOfflineTime = false })
+```
+
+Scribe stores the remaining seconds rather than a deadline for those, converting on every save, so a server crash costs at most the countdown since the last save and can only make the cooldown end slightly late, never early. A key holds one cooldown either way, and `PeekCooldown`/`ClearCooldown` cover both modes.
 
 To react the moment one lapses, connect [`OnCooldownEnded`](/api/Server#OnCooldownEnded). A cooldown holds no value, so unlike a lapsing `Timed` field it fires no `Changed`, and this signal is its only expiry notification:
 

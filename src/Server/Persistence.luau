@@ -45,6 +45,12 @@ export type Entry = {
 	ForceSaveOnce: boolean,
 	WipeGuardRebaselinePending: boolean?,
 	LocalSessionEnd: boolean?, -- set before every locally-initiated EndSession
+	-- Timed's live _Scribe.Timed dict while a save is in flight, held so the restore
+	-- can run from OnAfterSave or, if the save fails, from the OnError handler.
+	TimedHeld: { [string]: number }?,
+	TimedLive: { [string]: number }?, -- same table, read by Timed's own store lookup
+	TimedSaves: number?, -- open save windows; saves are not serialized per profile
+	LeavingHookRan: boolean?, -- OnPlayerLeaving fires at most once per session
 	SessionStolen: boolean?, -- OnSessionEnd fired that we did not initiate (external steal)
 	LastSavedSize: number?,
 	LiveSize: number?, -- approx bytes measured at the start of the last save attempt
@@ -360,6 +366,21 @@ function Persistence.new(ctx: any)
 					-- The failed save's payload never persisted: restore the dirtiness
 					-- captured at its start (plus anything written since).
 					entry.SaveInfo.Dirty = entry.DirtyAtSaveStart or entry.SaveInfo.Dirty
+					-- Deliberately NOT closing the Timed save window here. OnError is
+					-- module-global and cannot prove the call that failed was this
+					-- entry's in-flight save: an ordinary Data.SendMessage, gift
+					-- delivery or version read on the same key routes through the same
+					-- RegisterError. Closing it on one of those points the profile back
+					-- at the live DEADLINES while the save is still going to serialize
+					-- them, and a rejoin reads 1.78e9 "remaining" as a cooldown decades
+					-- out that never self-heals. Everything above errs pessimistically
+					-- and is safe when misattributed; this one would corrupt.
+					--
+					-- Nothing needs to replace it. The window is self-healing: every
+					-- reader and writer goes through Timed's own store lookup, which
+					-- keeps serving the live table, and the next BeforeSave re-derives
+					-- the persisted copy from it. A save that fails leaves only a
+					-- throwaway table stranded.
 					ctx.Signals.OnSave:Fire({ Player = entry.Player, Ok = false, Duration = nil, At = os.time() })
 					Metrics.Add("SavesFailed")
 					self.UpdateSaveInfoMirror(entry)
@@ -848,6 +869,39 @@ function Persistence.new(ctx: any)
 		})
 	end
 
+	-- Last chance to write. Runs BEFORE EndSession, which performs the final save,
+	-- so anything written here lands. The mirror of OnPlayerInit, which had no
+	-- counterpart: a game accumulating playtime or a session summary had nowhere to
+	-- put it, and racing Scribe's own PlayerRemoving handler is decided by connection
+	-- order.
+	--
+	-- Errors are contained: a throwing hook must not skip the save it was meant to
+	-- contribute to, which would lose the whole session rather than one field.
+	local function runLeavingHook(entry: Entry, reason: string)
+		local hook = ctx.Options.OnPlayerLeaving
+		-- The window this guards is BEFORE EndSession, not after it: the hook runs
+		-- under a plain pcall, so a hook that yields parks the whole leave with the
+		-- entry still in self.Entries, and the shutdown drain then walks that same
+		-- entry and calls this a second time. A double fire double-counts the
+		-- canonical hook body (Playtime.Increment) into one final save.
+		if hook == nil or entry.LeavingHookRan then
+			return
+		end
+		entry.LeavingHookRan = true
+		if entry.State ~= "Ready" or entry.Tree == nil then
+			return -- never loaded, so there is nothing coherent to hand it
+		end
+		local ok, err = pcall(hook, entry.Player, entry.Tree.Accessor, reason)
+		if not ok then
+			Log.Error(
+				"Lifecycle",
+				"LISTENER_ERROR",
+				`OnPlayerLeaving errored; the save continues without its writes: {tostring(err)}`,
+				{ Player = entry.Player }
+			)
+		end
+	end
+
 	local function teardown(entry: Entry, reason: string?)
 		if entry.TornDown then
 			return
@@ -954,6 +1008,10 @@ function Persistence.new(ctx: any)
 				and not options.ResetData
 			then Util.deepClone(profile.Data)
 			else nil
+
+		-- Before Reconcile: integer map keys arrive from the DataStore as JSON
+		-- strings, and every read after this point expects the declared key type.
+		Template.CoerceMapKeys(compiled, profile.Data)
 
 		profile:Reconcile()
 
@@ -1186,9 +1244,17 @@ function Persistence.new(ctx: any)
 		end
 
 		profile.OnSave:Connect(function()
+			-- Point the profile at a copy holding online-only cooldowns in their
+			-- persisted form, and keep the live deadlines aside until the store is done
+			-- with it. OnSave fires before the store reads profile.Data, OnAfterSave
+			-- once it has, and the OnError handler covers the save that never gets
+			-- there.
+			entry.TimedHeld = ctx.Timed.BeforeSave(entry)
 			onProfileSaving(entry)
 		end)
 		profile.OnAfterSave:Connect(function(lastSavedData: any)
+			ctx.Timed.AfterSave(entry, entry.TimedHeld)
+			entry.TimedHeld = nil
 			onProfileSaved(entry, lastSavedData)
 		end)
 		profile.OnSessionEnd:Connect(function()
@@ -1215,6 +1281,32 @@ function Persistence.new(ctx: any)
 		buildTree(entry)
 		entry.SaveInfo.Dirty = false
 		self.UpdateSaveInfoMirror(entry)
+
+		-- Subsystem hooks are isolated so one failing hook cannot abort the others
+		-- (or strand the load thread).
+		local function runHook(name: string, hook: (any) -> ...any)
+			local ok, err = pcall(hook, entry)
+			if not ok then
+				Log.Error(
+					"Lifecycle",
+					"SUBSYSTEM_HOOK_ERROR",
+					`{name} hook failed: {tostring(err)}`,
+					{ Player = player }
+				)
+			end
+		end
+
+		-- BEFORE Ready, unlike the hooks below. An online-only cooldown is stored as
+		-- REMAINING seconds and only becomes a deadline here, and setState resumes
+		-- every parked Data.WaitForData synchronously. Running this after would hand
+		-- the documented PlayerAdded -> WaitForData -> read path a remaining value to
+		-- interpret as a deadline: the gate reads as expired, so the reward is
+		-- re-claimable on every rejoin, and re-arming it inside that window persists
+		-- a deadline as a remaining and compounds into a permanent lockout. It also
+		-- has to stay BELOW `Dirty = false`, because the load sweep's clears write
+		-- through setTimed and must keep their dirty flag.
+		runHook("Timed", ctx.Timed.OnLoad)
+
 		setState(entry, "Ready", nil)
 		Metrics.Add("ProfilesLoaded")
 		Metrics.Set("ActiveSessions", Util.count(self.Entries))
@@ -1233,20 +1325,7 @@ function Persistence.new(ctx: any)
 			end
 		end)
 
-		-- Post-Ready subsystem hooks are isolated so one failing hook can't abort
-		-- initialization of the others (or strand the load thread).
-		local function runHook(name: string, hook: (any) -> ...any)
-			local ok, err = pcall(hook, entry)
-			if not ok then
-				Log.Error(
-					"Lifecycle",
-					"SUBSYSTEM_HOOK_ERROR",
-					`{name} hook failed: {tostring(err)}`,
-					{ Player = player }
-				)
-			end
-		end
-		runHook("Timed", ctx.Timed.OnLoad)
+		-- The rest run post-Ready; only Timed has to beat the state change.
 		runHook("Monetization", ctx.Monetization.OnLoad)
 		runHook("Leaderboards", ctx.Leaderboards.OnLoad)
 		runHook("Replication", ctx.Replication.OnEntryReady)
@@ -1392,6 +1471,7 @@ function Persistence.new(ctx: any)
 			return
 		end
 		if entry.Profile and entry.Profile:IsActive() then
+			runLeavingHook(entry, if player.Parent == Players then "session-ended" else "player-left")
 			entry.LocalSessionEnd = true
 			entry.Profile:EndSession() -- final save; OnSessionEnd triggers teardown
 		elseif entry.State ~= "Loading" then
@@ -1532,7 +1612,16 @@ function Persistence.new(ctx: any)
 			return nil
 		end
 		Health.ReportSuccess("OfflineRead")
-		return if profile then Util.deepClone(profile.Data) else nil
+		if not profile then
+			return nil
+		end
+		-- A DataStore round trip turns a Scribe.MapOf("integer") key into its string
+		-- form, and only the SESSION load undid that. An offline reader saw the raw
+		-- strings, so data.Friends[123] was nil for a map the live accessor reads
+		-- fine. Coerce the copy, not the store's table.
+		local snapshot = Util.deepClone(profile.Data)
+		Template.CoerceMapKeys(compiled, snapshot)
+		return snapshot
 	end
 
 	-- Serialize same-user offline read-modify-writes on THIS server. A ProfileStore
@@ -1602,6 +1691,11 @@ function Persistence.new(ctx: any)
 		end
 
 		local draft = Util.deepClone(profile.Data)
+		-- Same integer-key coercion the session load does, so the callback sees the
+		-- keys its template declares rather than the DataStore's string forms. The
+		-- commit below writes them back as numbers, which the store re-encodes on
+		-- the way out exactly as it does for a live save.
+		Template.CoerceMapKeys(compiled, draft)
 		local mutateOk, mutateErr = pcall(mutate, draft)
 		if not mutateOk then
 			return false, tostring(mutateErr), false
@@ -1689,7 +1783,10 @@ function Persistence.new(ctx: any)
 		if not profile then
 			return nil -- version genuinely not found
 		end
-		return Util.deepClone(profile.Data)
+		-- Same integer-key coercion as GetOffline: this is a raw DataStore read.
+		local snapshot = Util.deepClone(profile.Data)
+		Template.CoerceMapKeys(compiled, snapshot)
+		return snapshot
 	end
 
 	function self.RestoreVersion(userId: number, versionId: string): (boolean, string?)
@@ -1845,6 +1942,9 @@ function Persistence.new(ctx: any)
 		end
 		for _, entry in self.Entries :: { [Player]: Entry } do
 			if entry.Profile and entry.Profile:IsActive() then
+				-- Synchronous, before the spawn: the shutdown deadline is short, and a
+				-- write racing its own EndSession would be lost.
+				runLeavingHook(entry, "shutdown")
 				entry.LocalSessionEnd = true
 				task.spawn(function()
 					entry.Profile:EndSession()

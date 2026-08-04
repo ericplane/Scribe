@@ -89,7 +89,7 @@ return function()
 
 	it("the root freeze does not depend on whether the template declares a datatype", function()
 		-- The bug this pins: unpackRead returned the live store by reference only
-		-- when HasDatatype was false, so `Get().Coins = 1` wrote through on a plain
+		-- when HasPacked was false, so `Get().Coins = 1` wrote through on a plain
 		-- template and was silently discarded on one declaring a single Vector3.
 		-- Same code, opposite outcome, decided by an unrelated field.
 		local plain = TestCtx.make({ Template = { Coins = 0 } })

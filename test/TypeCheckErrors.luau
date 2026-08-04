@@ -4,7 +4,7 @@
 -- exactly EXPECTED_ERRORS diagnostics — if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
--- EXPECTED_ERRORS: 17
+-- EXPECTED_ERRORS: 23
 
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -15,6 +15,7 @@ local template = {
 	Quests = {} :: { number },
 	Bag = Scribe.ArrayOf(Scribe.Int(0)),
 	Secret = Scribe.ServerOnly({ Flagged = false }),
+	Squad = Scribe.ArrayOf({ Name = Scribe.String(""), Hidden = Scribe.ServerOnly(Scribe.Int(0)) }),
 	Furniture = Scribe.ArrayOf({
 		Cf = Scribe.CFrame(CFrame.identity),
 		Note = Scribe.Optional(Scribe.String("")),
@@ -113,11 +114,62 @@ local function serverOnlyOnClient(player: Player)
 	-- the CLIENT accessor type. It reads nil at runtime; before the marker type it
 	-- typechecked clean, which is the worst shape a defect can take.
 	local flagged: boolean = Client.Secret.Flagged.Get() -- TypeError: Secret is not a member of the client tree
+	-- 17) A Scribe.ServerOnly field inside an element shape is behind the indexer,
+	-- not in properties. It never replicates either, so it must be gone from the
+	-- client type too rather than typing clean and reading nil.
+	local hidden: number = Client.Squad[1].Hidden.Get() -- TypeError: Hidden is not on the client
 	-- The server still reads it normally, so this line must stay CLEAN. Its
 	-- absence would mean the strip leaked into ValueType and broke every
 	-- ServerOnly field everywhere.
 	local onServer: boolean = Data[player].Secret.Flagged.Get()
-	return flagged, onServer
+	return flagged, onServer, hidden
+end
+
+-- Scribe.Big and Scribe.MapOf get their own small template: the one above is
+-- already close to the new solver's complexity budget.
+local bigTemplate = {
+	Coins = Scribe.Big(0, { Min = 0 }),
+	Gems = Scribe.Int(0, { Min = 0 }),
+	Nick = Scribe.String(""),
+	Tags = Scribe.MapOf("string", Scribe.Int(0)),
+}
+
+type BigT = typeof(bigTemplate)
+
+-- 18) A typo is still caught alongside a Scribe.Big field. TypeCheck.luau asserts
+-- the positive half, that a big field IS an accepted stat.
+local bigBoards: { [string]: Scribe.LeaderboardConfig<BigT> } = {
+	Typo = { Stat = "Coinz" }, -- TypeError: not a template path
+}
+
+-- 19) A purchase cost path must be a plain number balance. Monetization refuses a
+-- non-number at runtime, so a big path is rejected here rather than at the till.
+local bigCost: Scribe.PurchaseSpec<BigT> = {
+	Cost = { Path = "Coins", Amount = 5 }, -- TypeError: a big is not a cost path
+	ItemId = "Hat",
+}
+
+local bigBundle = Scribe({ Template = bigTemplate, ProfileStoreIndex = "E", ProfileKeyPrefix = "E_", Banner = false })
+
+-- 22) A leaderboard entry's Score is `number | BigScore`, because a Scribe.Big
+-- board hands back the big itself. Reading it straight into a number has to be
+-- refused: it typechecked clean and crashed on a big board. This case is the only
+-- thing pinning the union, since a positive fixture narrows and the dead branch
+-- swallows the difference.
+local function badScore()
+	local entries = bigBundle.Server.GetLeaderboard("Top", 10)
+	local n: number = entries[1].Score -- TypeError: the union is not a number
+	return n
+end
+
+local function badMapContainer(player: Player)
+	local data = bigBundle.Server[player]
+	-- 20) The map node reads and writes the WHOLE map. Typing it as its element
+	-- made this line clean and the correct whole-map read a type error.
+	data.Tags.Set(5) -- TypeError: number vs { [string]: number }
+	-- 21) And the element's own methods must not leak onto the container.
+	data.Tags.Increment(5) -- TypeError: Increment is not on a map node
+	return data.Tags.Get()
 end
 
 return {
@@ -133,4 +185,8 @@ return {
 	badContainers,
 	badLifecycleReason,
 	serverOnlyOnClient,
+	bigBoards,
+	bigCost,
+	badMapContainer,
+	badScore,
 }

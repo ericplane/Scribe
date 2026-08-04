@@ -96,6 +96,29 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	]=]
 	local Data = {} :: any
 
+	-- Luau does not flag an unknown key in an INLINE table literal passed to an
+	-- optional table parameter, only in one bound to a local first, and inline is
+	-- what everyone writes. So a typo like `{ Forcce = true }` type-checks clean and
+	-- silently does nothing. This runtime check is the only layer that catches it.
+	local function checkOptions(given: any, what: string, allowed: { [string]: true })
+		if given == nil then
+			return
+		end
+		if type(given) ~= "table" then
+			error(`Scribe: {what} options must be a table`, 3)
+		end
+		local names = {}
+		for name in allowed do
+			table.insert(names, name)
+		end
+		table.sort(names)
+		for name in given do
+			if not allowed[name] then
+				error(`Scribe: {what}: unknown option "{tostring(name)}" (expected {table.concat(names, ", ")})`, 3)
+			end
+		end
+	end
+
 	local function entryOrError(player: Player, what: string): any
 		local entry = ctx.Persistence.EntryFor(player)
 		if not entry then
@@ -168,6 +191,29 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param fn () -> ()
 		Runs `fn` as a batch: all writes inside coalesce into a single replication
 		flush and one Changed pass. Use for bulk updates.
+
+		"One Changed pass" applies to **containers**. Writing four fields of one
+		table fires that table's (and the root's) `Changed` once, not four times, on
+		the server and on the client. Each individual field still fires its own leaf
+		`Changed`, because each is a distinct transition with its own old and new
+		value.
+
+		A container `Changed` carries state, not a transition, so it takes
+		`(new, old)` and no key: one fire can cover several children. Use
+		[Value.OnChildChanged] to learn which children moved. It takes `(key, new, old)`,
+		is not coalesced, and reports every write.
+
+		```lua
+		Data.Batch(player, function()
+		    state.Index.Set(i + 1)
+		    state.StartedAt.Set(0)
+		    state.Current.Set(next)
+		end)
+		-- state.Changed fires ONCE with the end state
+		-- state.OnChildChanged fires three times: Index, StartedAt, Current
+		-- state.Index.Changed fires once, with its own old and new
+		```
+
 	]=]
 	function Data.Batch(player: Player, fn: () -> ())
 		local entry = entryOrError(player, "Data.Batch")
@@ -209,6 +255,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		may still complete afterwards.
 	]=]
 	function Data.Flush(player: Player, opts: { Force: boolean?, Timeout: number? }?)
+		checkOptions(opts, "Data.Flush", { Force = true, Timeout = true })
 		return ctx.Persistence.Flush(player, opts)
 	end
 	--[=[
@@ -574,6 +621,13 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		`Scribe.PurchaseFilter`.
 	]=]
 	function Data.GetPurchases(player: Player, filter: any?)
+		checkOptions(filter, "Data.GetPurchases", {
+			Kind = true,
+			Category = true,
+			ItemId = true,
+			Since = true,
+			Limit = true,
+		})
 		return ctx.Monetization.GetPurchases(player, filter)
 	end
 
@@ -588,10 +642,32 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		Checks **and arms** a keyed cooldown: returns `false` and starts a new
 		`seconds` cooldown if it was off. Call it only at the grant/claim moment.
 		Use [Server.PeekCooldown] for display checks.
+
+		Pass `{ IncludeOfflineTime = false }` for a cooldown that only ticks down
+		while the player is **online**. The default counts wall-clock time, so a
+		one-hour cooldown armed before logging off is over on a rejoin the next day;
+		with the option off, that same rejoin still has the full hour left.
+
+		```lua
+		-- ticks while offline (default)
+		Data.OnCooldown(player, "DailyChest", 86400)
+		-- only ticks while playing
+		Data.OnCooldown(player, "Boost", 3600, { IncludeOfflineTime = false })
+		```
+
+		A key holds one cooldown either way: re-arming it in the other mode replaces
+		the first rather than leaving two running, and [Server.ClearCooldown] and
+		[Server.PeekCooldown] cover both without needing to know which was used.
 	]=]
-	function Data.OnCooldown(player: Player, key: string, seconds: number): (boolean, number)
+	function Data.OnCooldown(
+		player: Player,
+		key: string,
+		seconds: number,
+		opts: { IncludeOfflineTime: boolean? }?
+	): (boolean, number)
 		local entry = entryOrError(player, "Data.OnCooldown")
-		return ctx.Timed.OnCooldown(entry, key, seconds)
+		checkOptions(opts, "Data.OnCooldown", { IncludeOfflineTime = true })
+		return ctx.Timed.OnCooldown(entry, key, seconds, opts)
 	end
 
 	--[=[

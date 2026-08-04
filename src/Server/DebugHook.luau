@@ -957,22 +957,12 @@ function DebugHook.Attach(Data: any, ctx: any)
 				end
 				accessorAt(entry, path).ExtendTimed(seconds)
 			elseif mode == "ClearTimed" then
-				-- Cancel the timer, leave the value in place. Write the flat
-				-- _Scribe.Timed store DIRECTLY (as the core Timed sweep does): a NESTED
-				-- Timed field's pathKey embeds \31, which the accessor tree rejects, so
-				-- it must not route through Accessor[_Scribe].Timed[pathKey].
+				-- Cancel the timer, leave the value in place. Goes through Timed's own
+				-- raw-store write rather than touching _Scribe.Timed here: a NESTED
+				-- Timed field's pathKey embeds \31, which the accessor tree rejects, and
+				-- a save in flight has the profile pointed at a converted copy.
 				accessorAt(entry, path).Active() -- errors early on non-Timed fields
-				local reserved = entry.LiveData and entry.LiveData[Template.RESERVED_ROOT]
-				if type(reserved) == "table" and type(reserved.Timed) == "table" then
-					reserved.Timed[Util.pathKey(path)] = nil
-					-- Mirror core setTimed (Timed.luau): flag the profile dirty so the
-					-- cleared timer is saved promptly and Dirty-gated flows do not report
-					-- it clean (a crash before autosave would otherwise resurrect it).
-					local saveInfo = entry.SaveInfo :: any
-					if saveInfo then
-						saveInfo.Dirty = true
-					end
-				end
+				ctx.Timed.ClearField(entry, Util.pathKey(path))
 			else
 				error(`unknown write mode "{mode}"`)
 			end

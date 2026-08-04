@@ -194,17 +194,29 @@ export type SaveInfo = {
 
 export type Visibility = "Replicated" | "ServerOnly" | "Shared" | "Session"
 
+-- The read shape of a Scribe.Big, spelled out here rather than imported so Types
+-- stays dependency-free. Kept in sync with Internal.Big.
+export type BigScore = {
+	M: number,
+	E: number,
+	Short: (self: any, decimals: number?) -> string,
+	ToNumber: (self: any) -> number,
+}
+
 export type LeaderboardEntry = {
 	Rank: number,
 	UserId: number,
 	Name: string,
-	Score: number,
+	-- A big board hands back the big itself, not the packed OrderedDataStore key,
+	-- so this is not always a number.
+	Score: number | BigScore,
 }
 
 export type LeaderboardConfig = {
 	Stat: string,
 	Limit: number?,
 	Scale: number?,
+	SigFigs: number?, -- Scribe.Big stats only: ranking-key significant figures, 1 to 15 (default 12)
 	Replicate: boolean?, -- default false: server-only (Data.GetLeaderboard on the server); true streams the board to clients
 }
 

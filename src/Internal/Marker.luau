@@ -8,14 +8,18 @@ local MARKER_KEY = "__scribeMarker"
 export type MarkerKind =
 	"Int"
 	| "Number"
+	| "Big"
 	| "String"
 	| "Enum"
+	| "Flags"
 	| "Timed"
 	| "Datatype"
 	| "Dynamic"
 	| "Optional"
 	| "ArrayOf"
+	| "SetOf"
 	| "DictOf"
+	| "MapOf"
 	| "ServerOnly"
 	| "Shared"
 	| "Session"
@@ -29,7 +33,10 @@ export type Meta = {
 	Factory: (() -> any)?, -- Dynamic markers: produces the per-new-profile default
 	Element: any?, -- ArrayOf/DictOf markers: the raw element shape, compiled into AnyChild
 	MaxItems: number?, -- ArrayOf: cardinality cap
-	MaxKeys: number?, -- DictOf: cardinality cap
+	Evict: string?, -- ArrayOf: "Front" or "Back", which end an Insert at the cap drops
+	Unique: boolean?, -- SetOf: entries are deduplicated and kept in sorted order
+	KeyType: string?, -- MapOf: "integer" or "string"
+	MaxKeys: number?, -- DictOf/MapOf: cardinality cap
 	MaxKeyLength: number?, -- DictOf: per-key byte cap
 }
 

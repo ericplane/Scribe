@@ -214,6 +214,27 @@ return function()
 		end)
 	end)
 
+	it("refuses a varint it cannot encode, rather than looping forever", function()
+		-- The writer had no domain check while the reader caps itself at 10 groups.
+		-- math.floor(inf) is inf, `inf >= 128` stays true and inf/128 is inf, so an
+		-- infinite exponent put the encoder into an unbounded loop that grew the
+		-- buffer until the process died: a server hang, not a bad frame. A negative
+		-- was quieter and worse, wrapping writeu8 into bytes the reader mis-decodes.
+		for _, bad in { math.huge, -math.huge, 0 / 0, -1, -0.5, 2 ^ 54 } do
+			expect(function()
+				Wire.Varint(Wire.NewWriter(8), bad)
+			end).to.throw()
+		end
+
+		-- The whole legitimate domain still encodes and round-trips, including the
+		-- boundary a zigzagged Scribe.Big exponent lands on.
+		for _, good in { 0, 1, 127, 128, 2 ^ 32, 2 ^ 52, 2 ^ 53 } do
+			local w = Wire.NewWriter(16)
+			Wire.Varint(w, good)
+			expect(Wire.RVarint(Wire.NewReader(Wire.Finish(w)))).to.equal(good)
+		end
+	end)
+
 	describe("malformed input rejection", function()
 		it("rejects truncated frames", function()
 			local bytes = Wire.EncodeOpsFrame(Wire.Frames.Diff, compiled, {

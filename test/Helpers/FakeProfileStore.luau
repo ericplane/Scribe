@@ -42,6 +42,17 @@ function FakeProfileStore.new()
 	fake.DataStoreState = "Access"
 
 	fake.FailNextLoad = false
+	-- Opt-in yield inside StartSessionAsync. Real ProfileStore's StartSessionAsync
+	-- yields (WaitForStoreReady, then UpdateAsync), so a game's own PlayerAdded
+	-- handler genuinely parks in Data.WaitForData while the load runs. The fake is
+	-- synchronous by default, which makes that window zero-width and hides every
+	-- ordering bug in it, so a spec that cares can widen it.
+	fake.YieldOnSessionStart = false
+	-- Called between profile.OnSave:Fire() and the write, which is where real
+	-- ProfileStore spends its DataStore round trip: it fires OnSave, then reads
+	-- profile.Data BY REFERENCE inside the UpdateAsync transform once the fetch
+	-- returns. Nothing in the suite can reach a mid-save window without this.
+	fake.MidSave = nil :: (() -> ())?
 	fake.FailSaves = false
 	fake.FailMessages = false
 
@@ -194,6 +205,9 @@ function FakeProfileStore.new()
 					return
 				end
 				profile.OnSave:Fire()
+				if fake.MidSave then
+					fake.MidSave()
+				end
 				persist()
 			end
 
@@ -246,6 +260,9 @@ function FakeProfileStore.new()
 		end
 
 		function store.StartSessionAsync(_self: any, profileKey: string, params: any?)
+			if fake.YieldOnSessionStart then
+				task.wait()
+			end
 			if fake.FailNextLoad then
 				fake.FailNextLoad = false
 				fake.OnError:Fire("mock load failure", storeName, profileKey)

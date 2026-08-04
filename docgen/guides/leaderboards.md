@@ -35,7 +35,7 @@ local rank = Data.GetMyRank("TopWins")
 :::
 
 :::note Universe-global stores
-Boards are OrderedDataStores named `LB_<board>`, independent of `ProfileStoreIndex` and `ResetData`. Bumping your profile store index does **not** reset leaderboards, and renaming a board effectively resets it. Set a per-board `StoreName` to namespace one (e.g. for a test/prod split) or to intentionally share it across places.
+Boards are OrderedDataStores named `LB_<board>`, independent of `ProfileStoreIndex` and `ResetData`. Bumping your profile store index does **not** reset leaderboards, and renaming a board effectively resets it. Set a per-board `StoreName` to namespace one (e.g. for a test/prod split) or to intentionally share it across places. A **`Scribe.Big` board is named `LB_<board>_big<SigFigs>`**, always, even at the default `SigFigs`. A big is packed exponent-major and a plain numeric stat is packed as itself, so they are two key layouts, and two layouts must never share a store. Without the suffix, retyping a stat from `Scribe.Int` to `Scribe.Big` (which needs no migration and emits no warning) would silently reinterpret every key already written: a legacy `9e11` decodes as `9`, so a brand-new account with 100 outranks it.
 :::
 
 ## Typed configs
@@ -84,3 +84,53 @@ end)
 ```
 
 `entries` is rank-ordered, so `entries[1]` is rank 1 with the highest score, exactly what `GetLeaderboard` returns. A polling loop cannot align with the schedule (boards are staggered across their cycle), so it reads a cache anywhere from fresh to a full interval stale. `entries` is a fresh copy, so you can keep or mutate it freely.
+
+## Ranking a Scribe.Big
+
+A [`Scribe.Big`](/api/Scribe#Big) field works as a stat with no extra setup. An OrderedDataStore key is an integer, and a Luau number stops being an exact integer at 2^53, so the raw value cannot be stored. It does not need to be: a big is already normalized to `1 <= |m| < 10` with an integer exponent, so Scribe packs it exponent-major (`e * 1e12 + floor(m * 1e11)` by default, see [`SigFigs`](#resolution-vs-range-sigfigs)). The exponent dominates and the mantissa breaks ties, which is a big's own comparison order, so ranking is **exact** with no logarithm and no precision loss in the ordering.
+
+```lua
+Coins = Scribe.Big(0, { Min = 0 }),
+-- Leaderboards = { Top = { Stat = "Coins" } }
+
+for _, entry in Data.GetLeaderboard("Top", 10) do
+    -- Score is the big itself, not the packed key. It is typed
+    -- `number | BigScore` because the board's kind is a runtime property of the
+    -- name you passed, so narrow it once and the rest of the block is typed.
+    local score = entry.Score
+    if type(score) == "table" then
+        print(entry.Name, score:Short())
+    end
+end
+```
+
+Two constraints follow from the key being an integer. The value must be **non-negative**, because the packing has no room for a sign, and the exponent must be within the board's cap (1e9006 by default). A score outside either is dropped and logged as `LB_SCORE_OUT_OF_RANGE` rather than ranked wrongly. `Scale` is refused on a big board, since the packing already maps the value into the key space.
+
+### Resolution vs range: `SigFigs`
+
+The exponent and the mantissa share one integer that has to stay under 2^53, so they compete. `SigFigs` decides how that budget is split, **per board**. It is the number of significant figures the ranking key keeps, and since the `Score` you read back is decoded from that key, it is also the number of figures the board can display.
+
+```lua
+Leaderboards = {
+    -- A prestige currency: separate players who agree to 12 figures.
+    TopCoins = { Stat = "Coins", SigFigs = 14 },
+    -- Gems only need a rough ordering, over an enormous range.
+    TopGems  = { Stat = "Gems", SigFigs = 6 },
+}
+```
+
+Every extra figure costs a factor of ten of exponent range:
+
+| `SigFigs` | Largest rankable value | Good for |
+| --- | --- | --- |
+| 6 | 1e9007199253 | a counter whose magnitude is the whole story |
+| 9 | 1e9007198 | a middle ground |
+| **12** (default) | **1e9006** | almost everything |
+| 14 | 1e89 | separating near-identical prestige scores |
+| 15 | 1e8 | not a big currency at all; use `Scribe.Int` |
+
+The range is 1 to 15. Above 15 the mantissa alone would pass 2^53, and a big carries no more than about 15 significant digits anyway. A score past the board's cap is dropped and logged as `LB_SCORE_OUT_OF_RANGE`, naming both the cap and the `SigFigs` that set it. `SigFigs` is refused on a plain numeric stat: there the key **is** the value, and `Scale` is the dial.
+
+A big board is also **server-only**. The board frame writes each score as one f64, which a big does not fit into, so `Replicate = true` on a big stat is refused at startup rather than throwing on every broadcast. Read it on the server with `GetLeaderboard` or `OnLeaderboard`, and send whatever your UI needs over your own remote.
+
+Separately, the range guard for **plain** numeric stats is 2^53, not int64. Past that a Luau number is no longer an exact integer, so a scaled score would be written with silently wrong low digits and tie against its neighbours. A stat with a large `Scale` can reach that, and Scribe drops the write rather than storing a corrupted key.

@@ -194,9 +194,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				return
 			end
 			local ops = Wire.DecodeOps(reader, compiled)
-			for _, op in ops do
-				tree:ApplyOp(op)
-			end
+			-- One frame, one batch: a Server.Batch that coalesced into this frame
+			-- must not fan back out into one container fire per op.
+			tree:ApplyOps(ops)
 			Metrics.Add("DiffsApplied")
 		elseif frameType == Wire.Frames.CommandReply then
 			local correlation = Wire.RU32(reader)

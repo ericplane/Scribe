@@ -391,7 +391,7 @@ return function()
 		local _p, _e, data = harness.Join(7011)
 
 		-- Spawn/Zone are datatype fields at the ROOT; reading the whole root must
-		-- convert them, not leak the packed buffer (root.HasDatatype must be set).
+		-- convert them, not leak the packed buffer (root.HasPacked must be set).
 		local whole = data.Get()
 		expect(typeof(whole.Spawn)).to.equal("Vector3")
 		expect(typeof(whole.Zone)).to.equal("NumberRange")
@@ -407,7 +407,7 @@ return function()
 		local harness = TestCtx.make({ Template = makeTemplate() })
 		local _p, entry, data = harness.Join(7012)
 
-		-- The root holds Spawn (datatype) AND Blob (raw buffer), so root.HasDatatype
+		-- The root holds Spawn (datatype) AND Blob (raw buffer), so root.HasPacked
 		-- routes Clone through cloneUnpack. The raw buffer must be COPIED, not aliased.
 		local cloned = data.Clone()
 		expect(buffer.tostring(cloned.Blob)).to.equal("XYZ")

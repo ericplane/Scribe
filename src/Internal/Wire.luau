@@ -86,8 +86,24 @@ local function wf64(w: Writer, v: number)
 	w.len += 8
 end
 
+-- Largest value the writer will encode. The reader stops after 10 groups (70 bits),
+-- but a Luau number is only an exact integer to 2^53, so that is the real ceiling:
+-- past it the arithmetic below loses digits the reader cannot recover. Schema ints
+-- are already capped at 2^52 by canSchemaEncode for the same reason, and a zigzag
+-- doubles its input, so both paths land at or under this.
+local MAX_VARINT = 2 ^ 53
+
 -- Unsigned LEB128; arithmetic (not bit32) so values up to 2^53 round-trip.
 local function wvarint(w: Writer, v: number)
+	-- Refuse rather than loop. A non-finite input never terminates the loop below:
+	-- math.floor(inf) is inf, `inf >= 128` stays true, and inf/128 is inf, so the
+	-- buffer grows until the process dies. That is a server hang reachable from
+	-- whatever feeds the encoder, so the writer has to bound itself the way the
+	-- reader already does. A negative wraps buffer.writeu8 into garbage the reader
+	-- would silently mis-decode.
+	if v ~= v or v == math.huge or v == -math.huge or v < 0 or v > MAX_VARINT then
+		error(`Scribe: cannot encode {tostring(v)} as a varint (expected an integer from 0 to 2^53)`, 0)
+	end
 	v = math.floor(v)
 	while v >= 128 do
 		wu8(w, v % 128 + 128)
@@ -359,6 +375,18 @@ local function canSchemaEncode(node: SchemaNode, value: any): boolean
 		return type(value) == "number"
 	elseif vt == "enum" then
 		return type(value) == "string" and node.MemberIndex ~= nil and node.MemberIndex[value] ~= nil
+	elseif vt == "big" then
+		return type(value) == "table" and type(value[1]) == "number" and type(value[2]) == "number"
+	elseif vt == "flags" then
+		if type(value) ~= "table" or node.MemberIndex == nil then
+			return false
+		end
+		for _, name in value :: { any } do
+			if type(name) ~= "string" or node.MemberIndex[name] == nil then
+				return false
+			end
+		end
+		return true
 	elseif vt == "string" then
 		return type(value) == "string"
 	elseif vt == "buffer" or vt == "datatype" then
@@ -399,6 +427,30 @@ local function encodeValue(w: Writer, node: SchemaNode?, value: any, depth: numb
 		wf64(w, value)
 	elseif vt == "enum" then
 		wu8(w, (node.MemberIndex :: { [string]: number })[value])
+	elseif vt == "big" then
+		-- The mantissa needs full double precision; the exponent is a small signed
+		-- integer, so a zigzag varint is one or two bytes for any realistic value.
+		wf64(w, value[1])
+		wzigzag(w, value[2])
+	elseif vt == "flags" then
+		-- One bit per declared member, LSB = first member. Positional, but only for
+		-- the duration of this frame: the stored form is the member NAMES, and both
+		-- ends of a frame come from the same build (guarded by the schema hash).
+		local index = node.MemberIndex :: { [string]: number }
+		local mask = 0
+		for _, name in value :: { string } do
+			-- MemberIndex is 0-based (the enum reader does Members[idx + 1]), so the
+			-- first member owns bit 0.
+			mask += 2 ^ index[name]
+		end
+		local count = #(node.Members :: { string })
+		if count <= 8 then
+			wu8(w, mask)
+		elseif count <= 16 then
+			wu16(w, mask)
+		else
+			wu32(w, mask)
+		end
 	elseif vt == "string" then
 		wstr(w, value)
 	elseif vt == "buffer" or vt == "datatype" then
@@ -462,6 +514,19 @@ local function decodeValue(r: Reader, node: SchemaNode?, depth: number): any
 		end
 	elseif vt == "number" then
 		return rf64(r)
+	elseif vt == "big" then
+		return { rf64(r), rzigzag(r) }
+	elseif vt == "flags" then
+		local members = node.Members :: { string }
+		local count = #members
+		local mask = if count <= 8 then ru8(r) elseif count <= 16 then ru16(r) else ru32(r)
+		local out = {}
+		for i, name in members do
+			if mask % (2 ^ i) >= 2 ^ (i - 1) then
+				table.insert(out, name)
+			end
+		end
+		return out
 	elseif vt == "enum" then
 		local idx = ru8(r)
 		local member = (node.Members :: { string })[idx + 1]

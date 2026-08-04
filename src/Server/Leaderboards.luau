@@ -10,6 +10,7 @@ local Internal = script.Parent.Parent.Internal
 local Util = require(Internal.Util)
 local Wire = require(Internal.Wire)
 local Template = require(Internal.Template)
+local Big = require(Internal.Big)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
@@ -35,19 +36,58 @@ local NAME_TTL = 900
 local NAME_NEGATIVE_TTL = 120
 local NAME_CACHE_CAP = 4096 -- bound the resolved-name cache; entries are re-resolvable
 
+-- Scribe.Big leaderboards ----------------------------------------------------------
+--
+-- An OrderedDataStore key is an integer, and a Luau number stops being an exact
+-- integer at 2^53, so a big value cannot be stored raw. It does not need to be: a
+-- big is already normalized to 1 <= |m| < 10 with an integer exponent, so packing
+-- exponent-major preserves the ordering EXACTLY, with no logarithm.
+--
+--   key = e * stride + floor(m * mantissaScale)
+--
+-- with stride = 10^SigFigs and mantissaScale = 10^(SigFigs - 1), so the mantissa
+-- lands in [mantissaScale, stride) and can never spill into the next exponent's
+-- slot. Exponent dominates, mantissa breaks ties, which is a big's own comparison
+-- order.
+--
+-- SigFigs is per board, because the whole key has to stay under 2^53 and the two
+-- halves compete for it: every extra significant figure costs a factor of ten of
+-- exponent range. A prestige currency that needs to separate 1.23456789012345e900
+-- from its neighbour wants more; a gem counter that only needs a rough ordering
+-- over an enormous range wants fewer.
+local BIG_DEFAULT_SIG_FIGS = 12
+local BIG_MIN_SIG_FIGS = 1
+-- Past 15 the mantissa slot itself passes 2^53, so floor() would no longer be exact
+-- and a big carries no more than ~15 significant digits anyway.
+local BIG_MAX_SIG_FIGS = 15
+local MAX_EXACT_INT = 2 ^ 53
+
+-- The largest exponent whose key still lands under 2^53. The mantissa slot holds up
+-- to stride - 1, so that headroom comes off the top.
+local function bigMaxExponent(stride: number): number
+	return math.floor((MAX_EXACT_INT - stride + 1) / stride)
+end
+
 type Board = {
 	Name: string,
 	StatPath: { string },
 	Limit: number,
 	Scale: number,
+	IsBig: boolean,
+	-- Big packing, derived once at boot from the board's SigFigs.
+	BigSigFigs: number,
+	BigStride: number,
+	BigMantissaScale: number,
+	BigMaxExponent: number,
 	RefreshInterval: number,
 	Replicate: boolean, -- default false: server-only, no client mirror
 	StoreName: string,
 	Cache: { Entries: { any }, At: number },
 	Signature: string, -- fingerprint of Cache.Entries; broadcasts only on change
 	MyRanks: { [number]: number? },
-	MyScores: { [number]: number? },
-	SentState: { [number]: { Sig: string, Rank: number?, Score: number? } },
+	-- `any`, not `number`: a big board's score is the Big itself, not the packed key.
+	MyScores: { [number]: any },
+	SentState: { [number]: { Sig: string, Rank: number?, Score: any } },
 }
 
 -- In-memory OrderedDataStore shim for UseMock/DontSave testing.
@@ -156,12 +196,66 @@ function Leaderboards.new(ctx: any)
 		-- silently inverts the ordering against the descending query, and a
 		-- non-finite one makes every write a guaranteed OrderedDataStore rejection.
 		-- Fail fast like Stat/Period rather than serving nonsense at runtime.
+		if config.Replicate == true and walkNode ~= nil and walkNode.ValueType == "big" then
+			-- The board frame writes each Score as an f64, and a big Score is a table.
+			-- Sending one throws inside broadcastBoard, which runs under the inbound
+			-- frame pcall during a client Hello: the joining player is counted as a
+			-- malformed frame and silently loses every other player's Shared data.
+			-- Refuse it at boot rather than shipping a board that breaks the handshake.
+			error(
+				`Scribe: leaderboard "{name}" Stat "{config.Stat}" is a Scribe.Big, which cannot be `
+					.. "replicated yet; read it on the server with GetLeaderboard or OnLeaderboard",
+				0
+			)
+		end
+		if config.Scale ~= nil and walkNode ~= nil and walkNode.ValueType == "big" then
+			error(
+				`Scribe: leaderboard "{name}" Stat "{config.Stat}" is a Scribe.Big; Scale does not apply, `
+					.. "because the exponent packing already maps it into the key space",
+				0
+			)
+		end
 		if config.Scale ~= nil then
 			local scale = config.Scale
 			if type(scale) ~= "number" or scale ~= scale or scale <= 0 or scale == math.huge then
 				error(`Scribe: leaderboard "{name}" Scale must be a finite number greater than 0`, 0)
 			end
 		end
+		local isBig = walkNode ~= nil and walkNode.ValueType == "big"
+		local sigFigs = BIG_DEFAULT_SIG_FIGS
+		if config.SigFigs ~= nil then
+			-- SigFigs is the big packing's own dial. On a plain numeric stat the key IS
+			-- the value and Scale is the dial, so accepting it there would silently do
+			-- nothing.
+			if not isBig then
+				error(
+					`Scribe: leaderboard "{name}" Stat "{config.Stat}" is not a Scribe.Big; SigFigs only applies `
+						.. "to the big exponent packing. Use Scale to control a plain numeric stat's resolution",
+					0
+				)
+			end
+			local requested = config.SigFigs
+			if
+				type(requested) ~= "number"
+				or requested % 1 ~= 0
+				or requested < BIG_MIN_SIG_FIGS
+				or requested > BIG_MAX_SIG_FIGS
+			then
+				error(
+					`Scribe: leaderboard "{name}" SigFigs must be a whole number from {BIG_MIN_SIG_FIGS} to `
+						.. `{BIG_MAX_SIG_FIGS}, got {tostring(requested)}`,
+					0
+				)
+			end
+			sigFigs = requested
+		end
+		local bigStride = 10 ^ sigFigs
+		-- No boot warning for a narrowed exponent range. The developer chose this
+		-- deliberately, nothing is wrong yet, and warning every server start forever
+		-- is how a diagnostic becomes background noise. LB_SCORE_OUT_OF_RANGE already
+		-- names the cap and the SigFigs that set it, at the moment a score is actually
+		-- dropped, which is when there is something to act on.
+		local maxExponent = bigMaxExponent(bigStride)
 		-- Opt-in slower refresh. Clamped up rather than rejected so an existing config
 		-- keeps working, but the clamp is reported: silently running 6x slower than
 		-- asked would be its own bug.
@@ -188,8 +282,31 @@ function Leaderboards.new(ctx: any)
 			StatPath = Util.parsePath(config.Stat),
 			Limit = math.clamp(config.Limit or 100, 1, 100),
 			Scale = config.Scale or 1,
+			-- Resolved at boot from the stat's schema, so the write path never has to
+			-- re-walk it.
+			IsBig = isBig,
+			BigSigFigs = sigFigs,
+			BigStride = bigStride,
+			BigMantissaScale = bigStride / 10,
+			BigMaxExponent = maxExponent,
 			Replicate = config.Replicate == true,
-			StoreName = if type(config.StoreName) == "string" then config.StoreName else `LB_{name}`,
+			-- EVERY big board gets its own store, including one at the default
+			-- SigFigs. A big is packed exponent-major and a plain numeric stat is
+			-- packed as itself, so they are two key LAYOUTS, and a board name is all
+			-- that separates one store from another. Sharing `LB_<name>` meant that
+			-- retyping a stat from Scribe.Int to Scribe.Big (which needs no migration
+			-- and produces no warning) silently reinterpreted every key already
+			-- written: a legacy 9e11 decodes as 9, so a brand-new account with 100
+			-- outranks it, and a legacy 3.5e12 is bit-identical to the new-format key
+			-- for 5000, so no repair pass could ever separate them.
+			--
+			-- SigFigs is in the name because it changes the layout again, for the same
+			-- reason. An explicit StoreName still wins: that caller is managing the
+			-- namespace themselves.
+			StoreName = if type(config.StoreName) == "string"
+				then config.StoreName
+				elseif isBig then `LB_{name}_big{sigFigs}`
+				else `LB_{name}`,
 			Cache = { Entries = {}, At = 0 },
 			Signature = "",
 			MyRanks = {},
@@ -234,28 +351,94 @@ function Leaderboards.new(ctx: any)
 		return store
 	end
 
+	local function packBig(board: Board, value: any): number?
+		local big = Big.from(value)
+		if big == nil then
+			return nil
+		end
+		if big.M == 0 then
+			-- Below every representable key, NOT 0. A value in (0, 1) has a negative
+			-- exponent and therefore a negative key, so mapping zero to 0 ranked an
+			-- empty balance above every fractional one. The lowest real key is
+			-- -maxExponent * stride + mantissaScale, so this sits strictly under it.
+			return -board.BigMaxExponent * board.BigStride
+		end
+		-- The packing has no room for a sign, and silently mis-ranking negatives is
+		-- worse than refusing them.
+		if big.M < 0 or math.abs(big.E) > board.BigMaxExponent then
+			return nil
+		end
+		return big.E * board.BigStride + math.floor(big.M * board.BigMantissaScale)
+	end
+
+	-- A handed-out entry is a copy, because both docs invite the caller to keep or
+	-- mutate it. table.clone is SHALLOW, so a big board's Score would still alias the
+	-- object in the cache and a caller writing to it would corrupt every later read
+	-- until the next refresh. Rebuild the big instead.
+	local function copyEntry(board: Board, item: any): any
+		local copy = table.clone(item)
+		if board.IsBig and copy.Score ~= nil then
+			copy.Score = Big.from(copy.Score)
+		end
+		return copy
+	end
+
+	local function unpackBig(board: Board, key: number): any
+		local stride = board.BigStride
+		-- The zero sentinel, plus the legacy 0 that boards written before it used.
+		if key == 0 or key <= -board.BigMaxExponent * stride then
+			return Big.from(0)
+		end
+		-- The division cannot round up into the next exponent, which would decode a
+		-- score at the wrong magnitude. The true quotient is e + mantissa/stride, so
+		-- rounding up needs the gap to 1 (at least 1/stride) to fall inside half an
+		-- ulp of e, which is at most e * 2^-53. That needs e * stride >= 2^53, and
+		-- bigMaxExponent caps e strictly below that. Widening the cap would break
+		-- this, so keep the two together.
+		local exponent = math.floor(key / stride)
+		return Big.normalize((key - exponent * stride) / board.BigMantissaScale, exponent)
+	end
+
 	-- Write queue ------------------------------------------------------------------
 
-	function self.Enqueue(board: Board, userId: number, score: number)
-		if type(score) ~= "number" or score ~= score then
-			return
-		end
+	function self.Enqueue(board: Board, userId: number, score: any)
 		if isErased(userId) then
 			return -- within the GDPR tombstone window; do not re-add
 		end
-		local scaled = math.floor(score * board.Scale + 0.5)
+		local scaled: number
+		if board.IsBig then
+			-- Scale does not apply: the packing IS the mapping into the key space.
+			local packed = packBig(board, score)
+			if packed == nil then
+				Metrics.Add("LbScoreOutOfRange")
+				Log.Warn(
+					"Leaderboards",
+					"LB_SCORE_OUT_OF_RANGE",
+					`big score cannot be ranked (negative, or exponent past {board.BigMaxExponent} at SigFigs `
+						.. `{board.BigSigFigs}); not written`,
+					{ Board = board.Name, UserId = userId }
+				)
+				return
+			end
+			scaled = packed
+		else
+			if type(score) ~= "number" or score ~= score then
+				return
+			end
+			scaled = math.floor(score * board.Scale + 0.5)
+		end
 		-- OrderedDataStore only accepts a signed 64-bit integer. A scaled value past
 		-- that (an idle-game currency, an unbounded stat, an aggressive Scale) is
 		-- rejected by SetAsync EVERY time, and the value is re-enqueued on every
 		-- Changed and again on unload, so it becomes a permanent failure stream.
 		-- Drop it here, loudly and once per (board, user), instead of queueing a write
 		-- that cannot succeed.
-		if scaled ~= scaled or math.abs(scaled) >= 9223372036854775808 then
+		if scaled ~= scaled or math.abs(scaled) > 9007199254740992 then
 			Metrics.Add("LbScoreOutOfRange")
 			Log.Warn(
 				"Leaderboards",
 				"LB_SCORE_OUT_OF_RANGE",
-				`score {score} x Scale {board.Scale} is outside the OrderedDataStore integer range; not written`,
+				`score {tostring(score)} x Scale {board.Scale} is outside the exact integer range (2^53); not written`,
 				{ Board = board.Name, UserId = userId }
 			)
 			return
@@ -477,7 +660,7 @@ function Leaderboards.new(ctx: any)
 		local signatureParts = {}
 		for rank, item in page:GetCurrentPage() do
 			local userId = tonumber(item.key) or 0
-			local score = item.value / board.Scale
+			local score: any = if board.IsBig then unpackBig(board, item.value) else item.value / board.Scale
 			rankByUserId[userId] = rank
 			table.insert(entries, {
 				Rank = rank,
@@ -499,7 +682,7 @@ function Leaderboards.new(ctx: any)
 		if board.Signature ~= previousSignature then
 			local snapshot = table.create(#board.Cache.Entries)
 			for _, item in board.Cache.Entries do
-				table.insert(snapshot, table.clone(item))
+				table.insert(snapshot, copyEntry(board, item))
 			end
 			ctx.Signals.OnLeaderboard:Fire(board.Name, snapshot)
 		end
@@ -511,7 +694,7 @@ function Leaderboards.new(ctx: any)
 				for _, segment in board.StatPath do
 					value = if type(value) == "table" then value[segment] else nil
 				end
-				board.MyScores[entry.UserId] = if type(value) == "number" then value else nil
+				board.MyScores[entry.UserId] = if board.IsBig or type(value) == "number" then value else nil
 				board.MyRanks[entry.UserId] = rankByUserId[entry.UserId]
 			end
 		end
@@ -553,6 +736,13 @@ function Leaderboards.new(ctx: any)
 	end
 
 	-- Refresh one board (or all) immediately instead of waiting for the cycle.
+	-- The OrderedDataStore a board reads and writes. Exposed so a test can pin the
+	-- SigFigs namespacing, which is what keeps two key formats out of one store.
+	function self.BoardStoreName(name: string): string?
+		local board = boards[name]
+		return if board then board.StoreName else nil
+	end
+
 	function self.RefreshNow(name: string?)
 		if name then
 			local board = boards[name]
@@ -589,13 +779,13 @@ function Leaderboards.new(ctx: any)
 					accessor = accessor[segment]
 				end
 				local value = accessor.Get()
-				if type(value) == "number" then
+				if board.IsBig or type(value) == "number" then
 					self.Enqueue(board, entry.UserId, value)
 				end
 				table.insert(
 					disconnects,
 					accessor.Changed(function(newValue: any)
-						if type(newValue) == "number" then
+						if board.IsBig or type(newValue) == "number" then
 							self.Enqueue(board, entry.UserId, newValue)
 						end
 					end)
@@ -633,7 +823,7 @@ function Leaderboards.new(ctx: any)
 				for _, segment in board.StatPath do
 					value = if type(value) == "table" then value[segment] else nil
 				end
-				if type(value) == "number" then
+				if board.IsBig or type(value) == "number" then
 					self.Enqueue(board, entry.UserId, value)
 				end
 			end
@@ -666,7 +856,7 @@ function Leaderboards.new(ctx: any)
 		end
 		local out = {}
 		for i = 1, math.min(limit or board.Limit, #board.Cache.Entries) do
-			table.insert(out, table.clone(board.Cache.Entries[i]))
+			table.insert(out, copyEntry(board, board.Cache.Entries[i]))
 		end
 		return out
 	end
