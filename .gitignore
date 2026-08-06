@@ -31,4 +31,6 @@ __pycache__/
 .cache/
 # Edge render temp for devforum-post assets
 /devforum-post
+# Local design notes, not part of the shipped docs
+/global-design-note.md
 .DS_Store

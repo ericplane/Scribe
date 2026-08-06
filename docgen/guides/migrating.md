@@ -1,7 +1,3 @@
----
-sidebar_position: 11
----
-
 # Migrating to Scribe
 
 Moving an existing game onto Scribe. How you do it depends on where your data lives today.
@@ -33,15 +29,17 @@ Do not copy old data in by writing DataStore values directly, for example `SetAs
 
 **The key does not heal itself.** The error is raised inside the DataStore transform, so nothing is ever written back, every retry reads the same broken value, and the player is stuck in a join loop. Scribe reports this as a `PROFILE_STORE_ERROR` with an opaque message, because Roblox traps transform errors before ProfileStore can see them.
 
-Neither `UpdateOffline` nor `RestoreVersion` can repair such a key. Both write through a path that never sets `SessionLoadCount`, so they report success and the key still fails on the next join. Use [`Erase(userId)`](/api/Server#Erase), which deletes the key outright so the next join builds a correct profile, and re-import from your old store. Let ProfileStore create the profile and write your old data into `Data` afterwards, or adopt the existing keys in place as above.
+Neither `UpdateOffline` nor `RestoreVersion` can repair such a key. Both write through a path that never sets `SessionLoadCount`, so they report success and the key still fails on the next join. Use [`Erase(userId)`](/api/Server#Erase), which deletes the key outright so the next join builds a correct profile, and re-import from your old store. It is the GDPR erasure path, so it also clears that user from every leaderboard, and a `false` return can mean the profile went but a board key did not: retry rather than assuming nothing happened. Let ProfileStore create the profile and write your old data into `Data` afterwards, or adopt the existing keys in place as above.
 :::
 
-Your template's field names must match the keys already in the stored data (or a migration bridges the difference). **Validate against real data first** with `ViewedUserId` (loads that user's real profile read-only, never writes) before you point a live game at it. Note that `DontSave = true` is NOT a dry-run against real data: it swaps in a full in-memory mock store, so every profile loads as blank template defaults and validates nothing about your stored shapes.
+Your template's field names must match the keys already in the stored data (or a migration bridges the difference). **Validate against real data first** with `Mode = "NoSave"`, plus `TargetUserId = <id>` to pin one specific player, before you point a live game at it. That loads the real profile as a snapshot and never writes: no session is held, no save path runs, and leaderboard writes go to a mock store too. `Mode = "Mock"` is NOT a dry run against real data: it swaps in a full in-memory mock store, so every profile loads as blank template defaults and validates nothing about your stored shapes. (The older `ViewedUserId` and `DontSave` / `UseMock` flags still map onto these modes; see [configuration](./configuration#persistence-mode).)
 
-A `ViewedUserId` dry-run checks your **template** against real stored data, not the **envelope** around it. It reads through `GetAsync`, which skips the session-start code that a normal join runs, so a malformed envelope like the one above reads back perfectly clean and only fails once a real player joins. A clean dry-run means your field names and shapes line up; it is not evidence that the profiles are loadable.
+A `Mode = "NoSave"` dry run checks your **template** against real stored data, not the **envelope** around it. It reads through `GetAsync`, which skips the session-start code that a normal join runs, so a malformed envelope like the one above reads back perfectly clean and only fails once a real player joins. A clean dry run means your field names and shapes line up; it is not evidence that the profiles are loadable.
 
 :::caution Adopting in place while you already have `Migrations`
-Scribe stores its migration version under the reserved `_Scribe` root. Data written before you adopted Scribe has no such key, so it reads as **version 1** and every migration step from 2 upward then runs against your pre-Scribe shape on first load. Migration failure is fail-closed, so a step that throws kicks the player rather than loading them with half-migrated data. If you adopt in place while already carrying a `Migrations` table, make sure step 2 tolerates legacy input, or bridge the old shape in step 1 first.
+Scribe stores its migration version under the reserved `_Scribe` root. Data written before you adopted Scribe has no such key, so it reads as **version 1** and every migration step from 2 upward then runs against your pre-Scribe shape on first load. Migration failure is fail-closed, so a step that throws kicks the player rather than loading them with half-migrated data. If you adopt in place while already carrying a `Migrations` table, **step 2 itself must tolerate legacy input**. There is no step 1 to bridge in: keys below 2 are rejected outright at startup with `Scribe: Migrations keys must be integers >= 2`. `OnPlayerInit` cannot pre-bridge either, because it runs *after* the migration chain.
+
+Migration bodies also mutate the raw profile table, so a step that converts a stored legacy value into a [Roblox datatype field](./templates#roblox-datatype-fields) must pack it itself with [`Scribe.Datatypes.Pack`](/api/Scribe#Datatypes). Scribe scans the whole working clone once the chain finishes and treats any raw datatype it finds as `MIGRATION_FAIL`, which is fail-closed: a step that packs nine fields and misses one commits none of them, and every affected player is kicked on join.
 :::
 
 :::note Adding a field to a container element later
@@ -132,7 +130,7 @@ OnPlayerInit = function(player, data)
 end,
 ```
 
-Forget the `Pack` and the raw `CFrame` is flagged `PROFILE_UNPERSISTABLE` at load, and would fail the profile's next save. Once imported, `data.Placed[1].Cf.Get()` is a real `CFrame`, packed and unpacked for you from then on. Writing through the accessor tree instead of the raw table (as normal gameplay does) packs automatically, so this only comes up on the import path.
+Forget the `Pack` and the raw `CFrame` is flagged `PROFILE_UNPERSISTABLE` at load, and would fail the profile's next save. Once imported, `data.Placed[1].Cf.Get()` is a real `CFrame`, packed and unpacked for you from then on. Writing through the accessor tree instead of the raw table (as normal gameplay does) packs automatically, so this only comes up where you touch the raw table: `OnPlayerInit`, [`UpdateOffline`](/api/Server#UpdateOffline), and [`Migrations`](./lifecycle#migrations) bodies.
 
 ## Backfilling offline players
 
@@ -165,5 +163,5 @@ end
 
 - **Keep the legacy store readable** until you're confident. Don't delete old data the moment you cut over. The guard flag means a re-run is harmless.
 - **Convert shapes explicitly**: copy field by field into your Scribe template rather than assigning the whole old table, so the result matches your declarators. Nothing on the raw import path checks that for you: `OnPlayerInit` and [`Data.UpdateOffline`](/api/Server#UpdateOffline) mutate the profile table directly, so bounds, enum members, `MaxLength`, and `ArrayOf` / `DictOf` element shapes are all unenforced there, and a mismatch surfaces as a wrong-typed read later rather than an error at the write.
-- **Storability *is* checked.** Invalid UTF-8, a NaN/inf number, a table mixing array indices with string keys, or a raw Roblox datatype (see [above](#seeding-into-a-typed-container)) is reported as `PROFILE_UNPERSISTABLE` on load and refused outright by `UpdateOffline`.
-- **Dry-run first** with `ViewedUserId`, or against a throwaway `ProfileStoreIndex` seeded with copies, before touching production. `DontSave = true` is not a dry-run: it swaps in an in-memory mock store, so nothing you see there came from real data.
+- **Storability *is* checked.** Invalid UTF-8, a NaN/inf number, a table mixing array indices with string keys, or a raw Roblox datatype (see [above](#seeding-into-a-typed-container)) is reported as `PROFILE_UNPERSISTABLE` on load and refused outright by `UpdateOffline`. From inside a `Migrations` step the same value is `MIGRATION_FAIL` instead, which is fail-closed and kicks the player.
+- **Dry run first** with `Mode = "NoSave"` (add `TargetUserId = <id>` to pin one player), or against a throwaway `ProfileStoreIndex` seeded with copies, before touching production. `Mode = "Mock"` is not a dry run: it swaps in an in-memory mock store, so nothing you see there came from real data.

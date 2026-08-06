@@ -3,6 +3,10 @@
 
 local HttpService = game:GetService("HttpService")
 
+-- Datatypes requires nothing, so this cannot cycle back into Util. Used only to
+-- tell a raw-but-packable datatype apart from a genuinely unstorable value.
+local Datatypes = require(script.Parent.Datatypes)
+
 local Util = {}
 
 -- Deepest nesting a written value may have, counted from the root. Enforced at
@@ -45,6 +49,21 @@ export type Unpersistable = {
 function Util.findUnpersistable(value: any, path: { string | number }?, depth: number?): Unpersistable?
 	local at = path or {}
 	local d = depth or 0
+	-- Checked FIRST, on typeof rather than type: a Roblox datatype IS storable,
+	-- just not raw, and reaching this scan means it was written around the accessor
+	-- (OnPlayerInit, a migration, an offline draft) so nothing packed it. Ahead of
+	-- the type dispatch because these are userdata in Roblox but plain tables under
+	-- the headless shim, and recursing into one reports a confusing key-type error
+	-- instead of the real problem.
+	local typeName = typeof(value)
+	if Datatypes.IsSupported(typeName) then
+		return {
+			Path = at,
+			Kind = "Unserializable",
+			Detail = `a raw {typeName}, which only the accessor packs; write `
+				.. `Scribe.Datatypes.Pack("{typeName}", value) here, or store a plain number instead`,
+		}
+	end
 	local t = type(value)
 	if t == "string" then
 		if Util.isUtf8(value :: string) then
@@ -95,8 +114,9 @@ function Util.findUnpersistable(value: any, path: { string | number }?, depth: n
 		end
 		return nil
 	end
-	-- userdata (Instance, EnumItem), function, thread, native vector, etc.
-	return { Path = at, Kind = "Unserializable", Detail = `unsupported type "{typeof(value)}"` }
+	-- userdata (Instance), function, thread, native vector, etc. A packable
+	-- datatype never reaches here: it is caught by the typeof check at the top.
+	return { Path = at, Kind = "Unserializable", Detail = `unsupported type "{typeName}"` }
 end
 
 -- Deep copy of a plain data value. Buffers are mutable, so they are copied

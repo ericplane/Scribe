@@ -1,7 +1,3 @@
----
-sidebar_position: 8
----
-
 # Diagnostics
 
 Scribe is built to be observable in production. Every failure has a stable code, and even allows you to send logs off-platform (i.e. to your backend server).
@@ -31,7 +27,48 @@ Data.OnServiceStatus:Connect(function(status) ... end)    -- client
 
 ## Metrics and save state
 
-[`Scribe.GetMetrics()`](/api/Scribe#GetMetrics) exposes counters (saves, loads, receipt outcomes, queue depths, …) for developer/admin panels and load tests. Per-player save state ([`GetSaveInfo`](/api/Server#GetSaveInfo)) replicates to the owner for "Saved ✓ / Saving… / Unsaved changes" UI.
+[`Scribe.GetMetrics()`](/api/Scribe#GetMetrics) returns a flat snapshot for developer/admin panels and load tests. Plain counters and gauges are numbers; timing and size distributions are `{ Count, Average, Max }` records. Per-player save state ([`GetSaveInfo`](/api/Server#GetSaveInfo)) replicates to the owner for "Saved ✓ / Saving… / Unsaved changes" UI.
+
+The keys a panel usually wants:
+
+| Key | Kind | Meaning |
+| --- | --- | --- |
+| `ProfilesLoaded`, `ProfileLoadFailures` | counter | Profile loads attempted successfully vs failed |
+| `ActiveSessions` | gauge | Profiles currently held on this server |
+| `SavesOk`, `SavesFailed` | counter | Save outcomes |
+| `SaveDuration` | distribution | Seconds per save |
+| `ProfileSize` | distribution | Approximate bytes of the last saved payload, against the ~4 MB ceiling |
+| `WipeGuardTrips`, `Anomalies`, `SnapshotRootDropped` | counter | Integrity events; each one also fires [`OnAnomaly`](/api/Server#OnAnomaly) |
+| `MigrationsFailed` | counter | Migration steps that threw or produced unpersistable data. Logged as [`MIGRATION_FAIL`](./log-codes#persistence), with no `OnAnomaly` |
+| `HealthStatus` | gauge | `0` Healthy, `1` Degraded, `2` Outage |
+| `HealthFailures` | counter | Failed DataStore operations, plus one `HealthFailures_<Subsystem>` counter per subsystem (`ProfileStore`, `ProfileLoad`, `Leaderboards`, `OfflineRead`, …) |
+| `Handshakes`, `DiffFlushes`, `OpsQueued`, `OpsCoalesced`, `OpsSent` | counter | Replication throughput |
+| `BytesOutPerSend` | distribution | Bytes per outbound frame |
+| `MalformedFrames`, `InboundOversize` | counter | Rejected inbound frames, see the [Transport codes](./log-codes#transport) |
+| `CommandsReceived`, `CommandsHandled`, `CommandsRejected`, `CommandsRateLimited`, `CommandErrors` | counter | Command dispatch outcomes |
+| `ReceiptsReceived`, `ReceiptsGranted`, `ReceiptsRetried`, `ReceiptsDeclined`, `ReceiptsDuplicate` | counter | Receipt outcomes |
+| `GiftPrompts`, `GiftsDelivered`, `OwnershipCheckFailures` | counter | Monetization side |
+| `LbWrites`, `LbWriteFailures`, `LbReadFailures`, `LbQueueOverflow`, `LbScoreOutOfRange` | counter | Leaderboard traffic |
+| `LbQueueDepth` | gauge | Pending leaderboard writes |
+| `EconomyEvents`, `EconomyEventFailures` | counter | Analytics events emitted vs dropped |
+| `SchemaNodes` | gauge | Compiled schema size, useful as a template-growth canary |
+
+A key exists only once something has emitted it, so treat a missing key as zero rather than as an error. The counters are a **library-level singleton per context**: the server bundle owns everything above, while `Scribe.GetMetrics()` on the client reports only `DiffsApplied`, the count of diff frames the client mirror has applied.
+
+## Version and bundle skew
+
+[`Scribe.Version`](/api/Scribe#Version) is the library version string (`"1.3.1"`). Log it once on each side at startup, because server and client compile their schemas from the *same shared module*, and a stale copy on one side is the failure this catches:
+
+```lua
+print("Scribe", Scribe.Version)  -- run it from a server script and from a LocalScript
+```
+
+Skew shows up at the handshake, never as a wrong value. The server refuses to replicate to a mismatched client and logs one Warn:
+
+- [`PROTOCOL_MISMATCH`](./log-codes#replication): the wire layout differs, so two different Scribe versions are running.
+- [`SCHEMA_MISMATCH`](./log-codes#replication): same wire version, divergent templates, so the client derived a different schema hash.
+
+Both fail closed, so on that client `Data.WaitForData()` returns `false` after its timeout and every field stays at its template default. There is no client-side log for either, so the server log ring is where you look. Only a custom cross-place transport can produce this on vanilla Roblox, since a normal place ships one version of the shared module to both sides.
 
 ## Wipe guard
 

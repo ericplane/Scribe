@@ -78,10 +78,11 @@ nav:
   - Home: index.md
   - Guides:
       - Getting Started: getting-started.md
-      - Configuration: configuration.md
       - Templates & Declarators: templates.md
       - Replication & Visibility: visibility.md
+      - Commands & Requests: commands.md
       - Session Lifecycle: lifecycle.md
+      - Configuration: configuration.md
       - Monetization & Gifting: monetization.md
       - Economy Analytics: economy.md
       - Leaderboards: leaderboards.md

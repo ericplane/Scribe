@@ -1,7 +1,3 @@
----
-sidebar_position: 7
----
-
 # Economy Analytics
 
 Scribe owns your currency balances, which is half of what Roblox's economy analytics needs. So it emits the other half for you: any currency mutation you **tag** auto-fires `AnalyticsService:LogEconomyEvent`, with the currency name, the amount, and the post-transaction balance filled in from the value Scribe just wrote. You add the dimensions that only you know (transaction type, item, where it happened), and Scribe assembles the event.
@@ -22,7 +18,11 @@ Data[player].Gems.Decrement(10, {
 })
 ```
 
-That is the whole minimum. `Increment` logs a **Source** event, `Decrement` logs a **Sink**, the amount is the positive magnitude, and the ending balance is the value after the write. An **untagged** `Increment(50)` just writes the value and emits nothing, so instrumentation is always opt-in per call.
+That is the whole minimum. `Increment` logs a **Source** event, `Decrement` logs a **Sink**, the amount is the positive magnitude of the change that **actually landed**, and the ending balance is the value after the write. An **untagged** `Increment(50)` just writes the value and emits nothing, so instrumentation is always opt-in per call.
+
+:::note Clamped writes log what moved
+The amount is the effective delta, not what you asked for. `Coins.Decrement(50, meta)` against a balance of 30 on a field with `Min = 0` logs a Sink of **30**, and an `Increment` on a field already at `Max` logs **nothing at all**, because a zero-delta write emits no event. Dashboard totals therefore always match real balance movement, but they will not match your call sites if you rely on the field's bounds to do the clamping.
+:::
 
 :::note Enum or string
 `TransactionType` accepts an `Enum.AnalyticsEconomyTransactionType` (its `.Name` is extracted for you) or a plain string. Roblox groups the dashboard by the standard transaction-type names, so prefer the enum.
@@ -30,7 +30,25 @@ That is the whole minimum. `Increment` logs a **Source** event, `Decrement` logs
 
 ## Soft-currency purchases emit automatically
 
-You never tag [`Data.Purchase`](/api/Server#Purchase): the atomic soft-currency debit fires a **Sink** economy event on its own once the purchase commits. The currency is the `Cost.Path` field, the transaction type and item SKU both come from the purchase's `ItemId` (the transaction type falls back to `Category` when there is no `ItemId`; the SKU does not), and any custom fields the spent currency declares are filled from its `Resolve`. So a shop purchase is instrumented exactly like a manual `Decrement`, with nothing extra to wire up.
+You never tag [`Data.Purchase`](/api/Server#Purchase): the atomic soft-currency debit fires a **Sink** economy event on its own once the purchase commits. The currency is the `Cost.Path` field, the transaction type and item SKU both come from the purchase's `ItemId` (the transaction type falls back to `Category` when there is no `ItemId`; the SKU does not), and any custom fields the spent currency declares are filled from the shared **and** currency-level `Resolve`. So a shop purchase is instrumented exactly like a manual `Decrement`, with nothing extra to wire up. The only thing a purchase event cannot carry is a per-call `Fields` dimension, since there is no call site to put one on.
+
+## Robux grants do not emit
+
+That automatic path covers [`Data.Purchase`](/api/Server#Purchase) alone. A [product](./monetization#configuring-products-and-passes) `Grant` that credits currency is an ordinary write, so it logs nothing unless you tag it, and currency bought with Robux is usually a game's largest **Source** stream:
+
+```lua
+Products = {
+    Coins1000 = { Id = 111, Category = "Currency",
+        Grant = function(data)
+            data.Coins.Increment(1000, {
+                TransactionType = Enum.AnalyticsEconomyTransactionType.IAP,
+                ItemSku = "coins_1000",
+            })
+        end },
+},
+```
+
+A `Grant` runs inside a transaction, so this behaves like the section below: the event is held until the grant commits and dropped if the receipt rolls back.
 
 ## Rolled-back transactions emit nothing
 
@@ -49,6 +67,21 @@ Data[player].Tickets.Decrement(1, { TransactionType = "Raffle" })   -- currency 
 ```
 
 If a currency's display name differs from its field name, override it per currency with `Label` (below) or per call with `Currency`.
+
+## `Scribe.Big` currencies
+
+A tagged `Increment` or `Decrement` on a [`Scribe.Big`](./templates#big-numbers) field emits through the same path with no extra setup. Two things to know.
+
+**The reported numbers are doubles.** `LogEconomyEvent` takes plain numbers, so the amount and ending balance are converted out of the big at that boundary. Past about 15 significant digits they round, and past `1.8e308` they saturate to `inf`, which is precisely the range a big currency exists for. The event still reaches the dashboard; the figure on it is approximate. Scribe prefers that over a value that would throw inside the analytics call and be swallowed.
+
+**`Multiply` and `Divide` cannot be tagged.** Their signature is `(factor, replicate: boolean?)`, with no meta slot. A meta table passed there is read as the `replicate` argument and quietly ignored, so you get no error and no event. Since `Multiply` is the idiomatic big operation, a multiplier grant you want instrumented has to be expressed as an `Increment` of the difference:
+
+```lua
+local coins = data.Coins
+coins.Increment(coins.Get() * 0.15, {   -- a 15% bonus, instrumented
+    TransactionType = Enum.AnalyticsEconomyTransactionType.TimedReward,
+})
+```
 
 ## Custom fields
 
@@ -128,7 +161,7 @@ Data[player].Money.Increment(math.abs(amount), {
 })
 ```
 
-The clamp at zero is handled by the field's `Min`, and any UI or badge logic that used to run alongside the manual analytics call moves to an [`Observe`](/api/Value#Observe) on the value, which Scribe already replicates to the client.
+The clamp at zero is handled by the field's `Min`. That is also where the [clamped-amount rule](#tagging-a-mutation) starts to matter: once the bounds do the clamping, a spend of 50 against a balance of 30 logs 30, where a hand-rolled helper that clamped first would have logged whichever number it chose to pass along. Any UI or badge logic that used to run alongside the manual analytics call moves to an [`Observe`](/api/Value#Observe) on the value, which Scribe already replicates to the client.
 
 ## Fail-safe by design
 

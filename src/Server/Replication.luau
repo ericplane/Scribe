@@ -269,7 +269,7 @@ function Replication.new(ctx: any)
 		local rootChildren = compiled.Root.Children :: { [string]: Template.SchemaNode }
 		for _, rootKey in compiled.RootOrder do
 			local rootSchema = rootChildren[rootKey]
-			local store = if rootSchema.Visibility == "Session" then entry.SessionStore else entry.LiveData
+			local store = if not rootSchema.Persist then entry.SessionStore else entry.LiveData
 			local value = if store then store[rootKey] else nil
 			if value ~= nil then
 				-- CloneVisible strips ServerOnly subtrees and returns nil for
@@ -289,8 +289,12 @@ function Replication.new(ctx: any)
 		local rootChildren = compiled.Root.Children :: { [string]: Template.SchemaNode }
 		for _, rootKey in compiled.RootOrder do
 			local rootSchema = rootChildren[rootKey]
-			if rootSchema.Visibility == "Shared" and entry.LiveData then
-				local value = entry.LiveData[rootKey]
+			-- Same store choice as ownerSnapshotOps: a Shared root that is also
+			-- Session lives in the session store, so reading LiveData unconditionally
+			-- broadcast its default and dropped every value ever written to it.
+			local store = if not rootSchema.Persist then entry.SessionStore else entry.LiveData
+			if rootSchema.Visibility == "Shared" and store then
+				local value = store[rootKey]
 				if value ~= nil then
 					-- CloneVisible strips ServerOnly subtrees nested under the
 					-- Shared root; a plain deepClone would broadcast them.

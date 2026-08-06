@@ -1402,6 +1402,10 @@ Scribe.Version = require(script.Internal.Version)
 	The field is absent from the **client's** accessor type, so reading it there
 	is a type error rather than a `nil` at runtime. On the server it reads like
 	any other field.
+
+	Combines with [Scribe.Session] for runtime state only the server sees:
+	`Scribe.ServerOnly(Scribe.Session(v))`. Combining it with [Scribe.Shared] is
+	a startup error, since a field has one replication target, not two.
 ]=]
 function Scribe.ServerOnly<T>(value: T): ServerOnly<T>
 	return Marker.make("ServerOnly", value) :: any
@@ -1415,6 +1419,10 @@ end
 	@return T
 	Marks a **root** field shared: it replicates to *every* client (not just the
 	owner), for public info like a display name or team.
+
+	Combines with [Scribe.Session] for runtime state everyone sees and nothing
+	saves: `Scribe.Shared(Scribe.Session(v))`. Combining it with
+	[Scribe.ServerOnly] is a startup error.
 ]=]
 function Scribe.Shared<T>(value: T): T
 	return Marker.make("Shared", value) :: any
@@ -1426,9 +1434,13 @@ end
 	@function Session
 	@param value T
 	@return T
-	Marks a **root** field session-only: replicated to the owner but never
-	persisted. Ideal for runtime state like `InCombat` that should reset on
-	rejoin.
+	Marks a **root** field session-only: never persisted, and replicated to the
+	owner unless another wrapper says otherwise. Ideal for runtime state like
+	`InCombat` that should reset on rejoin.
+
+	Saving and replication are independent, so this composes with exactly one of
+	[Scribe.ServerOnly] (nobody sees it) or [Scribe.Shared] (everyone does), in
+	either order. Doubling it up is a startup error.
 ]=]
 function Scribe.Session<T>(value: T): T
 	return Marker.make("Session", value) :: any
@@ -1496,10 +1508,12 @@ end
 	infinity past the double range). `Set` and the arithmetic methods all accept a
 	plain number, a numeric string like `"1.5e100"`, or another big value.
 
-	`+`, `-`, `*`, `/` and the comparisons also accept a plain number or a numeric
-	string on either side, so `Get() + 5` and `5 + Get()` both work. `==` is the one
-	exception: Luau only consults it when BOTH sides are tables, so `Get() == 5` is
-	always false. Compare against another big, or against `:ToNumber()`.
+	The ARITHMETIC operators accept a plain number or a numeric string on either
+	side, so `Get() + 5` and `5 + Get()` both work. The COMPARISONS do not: Luau
+	picks `<` and `<=` by metatable identity, so `Get() < 2000` throws "attempt to
+	compare table < number". `==` fails more quietly, since Luau only consults it
+	when BOTH sides are tables, making `Get() == 5` always false. Two big values
+	compare directly; against a constant, go through `:ToNumber()`.
 
 	A big field **can** be a leaderboard stat. Scribe packs it exponent-major into the
 	OrderedDataStore key, which preserves the ordering exactly and breaks ties on the

@@ -17,7 +17,7 @@
 --    every write goes through the public server Value API — validation,
 --    bounds, logging and replication apply. The hook can never do something
 --    game code couldn't.
---  * Receipt injection additionally requires UseMock.
+--  * Receipt injection additionally requires the resolved Mode be "Mock".
 --
 -- Interception (op/bandwidth wrapping, log sink) installs at Attach — game
 -- boot — so ops that happen before the plugin window opens are recorded into
@@ -447,7 +447,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 				Blocked = entry.Blocked,
 				HandshakeReady = entry.HandshakeReady,
 				QueueDepth = #entry.Queue,
-				Mock = options.UseMock == true or options.DontSave == true,
+				Mock = ctx.Persistence.Mode == "Mock",
 			})
 		end
 		table.sort(roster, function(a: any, b: any)
@@ -804,8 +804,11 @@ function DebugHook.Attach(Data: any, ctx: any)
 			ScribeVersion = scribeVersion,
 			TemplateHash = compiled.Hash,
 			NodeCount = compiled.NodeCount,
-			UseMock = options.UseMock == true,
-			DontSave = options.DontSave == true,
+			-- Derived from the RESOLVED mode, so a Mode = "Mock" bundle reports as
+			-- mocked. Mode is sent alongside for a plugin that wants the exact value.
+			Mode = ctx.Persistence.Mode,
+			UseMock = ctx.Persistence.Mode == "Mock",
+			DontSave = ctx.Persistence.Mode == "Mock",
 			Clock = os.clock(),
 			WallClock = os.time(),
 			WritesEnabled = writesEnabled,
@@ -1166,8 +1169,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 		end
 		return {
 			Ok = true,
-			UseMock = options.UseMock == true,
-			DontSave = options.DontSave == true,
+			Mode = ctx.Persistence.Mode,
+			UseMock = ctx.Persistence.Mode == "Mock",
+			DontSave = ctx.Persistence.Mode == "Mock",
 			-- Where profiles live, so the plugin's Production panel can lock
 			-- its target to the real store instead of asking the user.
 			ProfileStoreIndex = options.ProfileStoreIndex or "Default",
@@ -1260,10 +1264,12 @@ function DebugHook.Attach(Data: any, ctx: any)
 		if gate then
 			return { Ok = false, Error = gate }
 		end
-		if options.UseMock ~= true then
+		-- The resolved mode, not the legacy flag: Mode never reaches options, so
+		-- gating on UseMock refused injection on a Mode = "Mock" bundle.
+		if ctx.Persistence.Mode ~= "Mock" then
 			return {
 				Ok = false,
-				Error = "receipt injection requires UseMock — matching the core's testing posture, no real store is ever touched",
+				Error = 'receipt injection requires Mode = "Mock" (or the legacy UseMock), matching the core\'s testing posture: no real store is ever touched',
 			}
 		end
 		local receipt = args.ReceiptInfo

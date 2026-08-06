@@ -1,7 +1,3 @@
----
-sidebar_position: 2
----
-
 # Templates & Declarators
 
 Your **template** is a plain table describing the shape and default values of a player's data. Scribe compiles it once into a schema that drives typing, validation, wire compression, and persistence.
@@ -32,12 +28,13 @@ A plain value (`Wins = 0`, `Settings = { ... }`) is the simplest way to declare 
 | --- | --- |
 | [`Scribe.Int(default, { Min, Max })`](/api/Scribe#Int) | Integers; bounded ints pack smaller |
 | [`Scribe.Number(default, { Min, Max })`](/api/Scribe#Number) | Floating-point values |
+| [`Scribe.Big(default, { Min, Max })`](/api/Scribe#Big) | Numbers past `2^53`, for idle and simulator currencies ([big numbers](#big-numbers)) |
 | [`Scribe.String(default, { MaxLength })`](/api/Scribe#String) | Strings, optionally length-capped |
 | [`Scribe.Enum(default, members)`](/api/Scribe#Enum) | A fixed set of string values (packs to one byte) |
 | [`Scribe.Timed(default)`](/api/Scribe#Timed) | Fields that expire (boosters, buffs) |
 | [`Scribe.Flags(members)`](/api/Scribe#Flags) | A fixed set of named booleans, up to 32, in one field |
 | [`Scribe.Dynamic(factory)`](/api/Scribe#Dynamic) | A default computed per profile (creation timestamps, seeds) |
-| [`Scribe.ArrayOf(shape, { MaxItems })`](/api/Scribe#ArrayOf) | A list whose entries have a schema ([typed containers](#typed-containers)) |
+| [`Scribe.ArrayOf(shape, { MaxItems, Evict })`](/api/Scribe#ArrayOf) | A list whose entries have a schema ([typed containers](#typed-containers)), optionally a [rolling window](#rolling-windows) |
 | [`Scribe.SetOf(element, { MaxItems })`](/api/Scribe#SetOf) | A collection of unique entries: membership, not order |
 | [`Scribe.DictOf(shape, { MaxKeys, MaxKeyLength })`](/api/Scribe#DictOf) | A string-keyed map whose values have a schema |
 | [`Scribe.MapOf(keyType, value, opts)`](/api/Scribe#MapOf) | A map whose **key** type is declared (`"integer"` or `"string"`) |
@@ -50,6 +47,15 @@ On the client you read data as `Data.Coins`, so a **root** field sharing a name 
 :::
 
 Declaring an absent field as `nil :: string?` looks like it works, but a `nil` value puts no key in the table literal at all, so the compiler never sees the field: it gets no type metadata, no bounds, and no packing. Use [`Scribe.Optional`](/api/Scribe#optional) instead.
+
+`Scribe.Enum` restricts a string field to a fixed set of members, and its **default must be one of them**. An empty string standing in for "no value yet" is a template error naming the field:
+
+```lua
+Status = Scribe.Enum("Idle", { "Idle", "Running", "Done" }),  -- OK
+Status = Scribe.Enum("", { "Idle", "Running", "Done" }),      -- error: enum default must be one of its members
+```
+
+That holds under `Scribe.Optional` too. The default there is only a type-and-validation sample, never seeded, so an enum field that should read `nil` until it is written is still spelled `Scribe.Optional(Scribe.Enum("Idle", { "Idle", "Running", "Done" }))`.
 
 ## Dynamic (per-profile) defaults
 
@@ -147,7 +153,9 @@ data.Unlocked.Count()
 
 `Add` on a value already present and `Remove` on one that is absent both return `false` and do nothing: no write, no replication op, no `Changed`. Entries are kept deduplicated and in sorted order, so two profiles holding the same members hold the same table.
 
-Unlike [`Scribe.ArrayOf`](#typed-containers) there is no `Insert` and no index-based `Remove`, since a set has no positions. `MaxItems` caps membership; `Evict` does not apply, because there is no oldest entry to drop.
+The element has to be a **scalar**: `Scribe.Int`, `Scribe.Number`, `Scribe.String`, or `Scribe.Enum`. Members are compared by value and stored in a sorted canonical order, and neither is meaningful for a record, so a record shape is refused by the declarator itself and anything else (a `Scribe.Big`, a datatype, a nested container) at compile time. When entries need structure, use [`Scribe.ArrayOf`](#typed-containers), or keep a scalar id in the set and the rest in a sibling `Scribe.DictOf` keyed by that id.
+
+Unlike [`Scribe.ArrayOf`](#typed-containers) there is no `Insert` and no index-based `Remove`, since a set has no positions. `MaxItems` caps membership; [`Evict`](#rolling-windows) does not apply, because there is no oldest entry to drop. `Clear` empties the set.
 
 ### Sets of named booleans
 
@@ -158,9 +166,13 @@ Tutorial = Scribe.Flags({ "Movement", "Combat", "Trading" }),
 
 data.Tutorial.Enable("Combat")
 data.Tutorial.Has("Combat")     --> true
-data.Tutorial.Toggle("Trading")
+data.Tutorial.Toggle("Trading") --> true  (the new state)
 data.Tutorial.Get()             --> { "Combat", "Trading" }
+data.Tutorial.Disable("Combat") -- now { "Trading" }
+data.Tutorial.Clear()           -- all off
 ```
+
+`Enable`, `Disable`, `Toggle`, and `Has` each take a **member name**; `Clear` takes none and turns every flag off. Note that the [`Value`](/api/Value) page documents `Toggle` in its plain-boolean form, which flips a boolean field and takes no argument.
 
 Compared with three sibling booleans it is one write and one `Changed` instead of one per flag, the valid names are declared rather than implied by whatever strings the code passes, and it packs to a bitmask on the wire. Enabling a name that is not a member is an error, not a silent no-op, and setting a flag to what it already is writes nothing at all.
 
@@ -233,6 +245,82 @@ end
 
 Use `Scribe.ServerData<T>` and `Scribe.ClientData<T>` for the whole `Data` object, and `Scribe.PlayerData<T>` for one player's tree.
 
+## Big numbers
+
+A plain Luau number stops being exact past `2^53` and stops existing past `1.8e308`. For an idle or simulator currency that runs off that scale, use [`Scribe.Big`](/api/Scribe#Big):
+
+```lua
+Coins = Scribe.Big(0, { Min = 0 }),
+
+data.Coins.Set("1.5e100")             -- a numeric string, since 1.5e100 is fine but 1e400 is not
+data.Coins.Increment("2e99")          -- 1.7e100
+data.Coins.Multiply(1.15)             -- 1.955e100
+data.Coins.Get():Short()              --> "1.955e100"
+```
+
+This trades precision for range **on purpose**. A big carries about 15 significant digits at any magnitude, so `1e20 + 1 == 1e20`. That is the right trade for a currency whose magnitude is the whole point, and the wrong one for anything audited: use [`Scribe.Int`](/api/Scribe#Int) when every digit has to be exact.
+
+`Set`, `Increment`, `Decrement`, `Multiply`, and `Divide` all accept a plain number, a numeric string like `"1.5e100"`, or another big value. A bound past `1.8e308` has to be a string too, because a larger literal is already `math.huge`:
+
+```lua
+Prestige = Scribe.Big(0, { Min = 0, Max = "1e600" }),
+```
+
+### Working with the value
+
+`Get()` returns an object, not a number. It supports `+`, `-`, `*`, `/`, `tostring`, `:Short()`, and `:ToNumber()`, and exposes its mantissa and exponent as `.M` and `.E`.
+
+```lua
+local coins = data.Coins.Get()
+coins + 5          -- fine, and 5 + coins works too
+coins * 2          -- fine
+tostring(coins)    --> "1.5e100"
+coins:ToNumber()   -- lossy, and saturates to inf past 1.8e308
+coins.M, coins.E   --> 1.5, 100
+```
+
+:::caution Comparisons need a big on **both** sides
+Luau picks `<` and `<=` by metatable identity, so mixing a big with a plain number throws *"attempt to compare table < number"*. `==` is worse: Luau only consults it when both sides are tables, so `Get() == 5` is silently `false` rather than an error.
+
+Two big fields compare directly. To test against a constant, convert first:
+
+```lua
+if data.Coins.Get() < data.Bank.Get() then end   -- OK, both are bigs
+if data.Coins.Get() < 2000 then end              -- THROWS
+if data.Coins.Get():ToNumber() < 2000 then end   -- OK
+if data.Coins.Get() == 5 then end                -- always false, never fires
+if data.Coins.Get():ToNumber() == 5 then end     -- OK
+```
+
+There is no public constructor for a standalone big, so a threshold comparison goes through `:ToNumber()`. That is exact while the threshold is inside the double range, which covers any constant you can write as a literal.
+:::
+
+### Displaying it
+
+`:Short()` formats for UI, with an optional decimal count (default 2). It uses letter suffixes while it can and falls back to scientific notation once it runs out:
+
+| Value | `:Short()` | `:Short(0)` | `:Short(3)` |
+| --- | --- | --- | --- |
+| `70` | `"70"` | `"70"` | `"70"` |
+| `1500` | `"1.50K"` | `"2K"` | `"1.500K"` |
+| `1e9` | `"1.00B"` | `"1B"` | `"1.000B"` |
+| `1e40` | `"10.00DDc"` | `"10DDc"` | `"10.000DDc"` |
+| `1.5e100` | `"1.5e100"` | `"1.5e100"` | `"1.5e100"` |
+
+Note `Short(0)` rounds rather than truncates, so `1500` shows as `"2K"`.
+
+### Bounds
+
+`Min` and `Max` behave like they do on `Scribe.Int`, which means they follow [`BoundsPolicy`](./configuration): the default `"Clamp"` pins the value into range and fires an anomaly, while `"Reject"` throws at the write site. Under the default, `Decrement`ing a `{ Min = 0 }` field below zero leaves it at `0` instead of erroring, so a "can they afford it?" check is still your job:
+
+```lua
+if data.Coins.Get():ToNumber() >= price then
+    data.Coins.Decrement(price, { Source = "Shop" })
+end
+```
+
+A big field can also be a leaderboard stat, ranked exactly rather than by a lossy `number`. That has its own rules (non-negative values, `SigFigs`, no `Scale`), covered in [Leaderboards](./leaderboards#ranking-a-scribebig).
+
 ## Timed fields
 
 A `Scribe.Timed` field auto-clears back to its default when its timer lapses, firing `Changed`. A client `Observe` already covers "the booster ended":
@@ -245,6 +333,8 @@ data.XPBooster.SetTimed(true, 3600)  -- true for one hour
 data.XPBooster.ExtendTimed(1800)     -- add 30 minutes
 local active, remaining = data.XPBooster.Active()
 ```
+
+`Scribe.Timed` wraps a **single leaf value**: a number, string, boolean, or a datatype declarator. A table is refused at startup with "Scribe.Timed only wraps leaf values", and a container declarator with "Scribe.Timed cannot wrap Scribe.ArrayOf". So a bundle of buff values that expire together (`Scribe.Timed({ Damage = 2, Speed = 1.5 })`) is not a template you can write: declare the fields normally and time a single flag beside them, or keep an expiry timestamp on the record and read it yourself.
 
 Two behaviors to know:
 
@@ -334,7 +424,7 @@ Putting a declarator inside a plain array literal is a template error for the sa
 
 **`DictOf`** is for string-keyed maps. A key exists only once something writes it, so `Get()` on an unwritten key is `nil` and `Count()` excludes it, and the element default is what that first write starts from. Any string is a valid key, so there is no typo protection on the key itself: when the key set is fixed and known, declare ordinary fields instead.
 
-They nest freely, in any combination and to any depth:
+They nest freely, in any combination, up to Scribe's 24-level write depth. That budget is counted from the template root, so the levels above a container come out of it too, and an element shape that pushes past it is refused at startup with an error naming the field:
 
 ```lua
 Plots = Scribe.ArrayOf({
@@ -344,6 +434,23 @@ Plots = Scribe.ArrayOf({
 ```
 
 The element shape can also be a single declarator rather than a record: `Scribe.ArrayOf(Scribe.CFrame(CFrame.new()))` is an array of CFrames.
+
+### Rolling windows
+
+By default an `Insert` at `MaxItems` is an error. `Evict` turns the cap into a rolling window instead: the insert drops an entry to make room. That is what you want for a bounded history like recent matches or a kill feed. It takes `"Front"` or `"Back"`, and it requires `MaxItems`, since a bare `Evict` has nothing to drop from.
+
+```lua
+RecentMatches = Scribe.ArrayOf({
+    MapId = Scribe.String("", { MaxLength = 32 }),
+    Score = Scribe.Int(0),
+}, { MaxItems = 10, Evict = "Front" }),
+```
+
+`Evict` names the **end to drop from**, not an age, because which end holds the oldest entry depends on how you insert. Append with `Insert(item)` and the oldest sits at the front, so you want `"Front"`; prepend with `Insert(item, 1)` and the oldest sits at the back, so you want `"Back"`. Picking the end your inserts do not target churns that end while the other freezes.
+
+The drop is a real removal, not a quiet truncation: it fires `OnRemove` and replicates, so a listener sees what was dropped and client mirrors stay the right length. An array that is already over cap (a lowered `MaxItems`, or entries written before the cap existed) is trimmed all the way down on the next `Insert` rather than one entry per write.
+
+`Evict` is an `ArrayOf` option only. `DictOf`, `MapOf`, and `SetOf` refuse it as an unknown option, since none of them has a positional end to drop from.
 
 ### Element rules
 
@@ -357,7 +464,7 @@ Note = Scribe.Optional(Scribe.String("", { MaxLength = 64 })),
 
 An optional field has no default at all: it is never seeded or filled, and reads `nil` until written.
 
-**Caps reject, they do not truncate or evict.** `MaxItems`, `MaxKeys`, and `MaxKeyLength` turn unbounded growth into an error naming the field, rather than a profile that quietly grows until it can no longer save.
+**Caps reject by default.** `MaxItems`, `MaxKeys`, and `MaxKeyLength` turn unbounded growth into an error naming the field, rather than a profile that quietly grows until it can no longer save. The one opt-in is [`Evict`](#rolling-windows) on an `ArrayOf`, which makes `MaxItems` a rolling window instead.
 
 **Searching compares by value.** `Has`, `Find`, and `RemoveValue` match declared elements structurally, so the value `Get()` handed you finds the stored one:
 

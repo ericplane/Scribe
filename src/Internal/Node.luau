@@ -135,7 +135,7 @@ local function storeFor(tree: Tree, rootKey: string | number): { [string]: any }
 	local children = tree.Compiled.Root.Children
 	if type(rootKey) == "string" and children then
 		local rootSchema = children[rootKey]
-		if rootSchema and rootSchema.Visibility == "Session" then
+		if rootSchema and not rootSchema.Persist then
 			return tree.Params.Stores.Session
 		end
 	end

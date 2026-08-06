@@ -1,7 +1,3 @@
----
-sidebar_position: 10
----
-
 # Scribe Studio (Companion Plugin)
 
 **Scribe Studio** is a Roblox Studio plugin that renders Scribe's diagnostics layer as a live, interactive dock. It turns "what is my data actually doing" into something you can watch and drive: inspect every player's session, replay the change feed, simulate outages, profile bandwidth, invoke commands, lint your template, and, with an explicit opt-in, edit live production profiles.
@@ -25,9 +21,9 @@ Editing real data is a serious capability, so the plugin is built to be trustwor
 | **Diagnostics** | Health machine with transition history, per-second metric graphs, the log ring buffer with filters, **simulation buttons** (Degraded / Outage / load failure / session steal), and a **flight recorder** to save whole sessions and replay them in edit mode. | Play |
 | **Bandwidth** | Real per-flush byte counts over time, chattiest paths by field with wire widths, and advisories. | Play |
 | **Commands** | Every `Data.Command` registration with an arg form generated from its spec. Invoke as any session player, see returns / errors / duration. | Play |
-| **Boards** | Leaderboard cached entries, per-player ranks, write-queue depth, refresh-from-store, and a gated queue flush. | Play |
+| **Boards** | Leaderboard cached entries, per-player ranks, write-queue depth, refresh-from-store, and a gated queue flush. Under `Mode = "Mock"` or `"NoSave"` the boards are backed by mock OrderedDataStores, so a flush reaches nothing real. | Play |
 | **Schema** | Runtime-derived schema browser (field IDs, types, wire widths, visibility) plus edit-mode **template lint** with open-at-line. | Play / Edit |
-| **Monetization** | Grant / revoke perks, gift state with TTL countdowns, gift credits, purchase logs, and **receipt injection** with edge-case presets. Mock mode only, zero Robux spent. | Play |
+| **Monetization** | Grant / revoke perks, gift state with TTL countdowns, gift credits, purchase logs, and **receipt injection** with edge-case presets. Injection requires `Mode = "Mock"`; zero Robux spent. | Play |
 | **Production** | Live profile tooling over Studio's DataStore access: lookup, version history + diff + **restore**, in-place **profile editing**, GDPR export, and erase. | Edit |
 | **Settings** | Per-session write & attribution toggles, stream buffer caps, template module path. | N/A |
 
@@ -39,6 +35,10 @@ Editing real data is a serious capability, so the plugin is built to be trustwor
 4. For the `script:line` column in Changes, flip **Capture source attribution** (off by default because it costs a stack capture per write).
 
 In a multi-client test the full toolset lives in the **server** view; switching to the **client** view attaches to Scribe's read-only client hook, so you can confirm exactly what a client received.
+
+:::note Receipt injection needs mock persistence
+Beyond **Enable writes**, injection checks the bundle's *resolved* [persistence mode](./configuration#persistence-mode) and runs only under `Mode = "Mock"`. The legacy `UseMock = true` and `DontSave = true` flags resolve to that same mode (unless `ViewedUserId` is set alongside them, which resolves to `NoSave`), so an older config still works. On a `Live` or `NoSave` bundle every injection is refused, with an error naming `Mode = "Mock"` as the requirement. That is what keeps a real store out of reach.
+:::
 
 ## Editing production data
 

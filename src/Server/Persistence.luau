@@ -831,8 +831,8 @@ function Persistence.new(ctx: any)
 			IsServer = true,
 			Label = entry.Player.Name,
 			OnOp = function(op, schema)
-				local visibility = if schema then schema.Visibility else Template.VisibilityOf(compiled, op.Path)
-				if visibility ~= "Session" and not entry.SaveInfo.Dirty then
+				local persists = if schema then schema.Persist else Template.PersistOf(compiled, op.Path)
+				if persists and not entry.SaveInfo.Dirty then
 					entry.SaveInfo.Dirty = true
 					task.defer(function()
 						if entry.Tree and not entry.Tree.Dead and entry.SaveInfo.Dirty then

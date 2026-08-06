@@ -64,7 +64,10 @@ function TestCtx.make(
 		ProfileStore = fake,
 		ProfileStoreIndex = "Default", -- required; keeps persisted keys "Default/PLAYER_<id>"
 		ProfileKeyPrefix = "PLAYER_",
-		UseMock = true, -- keeps leaderboards on the in-memory store
+		-- Legacy flag on purpose, NOT Mode: the AuditFixes specs assert on legacy
+		-- resolution, which only runs when Mode is absent. It resolves to Mode
+		-- "Mock", so profiles and leaderboards both stay on in-memory stores.
+		UseMock = true,
 		OwnReceipts = false, -- never bind the real MarketplaceService.ProcessReceipt
 		KickOnSessionEnd = false,
 		LogLevel = "Fatal",

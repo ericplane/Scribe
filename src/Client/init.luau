@@ -411,10 +411,12 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			end
 			return false, "edit-mode"
 		end
+		-- No transport check here: waitForLoaded only returns once an Init frame
+		-- arrived, which requires the transport. Edit mode returns above instead,
+		-- and if Resolve throws, loaded never flips and this blocks rather than
+		-- falling through. A nil transport would still be caught by the pcall
+		-- around SendToServer below, surfacing as "send-failed".
 		waitForLoaded()
-		if not transport then
-			return false, "no-transport"
-		end
 		nextCorrelation = (nextCorrelation + 1) % 4294967296
 		local correlation = nextCorrelation
 		local args = table.pack(...)
@@ -533,6 +535,10 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@return { [string]: any }?
 		Reads another player's `Scribe.Shared` roots (public info replicated to
 		everyone), or `nil` if not yet received.
+
+		Never returns the **local** player's own roots: the server broadcasts a
+		player's Shared data to everyone except that player, so `nil` there is
+		permanent rather than pending. Read your own through the ordinary accessor.
 	]=]
 	function Data.GetShared(playerOrUserId: Player | number): { [string]: any }?
 		local userId = if typeof(playerOrUserId) == "Instance"
@@ -850,7 +856,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@tag Edit Mode
 		@client
 		@param values { [string]: any }?
-		@param scribeState { Perks: { string }?, GiftCredits: { [string]: number }?, Leaderboards: { [string]: { LeaderboardEntry } }? }?
+		@param scribeState { Perks: { string }?, GiftCredits: { [string]: number }?, PurchaseLogs: { Robux: { any }?, InGame: { any }? }?, Leaderboards: { [string]: { LeaderboardEntry } }? }?
 		Seeds mock data for a storybook / edit mode. **Errors outside edit mode.**
 		Use it to render Scribe-backed components with realistic state.
 

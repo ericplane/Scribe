@@ -124,7 +124,13 @@ end
 function Leaderboards.new(ctx: any)
 	local self = {} :: any
 	local options = ctx.Options
-	local useMock: boolean = options.UseMock == true or options.DontSave == true
+	-- Read the RESOLVED mode, not the legacy flags. Persistence resolves Mode into
+	-- its own fields and never writes it back into options, so reading UseMock here
+	-- meant a Mode = "Mock" bundle still hit real OrderedDataStores. NoSave mocks
+	-- too: it promises nothing can be written back, and a board write is a write.
+	-- Persistence is built before Leaderboards, so Mode is set by now.
+	local mode: string = ctx.Persistence.Mode
+	local useMock: boolean = mode == "Mock" or mode == "NoSave"
 
 	local boards: { [string]: Board } = {}
 	local storeCache: { [string]: any } = {}
@@ -188,6 +194,30 @@ function Leaderboards.new(ctx: any)
 			error(
 				`Scribe: leaderboard "{name}" Stat "{config.Stat}": `
 					.. `no declared field "{tostring(statPath[#statPath])}"`,
+				0
+			)
+		end
+		-- A board's entries live in an OrderedDataStore that outlives the session,
+		-- but a Scribe.Session field is rebuilt from its default every session and
+		-- is never in LiveData, which is where the refresh cycle reads scores from.
+		-- The path resolves, so nothing downstream complains: the board just stays
+		-- empty forever. Refuse at boot instead.
+		if walkNode.Persist == false then
+			error(
+				`Scribe: leaderboard "{name}" Stat "{config.Stat}" is a Scribe.Session field, which never `
+					.. "persists and resets every session, so there is nothing for a board to rank",
+				0
+			)
+		end
+		-- The score becomes the OrderedDataStore key, so a non-numeric stat has
+		-- nothing to rank. The refresh cycle already drops it, silently, leaving an
+		-- empty board and no error anywhere. "any" is a dynamic subtree whose type
+		-- is unknowable at boot, so it stays allowed.
+		local statType = walkNode.ValueType
+		if statType ~= "number" and statType ~= "int" and statType ~= "big" and statType ~= "any" then
+			error(
+				`Scribe: leaderboard "{name}" Stat "{config.Stat}" is a {tostring(statType)} field; a Stat must `
+					.. "resolve to a number, a Scribe.Int, or a Scribe.Big",
 				0
 			)
 		end

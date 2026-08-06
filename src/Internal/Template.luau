@@ -10,7 +10,7 @@ local Marker = require(script.Parent.Marker)
 local Big = require(script.Parent.Big)
 local Datatypes = require(script.Parent.Datatypes)
 
-export type Visibility = "Replicated" | "ServerOnly" | "Shared" | "Session"
+export type Visibility = "Replicated" | "ServerOnly" | "Shared"
 
 export type SchemaNode = {
 	Id: number?, -- nil for dynamic (any) pseudo-nodes
@@ -29,7 +29,8 @@ export type SchemaNode = {
 		| "table"
 		| "any",
 	Datatype: string?, -- typeof() name when ValueType == "datatype"
-	Visibility: Visibility,
+	Visibility: Visibility, -- who receives diffs
+	Persist: boolean, -- false for a Scribe.Session subtree; orthogonal to Visibility
 	Timed: boolean,
 	Min: number?,
 	Max: number?,
@@ -286,6 +287,7 @@ local function buildNode(
 	rawValue: any,
 	path: { string },
 	inheritedVisibility: Visibility,
+	inheritedPersist: boolean,
 	parent: SchemaNode?
 ): SchemaNode
 	-- A field name is a persisted JSON object key. Reject invalid UTF-8 at compile
@@ -297,6 +299,13 @@ local function buildNode(
 	end
 
 	local visibility: Visibility = inheritedVisibility
+	local persist: boolean = inheritedPersist
+	-- Markers seen on THIS node, tracked separately from the inherited values so a
+	-- nested ServerOnly under a ServerOnly parent is still allowed. Replication and
+	-- persistence are independent axes: Session says "never saves", ServerOnly and
+	-- Shared say "who receives diffs". One of each combines; two of the same does not.
+	local replicationSeen: string? = nil
+	local sessionSeen = false
 	local timed = false
 	local meta: Marker.Meta? = nil
 	local valueType: string? = nil
@@ -312,9 +321,29 @@ local function buildNode(
 		if kind == nil then
 			break
 		end
-		if kind == "ServerOnly" or kind == "Shared" or kind == "Session" then
-			if (kind == "Shared" or kind == "Session") and #path > 1 then
-				compileError(path, `Scribe.{kind} is only supported on root fields`)
+		if kind == "Session" then
+			if sessionSeen then
+				compileError(path, "Scribe.Session is already applied to this field")
+			end
+			sessionSeen = true
+			if #path > 1 then
+				compileError(path, "Scribe.Session is only supported on root fields")
+			end
+			persist = false
+		elseif kind == "ServerOnly" or kind == "Shared" then
+			-- A field has ONE replication target, so these two cannot both apply.
+			-- Letting the inner win silently made Scribe.Shared(Scribe.ServerOnly(x))
+			-- broadcast a field the outer wrapper says nobody should receive.
+			if replicationSeen ~= nil then
+				compileError(
+					path,
+					`Scribe.{replicationSeen} cannot wrap Scribe.{kind}: a field has one replication target, `
+						.. `not two. Combine either one with Scribe.Session instead, which sets whether it saves.`
+				)
+			end
+			replicationSeen = kind
+			if kind == "Shared" and #path > 1 then
+				compileError(path, "Scribe.Shared is only supported on root fields")
 			end
 			visibility = kind :: Visibility
 		elseif kind == "Timed" then
@@ -367,7 +396,7 @@ local function buildNode(
 			-- from its default every session -- so a Session+Dynamic field's seed
 			-- would land in the wrong store (invisible and wrongly saved). Reject
 			-- the combination; use OnPlayerInit to generate per-session values.
-			if visibility == "Session" then
+			if not persist then
 				compileError(
 					path,
 					"Scribe.Dynamic is not supported on a Session field; generate per-session values in OnPlayerInit instead"
@@ -430,6 +459,7 @@ local function buildNode(
 			Kind = "table",
 			ValueType = "table",
 			Visibility = visibility,
+			Persist = persist,
 			Timed = false,
 			Container = containerKind :: "Array" | "Dict",
 			MaxItems = meta and meta.MaxItems,
@@ -456,7 +486,7 @@ local function buildNode(
 		-- element pass in Compile.
 		local elementPath = table.clone(path)
 		table.insert(elementPath, "[]")
-		local element = buildNode({ NextId = 0, ById = {} }, nil, elementShape, elementPath, visibility, node)
+		local element = buildNode({ NextId = 0, ById = {} }, nil, elementShape, elementPath, visibility, persist, node)
 		clearIds(element)
 		element.IsElement = true
 		if element.Children and next(element.Children) == nil then
@@ -558,6 +588,7 @@ local function buildNode(
 		Kind = if type(value) == "table" then "table" else "leaf",
 		ValueType = (valueType or (if type(value) == "table" then "table" else type(value))) :: any,
 		Visibility = visibility,
+		Persist = persist,
 		Timed = timed,
 		Datatype = datatypeName,
 		Default = nil,
@@ -714,7 +745,7 @@ local function buildNode(
 			for i, key in order do
 				local childPath = table.clone(path)
 				table.insert(childPath, key)
-				local child = buildNode(state, key, value[key], childPath, visibility, node)
+				local child = buildNode(state, key, value[key], childPath, visibility, persist, node)
 				children[key] = child
 				ordinal[key] = i
 				default[key] = child.Default
@@ -773,7 +804,7 @@ local function buildInternalRoots(state: any, root: SchemaNode, config: CompileC
 		Version = Marker.make("Int", 1, { Min = 0 }),
 	}
 
-	local scribeNode = buildNode(state, RESERVED_ROOT, scribeTemplate, { RESERVED_ROOT }, "ServerOnly", root)
+	local scribeNode = buildNode(state, RESERVED_ROOT, scribeTemplate, { RESERVED_ROOT }, "ServerOnly", true, root)
 	local children = scribeNode.Children :: { [string]: SchemaNode }
 	local function setVisibility(node: SchemaNode, visibility: Visibility)
 		node.Visibility = visibility
@@ -805,7 +836,7 @@ local function buildInternalRoots(state: any, root: SchemaNode, config: CompileC
 		SaveInfo = {},
 		OwnsSynced = false,
 	}
-	local sessionNode = buildNode(state, SESSION_ROOT, sessionTemplate, { SESSION_ROOT }, "Session", root)
+	local sessionNode = buildNode(state, SESSION_ROOT, sessionTemplate, { SESSION_ROOT }, "Replicated", false, root)
 
 	return scribeNode, sessionNode
 end
@@ -898,6 +929,7 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		Kind = "table",
 		ValueType = "table",
 		Visibility = "Replicated",
+		Persist = true,
 		Timed = false,
 		Default = nil,
 		Parent = nil,
@@ -907,7 +939,7 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 	local children: { [string]: SchemaNode } = {}
 	local userOrder = Util.sortedKeys(userTemplate)
 	for _, key in userOrder do
-		children[key] = buildNode(state, key, userTemplate[key], { key }, "Replicated", root)
+		children[key] = buildNode(state, key, userTemplate[key], { key }, "Replicated", true, root)
 	end
 
 	local scribeNode, sessionNode = buildInternalRoots(state, root, cfg)
@@ -954,7 +986,10 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 				members = table.concat(parts, ",")
 			end
 			hash = Util.fnv32(
-				`{id}:{node.Name or ""}:{node.ValueType}:{node.Visibility}`
+				-- Persist rides along because it used to be a Visibility value
+				-- ("Session"); without it a stale copy that moved a field on or off
+				-- Session would hash identically to the current one.
+				`{id}:{node.Name or ""}:{node.ValueType}:{node.Visibility}:{node.Persist}`
 					.. `:{node.Min or "nil"}:{node.Max or "nil"}:{node.MaxLength or "nil"}`
 					.. `:{node.Datatype or "nil"}:{members}:{node.Container or "nil"}`
 					.. `:{node.MaxItems or "nil"}:{node.Evict or "nil"}:{if node.Unique then "u" else "nil"}:{node.KeyType or "nil"}:{node.MaxKeys or "nil"}:{node.MaxKeyLength or "nil"}`
@@ -1091,6 +1126,7 @@ function Template.ChildSchema(node: SchemaNode, key: string | number): SchemaNod
 			Path = node.Path,
 			Kind = "any",
 			ValueType = "any",
+			Persist = node.Persist,
 			Visibility = node.Visibility,
 			Timed = false,
 			Default = nil,
@@ -1123,16 +1159,24 @@ function Template.VisibilityOf(compiled: Compiled, path: { string | number }): V
 	return node.Visibility
 end
 
+-- The persistence axis, for callers that only have a path. Separate from
+-- VisibilityOf because a field can be Session (never saves) AND ServerOnly or
+-- Shared (who receives it) at the same time.
+function Template.PersistOf(compiled: Compiled, path: { string | number }): boolean
+	local node = Template.Resolve(compiled, path)
+	return node.Persist
+end
+
 -- Deep-cloned default data. which:
---  "Persistent" — everything saved (visibility ~= Session); the ProfileStore template
---  "Session"    — Session roots only
+--  "Persistent" — everything saved (Persist); the ProfileStore template
+--  "Session"    — non-persisted roots only
 --  "Client"     — everything except ServerOnly subtrees (the owner's mirror)
 function Template.BuildDefaults(compiled: Compiled, which: "Persistent" | "Session" | "Client"): { [string]: any }
 	local function include(node: SchemaNode): boolean
 		if which == "Persistent" then
-			return node.Visibility ~= "Session"
+			return node.Persist
 		elseif which == "Session" then
-			return node.Visibility == "Session"
+			return not node.Persist
 		else
 			return node.Visibility ~= "ServerOnly"
 		end

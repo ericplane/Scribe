@@ -192,7 +192,7 @@ export type SaveInfo = {
 	Size: number?, -- approx bytes of the last successful save (nil before the first)
 }
 
-export type Visibility = "Replicated" | "ServerOnly" | "Shared" | "Session"
+export type Visibility = "Replicated" | "ServerOnly" | "Shared"
 
 -- The read shape of a Scribe.Big, spelled out here rather than imported so Types
 -- stays dependency-free. Kept in sync with Internal.Big.
