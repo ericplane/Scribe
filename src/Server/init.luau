@@ -38,6 +38,17 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	-- RunService itself, which works on a mock table but is illegal on a real
 	-- service Instance, so any spec that needs DevMode cannot run in Studio.
 	ctx.DevMode = if options.DevMode ~= nil then options.DevMode == true else RunService:IsStudio()
+	-- Coarse per-player ceiling on RAW inbound frames, spent before a frame is
+	-- read at all. Resolved here because Persistence seeds each entry's bucket and
+	-- Replication enforces it, and a default derived in two places drifts.
+	--
+	-- Deliberately well above CommandRateLimit: this tier drops SILENTLY (a reply
+	-- is the amplification it exists to avoid), and a silently dropped Command
+	-- strands the client until its RequestTimeout. The command token bucket, which
+	-- answers "rate-limited", is what a merely chatty client should hit; this only
+	-- trips on traffic no real client produces. The floor keeps a deliberately tiny
+	-- CommandRateLimit from also throttling handshake and status traffic.
+	ctx.InboundFrameRate = options.MaxInboundFrameRate or math.max(60, (options.CommandRateLimit or 20) * 4)
 	ctx.Signals = {
 		OnSave = Signal.new(), -- { Player, Ok, Duration, At }
 		SessionEnded = Signal.new(), -- (player, reason)

@@ -22,7 +22,8 @@ local Monetization = {}
 -- global callback, so a second receipt-owning bundle would silently steal it.
 local receiptsBound = false
 
-local PROCESSED_CAP = 200
+local PROCESSED_CAP = 200 -- default ceiling on the receipt-dedupe ring
+local PURCHASE_ID_TTL = 7 * 24 * 3600 -- default: comfortably past any receipt retry window
 
 function Monetization.new(ctx: any)
 	local self = {} :: any
@@ -46,6 +47,8 @@ function Monetization.new(ctx: any)
 	local giftCooldown: number = options.GiftCooldown or 5
 	local giftMaxPending: number = options.GiftMaxPending or 20
 	local giftIntentTTL: number = options.GiftIntentTTL or 3600
+	local purchaseIdTTL: number = options.PurchaseIdTTL or PURCHASE_ID_TTL
+	local processedCap: number = options.MaxProcessedPurchaseIds or PROCESSED_CAP
 	-- How long a same-product re-gift is blocked while a purchase could still be
 	-- in flight (so a second gift can't overwrite a live intent and misdeliver the
 	-- first purchase to the second recipient). Past this, a lingering intent is
@@ -209,31 +212,100 @@ function Monetization.new(ctx: any)
 		return reserved
 	end
 
+	-- A ring entry is `{ Id, At }`. Entries written before age-based eviction shipped
+	-- are bare strings, and both forms have to read alike for as long as any profile
+	-- still carries one.
+	local function processedId(item: any): string?
+		if type(item) == "string" then
+			return item
+		end
+		if type(item) == "table" then
+			return item.Id
+		end
+		return nil
+	end
+
 	local function isProcessedRaw(data: { [string]: any }, purchaseId: string): boolean
-		return table.find(reservedRaw(data).ProcessedPurchaseIds, purchaseId) ~= nil
+		for _, item in reservedRaw(data).ProcessedPurchaseIds do
+			if processedId(item) == purchaseId then
+				return true
+			end
+		end
+		return false
 	end
 
 	local function isProcessed(entry: any, purchaseId: string): boolean
 		return entry.LiveData ~= nil and isProcessedRaw(entry.LiveData, purchaseId)
 	end
 
-	-- Ring evictions use `while`, not `if`: a stored ring larger than the CURRENT
-	-- cap (the cap was lowered between deploys) must shrink back under it instead
-	-- of staying frozen at its old size forever.
-	local function markProcessedRaw(data: { [string]: any }, purchaseId: string)
-		local list = reservedRaw(data).ProcessedPurchaseIds
-		while #list >= PROCESSED_CAP and #list > 0 do
-			table.remove(list, 1)
+	-- The ring is the ONLY thing standing between a retried receipt and a second
+	-- grant, so what it evicts decides whether a purchase can be paid for once and
+	-- delivered twice. Count-based eviction alone could not tell a purchase Roblox
+	-- may still retry from one it has long since given up on, and it dropped the
+	-- oldest entry silently -- the one case that can actually double-grant produced
+	-- no signal at all.
+	--
+	-- Age is now the primary rule: past PurchaseIdTTL a receipt is beyond any retry
+	-- and is provably safe to forget, which for an ordinary player keeps the ring
+	-- far enough under the cap that the count backstop never runs. The backstop
+	-- still exists for a player buying faster than the TTL drains -- it is the one
+	-- eviction that can lose a live entry, so unlike before it says so.
+	--
+	-- A legacy bare string is stamped with `now` rather than treated as expired: it
+	-- could have been written seconds before this version deployed, and guessing old
+	-- is precisely the guess that double-grants. Stamping conservatively costs one
+	-- extra TTL of retention and cannot lose anything.
+	local function pruneProcessed(list: { any }, player: any?): { any }
+		local now = os.time()
+		local kept = {}
+		for _, item in list do
+			local id = processedId(item)
+			if id == nil then
+				continue -- unreadable entry; nothing can match it, so it only takes space
+			end
+			local at = if type(item) == "table" then tonumber(item.At) else nil
+			if at == nil then
+				table.insert(kept, { Id = id, At = now }) -- legacy: stamp, never assume old
+			elseif now - at <= purchaseIdTTL then
+				table.insert(kept, item)
+			end
 		end
-		table.insert(list, purchaseId)
+		-- `while`, not `if`: a stored ring larger than the CURRENT cap (the cap was
+		-- lowered between deploys) must shrink back under it instead of staying
+		-- frozen at its old size forever.
+		local dropped = 0
+		while #kept >= processedCap and #kept > 0 do
+			table.remove(kept, 1)
+			dropped += 1
+		end
+		if dropped > 0 then
+			Log.Warn(
+				"Monetization",
+				"PURCHASE_ID_EVICTED",
+				`dropped {dropped} un-expired purchase id(s) to stay under MaxProcessedPurchaseIds ({processedCap}); `
+					.. `a receipt Roblox retries for one of them would be granted twice; raise the cap`,
+				{ Player = player, Dropped = dropped, Cap = processedCap }
+			)
+			Metrics.Add("PurchaseIdsEvicted", dropped)
+		end
+		return kept
+	end
+
+	local function markProcessedRaw(data: { [string]: any }, purchaseId: string, player: any?)
+		local reserved = reservedRaw(data)
+		local kept = pruneProcessed(reserved.ProcessedPurchaseIds, player)
+		table.insert(kept, { Id = purchaseId, At = os.time() })
+		reserved.ProcessedPurchaseIds = kept
 	end
 
 	local function markProcessed(entry: any, purchaseId: string)
 		local accessor = reservedAcc(entry).ProcessedPurchaseIds
-		while accessor.Count() >= PROCESSED_CAP and accessor.Count() > 0 do
-			accessor.Remove(1)
-		end
-		accessor.Insert(purchaseId)
+		local kept = pruneProcessed(accessor.Get(), entry.Player)
+		table.insert(kept, { Id = purchaseId, At = os.time() })
+		-- One Set rather than a Remove loop plus an Insert: pruning is a rewrite of
+		-- the whole list (stamping legacy entries changes elements in place), and a
+		-- single op is what a surrounding Transaction rolls back cleanly.
+		accessor.Set(kept)
 	end
 
 	local function checkCategory(category: string?)

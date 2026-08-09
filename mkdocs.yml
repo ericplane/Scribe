@@ -87,6 +87,7 @@ nav:
       - Economy Analytics: economy.md
       - Leaderboards: leaderboards.md
       - Diagnostics: diagnostics.md
+      - Security: security.md
       - Testing & Edit Mode: testing.md
       - Studio Plugin: studio-plugin.md
       - Migrating to Scribe: migrating.md

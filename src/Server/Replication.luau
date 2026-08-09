@@ -20,6 +20,15 @@ local MAX_OPS_PER_FRAME = 60000
 local REINIT_COOLDOWN = 5 -- seconds between full snapshots for repeated Hellos
 local MALFORMED_LOG_INTERVAL = 1 -- seconds; throttle malformed-frame logs/anomalies per player
 local MALFORMED_MAX = 32 -- after this many malformed frames, ignore all further inbound from the player
+-- Oversize gets its OWN budget rather than counting toward MALFORMED_MAX, because
+-- the two say different things and a shared counter would let either mask the
+-- other: a malformed frame decoded and failed, an oversize frame was never read.
+-- Same ceiling, because the conclusion is the same -- Scribe builds every frame a
+-- real client sends, so it cannot emit one over the limit. The one innocent cause
+-- is a MaxInboundBytes set below what this game's own commands produce, which
+-- breaks every client equally and is named in the log so it is not mistaken for
+-- an attack.
+local OVERSIZE_MAX = 32
 
 local STATUS_TO_ID: { [string]: number } = { Healthy = 0, Degraded = 1, Outage = 2 }
 
@@ -30,6 +39,22 @@ function Replication.new(ctx: any)
 	local options = ctx.Options
 
 	local maxInbound: number = options.MaxInboundBytes or 8192
+	local inboundFrameRate: number = ctx.InboundFrameRate
+
+	-- Same token-bucket shape as the command limiter, on its own per-entry clock:
+	-- refills at `inboundFrameRate` per second and is capped there, so a burst
+	-- costs from a budget an idle player has already rebuilt.
+	local function takeFrameToken(entry: any): boolean
+		local now = os.clock()
+		local elapsed = now - entry.FrameLast
+		entry.FrameLast = now
+		entry.FrameTokens = math.min(inboundFrameRate, entry.FrameTokens + elapsed * inboundFrameRate)
+		if entry.FrameTokens >= 1 then
+			entry.FrameTokens -= 1
+			return true
+		end
+		return false
+	end
 
 	-- Op queueing ---------------------------------------------------------------
 
@@ -514,12 +539,38 @@ function Replication.new(ctx: any)
 		if not entry then
 			return
 		end
-		if entry.MalformedBlocked then
-			-- This player crossed the malformed-frame limit; drop without parsing so a
-			-- flood of crafted frames can't keep burning CPU or spamming handlers.
+		if entry.MalformedBlocked or entry.OversizeBlocked then
+			-- This player crossed the malformed-frame or oversize limit; drop without
+			-- parsing so a flood of crafted frames can't keep burning CPU or spamming
+			-- handlers. Two counters, two flags, one guard: which budget tripped is
+			-- what the logs and any OnAnomaly consumer need to tell apart, but the
+			-- response to either is identical.
+			return
+		end
+		-- Ahead of the size check on purpose. Every other budget is per-KIND -- the
+		-- command token bucket sees only Commands, the malformed budget only frames
+		-- that fail to parse, and an OVERSIZE frame is excluded from the malformed
+		-- budget by design (below), so today it counts against nothing at all and can
+		-- be sent forever. This is the one ceiling that sees every frame whatever its
+		-- type, size, or validity, and it is spent before the frame is looked at.
+		--
+		-- Silent: no reply, because replying is exactly the amplification this tier
+		-- exists to avoid, and a client this far past the limit is not waiting on
+		-- answers. The metric counts every drop; the log is throttled like its
+		-- neighbours so a flood cannot evict the diagnostic ring.
+		if not takeFrameToken(entry) then
+			Metrics.Add("InboundRateLimited")
+			local now = os.clock()
+			if now - (entry.LastInboundRateLog or -math.huge) >= MALFORMED_LOG_INTERVAL then
+				entry.LastInboundRateLog = now
+				Log.Warn("Transport", "INBOUND_RATE_LIMITED", `player exceeded {inboundFrameRate} frames/s`, {
+					Player = player,
+				})
+			end
 			return
 		end
 		if buffer.len(bytes) > maxInbound then
+			entry.OversizeCount += 1
 			Metrics.Add("InboundOversize")
 			-- Throttle the LOG, on its own clock. This frame is dropped before decode
 			-- and deliberately does NOT count toward the malformed budget, but it is
@@ -533,7 +584,17 @@ function Replication.new(ctx: any)
 					"Transport",
 					"INBOUND_OVERSIZE",
 					`dropped oversized inbound frame ({buffer.len(bytes)} bytes)`,
-					{ Player = player }
+					{ Player = player, Count = entry.OversizeCount }
+				)
+			end
+			if entry.OversizeCount >= OVERSIZE_MAX and not entry.OversizeBlocked then
+				entry.OversizeBlocked = true
+				Log.Warn(
+					"Transport",
+					"INBOUND_OVERSIZE_LIMIT",
+					`player exceeded {OVERSIZE_MAX} oversized frames; ignoring further inbound frames this session `
+						.. `(if legitimate client traffic is this large, raise MaxInboundBytes)`,
+					{ Player = player, Count = entry.OversizeCount, Limit = maxInbound }
 				)
 			end
 			return

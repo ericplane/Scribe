@@ -33,7 +33,7 @@ end)
 
 ## The `Args` spec
 
-`Args` is a list of type strings, one per positional argument. The leading `player` is not counted, so `{ "string" }` describes `function(player, itemId)`. Only the `Args` key of the spec table is read.
+`Args` is a list of specs, one per positional argument. A spec is a type string, a [Scribe declarator](#declarators-optional), or a [shape table](#table-shapes-optional). The leading `player` is not counted, so `{ "string" }` describes `function(player, itemId)`. Only the `Args` key of the spec table is read.
 
 The check runs before the handler does, and it is a **shape** check only. Semantic validation ("does this player actually own that item") stays the handler's job.
 
@@ -43,6 +43,51 @@ The check runs before the handler does, and it is a **shape** check only. Semant
 | `"any"` | any value except `nil` |
 | a trailing `?`, as in `"string?"` | that type, or `nil` (including an omitted trailing argument) |
 | `"any?"` | anything at all, `nil` included |
+
+### Declarators (optional)
+
+A spec entry may also be a **Scribe declarator**, the same vocabulary the template uses. This is the form to reach for when the argument has a legal *range*, not just a legal type:
+
+```lua
+Data.Command("Buy", {
+    Args = {
+        Scribe.Enum("Sword", { "Sword", "Shield" }),
+        Scribe.Int(1, { Min = 1, Max = 99 }),
+        Scribe.Optional(Scribe.String("", { MaxLength = 32 })),
+    },
+}, function(player, item, qty, giftTo) ... end)
+```
+
+The declarator's **constraints come with it**: `Min`/`Max`, `MaxLength`, `Enum` members, `MaxItems`, `MaxKeys`, `MaxKeyLength`, and integrality for `Scribe.Int`. `"number"` can only say a number arrived, which is the half of the check that never catches anything interesting. `qty = 0`, `qty = 2.5`, and `qty = 1e9` all pass `"number"` and all fail `Scribe.Int(1, { Min = 1, Max = 99 })`.
+
+Accepted: `Int`, `Number`, `String`, `Enum`, `Flags`, `Optional`, `ArrayOf`, `SetOf`, `DictOf`, `MapOf`. The rest describe how a field is **stored or replicated** (`Timed`, `ServerOnly`, `Shared`, `Session`, `Dynamic`) or carry a value the wire cannot represent (`Datatype`, `Big`); passing one is refused at registration, naming the declarator.
+
+:::note A constraint miss is rejected, never clamped
+A template write **clamps** an out-of-range number under the default `BoundsPolicy`, because the server chose that value and losing precision beats losing the write. A command argument is the *client's* claim about what it wants, so it is rejected with `bad-args` instead. Silently clamping is how "buy 999999" quietly becomes "buy 99".
+:::
+
+### Table shapes (optional)
+
+A spec entry may also be a **shape table** describing a table argument, nested as deep as 8. This is opt-in: `"table"` alone stays exactly as permissive as it was, and most commands take scalars where a shape would only be noise. Reach for one when a command takes a payload, so the check happens before the handler rather than halfway through it.
+
+```lua
+Data.Command("Trade", {
+    Args = { { Id = "string", Qty = "number?", Tags = { "string" } } },
+}, function(player, payload)
+    -- payload.Id is a string, payload.Qty is a number or nil, and every
+    -- payload.Tags element is a string. All of it, before this line runs.
+end)
+```
+
+| Shape form | Means |
+| --- | --- |
+| `{ Field = spec, ... }` | a table with exactly these keys; each value matches its spec |
+| a declarator | that declarator's type **and** its constraints |
+| `{ spec }`, a single entry at index `1` | an array whose every element matches `spec` |
+
+Two rules worth knowing. A shape **rejects undeclared keys**: a payload carrying a field the command never declared is version skew or someone probing, and letting it reach the handler is how an unvalidated field ends up in game logic. And a shape is always **required**: for an optional table argument, declare `"table?"` and check the contents yourself.
+
+A malformed spec is rejected at **registration**, not on the first client call, so a shape that could never match fails at startup instead of turning every request into `bad-args` in production.
 
 Passing **fewer** arguments than the spec declares is fine only where the entries are optional: the missing positions read as `nil`, and a non-optional entry rejects them. Passing **more** arguments than the spec declares is rejected outright, before any per-position check, and unlike a type mismatch it is not logged at all. Both rejections reply `bad-args`.
 
@@ -112,12 +157,13 @@ end
 
 Each inbound command frame runs the same gauntlet on the server, in this order. The first gate that rejects sends its sentinel and stops.
 
-1. **Rate limit.** A token is taken before anything else, so even an unknown command name costs one.
-2. **Registry lookup.** No registration under that name gives `unknown-command`.
-3. **Ready gate.** The caller's profile must be in the `Ready` state, which is why [`Data[player]`](./lifecycle) is safe inside a handler without a `WaitForData` first. A profile still loading, or one whose session already ended, gives `not-ready`.
-4. **`Args` check**, if the command declared one.
-5. **The handler**, inside an `xpcall`. A throw is logged as `COMMAND_ERROR` and answered `error`.
-6. **The reply**, encoded and sent.
+1. **Rate limit.** A token is taken before anything else, so even an unknown command name costs one. The arguments are **not decoded** until every gate below has passed, so a rejected frame costs only its fixed-size header. Arguments are attacker-sized, and decoding one before deciding to reject it is work an exploiter chooses for you.
+2. **Ready gate.** The caller's profile must be in the `Ready` state, which is why [`Data[player]`](./lifecycle) is safe inside a handler without a `WaitForData` first. A profile still loading, or one whose session already ended, gives `not-ready`, for **every** name, registered or not, so an unauthenticated client cannot tell the two apart and enumerate the command surface.
+3. **Registry lookup.** No registration under that name gives `unknown-command`.
+4. **`Args` arity**, if the command declared a spec: more arguments than declared is rejected here, from the header alone.
+5. **`Args` types**, once the arguments have been decoded.
+6. **The handler**, inside an `xpcall`. A throw is logged as `COMMAND_ERROR` and answered `error`.
+7. **The reply**, encoded and sent.
 
 ## Yielding and `RequestTimeout`
 

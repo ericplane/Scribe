@@ -1119,6 +1119,8 @@ export type ScribeOptions<T> = {
 	GiftCooldown: number?,
 	GiftMaxPending: number?,
 	GiftIntentTTL: number?,
+	PurchaseIdTTL: number?,
+	MaxProcessedPurchaseIds: number?,
 	AllowDuplicateGifts: boolean?,
 	NoGiftIntentPolicy: ("GrantOrCredit" | "Hold")?,
 
@@ -1129,6 +1131,7 @@ export type ScribeOptions<T> = {
 	CommandRateLimit: number?,
 	RequestTimeout: number?,
 	MaxInboundBytes: number?,
+	MaxInboundFrameRate: number?,
 	TransportChannel: string?,
 
 	-- integrity
@@ -1234,12 +1237,15 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	GiftCooldown = true,
 	GiftMaxPending = true,
 	GiftIntentTTL = true,
+	PurchaseIdTTL = true,
+	MaxProcessedPurchaseIds = true,
 	AllowDuplicateGifts = true,
 	NoGiftIntentPolicy = true,
 	Economy = true,
 	CommandRateLimit = true,
 	RequestTimeout = true,
 	MaxInboundBytes = true,
+	MaxInboundFrameRate = true,
 	BoundsPolicy = true,
 	WipeGuardPolicy = true,
 	WipeGuardShrinkRatio = true,

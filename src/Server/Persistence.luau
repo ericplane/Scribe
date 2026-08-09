@@ -66,6 +66,14 @@ export type Entry = {
 	MalformedCount: number,
 	MalformedBlocked: boolean?, -- crossed the malformed-frame limit; inbound frames ignored
 	LastMalformedLog: number?, -- os.clock of the last emitted malformed-frame log/anomaly
+	OversizeCount: number, -- own budget: an oversize frame is never read, a malformed one was
+	OversizeBlocked: boolean?, -- crossed the oversize limit; inbound frames ignored
+	LastOversizeLog: number?, -- os.clock of the last emitted INBOUND_OVERSIZE
+	-- Raw inbound frame budget: covers EVERY frame the player sends, whatever its
+	-- type, size, or validity, and is spent before the frame is looked at at all.
+	FrameTokens: number,
+	FrameLast: number,
+	LastInboundRateLog: number?, -- os.clock of the last emitted INBOUND_RATE_LIMITED
 	-- Commands state
 	RateTokens: number,
 	RateLast: number,
@@ -1457,6 +1465,9 @@ function Persistence.new(ctx: any)
 			QueueIndex = {},
 			SharedQueue = {},
 			MalformedCount = 0,
+			OversizeCount = 0,
+			FrameTokens = ctx.InboundFrameRate,
+			FrameLast = os.clock(),
 			RateTokens = options.CommandRateLimit or 20,
 			RateLast = os.clock(),
 			GiftLastAt = 0,

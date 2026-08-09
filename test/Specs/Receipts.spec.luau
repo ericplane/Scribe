@@ -36,6 +36,16 @@ return function()
 		return TestCtx.make({ Options = options })
 	end
 
+	-- The dedupe ring stores `{ Id, At }`, and still has to read bare strings
+	-- written before age-based eviction shipped.
+	local function processedIds(list)
+		local out = {}
+		for _, item in list or {} do
+			table.insert(out, if type(item) == "string" then item else item.Id)
+		end
+		return out
+	end
+
 	local function receipt(userId, productId, purchaseId)
 		return {
 			PlayerId = userId,
@@ -289,9 +299,84 @@ return function()
 		expect(harness.Data.HandleReceipt(receipt(6100, 222, "pc-4"))).to.equal(NOT_PROCESSED)
 		local persisted = harness.Fake.Persisted["Default/PLAYER_6100"]
 		expect(persisted._Scribe.GiftCredits.GiftVIP).to.equal(1) -- unchanged
-		expect(table.find(persisted._Scribe.ProcessedPurchaseIds, "pc-4")).to.equal(nil)
+		expect(table.find(processedIds(persisted._Scribe.ProcessedPurchaseIds), "pc-4")).to.equal(nil)
 
 		harness.Cleanup()
+	end)
+
+	describe("dedupe ring eviction", function()
+		it("still dedupes a receipt whose id was stored as a bare legacy string", function()
+			local harness = makeHarness()
+			local _, entry, data = harness.Join(6300)
+			-- Exactly what a profile written before age-based eviction carries.
+			entry.LiveData._Scribe.ProcessedPurchaseIds = { "legacy-1" }
+
+			-- A retry of that purchase must be recognised as already granted, not
+			-- re-granted: this is the whole reason the ring exists.
+			local before = data.Coins.Get()
+			expect(harness.Data.HandleReceipt(receipt(6300, 111, "legacy-1"))).to.equal(GRANTED)
+			expect(data.Coins.Get()).to.equal(before)
+
+			harness.Cleanup()
+		end)
+
+		it("stamps a legacy entry rather than assuming it is old enough to drop", function()
+			local harness = makeHarness()
+			local _, entry, data = harness.Join(6301)
+			entry.LiveData._Scribe.ProcessedPurchaseIds = { "legacy-1" }
+
+			harness.Data.HandleReceipt(receipt(6301, 111, "new-1"))
+
+			local list = data._Scribe.ProcessedPurchaseIds.Get()
+			expect(#list).to.equal(2) -- legacy survived; guessing "old" is what double-grants
+			expect(list[1].Id).to.equal("legacy-1")
+			expect(type(list[1].At)).to.equal("number")
+
+			harness.Cleanup()
+		end)
+
+		it("drops entries past PurchaseIdTTL and keeps the ones still inside it", function()
+			local harness = makeHarness({ PurchaseIdTTL = 100 })
+			local _, entry, data = harness.Join(6302)
+			local now = os.time()
+			entry.LiveData._Scribe.ProcessedPurchaseIds = {
+				{ Id = "expired", At = now - 500 },
+				{ Id = "fresh", At = now - 10 },
+			}
+
+			harness.Data.HandleReceipt(receipt(6302, 111, "new-1"))
+
+			local ids = processedIds(data._Scribe.ProcessedPurchaseIds.Get())
+			expect(table.find(ids, "expired")).to.equal(nil)
+			expect(table.find(ids, "fresh")).never.to.equal(nil)
+			expect(table.find(ids, "new-1")).never.to.equal(nil)
+
+			harness.Cleanup()
+		end)
+
+		it("warns when the count backstop evicts an un-expired id", function()
+			-- A cap of 3 with a long TTL: nothing ages out, so the backstop is the
+			-- only thing that can make room -- the one eviction that can double-grant.
+			local harness = makeHarness({ MaxProcessedPurchaseIds = 3, PurchaseIdTTL = 999999 })
+			local _, entry, data = harness.Join(6303)
+			local now = os.time()
+			entry.LiveData._Scribe.ProcessedPurchaseIds = {
+				{ Id = "a", At = now },
+				{ Id = "b", At = now },
+				{ Id = "c", At = now },
+			}
+			local before = Scribe.GetMetrics().PurchaseIdsEvicted or 0
+
+			harness.Data.HandleReceipt(receipt(6303, 111, "new-1"))
+
+			local ids = processedIds(data._Scribe.ProcessedPurchaseIds.Get())
+			expect(table.find(ids, "a")).to.equal(nil) -- oldest dropped
+			expect(table.find(ids, "new-1")).never.to.equal(nil)
+			-- Silence here was the actual defect: the dangerous eviction now reports.
+			expect((Scribe.GetMetrics().PurchaseIdsEvicted or 0) - before).to.equal(1)
+
+			harness.Cleanup()
+		end)
 	end)
 
 	it("keeps retrying unresolved gift receipts under the Hold policy", function()

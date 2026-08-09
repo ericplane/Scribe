@@ -13,7 +13,14 @@ return function()
 	local harness
 
 	beforeEach(function()
-		harness = TestCtx.make()
+		-- Pinned well above any burst below. Several specs inject frame floods to
+		-- exercise a per-KIND budget (the malformed limit needs 40 frames to cross
+		-- MALFORMED_MAX), and the raw inbound frame ceiling is a different limit that
+		-- must not be what stops them. Left at its default -- max(60, CommandRateLimit
+		-- * 4) -- a burst sized against one budget silently starts tripping the other,
+		-- and the spec fails for a reason it does not name. Tests that DO exercise the
+		-- frame ceiling build their own harness with an explicit low rate.
+		harness = TestCtx.make({ Options = { MaxInboundFrameRate = 1000 } })
 	end)
 
 	afterEach(function()
@@ -332,6 +339,69 @@ return function()
 			task.wait()
 			-- Blocked frames are dropped before parsing, so the count does not grow.
 			expect(entry.MalformedCount).to.equal(countWhenBlocked)
+		end)
+
+		it("drops raw frames past MaxInboundFrameRate, before they are parsed", function()
+			local limited = TestCtx.make({ Options = { MaxInboundFrameRate = 5 } })
+			local player, entry = limited.Join()
+			limited.SendHello(player)
+
+			-- Seed the bucket so the assertion does not depend on how many frames the
+			-- handshake above happened to spend.
+			entry.FrameTokens = 5
+			entry.FrameLast = os.clock()
+
+			local before = Scribe.GetMetrics().InboundRateLimited or 0
+			for _ = 1, 25 do
+				limited.Transport:InjectToServer(player, garbageFrame())
+			end
+			task.wait()
+
+			-- Only the budget reaches the decoder. The rest are dropped before parsing,
+			-- so the malformed counter stops moving and this counter takes over --
+			-- which is the point: every other budget is per-kind, this one is not.
+			expect(entry.MalformedCount).to.equal(5)
+			expect((Scribe.GetMetrics().InboundRateLimited or 0) - before).to.equal(20)
+
+			limited.Cleanup()
+		end)
+
+		it("spends the frame budget on oversized frames, which no other budget counts", function()
+			local limited = TestCtx.make({ Options = { MaxInboundFrameRate = 5 } })
+			local player, entry = limited.Join()
+			entry.FrameTokens = 5
+			entry.FrameLast = os.clock()
+
+			local before = Scribe.GetMetrics().InboundOversize or 0
+			for _ = 1, 25 do
+				limited.Transport:InjectToServer(player, buffer.create(8193))
+			end
+			task.wait()
+
+			-- Oversize frames are excluded from the malformed budget by design, so
+			-- before this limit existed they were free to send without bound.
+			expect((Scribe.GetMetrics().InboundOversize or 0) - before).to.equal(5)
+			expect(entry.MalformedCount).to.equal(0)
+
+			limited.Cleanup()
+		end)
+
+		it("blocks a player past the oversize limit, on a budget of its own", function()
+			local player, entry = joinAndHandshake()
+			for _ = 1, 40 do -- OVERSIZE_MAX is 32
+				harness.Transport:InjectToServer(player, buffer.create(8193))
+			end
+			task.wait()
+			expect(entry.OversizeBlocked).to.equal(true)
+			-- Its own counter: an oversize frame was never read, a malformed one was
+			-- decoded and failed, and a shared count would let either mask the other.
+			expect(entry.MalformedCount).to.equal(0)
+			expect(entry.MalformedBlocked).never.to.equal(true)
+
+			local countWhenBlocked = entry.OversizeCount
+			harness.Transport:InjectToServer(player, buffer.create(8193))
+			task.wait()
+			expect(entry.OversizeCount).to.equal(countWhenBlocked)
 		end)
 
 		it("fails closed on a schema-hash mismatch (no Init sent)", function()

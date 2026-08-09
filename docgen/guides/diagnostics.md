@@ -44,7 +44,8 @@ The keys a panel usually wants:
 | `HealthFailures` | counter | Failed DataStore operations, plus one `HealthFailures_<Subsystem>` counter per subsystem (`ProfileStore`, `ProfileLoad`, `Leaderboards`, `OfflineRead`, …) |
 | `Handshakes`, `DiffFlushes`, `OpsQueued`, `OpsCoalesced`, `OpsSent` | counter | Replication throughput |
 | `BytesOutPerSend` | distribution | Bytes per outbound frame |
-| `MalformedFrames`, `InboundOversize` | counter | Rejected inbound frames, see the [Transport codes](./log-codes#transport) |
+| `MalformedFrames`, `InboundOversize`, `InboundRateLimited` | counter | Rejected inbound frames, see the [Transport codes](./log-codes#transport) |
+| `PurchaseIdsEvicted` | counter | Un-expired receipt ids dropped by the ring's count backstop, see [`PURCHASE_ID_EVICTED`](./log-codes#monetization) |
 | `CommandsReceived`, `CommandsHandled`, `CommandsRejected`, `CommandsRateLimited`, `CommandErrors` | counter | Command dispatch outcomes |
 | `ReceiptsReceived`, `ReceiptsGranted`, `ReceiptsRetried`, `ReceiptsDeclined`, `ReceiptsDuplicate` | counter | Receipt outcomes |
 | `GiftPrompts`, `GiftsDelivered`, `OwnershipCheckFailures` | counter | Monetization side |

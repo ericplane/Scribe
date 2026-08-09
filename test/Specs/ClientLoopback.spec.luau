@@ -8,6 +8,7 @@ return function()
 	local Root = script.Parent.Parent.Parent
 	local ScribeRoot = Root.Scribe
 	local Wire = require(ScribeRoot.Internal.Wire)
+	local Scribe = require(ScribeRoot) :: any
 	local Client = require(ScribeRoot.Client)
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
 
@@ -201,7 +202,6 @@ return function()
 	end)
 
 	itRunning("exposes the declared Default of a field (client and server, incl. datatypes)", function()
-		local Scribe = require(ScribeRoot) :: any
 		local harness = TestCtx.make({
 			Template = {
 				Coins = Scribe.Int(0, { Min = 0 }),
@@ -314,7 +314,6 @@ return function()
 		-- so a Sandboxed Scribe silently fails to send its Hello and looks like a
 		-- mysterious handshake timeout. The send failure must be logged (once),
 		-- not swallowed and retried forever.
-		local Scribe = require(ScribeRoot) :: any
 		local harness = TestCtx.make({ AutoPump = false })
 		local blocked = {
 			Name = "Blocked",
@@ -424,6 +423,141 @@ return function()
 		harness.Cleanup()
 	end)
 
+	itRunning("gives a pre-Ready client the same answer for registered and unknown names", function()
+		local harness, _, entry, _, clientData = makeLoopback()
+		harness.Data.Command("Ping", function()
+			return true
+		end)
+		entry.State = "Loading"
+		local _, registeredReason = clientData.Request("Ping")
+		local _, unknownReason = clientData.Request("NoSuchCommand")
+		entry.State = "Ready" -- restore so teardown is clean
+
+		-- Identical replies. A difference here is an enumeration oracle: an
+		-- unauthenticated client learns the whole command surface by diffing
+		-- "unknown-command" against "not-ready".
+		expect(registeredReason).to.equal("not-ready")
+		expect(unknownReason).to.equal("not-ready")
+		harness.Cleanup()
+	end)
+
+	itRunning("validates a declared table shape, recursively, and rejects unknown keys", function()
+		local harness, _, _, _, clientData = makeLoopback()
+		local seen
+		harness.Data.Command("Trade", {
+			Args = { { Id = "string", Qty = "number?", Tags = { "string" } } },
+		}, function(_, payload)
+			seen = payload
+			return true
+		end)
+
+		expect(clientData.Request("Trade", { Id = "sword", Qty = 2, Tags = { "rare" } })).to.equal(true)
+		expect(seen.Id).to.equal("sword")
+
+		-- Optional field absent is fine; the rest must still hold.
+		expect(clientData.Request("Trade", { Id = "shield", Tags = {} })).to.equal(true)
+
+		local badField = { clientData.Request("Trade", { Id = 7, Tags = {} }) }
+		expect(badField[2]).to.equal("bad-args")
+
+		local badNested = { clientData.Request("Trade", { Id = "axe", Tags = { 1 } }) }
+		expect(badNested[2]).to.equal("bad-args")
+
+		-- An undeclared key is version skew or probing; passing it through is how an
+		-- unvalidated field reaches game logic.
+		local extra = { clientData.Request("Trade", { Id = "axe", Tags = {}, Admin = true }) }
+		expect(extra[2]).to.equal("bad-args")
+
+		-- Not declaring a shape is still allowed and still permissive.
+		harness.Data.Command("Loose", { Args = { "table" } }, function()
+			return true
+		end)
+		expect(clientData.Request("Loose", { Anything = { Nested = true } })).to.equal(true)
+
+		harness.Cleanup()
+	end)
+
+	itRunning("enforces declarator constraints on command arguments", function()
+		local harness, _, _, _, clientData = makeLoopback()
+		harness.Data.Command("Buy", {
+			Args = {
+				Scribe.Enum("Sword", { "Sword", "Shield" }),
+				Scribe.Int(1, { Min = 1, Max = 99 }),
+				Scribe.Optional(Scribe.String("", { MaxLength = 8 })),
+			},
+		}, function()
+			return true
+		end)
+
+		expect(clientData.Request("Buy", "Sword", 5, "gift")).to.equal(true)
+		expect(clientData.Request("Buy", "Shield", 99)).to.equal(true) -- Optional omitted
+
+		-- The half a type string cannot express. Each of these is a `number` or a
+		-- `string`, so "number"/"string" would have waved every one through.
+		local cases = {
+			{ "Bow", 5 }, -- not an Enum member
+			{ "Sword", 0 }, -- below Min
+			{ "Sword", 100 }, -- above Max
+			{ "Sword", 2.5 }, -- Int, not a number
+			{ "Sword", 5, "far too long" }, -- past MaxLength
+		}
+		for _, case in cases do
+			local res = { clientData.Request("Buy", table.unpack(case)) }
+			expect(res[2]).to.equal("bad-args")
+		end
+
+		harness.Cleanup()
+	end)
+
+	itRunning("validates declared containers, keys and all", function()
+		local harness, _, _, _, clientData = makeLoopback()
+		harness.Data.Command("Craft", {
+			Args = { Scribe.DictOf(Scribe.Int(0, { Min = 0 }), { MaxKeys = 2, MaxKeyLength = 6 }) },
+		}, function()
+			return true
+		end)
+
+		expect(clientData.Request("Craft", { Iron = 3, Wood = 1 })).to.equal(true)
+
+		local overKeys = { clientData.Request("Craft", { A = 1, B = 2, C = 3 }) }
+		expect(overKeys[2]).to.equal("bad-args")
+		local longKey = { clientData.Request("Craft", { VeryLongKey = 1 }) }
+		expect(longKey[2]).to.equal("bad-args")
+		local badValue = { clientData.Request("Craft", { Iron = -1 }) }
+		expect(badValue[2]).to.equal("bad-args")
+		local badKeyType = { clientData.Request("Craft", { [1] = 1 }) }
+		expect(badKeyType[2]).to.equal("bad-args")
+
+		harness.Cleanup()
+	end)
+
+	itRunning("names the declarator when one describes storage rather than an argument", function()
+		local harness = makeLoopback()
+		local ok, err = pcall(function()
+			harness.Data.Command("Nope", { Args = { Scribe.ServerOnly({}) } }, function() end)
+		end)
+		expect(ok).to.equal(false)
+		-- The old failure walked the marker's internals and reported "Args[1].Meta.Min",
+		-- which is Scribe's own structure leaking into the caller's error.
+		expect(string.find(tostring(err), "Scribe.ServerOnly") ~= nil).to.equal(true)
+		harness.Cleanup()
+	end)
+
+	itRunning("rejects a malformed Args spec at register time, not on first call", function()
+		local harness = makeLoopback()
+		expect(function()
+			harness.Data.Command("Bad", { Args = { { Id = 5 } } }, function() end)
+		end).to.throw()
+		-- Built rather than written as a literal: a shape is either an array element
+		-- spec or named fields, and mixing them is what this asserts Register catches.
+		local mixed = { "string" }
+		mixed.Extra = "number"
+		expect(function()
+			harness.Data.Command("Mixed", { Args = { mixed } }, function() end)
+		end).to.throw()
+		harness.Cleanup()
+	end)
+
 	itRunning("rate-limits command floods", function()
 		local harness, _, _, _, clientData = makeLoopback({ CommandRateLimit = 5 })
 		harness.Data.Command("Ping", function()
@@ -438,6 +572,48 @@ return function()
 			end
 		end
 		expect(rejected > 0).to.equal(true)
+
+		harness.Cleanup()
+	end)
+
+	itRunning("rejects a rate-limited command before decoding its arguments", function()
+		local harness, player, entry = makeLoopback({ CommandRateLimit = 5 })
+		harness.Data.Command("Ping", function()
+			return true
+		end)
+
+		-- Valid header, one argument carrying a tag the generic decoder does not
+		-- know, so reaching the tail throws. Arguments are attacker-sized, so a
+		-- rejected frame must never be decoded: the limit has to be spent on the
+		-- fixed-cost header alone.
+		local function poisoned(): buffer
+			local w = Wire.NewWriter(32)
+			Wire.U8(w, Wire.Frames.Command)
+			Wire.U32(w, 1) -- correlation
+			Wire.Str(w, "Ping")
+			Wire.U8(w, 1) -- argc
+			Wire.U8(w, 200) -- not a generic tag
+			return Wire.Finish(w)
+		end
+
+		local function handle(bytes: buffer)
+			local reader = Wire.NewReader(bytes)
+			Wire.RU8(reader) -- frame type, consumed by the real dispatcher
+			harness.Ctx.Commands.HandleFrame(entry, reader)
+		end
+
+		-- With tokens left the tail IS decoded and the poison bites, so the
+		-- assertion below cannot pass just because the frame was harmless.
+		expect(pcall(handle, poisoned())).to.equal(false)
+
+		entry.RateTokens = 0
+		entry.RateLast = os.clock()
+		expect(pcall(handle, poisoned())).to.equal(true)
+
+		local replies = harness.FramesFor(player, Wire.Frames.CommandReply)
+		local last = replies[#replies]
+		expect(last.Ok).to.equal(false)
+		expect(last.Results[1]).to.equal("rate-limited")
 
 		harness.Cleanup()
 	end)
