@@ -45,7 +45,14 @@ export type Impl = {
 -- module itself, which keeps a call one table index -- the same cost as any other
 -- module function, so routing a hot path (a per-frame rate-limit bucket) through
 -- here does not make it measurably dearer.
-local DEFAULT_NOW: () -> number = os.time
+-- Wrapped rather than assigned directly: Roblox's os.time is `(DateTypeArg?) ->
+-- number` (it optionally formats a date table), which does not satisfy `() ->
+-- number`. Typing the seam to match os.time instead would drag a Roblox-specific
+-- type into the public Impl and force every virtual clock to declare a parameter
+-- it ignores, so the wrapper is the cheaper of the two.
+local DEFAULT_NOW: () -> number = function()
+	return os.time()
+end
 local DEFAULT_MONOTONIC: () -> number = os.clock
 local DEFAULT_WAIT: (seconds: number?) -> number = task.wait
 local DEFAULT_DELAY: (seconds: number, fn: (...any) -> (), ...any) -> thread = task.delay
