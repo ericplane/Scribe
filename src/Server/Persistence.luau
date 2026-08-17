@@ -19,6 +19,7 @@ local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
 local Signal = require(Internal.Signal)
 local Config = require(Internal.Config)
+local Clock = require(Internal.Clock)
 
 local Persistence = {}
 
@@ -265,6 +266,10 @@ function Persistence.new(ctx: any)
 	end
 
 	self.Store = store
+	-- Connections this bundle makes to PROCESS-GLOBAL signals. They outlive the
+	-- bundle unless released, so Stop() disconnects them; per-profile signals are
+	-- not here because they die with the profile.
+	local connections: { any } = {}
 	self.Entries = {} :: { [Player]: Entry }
 	-- Maintained alongside Entries rather than recomputed. Util.count is an O(N)
 	-- dict walk, and it used to run on every teardown, which made draining a full
@@ -345,64 +350,71 @@ function Persistence.new(ctx: any)
 	-- ProfileStore health signals (member names verified against v1.0.3).
 	local baseStoreName = storeIndex
 	local okErr = pcall(function()
-		ProfileStore.OnError:Connect(function(message: string, storeName: string, profileKey: string)
-			-- OnError is module-global and fires for EVERY DataStore error
-			-- (loads, view reads, version queries, other stores). Only our store
-			-- counts toward Health, and only an in-flight SAVE should mark a
-			-- save failure — otherwise a throttled version read for an online
-			-- player would spuriously fail their receipts/save state.
-			if storeName ~= baseStoreName then
-				return
-			end
-			Health.ReportFailure("ProfileStore")
-			Log.Warn("Persistence", "PROFILE_STORE_ERROR", tostring(message), { Store = storeName, Key = profileKey })
-			for _, entry in self.Entries :: { [Player]: Entry } do
-				if entry.Key == profileKey and entry.SaveT0 ~= nil then
-					-- Attribute this failure to the in-flight save AT MOST ONCE, then
-					-- clear SaveT0. A real save failure fires OnError (never
-					-- OnAfterSave/onProfileSaved), so without clearing it here SaveT0
-					-- lingers and every later unrelated same-key error (an operator
-					-- view read or version query on this online player) would keep
-					-- re-reporting the same save as failed.
-					entry.SaveT0 = nil
-					entry.SaveInfo.LastResult = "Fail"
-					-- Classify a likely-oversize failure distinctly from a transient
-					-- throttle/outage: a profile already over the size-warning threshold
-					-- will fail EVERY UpdateAsync (unrecoverable) until it is trimmed,
-					-- which the developer must act on differently from "retry later".
-					if entry.LiveSize and entry.LiveSize > SIZE_WARN_BYTES then
-						Log.Error(
-							"Persistence",
-							"PROFILE_TOO_LARGE",
-							`save failed and the profile is {entry.LiveSize} bytes (~4 MB DataStore ceiling); this will not recover until the profile is trimmed`,
-							{ Player = entry.Player, Bytes = entry.LiveSize }
-						)
+		connections[#connections + 1] = ProfileStore.OnError:Connect(
+			function(message: string, storeName: string, profileKey: string)
+				-- OnError is module-global and fires for EVERY DataStore error
+				-- (loads, view reads, version queries, other stores). Only our store
+				-- counts toward Health, and only an in-flight SAVE should mark a
+				-- save failure — otherwise a throttled version read for an online
+				-- player would spuriously fail their receipts/save state.
+				if storeName ~= baseStoreName then
+					return
+				end
+				Health.ReportFailure("ProfileStore")
+				Log.Warn(
+					"Persistence",
+					"PROFILE_STORE_ERROR",
+					tostring(message),
+					{ Store = storeName, Key = profileKey }
+				)
+				for _, entry in self.Entries :: { [Player]: Entry } do
+					if entry.Key == profileKey and entry.SaveT0 ~= nil then
+						-- Attribute this failure to the in-flight save AT MOST ONCE, then
+						-- clear SaveT0. A real save failure fires OnError (never
+						-- OnAfterSave/onProfileSaved), so without clearing it here SaveT0
+						-- lingers and every later unrelated same-key error (an operator
+						-- view read or version query on this online player) would keep
+						-- re-reporting the same save as failed.
+						entry.SaveT0 = nil
+						entry.SaveInfo.LastResult = "Fail"
+						-- Classify a likely-oversize failure distinctly from a transient
+						-- throttle/outage: a profile already over the size-warning threshold
+						-- will fail EVERY UpdateAsync (unrecoverable) until it is trimmed,
+						-- which the developer must act on differently from "retry later".
+						if entry.LiveSize and entry.LiveSize > SIZE_WARN_BYTES then
+							Log.Error(
+								"Persistence",
+								"PROFILE_TOO_LARGE",
+								`save failed and the profile is {entry.LiveSize} bytes (~4 MB DataStore ceiling); this will not recover until the profile is trimmed`,
+								{ Player = entry.Player, Bytes = entry.LiveSize }
+							)
+						end
+						-- The failed save's payload never persisted: restore the dirtiness
+						-- captured at its start (plus anything written since).
+						entry.SaveInfo.Dirty = entry.DirtyAtSaveStart or entry.SaveInfo.Dirty
+						-- Deliberately NOT closing the Timed save window here. OnError is
+						-- module-global and cannot prove the call that failed was this
+						-- entry's in-flight save: an ordinary Data.SendMessage, gift
+						-- delivery or version read on the same key routes through the same
+						-- RegisterError. Closing it on one of those points the profile back
+						-- at the live DEADLINES while the save is still going to serialize
+						-- them, and a rejoin reads 1.78e9 "remaining" as a cooldown decades
+						-- out that never self-heals. Everything above errs pessimistically
+						-- and is safe when misattributed; this one would corrupt.
+						--
+						-- Nothing needs to replace it. The window is self-healing: every
+						-- reader and writer goes through Timed's own store lookup, which
+						-- keeps serving the live table, and the next BeforeSave re-derives
+						-- the persisted copy from it. A save that fails leaves only a
+						-- throwaway table stranded.
+						ctx.Signals.OnSave:Fire({ Player = entry.Player, Ok = false, Duration = nil, At = Clock.Now() })
+						Metrics.Add("SavesFailed")
+						self.UpdateSaveInfoMirror(entry)
+						resumeWaiters(entry, false)
 					end
-					-- The failed save's payload never persisted: restore the dirtiness
-					-- captured at its start (plus anything written since).
-					entry.SaveInfo.Dirty = entry.DirtyAtSaveStart or entry.SaveInfo.Dirty
-					-- Deliberately NOT closing the Timed save window here. OnError is
-					-- module-global and cannot prove the call that failed was this
-					-- entry's in-flight save: an ordinary Data.SendMessage, gift
-					-- delivery or version read on the same key routes through the same
-					-- RegisterError. Closing it on one of those points the profile back
-					-- at the live DEADLINES while the save is still going to serialize
-					-- them, and a rejoin reads 1.78e9 "remaining" as a cooldown decades
-					-- out that never self-heals. Everything above errs pessimistically
-					-- and is safe when misattributed; this one would corrupt.
-					--
-					-- Nothing needs to replace it. The window is self-healing: every
-					-- reader and writer goes through Timed's own store lookup, which
-					-- keeps serving the live table, and the next BeforeSave re-derives
-					-- the persisted copy from it. A save that fails leaves only a
-					-- throwaway table stranded.
-					ctx.Signals.OnSave:Fire({ Player = entry.Player, Ok = false, Duration = nil, At = os.time() })
-					Metrics.Add("SavesFailed")
-					self.UpdateSaveInfoMirror(entry)
-					resumeWaiters(entry, false)
 				end
 			end
-		end)
+		)
 	end)
 	if not okErr then
 		Log.Warn(
@@ -421,7 +433,7 @@ function Persistence.new(ctx: any)
 	-- isNewProfile = true. A player who just lost everything was indistinguishable
 	-- from a first-time player.
 	local okOverwrite = pcall(function()
-		ProfileStore.OnOverwrite:Connect(function(storeName: string, profileKey: string)
+		connections[#connections + 1] = ProfileStore.OnOverwrite:Connect(function(storeName: string, profileKey: string)
 			-- OnOverwrite is module-global; only our store is ours to report on.
 			if storeName ~= baseStoreName then
 				return
@@ -462,7 +474,7 @@ function Persistence.new(ctx: any)
 		)
 	end
 	local okCrit = pcall(function()
-		ProfileStore.OnCriticalToggle:Connect(function(isCritical: boolean)
+		connections[#connections + 1] = ProfileStore.OnCriticalToggle:Connect(function(isCritical: boolean)
 			Health.SetCritical(isCritical)
 			if isCritical then
 				Log.Error("Persistence", "DATASTORE_CRITICAL", "ProfileStore entered critical state", {})
@@ -657,7 +669,7 @@ function Persistence.new(ctx: any)
 	end
 
 	local function onProfileSaving(entry: Entry)
-		entry.SaveT0 = os.clock()
+		entry.SaveT0 = Clock.Monotonic()
 		-- This save's payload is serialized NOW: bump the generation (used to gate
 		-- which AwaitSave waiters the completion covers) and reset Dirty so it
 		-- re-accumulates from writes landing AFTER the payload snapshot. The pre-
@@ -752,9 +764,9 @@ function Persistence.new(ctx: any)
 		if entry.TornDown and entry.SessionStolen then
 			return
 		end
-		local duration = if entry.SaveT0 then os.clock() - entry.SaveT0 else nil
+		local duration = if entry.SaveT0 then Clock.Monotonic() - entry.SaveT0 else nil
 		entry.SaveT0 = nil -- save settled; OnError should no longer attribute a failure here
-		entry.SaveInfo.LastSaveAt = os.time()
+		entry.SaveInfo.LastSaveAt = Clock.Now()
 		entry.SaveInfo.LastResult = "Ok"
 		-- Keep any dirtiness accumulated from writes landing AFTER this save's payload
 		-- snapshot (onProfileSaving reset the flag at that moment); blocked saves
@@ -770,7 +782,7 @@ function Persistence.new(ctx: any)
 			Metrics.Observe("SaveDuration", duration)
 		end
 		Health.ReportSuccess("Saves")
-		ctx.Signals.OnSave:Fire({ Player = entry.Player, Ok = true, Duration = duration, At = os.time() })
+		ctx.Signals.OnSave:Fire({ Player = entry.Player, Ok = true, Duration = duration, At = Clock.Now() })
 
 		-- Record the size that actually persisted (the warning + anomaly are owned by
 		-- the pre-save check in onProfileSaving, which also fires when a save fails).
@@ -1514,7 +1526,7 @@ function Persistence.new(ctx: any)
 			end
 			-- "Wait": stay in Loading, keep retrying with backoff; never fall
 			-- back to template data on a live account.
-			task.wait(math.min(5 * attempt, 60))
+			Clock.Wait(math.min(5 * attempt, 60))
 		end
 		-- Loop exited because Closing flipped during a "Wait" backoff: tear the
 		-- stranded Loading entry down so the shutdown drain isn't held to its
@@ -1560,9 +1572,9 @@ function Persistence.new(ctx: any)
 			MalformedCount = 0,
 			OversizeCount = 0,
 			FrameTokens = ctx.InboundFrameRate,
-			FrameLast = os.clock(),
+			FrameLast = Clock.Monotonic(),
 			RateTokens = options.CommandRateLimit or 20,
-			RateLast = os.clock(),
+			RateLast = Clock.Monotonic(),
 			GiftLastAt = 0,
 		}
 		self.Entries[player] = entry
@@ -1602,13 +1614,13 @@ function Persistence.new(ctx: any)
 			end
 		end
 		local connection = entry.StateChanged:Connect(resume)
-		task.delay(math.max(deadline - os.clock(), 0), resume)
+		Clock.Delay(math.max(deadline - Clock.Monotonic(), 0), resume)
 		coroutine.yield()
 		connection:Disconnect()
 	end
 
 	function self.WaitForData(player: Player, timeout: number?): (any?, string?)
-		local deadline = os.clock() + (timeout or 60)
+		local deadline = Clock.Monotonic() + (timeout or 60)
 		while true do
 			local entry = self.Entries[player]
 			if entry then
@@ -1617,7 +1629,7 @@ function Persistence.new(ctx: any)
 				elseif entry.State == "SessionEnded" then
 					return nil, entry.FailReason or "session-ended"
 				end
-				if os.clock() >= deadline then
+				if Clock.Monotonic() >= deadline then
 					return nil, "timeout"
 				end
 				waitStateChangedUntil(entry, deadline)
@@ -1629,10 +1641,10 @@ function Persistence.new(ctx: any)
 				if player.Parent ~= Players then
 					return nil, "player-left"
 				end
-				if os.clock() >= deadline then
+				if Clock.Monotonic() >= deadline then
 					return nil, "timeout"
 				end
-				task.wait(0.1)
+				Clock.Wait(0.1)
 			end
 		end
 	end
@@ -1665,7 +1677,7 @@ function Persistence.new(ctx: any)
 		-- STARTS after this point serializes this caller's writes into its payload.
 		table.insert(entry.SaveWaiters, { Thread = thread, Gen = entry.SaveGen })
 		local done = false
-		task.delay(timeout, function()
+		Clock.Delay(timeout, function()
 			if not done then
 				for idx, waiter in entry.SaveWaiters do
 					if waiter.Thread == thread then
@@ -1944,7 +1956,7 @@ function Persistence.new(ctx: any)
 			if type(data[Template.RESERVED_ROOT]) ~= "table" then
 				data[Template.RESERVED_ROOT] = {}
 			end
-			data[Template.RESERVED_ROOT].RestoredFrom = { VersionId = versionId, At = os.time() }
+			data[Template.RESERVED_ROOT].RestoredFrom = { VersionId = versionId, At = Clock.Now() }
 			local committed, commitErr = commitViewProfile(versionProfile, self.KeyFor(userId))
 			if not committed then
 				error(commitErr)
@@ -2050,7 +2062,7 @@ function Persistence.new(ctx: any)
 		-- never squeeze profile saves past Roblox's ~30s BindToClose window.
 		-- Profile saves (player data) are started first; the leaderboard queue
 		-- is rebuildable and gets whatever time remains.
-		local deadline = os.clock() + (budget or 25)
+		local deadline = Clock.Monotonic() + (budget or 25)
 		-- Tear down profile-less Loading entries up front: one parked in a
 		-- LoadFailurePolicy="Wait" backoff sleeps up to 60s before noticing Closing,
 		-- which would otherwise hold the drain loop below to its FULL budget during
@@ -2077,10 +2089,10 @@ function Persistence.new(ctx: any)
 				end)
 			end
 		end
-		local lbBudget = math.max(0, math.min(deadline - os.clock(), 20))
+		local lbBudget = math.max(0, math.min(deadline - Clock.Monotonic(), 20))
 		ctx.Leaderboards.FlushAllBlocking(lbBudget)
-		while next(self.Entries) ~= nil and os.clock() < deadline do
-			task.wait(0.2)
+		while next(self.Entries) ~= nil and Clock.Monotonic() < deadline do
+			Clock.Wait(0.2)
 		end
 		Log.Info("Persistence", "SHUTDOWN_DONE", "shutdown drain complete", {
 			Remaining = self.EntryCount,
@@ -2091,6 +2103,16 @@ function Persistence.new(ctx: any)
 		game:BindToClose(function()
 			self.Shutdown(25)
 		end)
+	end
+
+	-- Release the process-global signal connections this bundle installed.
+	function self.Stop()
+		for _, connection in connections do
+			pcall(function()
+				connection:Disconnect()
+			end)
+		end
+		table.clear(connections)
 	end
 
 	return self

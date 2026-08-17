@@ -17,6 +17,7 @@ local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
 local Signal = require(Internal.Signal)
+local Clock = require(script.Parent.Internal.Clock)
 
 local Client = {}
 
@@ -322,7 +323,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			sendHello()
 			local delaySeconds = 2
 			while not loaded do
-				task.wait(delaySeconds)
+				Clock.Wait(delaySeconds)
 				if loaded then
 					break
 				end
@@ -393,7 +394,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		local conn = loadedSignal:Connect(function()
 			resume(true)
 		end)
-		task.delay(timeout or 30, function()
+		Clock.Delay(timeout or 30, function()
 			resume(false)
 		end)
 		local result = coroutine.yield()
@@ -455,7 +456,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 
 		local thread = coroutine.running()
 		requestWaiters[correlation] = thread
-		task.delay(options.RequestTimeout or 10, function()
+		Clock.Delay(options.RequestTimeout or 10, function()
 			if requestWaiters[correlation] == thread then
 				requestWaiters[correlation] = nil
 				task.spawn(thread, false, "timeout")
@@ -660,7 +661,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 					wake()
 				end
 			end)
-			task.delay(timeout or 10, wake)
+			Clock.Delay(timeout or 10, wake)
 			-- If the flag arrived between the check and the connect, clean up and
 			-- skip the yield -- never task.spawn a thread that has not yielded.
 			if ownsSyncedFromMirror() then

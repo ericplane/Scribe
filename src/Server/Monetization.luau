@@ -15,6 +15,7 @@ local Template = require(Internal.Template)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
+local Clock = require(Internal.Clock)
 
 local Monetization = {}
 
@@ -256,7 +257,7 @@ function Monetization.new(ctx: any)
 	-- is precisely the guess that double-grants. Stamping conservatively costs one
 	-- extra TTL of retention and cannot lose anything.
 	local function pruneProcessed(list: { any }, player: any?): { any }
-		local now = os.time()
+		local now = Clock.Now()
 		local kept = {}
 		for _, item in list do
 			local id = processedId(item)
@@ -294,14 +295,14 @@ function Monetization.new(ctx: any)
 	local function markProcessedRaw(data: { [string]: any }, purchaseId: string, player: any?)
 		local reserved = reservedRaw(data)
 		local kept = pruneProcessed(reserved.ProcessedPurchaseIds, player)
-		table.insert(kept, { Id = purchaseId, At = os.time() })
+		table.insert(kept, { Id = purchaseId, At = Clock.Now() })
 		reserved.ProcessedPurchaseIds = kept
 	end
 
 	local function markProcessed(entry: any, purchaseId: string)
 		local accessor = reservedAcc(entry).ProcessedPurchaseIds
 		local kept = pruneProcessed(accessor.Get(), entry.Player)
-		table.insert(kept, { Id = purchaseId, At = os.time() })
+		table.insert(kept, { Id = purchaseId, At = Clock.Now() })
 		-- One Set rather than a Remove loop plus an Insert: pruning is a rewrite of
 		-- the whole list (stamping legacy entries changes elements in place), and a
 		-- single op is what a surrounding Transaction rolls back cleanly.
@@ -700,7 +701,7 @@ function Monetization.new(ctx: any)
 			Product = product.Name,
 			Category = product.Category,
 			From = { Type = "GiftReceived", FromUserId = fromUserId, GiftId = giftId },
-			Ts = os.time(),
+			Ts = Clock.Now(),
 		})
 		markProcessed(recipientEntry, purchaseId)
 		Metrics.Add("GiftsDelivered")
@@ -864,7 +865,7 @@ function Monetization.new(ctx: any)
 			})
 			return nil
 		end
-		if os.time() - (tonumber(intent.Ts) or 0) > giftIntentTTL then
+		if Clock.Now() - (tonumber(intent.Ts) or 0) > giftIntentTTL then
 			-- Stale intent (abandoned prompt): expire it; the
 			-- receipt follows the no-intent policy.
 			reservedAcc(entry).PendingGifts[tostring(product.Id)].Set(nil)
@@ -911,7 +912,7 @@ function Monetization.new(ctx: any)
 				Category = product.Category,
 				PriceInRobux = receiptInfo.CurrencySpent,
 				From = { Type = "GiftCredit", IntendedFor = recipientId },
-				Ts = os.time(),
+				Ts = Clock.Now(),
 			})
 			markProcessed(entry, purchaseId)
 			Log.Warn(
@@ -947,7 +948,7 @@ function Monetization.new(ctx: any)
 			-- later retry then delivers to userId 0.
 			local liveIntent = reservedRaw(entry.LiveData).PendingGifts[tostring(product.Id)]
 			if type(liveIntent) == "table" and tostring(liveIntent.GiftId) == giftId then
-				reservedAcc(entry).PendingGifts[tostring(product.Id)].Ts.Set(os.time())
+				reservedAcc(entry).PendingGifts[tostring(product.Id)].Ts.Set(Clock.Now())
 			end
 			Metrics.Add("ReceiptsRetried")
 			return NOT_PROCESSED
@@ -960,7 +961,7 @@ function Monetization.new(ctx: any)
 			Category = product.Category,
 			PriceInRobux = receiptInfo.CurrencySpent,
 			From = { Type = "GiftSent", ToUserId = recipientId, GiftId = giftId },
-			Ts = os.time(),
+			Ts = Clock.Now(),
 		})
 		markProcessed(entry, purchaseId)
 		Log.Info("Gifting", "GIFT_RECEIPT_GRANTED", "gift purchase delivered", {
@@ -1041,7 +1042,7 @@ function Monetization.new(ctx: any)
 				Category = product.Category,
 				PriceInRobux = receiptInfo.CurrencySpent,
 				From = { Type = "GiftCredit" },
-				Ts = os.time(),
+				Ts = Clock.Now(),
 			})
 			markProcessed(entry, purchaseId)
 			Log.Warn("Gifting", "GIFT_CREDIT_ISSUED", "buyer already owns the perk; issued an unassigned gift credit", {
@@ -1074,7 +1075,7 @@ function Monetization.new(ctx: any)
 			Category = product.Category,
 			PriceInRobux = receiptInfo.CurrencySpent,
 			From = { Type = "Purchase" },
-			Ts = os.time(),
+			Ts = Clock.Now(),
 		})
 		markProcessed(entry, purchaseId)
 		Log.Info("Monetization", "RECEIPT_GRANTED", "purchase granted", {
@@ -1141,7 +1142,7 @@ function Monetization.new(ctx: any)
 			)
 			intent = nil
 		end
-		if type(intent) == "table" and os.time() - (tonumber(intent.Ts) or 0) <= giftIntentTTL then
+		if type(intent) == "table" and Clock.Now() - (tonumber(intent.Ts) or 0) <= giftIntentTTL then
 			local recipientId = tonumber(intent.RecipientId) or 0
 			local giftId = tostring(intent.GiftId)
 
@@ -1168,7 +1169,7 @@ function Monetization.new(ctx: any)
 						Category = product.Category,
 						PriceInRobux = receiptInfo.CurrencySpent,
 						From = { Type = "GiftCredit", IntendedFor = recipientId },
-						Ts = os.time(),
+						Ts = Clock.Now(),
 					})
 					markProcessedRaw(offlineData, purchaseId)
 				end)
@@ -1200,7 +1201,7 @@ function Monetization.new(ctx: any)
 					Category = product.Category,
 					PriceInRobux = receiptInfo.CurrencySpent,
 					From = { Type = "GiftSent", ToUserId = recipientId, GiftId = giftId },
-					Ts = os.time(),
+					Ts = Clock.Now(),
 				})
 				markProcessedRaw(offlineData, purchaseId)
 			end)
@@ -1250,7 +1251,7 @@ function Monetization.new(ctx: any)
 					Category = product.Category,
 					PriceInRobux = receiptInfo.CurrencySpent,
 					From = { Type = "Purchase" },
-					Ts = os.time(),
+					Ts = Clock.Now(),
 				})
 				markProcessedRaw(offlineData, purchaseId)
 			end)
@@ -1355,7 +1356,7 @@ function Monetization.new(ctx: any)
 		end
 
 		-- Anti-abuse: per-sender cooldown + max pending gifts.
-		local now = os.clock()
+		local now = Clock.Monotonic()
 		if now - entry.GiftLastAt < giftCooldown then
 			return false, "gift cooldown"
 		end
@@ -1435,7 +1436,7 @@ function Monetization.new(ctx: any)
 		-- recipient. Past giftPromptWindow the intent is an abandoned/cancelled
 		-- prompt (no receipt ever came) and is safe to overwrite below.
 		local pendingIntent = intentFor(entry, product)
-		if pendingIntent ~= nil and os.time() - (tonumber(pendingIntent.Ts) or 0) < giftPromptWindow then
+		if pendingIntent ~= nil and Clock.Now() - (tonumber(pendingIntent.Ts) or 0) < giftPromptWindow then
 			return false, "a gift of this item is already pending; try again shortly"
 		end
 		local giftId = Util.guid()
@@ -1443,7 +1444,7 @@ function Monetization.new(ctx: any)
 		intentAccessor.Set({
 			RecipientId = recipientUserId,
 			GiftId = giftId,
-			Ts = os.time(),
+			Ts = Clock.Now(),
 			Product = productName,
 		})
 		if not ctx.Persistence.AwaitSave(entry, 10) then
@@ -1484,7 +1485,7 @@ function Monetization.new(ctx: any)
 		end
 		checkCategory(logEntry.Category)
 		local record = table.clone(logEntry)
-		record.Ts = record.Ts or os.time()
+		record.Ts = record.Ts or Clock.Now()
 		appendRing(reservedAcc(entry).PurchaseLogs.InGame, inGameCap, record)
 	end
 
@@ -1625,7 +1626,7 @@ function Monetization.new(ctx: any)
 				ItemId = spec.ItemId,
 				Currency = tostring(costPath[#costPath]),
 				Amount = amount,
-				Ts = os.time(),
+				Ts = Clock.Now(),
 				Meta = spec.Meta,
 			})
 		end)
@@ -1650,7 +1651,7 @@ function Monetization.new(ctx: any)
 	function self.OnLoad(entry: any)
 		-- Expire stale gift intents.
 		local reserved = reservedRaw(entry.LiveData)
-		local now = os.time()
+		local now = Clock.Now()
 		for productIdStr, intent in reserved.PendingGifts do
 			if type(intent) ~= "table" or now - (tonumber(intent.Ts) or 0) > giftIntentTTL then
 				reservedAcc(entry).PendingGifts[productIdStr].Set(nil)
@@ -1685,6 +1686,9 @@ function Monetization.new(ctx: any)
 		end
 	end
 
+	local connections: { any } = {}
+	local boundReceipts = false
+
 	function self.Start()
 		-- Only take over ProcessReceipt when there are developer products to grant.
 		-- A data-only or pass-only game keeps its own receipt handler untouched.
@@ -1698,6 +1702,7 @@ function Monetization.new(ctx: any)
 				)
 			end
 			receiptsBound = true
+			boundReceipts = true
 			MarketplaceService.ProcessReceipt = function(receiptInfo)
 				return self.HandleReceipt(receiptInfo)
 			end
@@ -1709,7 +1714,7 @@ function Monetization.new(ctx: any)
 			)
 		end
 
-		MarketplaceService.PromptGamePassPurchaseFinished:Connect(
+		connections[#connections + 1] = MarketplaceService.PromptGamePassPurchaseFinished:Connect(
 			function(player: Player, passId: number, purchased: boolean)
 				if not purchased then
 					return
@@ -1722,11 +1727,11 @@ function Monetization.new(ctx: any)
 				if entry and entry.State == "Ready" then
 					setOwnsCache(entry, passName, true)
 					robuxLog(entry, {
-						PurchaseId = `pass:{passId}:{os.time()}`,
+						PurchaseId = `pass:{passId}:{Clock.Now()}`,
 						Product = passName,
 						Category = passesByName[passName].Category or "Gamepass",
 						From = { Type = "GamePass" },
-						Ts = os.time(),
+						Ts = Clock.Now(),
 					})
 					task.spawn(function()
 						ctx.Persistence.AwaitSave(entry, 15)
@@ -1735,12 +1740,32 @@ function Monetization.new(ctx: any)
 			end
 		)
 
-		Players.PlayerMembershipChanged:Connect(function(player: Player)
+		connections[#connections + 1] = Players.PlayerMembershipChanged:Connect(function(player: Player)
 			local entry = ctx.Persistence.EntryFor(player)
 			if entry and entry.State == "Ready" then
 				setOwnsCache(entry, "RobloxPlus", player.HasRobloxSubscription)
 			end
 		end)
+	end
+
+	-- Release the marketplace listeners, and hand ProcessReceipt back. The
+	-- receiptsBound guard is module-global (it exists to stop two bundles owning
+	-- the handler at once), so leaving it set would make a later bundle in the same
+	-- process throw even though nothing owns it any more.
+	function self.Stop()
+		for _, connection in connections do
+			pcall(function()
+				connection:Disconnect()
+			end)
+		end
+		table.clear(connections)
+		if boundReceipts then
+			boundReceipts = false
+			receiptsBound = false
+			pcall(function()
+				MarketplaceService.ProcessReceipt = nil
+			end)
+		end
 	end
 
 	return self

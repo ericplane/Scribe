@@ -14,6 +14,7 @@ local Big = require(Internal.Big)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
+local Clock = require(Internal.Clock)
 
 local Leaderboards = {}
 
@@ -139,6 +140,9 @@ function Leaderboards.new(ctx: any)
 	local storeCache: { [string]: any } = {}
 	local mockStores: { [string]: any } = {}
 
+	local stopped = false
+	local pacerThread: thread? = nil
+	local refreshThread: thread? = nil
 	local writeQueue: { { Board: Board, UserId: number, Score: number, Attempts: number } } = {}
 	local writeQueueMap: { [string]: { Board: Board, UserId: number, Score: number, Attempts: number } } = {}
 	-- Overflow-log throttle. Once the queue is over cap, an evicted player's next
@@ -155,7 +159,7 @@ function Leaderboards.new(ctx: any)
 		if until_ == nil then
 			return false
 		end
-		if os.clock() >= until_ then
+		if Clock.Monotonic() >= until_ then
 			erasedUsers[userId] = nil -- expired; a returning player may re-enter
 			return false
 		end
@@ -537,7 +541,7 @@ function Leaderboards.new(ctx: any)
 			end
 			Metrics.Add("LbQueueOverflow")
 			overflowSinceLog += 1
-			local now = os.clock()
+			local now = Clock.Monotonic()
 			if lastOverflowLog == nil or now - lastOverflowLog >= OVERFLOW_LOG_INTERVAL then
 				lastOverflowLog = now
 				Log.Warn(
@@ -581,8 +585,8 @@ function Leaderboards.new(ctx: any)
 	end
 
 	local function writePacerLoop()
-		while true do
-			task.wait(WRITE_INTERVAL)
+		while not stopped do
+			Clock.Wait(WRITE_INTERVAL)
 			local item = table.remove(writeQueue, 1)
 			if item then
 				local key = `{item.Board.Name}|{item.UserId}`
@@ -635,7 +639,7 @@ function Leaderboards.new(ctx: any)
 		end
 		nameCache[userId] = entry
 		if nameCacheCount >= NAME_CACHE_CAP then
-			local now = os.clock()
+			local now = Clock.Monotonic()
 			local kept = 0
 			for id, c in nameCache do
 				local ttl = if c.Name then NAME_TTL else NAME_NEGATIVE_TTL
@@ -670,7 +674,7 @@ function Leaderboards.new(ctx: any)
 
 	local function resolveName(userId: number): string
 		local cached = nameCache[userId]
-		local now = os.clock()
+		local now = Clock.Monotonic()
 		if cached then
 			local ttl = if cached.Name then NAME_TTL else NAME_NEGATIVE_TTL
 			if now - cached.At < ttl then
@@ -762,7 +766,7 @@ function Leaderboards.new(ctx: any)
 			})
 			table.insert(signatureParts, `{userId}:{score}`)
 		end
-		board.Cache = { Entries = entries, At = os.clock() }
+		board.Cache = { Entries = entries, At = Clock.Monotonic() }
 		local previousSignature = board.Signature
 		board.Signature = table.concat(signatureParts, "|")
 
@@ -795,16 +799,16 @@ function Leaderboards.new(ctx: any)
 	-- a due-time scheduler. Initial due times are staggered across the first cycle so
 	-- boot does not fire every board in the same instant.
 	local function refreshLoop()
-		task.wait(5)
+		Clock.Wait(5)
 		local dueAt: { [string]: number } = {}
 		local index = 0
 		local count = math.max(Util.count(boards), 1)
 		for boardName, board in boards do
-			dueAt[boardName] = os.clock() + (board.RefreshInterval * index) / count
+			dueAt[boardName] = Clock.Monotonic() + (board.RefreshInterval * index) / count
 			index += 1
 		end
-		while true do
-			local now = os.clock()
+		while not stopped do
+			local now = Clock.Monotonic()
 			for boardName, board in boards do
 				local due = dueAt[boardName]
 				if due == nil or now >= due then
@@ -812,7 +816,7 @@ function Leaderboards.new(ctx: any)
 					task.spawn(refreshBoard, board)
 				end
 			end
-			task.wait(1)
+			Clock.Wait(1)
 		end
 	end
 
@@ -820,8 +824,22 @@ function Leaderboards.new(ctx: any)
 	-- write queue and refresh cycle never run against a half-constructed
 	-- context.
 	function self.Start()
-		task.spawn(writePacerLoop)
-		task.spawn(refreshLoop)
+		pacerThread = task.spawn(writePacerLoop)
+		refreshThread = task.spawn(refreshLoop)
+	end
+
+	-- Release both loops. Cancelled as well as flagged: the pacer parks for
+	-- WRITE_INTERVAL and the refresh cycle for a second, so a flag alone would keep
+	-- two threads alive per bundle for as long as that.
+	function self.Stop()
+		if stopped then
+			return
+		end
+		stopped = true
+		for _, thread in { pacerThread, refreshThread } do
+			pcall(task.cancel, thread)
+		end
+		pacerThread, refreshThread = nil, nil
 	end
 
 	-- The OrderedDataStore a board reads and writes. Exposed so a test can pin the
@@ -969,9 +987,9 @@ function Leaderboards.new(ctx: any)
 
 	-- Drain the whole queue synchronously within a deadline.
 	function self.FlushAllBlocking(budget: number)
-		local deadline = os.clock() + budget
+		local deadline = Clock.Monotonic() + budget
 		local flushed = 0
-		while os.clock() < deadline do
+		while Clock.Monotonic() < deadline do
 			local item = table.remove(writeQueue, 1)
 			if not item then
 				break
@@ -1003,7 +1021,7 @@ function Leaderboards.new(ctx: any)
 		-- Tombstone first so an in-flight pacer write (already dequeued) cannot
 		-- resurrect the score after we RemoveAsync it. Kept for a few minutes,
 		-- enough to outlive the in-flight write plus its retries.
-		erasedUsers[userId] = os.clock() + 300
+		erasedUsers[userId] = Clock.Monotonic() + 300
 
 		-- Drop any still-queued writes for this user, or the pacer would
 		-- SetAsync their score back into a board we just RemoveAsync'd.

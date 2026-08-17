@@ -81,7 +81,6 @@ export type Tree = typeof(setmetatable(
 		-- a subtree that is replaced or removed becomes unreachable and takes its
 		-- entry with it, so the cache is bounded by the LIVE store shape rather
 		-- than by how many distinct paths were ever read.
-		_unpacked: { [any]: any },
 		-- true only while replaying the initial snapshot: suppresses per-op fires
 		-- so descendants can be fired once, together, afterwards.
 		_replaying: boolean,
@@ -138,7 +137,6 @@ function Node.NewTree(params: TreeParams): Tree
 		-- Luau has no ephemerons: a weak-keyed entry whose VALUE can reach its KEY
 		-- is never collected. Safe here because a view holds only DESCENDANTS of the
 		-- source table, never the source itself.
-		_unpacked = setmetatable({}, { __mode = "k" }) :: any,
 		_replaying = false,
 		_batchDepth = 0,
 		_pendingAncestors = nil,
@@ -192,36 +190,6 @@ end
 -- which is also what makes Remove()'s string/number dispatch correct by construction.
 -- Untyped containers (a plain `{}` template field) have no Container and are
 -- unaffected, keeping exactly the behavior they have today.
--- Drop the cached view of every container along `path`, plus the value at its end.
---
--- Only IDENTITY-PRESERVING mutations need this: a write below a container,
--- table.clear, an array op. A mutation that REPLACES or removes a subtree needs no
--- help at all -- the cache is weak-keyed by the stored table, so the old table
--- becoming unreachable takes its entry with it. That is what makes descendants
--- safe: keying by pathKey used to strand one strong entry per previously-read
--- child on every subtree replacement, and each stranded entry then held the dead
--- store table alive.
-local function invalidateUnpacked(tree: Tree, path: { string | number })
-	local cache = tree._unpacked
-	if next(cache) == nil then
-		return -- nothing packed has been read; the whole mechanism costs one lookup
-	end
-	local rootKey = path[1]
-	if rootKey == nil then
-		return
-	end
-	local node: any = storeFor(tree, rootKey)
-	for i = 1, #path do
-		if type(node) ~= "table" then
-			return
-		end
-		cache[node] = nil
-		node = node[path[i]]
-	end
-	if type(node) == "table" then
-		cache[node] = nil
-	end
-end
 
 -- Container memos -------------------------------------------------------------
 --
@@ -1719,17 +1687,6 @@ function applySet(tree: Tree, path: { string | number }, schema: SchemaNode?, va
 	-- After the no-op early-out, so an unchanged write never triggers a recompute,
 	-- and before the fires, so a listener reading a derived field sees it settled.
 	markDerivedDirty(tree, pathKey)
-	invalidateUnpacked(tree, path)
-	if type(old) == "table" then
-		-- Replacing or removing a whole subtree orphans every table inside it, and
-		-- those are precisely the keys cached views are stored under. The weak keys
-		-- make them COLLECTABLE, but collectable is not collected: nothing promises
-		-- when a GC pass runs, and until one does the cache is the sole owner of
-		-- data the store has already dropped. Evicting wholesale here is O(1), runs
-		-- only on a write that was already discarding a subtree, and makes the
-		-- release immediate rather than eventual. The weak keys stay as a backstop.
-		table.clear(tree._unpacked)
-	end
 	snapshotForTxn(tree, path, pathKey, old)
 	-- Snapshot observed descendants BEFORE the write; a whole-table Set changes
 	-- every leaf beneath this path and only this pass can report it.
@@ -1907,7 +1864,6 @@ local function applyInsert(
 	-- BEFORE the snapshot so intermediate declared elements replicate as real ops.
 	seedMissingElements(tree, path, schema, opts)
 	markDerivedDirty(tree, pathKey)
-	invalidateUnpacked(tree, path)
 	snapshotForTxn(tree, path, pathKey, preValue)
 
 	local arr = ensureContainerValue(tree, path, schema)
@@ -1953,14 +1909,8 @@ function applyArrayRemove(
 
 	local pathKey = Util.pathKey(path)
 	markDerivedDirty(tree, pathKey)
-	invalidateUnpacked(tree, path)
 	snapshotForTxn(tree, path, pathKey, arr)
 	local item = table.remove(arr, index)
-	if type(item) == "table" then
-		-- Same reasoning as the subtree replacement in applySet: the removed element
-		-- is orphaned now, and a cached view keyed by it should not outlive it.
-		table.clear(tree._unpacked)
-	end
 
 	emitOp(tree, { Kind = "Remove", Path = table.clone(path), Index = index }, schema, opts)
 	fire(tree, pathKey, "OnRemove", item, index)
@@ -1997,7 +1947,6 @@ local function applyClear(tree: Tree, path: { string | number }, schema: SchemaN
 	-- its declared children -- so this is the one non-Set path that can blank an
 	-- input (data.Stats.Clear() takes Stats.PoliceXP with it).
 	markDerivedDirty(tree, pathKey)
-	invalidateUnpacked(tree, path)
 	snapshotForTxn(tree, path, pathKey, value)
 	local descendantOlds = snapshotDescendants(tree, pathKey)
 	table.clear(value)
@@ -2007,7 +1956,6 @@ local function applyClear(tree: Tree, path: { string | number }, schema: SchemaN
 	-- but "eventually" is a GC pass away and a wiped inventory should not stay
 	-- resident until one happens; a bulk operation can afford a bulk eviction, and
 	-- the rollback path already takes the same trade.
-	table.clear(tree._unpacked)
 
 	emitOp(tree, { Kind = "Clear", Path = table.clone(path) }, schema, opts)
 	-- Bulk semantics: parent Changed fires once; per-entry key events don't. A
@@ -2483,7 +2431,6 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 	-- case about which of those could leave a stale view is a poor trade against
 	-- one table.clear on a path that only runs when a transaction has already
 	-- failed. A stale read here would be silent, so this end is the cheap one.
-	table.clear(self._unpacked)
 	return false, tostring(err)
 end
 
@@ -2496,7 +2443,6 @@ function Tree.Destroy(self: Tree)
 	-- equivalent sweep: the per-parent _children caches are weak-valued.
 	table.clear(self._paths)
 	table.clear(self._descendants)
-	table.clear(self._unpacked)
 end
 
 -- Accessor methods -----------------------------------------------------------------
@@ -2534,14 +2480,6 @@ end
 	shared by reference. Mutating what `Get` hands you edits authoritative state with
 	no validation and no replication, so treat it as read-only and use [Value.Clone]
 	when you intend to mutate.
-
-	A subtree that *does* contain a datatype or a [Scribe.Big] comes back **frozen**,
-	and the same view is reused until something writes to that subtree. The rebuild
-	those fields need is expensive on a large container, and it used to run on every
-	read and every fire — including fires caused by writes to unrelated fields. Since
-	the view is now shared between readers, it is frozen so one caller's edit cannot
-	leak into another's read; `Get()` at the root has always been frozen for the same
-	reason. Use [Value.Clone] for a mutable copy.
 
 	:::note The root is a special case
 	`Data[player].Get()` is the one read that does not hand back the store. It
@@ -2997,13 +2935,7 @@ end
 -- subtrees are shared by reference (same as a plain container read today) and
 -- containers with nothing packed below return unchanged: no walk, no allocation for
 -- the overwhelming common case.
--- Nodes rebuilt by the current unpackRead walk, read by unpackCached's cost
--- gate. A plain counter rather than a threaded parameter: unpackRead is
--- recursive and already on an O(n) path, and every caller is single-threaded.
-local unpackNodes = 0
-
 local function unpackRead(schema: SchemaNode?, value: any): any
-	unpackNodes += 1
 	-- A big value is STORED as { mantissa, exponent } and READ as the object with
 	-- arithmetic on it, the same split datatype fields use.
 	if schema and schema.ValueType == "big" then
@@ -3165,50 +3097,6 @@ end
 -- Scribe's own internals stay reachable by indexing the accessor
 -- (`data._Scribe.Perks`), which is how the server layers read them; this only
 -- changes what a whole-data read hands back.
--- Cached unpacked read views ---------------------------------------------------
---
--- A PACKED subtree (one holding a Scribe.CFrame, a Scribe.Big, or any datatype
--- anywhere below it) has to be rebuilt key by key to be read, because the stored
--- form is packed. That rebuild ran on every Get, every container Changed fire and
--- every root Observe fire, so a template with 3,000 packed elements paid ~9 ms of
--- it per write -- including writes to a completely unrelated field, because a root
--- Observe re-reads every root.
---
--- Each entry remembers the exact table it was built from. A whole-table Set
--- installs a DIFFERENT table, so that case invalidates itself on identity and
--- needs no bookkeeping at all; the same is true of a subtree that was replaced or
--- removed above. Explicit invalidation is therefore only needed for mutations that
--- KEEP the identity -- a write below the container, table.clear, an array op --
--- which is why the hook walks ancestors and nothing else.
---
--- The view is frozen. It is shared between readers now, so handing back a mutable
--- one would let one caller's edit leak into every later read. Root Get() has
--- always been frozen for exactly this reason; this makes containers agree with it.
--- Below this many rebuilt nodes a miss is cheap enough that caching it costs more
--- memory than it saves time. Measured rebuild rate is ~2.8 us per element record,
--- so a 64-node floor caps an uncached miss at roughly 180 us while every entry
--- that does get stored is saving milliseconds. Without a gate, a game reading
--- thousands of SMALL packed records (an inventory keyed by item id) retained one
--- copy each and got nothing back for it.
-local MIN_CACHED_NODES = 64
-
-local function unpackCached(tree: Tree, schema: SchemaNode?, value: any): any
-	if type(value) ~= "table" or not Template.IsPacked(schema) then
-		-- Nothing to rebuild: unpackRead hands a non-packed table straight back
-		-- (it is the live store table) and only converts packed leaves.
-		return unpackRead(schema, value)
-	end
-	local hit = tree._unpacked[value]
-	if hit ~= nil then
-		return hit
-	end
-	unpackNodes = 0
-	local view = table.freeze(unpackRead(schema, value))
-	if unpackNodes >= MIN_CACHED_NODES then
-		tree._unpacked[value] = view
-	end
-	return view
-end
 
 local function rootShell(tree: Tree, clone: boolean): { [string]: any }
 	local out: { [string]: any } = {}
@@ -3225,7 +3113,7 @@ local function rootShell(tree: Tree, clone: boolean): { [string]: any }
 			continue
 		end
 		if not clone then
-			out[key] = unpackCached(tree, childSchema, value)
+			out[key] = unpackRead(childSchema, value)
 		elseif Template.IsPacked(childSchema) then
 			out[key] = cloneUnpack(childSchema, value)
 		else
@@ -3241,6 +3129,62 @@ local function frozenRootShell(tree: Tree): { [string]: any }
 	return table.freeze(rootShell(tree, false))
 end
 
+-- A root Observe/Changed re-reads EVERY root on every write, and a root holding a
+-- datatype or a Scribe.Big has to be rebuilt key by key to be read at all. Put
+-- those together over a few thousand packed elements and one write to an
+-- unrelated field costs milliseconds -- measured at ~9 ms with 3,000 CFrames.
+--
+-- There is no safe way for the library to make that cheap: the rebuild can only be
+-- skipped by handing every reader the SAME view, and that view aliases live store
+-- tables, so sharing it lets one caller's edit reach another's read and the profile
+-- itself. The fix belongs in the game -- listen to the CONTAINER you care about
+-- instead. A container's Changed only fires for writes at or under it, so a
+-- genuinely unrelated write costs microseconds. This says so, once, in DevMode.
+local ROOT_OBSERVE_WARN_NODES = 512
+local warnedRootObserve: { [any]: boolean } = setmetatable({}, { __mode = "k" }) :: any
+
+local function countNodes(value: any, budget: number): number
+	if type(value) ~= "table" or budget <= 0 then
+		return 1
+	end
+	local n = 1
+	for _, child in value do
+		n += countNodes(child, budget - n)
+		if n >= budget then
+			break
+		end
+	end
+	return n
+end
+
+local function warnIfRootObserveIsExpensive(tree: Tree, what: string)
+	if not tree.Params.DevMode or warnedRootObserve[tree] then
+		return
+	end
+	local warnFn = tree.Params.LogWarn
+	if warnFn == nil then
+		return
+	end
+	local children = tree.Compiled.Root.Children
+	if children == nil then
+		return
+	end
+	for key, childSchema in children do
+		if key ~= Template.RESERVED_ROOT and key ~= Template.SESSION_ROOT and Template.IsPacked(childSchema) then
+			local nodes = countNodes(storeFor(tree, key)[key], ROOT_OBSERVE_WARN_NODES)
+			if nodes >= ROOT_OBSERVE_WARN_NODES then
+				warnedRootObserve[tree] = true
+				warnFn(
+					`a root {what} re-reads every root on every write, and "{key}" holds a datatype or `
+						.. `Scribe.Big across {nodes}+ values, which must be unpacked each time. Listen to the `
+						.. `container you care about instead (data.{key}.{what}) -- a container only fires for `
+						.. "writes at or under it, so unrelated writes cost nothing. DevMode-only warning."
+				)
+				return
+			end
+		end
+	end
+end
 -- Whether this node holds children, and so receives coalesced ancestor fires
 -- rather than leaf transitions. The root always does. A schema-less (dynamic) node
 -- is judged by what is actually stored there right now, which is the best answer
@@ -3283,7 +3227,7 @@ METHOD_FACTORIES.Get = function(accessor)
 			-- template happened to declare a datatype field somewhere.
 			return frozenRootShell(tree)
 		end
-		return unpackCached(tree, accessorSchema(accessor), readValue(tree, path))
+		return unpackRead(accessorSchema(accessor), readValue(tree, path))
 	end
 end
 
@@ -3696,6 +3640,7 @@ METHOD_FACTORIES.Changed = function(accessor)
 		end
 
 		if #path == 0 then
+			warnIfRootObserveIsExpensive(tree, "Changed")
 			-- Match what Get hands back. The root has no Set or Update, so its only
 			-- fires are ancestor fires, where old and new are one reference; a single
 			-- shell serves both and a listener's `if new == old then return` holds.
@@ -3709,7 +3654,7 @@ METHOD_FACTORIES.Changed = function(accessor)
 		if Template.IsPacked(schema) then
 			local inner = fn
 			fn = function(newValue, oldValue)
-				local newUnpacked = unpackCached(tree, schema, newValue)
+				local newUnpacked = unpackRead(schema, newValue)
 				-- An ancestor container fire passes the SAME reference for new and old;
 				-- reuse the unpacked value to skip a second walk and to preserve
 				-- reference-equality for a listener's `if new == old then return` guard.
@@ -3728,11 +3673,14 @@ METHOD_FACTORIES.Observe = function(accessor)
 		local schema = accessorSchema(accessor)
 		local path = accessorPath(accessor)
 		local isRoot = #path == 0
+		if isRoot then
+			warnIfRootObserveIsExpensive(tree, "Observe")
+		end
 		local disconnect = connect(tree, path, "Changed", function(newValue)
-			fn(if isRoot then frozenRootShell(tree) else unpackCached(tree, schema, newValue))
+			fn(if isRoot then frozenRootShell(tree) else unpackRead(schema, newValue))
 		end)
 		local ok, err = xpcall(function()
-			fn(if isRoot then frozenRootShell(tree) else unpackCached(tree, schema, readValue(tree, path)))
+			fn(if isRoot then frozenRootShell(tree) else unpackRead(schema, readValue(tree, path)))
 		end, function(e)
 			return debug.traceback(tostring(e), 2)
 		end)

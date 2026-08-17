@@ -8,6 +8,7 @@ local Internal = script.Parent.Parent.Internal
 local Util = require(Internal.Util)
 local Template = require(Internal.Template)
 local Log = require(Internal.Log)
+local Clock = require(Internal.Clock)
 
 local Timed = {}
 
@@ -101,7 +102,7 @@ function Timed.new(ctx: any)
 				end
 				accessor.Set(value, replicate)
 				local pathKey = rawget(accessor, "_key") :: string
-				setTimed(entry, pathKey, os.time() + clampSeconds(seconds))
+				setTimed(entry, pathKey, Clock.Now() + clampSeconds(seconds))
 			end,
 			ExtendTimed = function(accessor: any, seconds: number, replicate: boolean?)
 				if type(seconds) ~= "number" or seconds <= 0 then
@@ -109,7 +110,7 @@ function Timed.new(ctx: any)
 				end
 				local pathKey = rawget(accessor, "_key") :: string
 				local store = timedStore(entry)
-				local now = os.time()
+				local now = Clock.Now()
 				local current = if store then store[pathKey] else nil
 				-- Stack onto a running timer; if expired/inactive, behave like
 				-- SetTimed from now (the value itself is left untouched).
@@ -121,7 +122,7 @@ function Timed.new(ctx: any)
 				local pathKey = rawget(accessor, "_key") :: string
 				local store = timedStore(entry)
 				local expiry = if store then store[pathKey] else nil
-				local now = os.time()
+				local now = Clock.Now()
 				if expiry and now < expiry then
 					return true, expiry - now
 				end
@@ -155,7 +156,7 @@ function Timed.new(ctx: any)
 		if not store then
 			return false, 0
 		end
-		local now = os.time()
+		local now = Clock.Now()
 		-- Both slots hold an ABSOLUTE deadline for the whole session, saves included;
 		-- the online one is converted to remaining seconds only in the copy the
 		-- DataStore receives, so reads here are identical for the two modes.
@@ -186,7 +187,7 @@ function Timed.new(ctx: any)
 		if not store then
 			return false, 0
 		end
-		local now = os.time()
+		local now = Clock.Now()
 		for _, prefix in { COOLDOWN_PREFIX, ONLINE_PREFIX } do
 			local expiry = store[prefix .. key]
 			if expiry and now < expiry then
@@ -219,7 +220,7 @@ function Timed.new(ctx: any)
 		if not store or not entry.Tree or entry.Tree.Dead then
 			return
 		end
-		local now = os.time()
+		local now = Clock.Now()
 		local lapsed: { { Key: string, Expiry: number } }? = nil
 		for pathKey, expiry in store do
 			if type(expiry) == "number" and now >= expiry then
@@ -263,7 +264,7 @@ function Timed.new(ctx: any)
 		if not store then
 			return
 		end
-		local now = os.time()
+		local now = Clock.Now()
 		for pathKey, remaining in remainingByKey do
 			store[pathKey] = now + remaining
 		end
@@ -289,7 +290,7 @@ function Timed.new(ctx: any)
 		if not store then
 			return nil
 		end
-		local now = os.time()
+		local now = Clock.Now()
 		local persisted: { [string]: number } = {}
 		for pathKey, value in store do
 			if string.sub(pathKey, 1, #ONLINE_PREFIX) == ONLINE_PREFIX and type(value) == "number" then
@@ -377,12 +378,14 @@ function Timed.new(ctx: any)
 
 	function self.OnUnload(_entry: any) end
 
+	local stopped = false
+	local sweepThread: thread? = nil
 	-- Called by Server.build once the full ctx is assembled, so the sweep
 	-- never runs against a half-constructed context.
 	function self.Start()
-		task.spawn(function()
-			while true do
-				task.wait(SWEEP_INTERVAL)
+		sweepThread = task.spawn(function()
+			while not stopped do
+				Clock.Wait(SWEEP_INTERVAL)
 				local persistence = ctx.Persistence
 				if persistence then
 					for _, entry in persistence.Entries do
@@ -393,6 +396,21 @@ function Timed.new(ctx: any)
 				end
 			end
 		end)
+	end
+
+	-- Release the sweep so the bundle can be discarded. The flag alone would leave
+	-- the thread parked in task.wait for up to SWEEP_INTERVAL; cancelling frees it
+	-- now, which is what makes building many bundles in one process (a multi-server
+	-- simulation, or 300-odd test harnesses) measure Scribe rather than the leak.
+	function self.Stop()
+		if stopped then
+			return
+		end
+		stopped = true
+		if sweepThread ~= nil then
+			pcall(task.cancel, sweepThread)
+			sweepThread = nil
+		end
 	end
 
 	return self

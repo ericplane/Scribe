@@ -979,6 +979,42 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		Transport = ctx.Transport.Name,
 	})
 
+	--[=[
+		@within Server
+		@tag Lifecycle
+		@server
+		Releases everything this bundle holds on the process: the Timed sweep, the
+		leaderboard write pacer and refresh cycle, the per-frame replication flush,
+		the Players and MarketplaceService listeners, the ProfileStore signal
+		handlers, and `MarketplaceService.ProcessReceipt` if this bundle owns it.
+
+		A Scribe bundle is normally built once and lives for the server's lifetime,
+		so a game never needs this. It exists because a PROCESS that builds many
+		bundles -- a test suite, or a simulation standing up a fleet of servers --
+		otherwise accumulates immortal loops and listeners, and ends up measuring
+		that accumulation rather than Scribe.
+
+		Idempotent, and does NOT save: call `Data.Flush` first if the data matters.
+		Loaded sessions are left alone; drop the bundle and they go with it.
+	]=]
+	local stopped = false
+	function Data.Stop()
+		if stopped then
+			return
+		end
+		stopped = true
+		-- Reverse of the Start order at the top of build: stop producing work
+		-- before releasing what consumes it.
+		for _, subsystem in { ctx.Leaderboards, ctx.Timed, ctx.Monetization, ctx.Replication, ctx.Persistence } do
+			if subsystem ~= nil and type(subsystem.Stop) == "function" then
+				local ok, err = pcall(subsystem.Stop)
+				if not ok then
+					Log.Warn("Lifecycle", "SUBSYSTEM_HOOK_ERROR", `Stop failed: {tostring(err)}`, {})
+				end
+			end
+		end
+	end
+
 	return Data, ctx
 end
 
@@ -998,14 +1034,29 @@ function Server.new(options: any, compiled: Template.Compiled): any
 
 	ctx.Persistence.BindShutdown()
 
-	Players.PlayerAdded:Connect(function(player)
-		ctx.Persistence.OnPlayerAdded(player)
-	end)
-	Players.PlayerRemoving:Connect(function(player)
-		ctx.Persistence.OnPlayerRemoving(player)
-	end)
+	local playerConnections = {
+		Players.PlayerAdded:Connect(function(player)
+			ctx.Persistence.OnPlayerAdded(player)
+		end),
+		Players.PlayerRemoving:Connect(function(player)
+			ctx.Persistence.OnPlayerRemoving(player)
+		end),
+	}
 	for _, player in Players:GetPlayers() do
 		ctx.Persistence.OnPlayerAdded(player)
+	end
+
+	-- Extend build's Stop with the engine wiring only Server.new installs, so each
+	-- scope releases exactly what it created.
+	local stopSubsystems = Data.Stop
+	function Data.Stop()
+		for _, connection in playerConnections do
+			pcall(function()
+				connection:Disconnect()
+			end)
+		end
+		table.clear(playerConnections)
+		stopSubsystems()
 	end
 
 	-- Load banner: one clean line confirming the bundle initialized

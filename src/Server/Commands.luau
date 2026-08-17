@@ -8,6 +8,7 @@ local Wire = require(Internal.Wire)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Marker = require(Internal.Marker)
+local Clock = require(Internal.Clock)
 
 local Commands = {}
 
@@ -180,7 +181,7 @@ function Commands.new(ctx: any)
 	end
 
 	local function takeToken(entry: any): boolean
-		local now = os.clock()
+		local now = Clock.Monotonic()
 		local elapsed = now - entry.RateLast
 		entry.RateLast = now
 		entry.RateTokens = math.min(rateLimit, entry.RateTokens + elapsed * rateLimit)
@@ -197,7 +198,7 @@ function Commands.new(ctx: any)
 	-- the evidence of everything else. One entry per interval per player per code
 	-- is enough to see the pattern.
 	local function throttledWarn(entry: any, code: any, message: string, context: { [string]: any })
-		local now = os.clock()
+		local now = Clock.Monotonic()
 		local seen = entry.LastCommandWarnAt
 		if not seen then
 			seen = {}
@@ -398,7 +399,7 @@ function Commands.new(ctx: any)
 		-- the rejection reply needs; the undecoded tail dies with the reader.
 		if not takeToken(entry) then
 			Metrics.Add("CommandsRateLimited")
-			local now = os.clock()
+			local now = Clock.Monotonic()
 			-- Decay first: a player who stopped flooding starts fresh, so a rare
 			-- legitimate burst never creeps toward the sustained-flood cutoff.
 			if now - (entry.LastRateLimitAt or -math.huge) > RATE_RESET_WINDOW then

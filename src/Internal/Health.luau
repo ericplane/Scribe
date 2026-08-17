@@ -7,6 +7,7 @@
 local Signal = require(script.Parent.Signal)
 local Log = require(script.Parent.Log)
 local Metrics = require(script.Parent.Metrics)
+local Clock = require(script.Parent.Clock)
 
 export type Status = "Healthy" | "Degraded" | "Outage"
 
@@ -54,7 +55,7 @@ local function pruneFailures(now: number)
 end
 
 local function evaluate()
-	local now = os.clock()
+	local now = Clock.Monotonic()
 	pruneFailures(now)
 	local recent = #failures
 
@@ -85,7 +86,7 @@ end
 -- Report a failed DataStore/OrderedDataStore/MessageAsync operation.
 function Health.ReportFailure(subsystem: string)
 	successStreak = 0
-	table.insert(failures, os.clock())
+	table.insert(failures, Clock.Monotonic())
 	Metrics.Add("HealthFailures")
 	Metrics.Add("HealthFailures_" .. subsystem)
 	evaluate()
@@ -109,13 +110,13 @@ end
 function Health.SetCritical(isCritical: boolean)
 	if isCritical then
 		if not criticalSince then
-			criticalSince = os.clock()
+			criticalSince = Clock.Monotonic()
 			-- evaluate() runs only on ReportFailure / SetCritical, so a sustained
 			-- critical window with no further failures would never escalate to
 			-- Outage. Re-check once the sustained-critical delay elapses; evaluate()
 			-- re-reads the real elapsed time, so a since-cleared or freshly-reset
 			-- critical state won't escalate prematurely.
-			task.delay(thresholds.CriticalOutageDelay, function()
+			Clock.Delay(thresholds.CriticalOutageDelay, function()
 				if criticalSince then
 					evaluate()
 				end

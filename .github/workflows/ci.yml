@@ -139,6 +139,40 @@ jobs:
             exit 1
           fi
 
+  clock-seam:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Every reading of time and every timed wait in src/ must route through
+      # Internal/Clock, or a simulation cannot fast-forward past it. One stray
+      # os.time() is enough to pin a cooldown, a TTL or a retry backoff to real
+      # time while everything around it moves -- worse than having no seam at all,
+      # because the result LOOKS controllable. It is the kind of thing that creeps
+      # back one call at a time, so it is checked rather than trusted.
+      #
+      # Exempt: Clock.luau itself (it holds the real implementations); Signal.luau
+      # (task.spawn there is runner-thread reuse, a scheduler concern rather than a
+      # clock one); and the DebugHook pair (Studio tooling, never simulated).
+      #
+      # Fixed-string matching (-F): the patterns are literals, and a regex here
+      # would only be an opportunity to mis-escape a dot.
+      - name: Time and waits must route through Internal/Clock
+        run: |
+          HITS=$(grep -rnF --include='*.luau' \
+            -e 'os.time()' -e 'os.clock()' -e 'task.wait(' -e 'task.delay(' \
+            src \
+            | grep -v 'src/Internal/Clock.luau' \
+            | grep -v 'src/Internal/Signal.luau' \
+            | grep -v 'DebugHook.luau' \
+            | grep -v ':[[:space:]]*--' || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::raw time/wait calls outside Internal/Clock:"
+            echo "$HITS"
+            echo 'Use Clock.Now() / Clock.Monotonic() / Clock.Wait() / Clock.Delay().'
+            exit 1
+          fi
+          echo 'All time and wait calls route through Internal/Clock.'
+
   version-check:
     runs-on: ubuntu-latest
     steps:

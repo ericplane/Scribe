@@ -12,6 +12,7 @@ local Template = require(Internal.Template)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
+local Clock = require(Internal.Clock)
 
 local Replication = {}
 
@@ -45,7 +46,7 @@ function Replication.new(ctx: any)
 	-- refills at `inboundFrameRate` per second and is capped there, so a burst
 	-- costs from a budget an idle player has already rebuilt.
 	local function takeFrameToken(entry: any): boolean
-		local now = os.clock()
+		local now = Clock.Monotonic()
 		local elapsed = now - entry.FrameLast
 		entry.FrameLast = now
 		entry.FrameTokens = math.min(inboundFrameRate, entry.FrameTokens + elapsed * inboundFrameRate)
@@ -279,7 +280,8 @@ function Replication.new(ctx: any)
 		flushSharedQueue(entry)
 	end
 
-	RunService.PostSimulation:Connect(function()
+	local connections: { any } = {}
+	connections[#connections + 1] = RunService.PostSimulation:Connect(function()
 		for _, entry in ctx.Persistence.Entries do
 			if #entry.Queue > 0 or #entry.SharedQueue > 0 then
 				self.FlushEntry(entry)
@@ -404,7 +406,7 @@ function Replication.new(ctx: any)
 		entry.Queue = {}
 		entry.QueueIndex = {}
 		entry.HandshakeReady = true
-		entry.LastInitAt = os.clock()
+		entry.LastInitAt = Clock.Monotonic()
 		sendBuffer(entry, bytesOrErr)
 		sendStatus(entry)
 		if ctx.Leaderboards then
@@ -474,7 +476,7 @@ function Replication.new(ctx: any)
 		if entry.State == "Ready" then
 			-- A repeated Hello re-Inits (client-driven resync), but a full
 			-- snapshot encode is expensive — throttle floods.
-			if entry.HandshakeReady and os.clock() - entry.LastInitAt < REINIT_COOLDOWN then
+			if entry.HandshakeReady and Clock.Monotonic() - entry.LastInitAt < REINIT_COOLDOWN then
 				Metrics.Add("ReInitThrottled")
 				return
 			end
@@ -503,7 +505,7 @@ function Replication.new(ctx: any)
 		-- unconditionally, mirroring what sendInit does with entry.Queue above: the
 		-- snapshot is authoritative whether or not it had any ops to send.
 		entry.SharedQueue = {}
-		task.delay(HANDSHAKE_TIMEOUT, function()
+		Clock.Delay(HANDSHAKE_TIMEOUT, function()
 			if not entry.TornDown and not entry.HandshakeReady then
 				Log.Warn(
 					"Replication",
@@ -546,7 +548,7 @@ function Replication.new(ctx: any)
 		broadcastBuffer(bytes)
 	end
 
-	Health.OnStatusChanged:Connect(function()
+	connections[#connections + 1] = Health.OnStatusChanged:Connect(function()
 		self.BroadcastStatus()
 	end)
 
@@ -578,7 +580,7 @@ function Replication.new(ctx: any)
 		-- neighbours so a flood cannot evict the diagnostic ring.
 		if not takeFrameToken(entry) then
 			Metrics.Add("InboundRateLimited")
-			local now = os.clock()
+			local now = Clock.Monotonic()
 			if now - (entry.LastInboundRateLog or -math.huge) >= MALFORMED_LOG_INTERVAL then
 				entry.LastInboundRateLog = now
 				Log.Warn("Transport", "INBOUND_RATE_LIMITED", `player exceeded {inboundFrameRate} frames/s`, {
@@ -595,7 +597,7 @@ function Replication.new(ctx: any)
 			-- attacker-controlled and was previously logged unthrottled, which made it
 			-- the cheapest way to evict the whole diagnostic ring and erase the
 			-- evidence of everything else. The metric above still counts every one.
-			local now = os.clock()
+			local now = Clock.Monotonic()
 			if now - (entry.LastOversizeLog or -math.huge) >= MALFORMED_LOG_INTERVAL then
 				entry.LastOversizeLog = now
 				Log.Warn(
@@ -633,7 +635,7 @@ function Replication.new(ctx: any)
 			Metrics.Add("MalformedFrames")
 			-- Throttle the log + anomaly so a crafted-frame flood can't spam the log
 			-- buffer or an OnAnomaly handler (the count still increments every time).
-			local now = os.clock()
+			local now = Clock.Monotonic()
 			if now - (entry.LastMalformedLog or -math.huge) >= MALFORMED_LOG_INTERVAL then
 				entry.LastMalformedLog = now
 				Log.Warn("Transport", "MALFORMED_FRAME", tostring(err), {
@@ -660,6 +662,18 @@ function Replication.new(ctx: any)
 			end
 		end
 	end)
+
+	-- Release the per-frame flush handler and the status listener. Without this a
+	-- discarded bundle keeps running its flush loop against a dead Persistence for
+	-- the lifetime of the process.
+	function self.Stop()
+		for _, connection in connections do
+			pcall(function()
+				connection:Disconnect()
+			end)
+		end
+		table.clear(connections)
+	end
 
 	return self
 end

@@ -9,6 +9,7 @@ local HttpService = game:GetService("HttpService")
 local Util = require(script.Parent.Util)
 local Signal = require(script.Parent.Signal)
 local Types = require(script.Parent.Parent.Types)
+local Clock = require(script.Parent.Clock)
 
 type LogEntry = Types.LogEntry
 
@@ -118,7 +119,7 @@ local function emit(
 		message = string.sub(message, 1, MAX_MESSAGE_LEN) .. "…"
 	end
 	local entry: LogEntry = {
-		At = os.time(),
+		At = Clock.Now(),
 		Level = level,
 		Category = category,
 		Code = code,
