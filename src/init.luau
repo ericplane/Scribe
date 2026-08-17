@@ -183,6 +183,10 @@ export type function ValueType(T)
 		if serverOnly ~= nil then
 			return memo(unwrapWrappers(widen(serverOnly), depth + 1))
 		end
+		local derived = t:readproperty(ts.singleton("__scribeDerived"))
+		if derived ~= nil then
+			return memo(unwrapWrappers(widen(derived), depth + 1))
+		end
 		-- A marker cannot hide under one of the branded declarators: their metatable
 		-- brand means the shape below them is already the read shape.
 		if hasMarker(t, "__scribeBig") or hasMarker(t, "__scribeFlags") or hasMarker(t, "__scribeSet") then
@@ -232,6 +236,18 @@ export type function ValueType(T)
 		if t:is("table") then
 			local inner = t:readproperty(ts.singleton("__scribeServerOnly"))
 			if inner ~= nil then
+				t = widen(inner)
+			end
+		end
+
+		-- Scribe.Derived carries a { __scribeDerived: V } marker type. The node reads
+		-- as V and writes not at all, so this only records the flag; the mutator
+		-- block below is skipped the same way it is for the root accessor.
+		local isDerived = false
+		if t:is("table") then
+			local inner = t:readproperty(ts.singleton("__scribeDerived"))
+			if inner ~= nil then
+				isDerived = true
 				t = widen(inner)
 			end
 		end
@@ -421,7 +437,7 @@ export type function ValueType(T)
 		-- A big field declares its own Set and Update below, taking the wider operand
 		-- union. Re-adding them here would leave two entries for the same name rather
 		-- than overriding, because two ts.singleton("Set") calls are distinct keys.
-		if not isRoot and not isBig then
+		if not isRoot and not isBig and not isDerived then
 			-- Writes take the UNBRANDED shape. A map's type carries its declared key on
 			-- the metatable so the accessor can tell an integer map from a string one,
 			-- and a caller writing a plain table literal has no way to produce that
@@ -443,11 +459,15 @@ export type function ValueType(T)
 		add("Observe", fn({ fn({ valueType }, {}) }, { disconnectType }))
 
 		if t:is("number") then
-			add("Increment", fn({ ts.number, anyType }, { ts.number }))
-			add("Decrement", fn({ ts.number, anyType }, { ts.number }))
+			-- Min/Max read the declared bounds, so they stay on a derived field; the
+			-- two mutators do not.
+			if not isDerived then
+				add("Increment", fn({ ts.number, anyType }, { ts.number }))
+				add("Decrement", fn({ ts.number, anyType }, { ts.number }))
+			end
 			add("Min", fn({}, { optNumber }))
 			add("Max", fn({}, { optNumber }))
-		elseif t:is("boolean") then
+		elseif t:is("boolean") and not isDerived then
 			add("Toggle", fn({ optBool }, { ts.boolean }))
 		end
 
@@ -561,6 +581,16 @@ export type function StatPathsType(T, IncludeBig)
 			local serverOnly = t:readproperty(ts.singleton("__scribeServerOnly"))
 			if serverOnly ~= nil then
 				t = widen(serverOnly)
+			end
+		end
+		if t:is("table") then
+			-- And Scribe.Derived. A board reads its stat through the accessor tree,
+			-- which computes derived fields like any other, so a derived number is a
+			-- valid stat. Without this the marker itself was walked and offered the
+			-- unaddressable "Field.__scribeDerived" in place of "Field".
+			local derived = t:readproperty(ts.singleton("__scribeDerived"))
+			if derived ~= nil then
+				t = widen(derived)
 			end
 		end
 		if t:is("table") and isMapMarker(t) then
@@ -942,6 +972,10 @@ export type Flags = typeof(setmetatable({} :: { string }, {} :: { __scribeFlags:
 -- A set READS BACK as its members. Label in the metatable, as above.
 export type SetOf<T> = typeof(setmetatable({} :: { T }, {} :: { __scribeSet: true }))
 export type ServerOnly<T> = { __scribeServerOnly: T }
+--- A derived field reads back as its output type, which may be a scalar, so the
+--- label has to be an ordinary field (as Timed's is) and is stripped from
+--- whole-subtree reads by unwrapWrappers rather than carried on a metatable.
+export type Derived<T> = { __scribeDerived: T }
 
 export type NumberMeta = { Min: number?, Max: number? }
 -- Scribe.Big only. A bound past 1.8e308 has to be written as a numeric string,
@@ -1077,6 +1111,7 @@ export type ScribeOptions<T> = {
 	Migrations: { [number]: (data: { [string]: any }) -> () }?,
 	UserOwnsGamePassAsync: ((userId: number, passId: number) -> boolean)?, -- advanced/test seam
 	DevMode: boolean?, -- advanced/test seam: overrides the RunService:IsStudio() default
+	IsRunning: boolean?, -- advanced/test seam: overrides the RunService:IsRunning() default (false builds the edit-mode client half)
 	MigrationShadow: boolean?, -- audit aid: re-runs migrations against raw pre-Reconcile data and warns on divergence (re-executes your migration bodies)
 	OnPlayerInit: ((player: Player, rawData: { [string]: any }, isNewProfile: boolean) -> ())?,
 	OnPlayerLeaving: ((player: Player, data: any, reason: LifecycleReason) -> ())?,
@@ -1209,6 +1244,7 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	Migrations = true,
 	UserOwnsGamePassAsync = true,
 	DevMode = true,
+	IsRunning = true,
 	MigrationShadow = true,
 	OnPlayerInit = true,
 	OnPlayerLeaving = true,
@@ -1331,8 +1367,20 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 		)
 	end
 
+	-- Edit mode (a UI Labs / Hoarcekat storybook, the command bar, a plugin) has
+	-- no server, but RunService:IsServer() is still true there. Dispatching on it
+	-- alone therefore built the SERVER half inside a storybook: it resolved the
+	-- transport, creating the ScribeTransport folder and RemoteEvents in
+	-- ReplicatedStorage — which then get saved into the place file — and left
+	-- `.Client` as the stub that throws on first use. The client half is the one
+	-- that understands edit mode (it skips the transport and handshake entirely
+	-- and initializes to template defaults), so a shared bundle module required
+	-- from a story builds that instead. `IsRunning` is also the seam specs use,
+	-- since RunService itself cannot be patched on a real service Instance.
+	local isRunning = if anyOptions.IsRunning ~= nil then anyOptions.IsRunning == true else RunService:IsRunning()
+
 	local bundle: any
-	if RunService:IsServer() then
+	if RunService:IsServer() and isRunning then
 		local Server = require(script.Server) :: any
 		local serverData = Server.new(anyOptions, compiled)
 		local clientStub = setmetatable({}, {
@@ -1347,7 +1395,9 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 		local serverStub = setmetatable({}, {
 			__index = function()
 				error(
-					"Scribe: the Server API is not available on the client — client writes go through Data.Request commands",
+					if isRunning
+						then "Scribe: the Server API is not available on the client. Client writes go through Data.Request commands"
+						else "Scribe: the Server API is not available in edit mode. Scribe builds only the client half there (storybooks, the command bar)",
 					2
 				)
 			end,
@@ -1370,6 +1420,10 @@ end
 	The module you require and call. `Scribe(options)` compiles your template
 	and returns a `{ Server, Client }` bundle. Use `.Server` on the server and
 	`.Client` on the client from the same shared module.
+
+	In edit mode (`RunService:IsRunning()` false — a UI Labs / Hoarcekat
+	storybook, the command bar) there is no server to build, so the bundle holds
+	the edit-mode client half and `.Server` errors if touched.
 
 	`Scribe` also exposes the field *declarators* (`Scribe.Int`, `Scribe.Vector3`,
 	…) you use inside a template, the visibility wrappers (`Scribe.ServerOnly`,
@@ -1648,6 +1702,56 @@ end
 -- params typecheck when passed directly, e.g. `Scribe.Dynamic(os.time)`.
 function Scribe.Dynamic<T>(factory: (...any) -> T): T
 	return Marker.make("Dynamic", factory(), { Factory = factory :: any }) :: any
+end
+
+--[=[
+	@within Scribe
+	@tag Field Types
+	@function Derived
+	@param output T
+	@param inputs { string }
+	@param compute (...any) -> T
+	@return T
+	Declares a field Scribe **computes** from other declared fields instead of
+	accepting writes. It is never persisted, never migrated, recomputed whenever an
+	input changes, and replicated only when the receiving realm cannot compute it
+	for itself.
+
+	```lua
+	Rank = Scribe.Derived(
+	    Scribe.Enum("Recruit", { "Recruit", "Officer", "Sergeant" }),
+	    { "Team", "Stats.PoliceXP", "Stats.EMSXP" },
+	    function(team, policeXp, emsXp)
+	        if team == "Police" then return policeRank(policeXp) end
+	        if team == "EMS" then return emsRank(emsXp) end
+	        return "Recruit"
+	    end
+	),
+	```
+
+	`output` is an ordinary declarator supplying the type and bounds (an Int, Number,
+	String, Boolean or Enum). `inputs` are dotted paths to **statically declared**
+	scalar fields — the same path syntax a leaderboard `Stat` uses — passed to
+	`compute` in the order written. A derived field may read another derived field;
+	the compiler orders the graph and rejects cycles at startup.
+
+	`compute` must be **pure**: it runs on the server and, when every input is
+	visible there, on the client too. Scribe calls it once per realm at startup to
+	seed the field's default, so a function that throws fails the template rather
+	than the first write.
+
+	Reads are ordinary — `Get`, `Changed`, `Observe` — and every mutator (`Set`,
+	`Increment`, …) is absent from the type and throws. Since nothing writes it, a
+	change to the formula takes effect on next read with no migration.
+
+	A derived field never persists, so it must be a **root** field or live inside a
+	[Scribe.Session] root. Combine it with [Scribe.ServerOnly] or [Scribe.Shared] to
+	set who receives it: when every input is visible to that audience the value is
+	computed locally and never crosses the wire, and otherwise the server computes it
+	and replicates it like any other field.
+]=]
+function Scribe.Derived<T>(output: T, inputs: { string }, compute: (...any) -> T): Derived<T>
+	return Marker.make("Derived", output, { Inputs = inputs, Compute = compute :: any }) :: any
 end
 
 --[=[

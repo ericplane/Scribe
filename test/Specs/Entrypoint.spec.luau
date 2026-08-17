@@ -78,4 +78,58 @@ return function()
 		Config.AutoSaveSource = nil
 		Config.BundleConstructed = false
 	end)
+
+	-- A UI Labs / Hoarcekat story requires the same shared bundle module a live
+	-- client does, and RunService:IsServer() is true in edit mode. Dispatching on
+	-- that alone built the SERVER half inside the storybook: the transport folder
+	-- and its RemoteEvents appeared in ReplicatedStorage (and got saved into the
+	-- place), and the story's `.Client` was the stub that throws on first use.
+	describe("edit mode", function()
+		local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+		-- IsRunning is the seam, not RunService: it reports true under both
+		-- TestEZ-in-Studio and the Lune shim, and a real service Instance cannot
+		-- be patched. Scribe(options) also poisons BundleConstructed, so put it
+		-- back for the Configure specs.
+		local function buildEditMode(): any
+			local constructed = Config.BundleConstructed
+			local bundle = Scribe({
+				Template = { Coins = Scribe.Int(0, { Min = 0 }) },
+				ProfileStoreIndex = "EntrypointSpec",
+				ProfileKeyPrefix = "PLAYER_",
+				IsRunning = false,
+				Banner = false,
+			})
+			Config.BundleConstructed = constructed
+			return bundle
+		end
+
+		it("builds the client half without touching the transport", function()
+			local before = ReplicatedStorage:FindFirstChild("ScribeTransport")
+			local bundle = buildEditMode()
+
+			-- Nothing was added to ReplicatedStorage: the client skips the
+			-- transport in edit mode, and the server half never ran.
+			expect(ReplicatedStorage:FindFirstChild("ScribeTransport")).to.equal(before)
+
+			-- A real client, initialized to template defaults with no handshake.
+			expect(bundle.Client.Coins.Get()).to.equal(0)
+
+			-- Mock errors outside edit mode, so seeding through it is the proof
+			-- that this is the edit-mode client and not a live one.
+			bundle.Client.Mock({ Coins = 25 })
+			expect(bundle.Client.Coins.Get()).to.equal(25)
+		end)
+
+		it("explains the missing server half in edit-mode terms", function()
+			local bundle = buildEditMode()
+			local ok, err = pcall(function()
+				return bundle.Server.Command
+			end)
+			expect(ok).to.equal(false)
+			-- Not the "on the client — use Data.Request" wording: in a storybook
+			-- there is no server to request from.
+			expect(string.find(tostring(err), "edit mode", 1, true) ~= nil).to.equal(true)
+		end)
+	end)
 end

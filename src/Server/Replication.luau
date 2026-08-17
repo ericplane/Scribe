@@ -390,9 +390,13 @@ function Replication.new(ctx: any)
 		-- this client on the next flush -- double-applying non-idempotent Shared ops
 		-- (Insert/Remove/Clear). Flushing here (while this entry is not yet ready, so
 		-- broadcastBuffer excludes it) makes the snapshot the single source.
-		for _, other in ctx.Persistence.Entries do
-			if other ~= entry and other.State == "Ready" and #other.SharedQueue > 0 then
-				flushSharedQueue(other)
+		-- Gated on HasShared: with no Shared root, PushOp never appends to any
+		-- SharedQueue, so this loop could only ever walk every entry to find nothing.
+		if compiled.HasShared then
+			for _, other in ctx.Persistence.Entries do
+				if other ~= entry and other.State == "Ready" and #other.SharedQueue > 0 then
+					flushSharedQueue(other)
+				end
 			end
 		end
 
@@ -407,22 +411,27 @@ function Replication.new(ctx: any)
 			ctx.Leaderboards.OnClientReady(entry)
 		end
 
-		-- Existing players' Shared roots for the new client.
-		for _, other in ctx.Persistence.Entries do
-			if other ~= entry and other.State == "Ready" then
-				local sharedOps = sharedSnapshotOps(other)
-				if #sharedOps > 0 then
-					local okShared, sharedBytes = pcall(
-						Wire.EncodeOpsFrame,
-						Wire.Frames.SharedInit,
-						compiled,
-						sharedOps,
-						function(w)
-							Wire.F64(w, other.UserId)
+		-- Existing players' Shared roots for the new client. Gated on HasShared: with
+		-- no Shared root, sharedSnapshotOps returns empty for every entry, so this
+		-- walked all N entries (and ran CloneVisible over each one's roots) per join
+		-- purely to send nothing -- O(N^2) of pure waste across a server fill.
+		if compiled.HasShared then
+			for _, other in ctx.Persistence.Entries do
+				if other ~= entry and other.State == "Ready" then
+					local sharedOps = sharedSnapshotOps(other)
+					if #sharedOps > 0 then
+						local okShared, sharedBytes = pcall(
+							Wire.EncodeOpsFrame,
+							Wire.Frames.SharedInit,
+							compiled,
+							sharedOps,
+							function(w)
+								Wire.F64(w, other.UserId)
+							end
+						)
+						if okShared then
+							sendBuffer(entry, sharedBytes)
 						end
-					)
-					if okShared then
-						sendBuffer(entry, sharedBytes)
 					end
 				end
 			end
@@ -510,6 +519,15 @@ function Replication.new(ctx: any)
 
 	function self.OnEntryRemoved(entry: any)
 		entry.HandshakeReady = false
+		-- Only meaningful when the template declares a Shared root: SharedGone tells
+		-- a client to drop its mirror of this player, and a template with no Shared
+		-- field never gave any client a mirror to drop. Sending it anyway cost one
+		-- frame per remaining client on EVERY leave (broadcastBuffer takes its
+		-- per-entry path here, since the leaver is excluded), so draining a full
+		-- server was quadratic in session count for games that never use the feature.
+		if not compiled.HasShared then
+			return
+		end
 		local w = Wire.NewWriter(16)
 		Wire.U8(w, Wire.Frames.SharedGone)
 		Wire.F64(w, entry.UserId)

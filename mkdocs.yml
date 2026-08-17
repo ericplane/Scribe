@@ -79,6 +79,7 @@ nav:
   - Guides:
       - Getting Started: getting-started.md
       - Templates & Declarators: templates.md
+      - Derived Fields: derived.md
       - Replication & Visibility: visibility.md
       - Commands & Requests: commands.md
       - Session Lifecycle: lifecycle.md

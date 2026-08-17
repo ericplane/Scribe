@@ -13,6 +13,7 @@ local Internal = script.Parent.Parent.Internal
 local Util = require(Internal.Util)
 local Node = require(Internal.Node)
 local Template = require(Internal.Template)
+local DerivedModule = require(Internal.Derived)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
@@ -265,6 +266,12 @@ function Persistence.new(ctx: any)
 
 	self.Store = store
 	self.Entries = {} :: { [Player]: Entry }
+	-- Maintained alongside Entries rather than recomputed. Util.count is an O(N)
+	-- dict walk, and it used to run on every teardown, which made draining a full
+	-- server O(N^2) in session count.
+	self.EntryCount = 0
+	-- userId -> Entry, so a lookup by userId is not a linear scan over Entries.
+	self.EntriesByUserId = {} :: { [number]: Entry }
 	self.Closing = false
 	-- Why the last session ended, for WaitForData callers arriving after a
 	-- synchronous teardown (weak keys: entries vanish with the Player).
@@ -405,6 +412,55 @@ function Persistence.new(ctx: any)
 			{}
 		)
 	end
+	-- ProfileStore replaces a stored value it cannot recognise as a profile with a
+	-- fresh template and fires OnOverwrite (its RegisterOverwrite: "Called when a
+	-- corrupted profile is loaded"). That is silent, irreversible data loss, and
+	-- without this it reached the developer as nothing at all: the overwritten
+	-- profile comes back at SessionLoadCount 1, so Scribe's own isNew test is true,
+	-- migrations are skipped by the version stamp, and OnPlayerInit runs with
+	-- isNewProfile = true. A player who just lost everything was indistinguishable
+	-- from a first-time player.
+	local okOverwrite = pcall(function()
+		ProfileStore.OnOverwrite:Connect(function(storeName: string, profileKey: string)
+			-- OnOverwrite is module-global; only our store is ours to report on.
+			if storeName ~= baseStoreName then
+				return
+			end
+			Health.ReportFailure("ProfileOverwrite")
+			Metrics.Add("ProfilesOverwritten")
+			-- The entry may not exist yet (the overwrite happens during the load that
+			-- creates it), so the player is best-effort and the key is the reliable id.
+			local entry: Entry? = nil
+			for _, candidate in self.Entries :: { [Player]: Entry } do
+				if candidate.Key == profileKey then
+					entry = candidate
+					break
+				end
+			end
+			Log.Error(
+				"Integrity",
+				"PROFILE_OVERWRITTEN",
+				`stored data for key "{profileKey}" was not a valid profile and has been REPLACED with a fresh `
+					.. "template by ProfileStore; this session starts from defaults and the previous data is gone. "
+					.. "Restore from version history before the player saves over it",
+				{ Player = if entry then entry.Player else nil, Store = storeName, Key = profileKey }
+			)
+			ctx.Signals.OnAnomaly:Fire({
+				Player = if entry then entry.Player else nil,
+				Path = {},
+				Value = nil,
+				Reason = "ProfileOverwritten",
+			})
+		end)
+	end)
+	if not okOverwrite then
+		Log.Warn(
+			"Persistence",
+			"PROFILE_STORE_SIGNAL_MISSING",
+			"ProfileStore.OnOverwrite not connectable; silent corruption-overwrite detection disabled",
+			{}
+		)
+	end
 	local okCrit = pcall(function()
 		ProfileStore.OnCriticalToggle:Connect(function(isCritical: boolean)
 			Health.SetCritical(isCritical)
@@ -428,12 +484,7 @@ function Persistence.new(ctx: any)
 	end
 
 	function self.EntryForUserId(userId: number): Entry?
-		for _, entry in self.Entries :: { [Player]: Entry } do
-			if entry.UserId == userId then
-				return entry
-			end
-		end
-		return nil
+		return self.EntriesByUserId[userId]
 	end
 
 	local function setState(entry: Entry, state: "Loading" | "Ready" | "SessionEnded", reason: string?)
@@ -573,7 +624,11 @@ function Persistence.new(ctx: any)
 	end
 
 	-- Wipe guard: compare against the last successful save.
-	local function wipeGuardCheck(entry: Entry): (boolean, string?)
+	-- `liveSize` is the caller's already-computed Util.approxSize(entry.LiveData).
+	-- It is passed in rather than recomputed because onProfileSaving measures the
+	-- very same table in the very same synchronous frame; walking it twice was
+	-- pure duplicated work on the largest table in the process.
+	local function wipeGuardCheck(entry: Entry, liveSize: number?): (boolean, string?)
 		local profile = entry.Profile
 		local live = entry.LiveData
 		if not profile or not live then
@@ -594,7 +649,7 @@ function Persistence.new(ctx: any)
 		end
 		local ratio = options.WipeGuardShrinkRatio or 0.6
 		local oldSize = entry.LastSavedSize or Util.approxSize(lastSaved)
-		local newSize = Util.approxSize(live)
+		local newSize = liveSize or Util.approxSize(live)
 		if oldSize and newSize and oldSize > 1024 and newSize < oldSize * (1 - ratio) then
 			return true, `serialized size collapsed {oldSize} -> {newSize} bytes`
 		end
@@ -657,7 +712,7 @@ function Persistence.new(ctx: any)
 			return
 		end
 
-		local tripped, reason = wipeGuardCheck(entry)
+		local tripped, reason = wipeGuardCheck(entry, liveSize)
 		if tripped then
 			Log.Error("Integrity", "WIPE_GUARD_TRIPPED", reason :: string, { Player = entry.Player })
 			Metrics.Add("WipeGuardTrips")
@@ -874,6 +929,12 @@ function Persistence.new(ctx: any)
 			OnBatchEnd = function()
 				ctx.Replication.FlushEntry(entry)
 			end,
+			OnDerivedIssue = function(code, field, detail)
+				-- MISMATCH is a dev-mode purity report, not a live fault; the other
+				-- two mean a field is serving a value its inputs no longer justify.
+				local report = if code == "DERIVED_MISMATCH" then Log.Warn else Log.Error
+				report("Derived", code :: any, `"{field}": {detail}`, { Player = entry.Player, Field = field })
+			end,
 		})
 	end
 
@@ -945,8 +1006,17 @@ function Persistence.new(ctx: any)
 			entry.Player:Kick(options.SessionEndMessage or "Your data session has ended. Please rejoin!")
 		end
 
-		self.Entries[entry.Player] = nil
-		Metrics.Set("ActiveSessions", Util.count(self.Entries))
+		-- Only adjust the maintained counters if this entry was still the live one
+		-- for its player: teardown can run more than once for a session, and a
+		-- rejoin can already have installed a NEWER entry under the same Player.
+		if self.Entries[entry.Player] == entry then
+			self.Entries[entry.Player] = nil
+			self.EntryCount -= 1
+		end
+		if self.EntriesByUserId[entry.UserId] == entry then
+			self.EntriesByUserId[entry.UserId] = nil
+		end
+		Metrics.Set("ActiveSessions", self.EntryCount)
 	end
 
 	local function finishLoad(entry: Entry)
@@ -1238,7 +1308,8 @@ function Persistence.new(ctx: any)
 		-- replication) opaquely, with no path in the log. Scan once here and
 		-- surface the exact location loudly instead -- non-fatal, because the
 		-- library cannot safely rewrite developer data; the developer fixes it.
-		local badInit = Util.findUnpersistable(profile.Data)
+		local depthStats = { MaxDepth = 0 }
+		local badInit = Util.findUnpersistable(profile.Data, nil, nil, depthStats)
 		if badInit ~= nil then
 			local where = Util.pathString(badInit.Path)
 			Log.Error(
@@ -1249,6 +1320,21 @@ function Persistence.new(ctx: any)
 				{ Player = player, Path = where }
 			)
 			ctx.Signals.OnAnomaly:Fire({ Player = player, Path = badInit.Path, Value = nil, Reason = badInit.Kind })
+		end
+		-- Stored data may legally be nested deeper than a write is allowed to reach.
+		-- Such a profile loads and READS fine, then refuses every write to its
+		-- deepest leaves at the first Set -- with nothing at load having hinted at
+		-- it. Say so here instead, once, while the developer can still connect the
+		-- failure to the data rather than to the write that tripped over it.
+		if depthStats.MaxDepth > Util.MAX_VALUE_DEPTH then
+			Log.Warn(
+				"Integrity",
+				"PROFILE_TOO_DEEP",
+				`stored data is nested {depthStats.MaxDepth} levels deep, past the {Util.MAX_VALUE_DEPTH}-level `
+					.. "write limit; those leaves load and read but every write to them will be refused. "
+					.. "Flatten the shape or migrate it",
+				{ Player = player, Depth = depthStats.MaxDepth, Limit = Util.MAX_VALUE_DEPTH }
+			)
 		end
 
 		profile.OnSave:Connect(function()
@@ -1287,6 +1373,13 @@ function Persistence.new(ctx: any)
 		end
 
 		buildTree(entry)
+		-- The session store was built from the template's defaults, and a derived
+		-- field's default was computed from ITS inputs' defaults -- not from the data
+		-- that just loaded. Recompute the set once, here: before Ready (so the
+		-- documented PlayerAdded -> WaitForData -> read path never sees a default),
+		-- before Leaderboards.OnLoad (which enqueues an initial score), and before
+		-- Replication.OnEntryReady (whose Init snapshot must carry the real values).
+		entry.Tree:SeedDerived()
 		entry.SaveInfo.Dirty = false
 		self.UpdateSaveInfoMirror(entry)
 
@@ -1317,7 +1410,7 @@ function Persistence.new(ctx: any)
 
 		setState(entry, "Ready", nil)
 		Metrics.Add("ProfilesLoaded")
-		Metrics.Set("ActiveSessions", Util.count(self.Entries))
+		Metrics.Set("ActiveSessions", self.EntryCount)
 		Log.Info("Persistence", "PROFILE_LOADED", "profile session started", { Player = player })
 
 		-- Register the cross-server gift handler FIRST and independently: it only
@@ -1473,6 +1566,8 @@ function Persistence.new(ctx: any)
 			GiftLastAt = 0,
 		}
 		self.Entries[player] = entry
+		self.EntryCount += 1
+		self.EntriesByUserId[entry.UserId] = entry
 		task.spawn(loadProfile, entry)
 	end
 
@@ -1607,10 +1702,27 @@ function Persistence.new(ctx: any)
 
 	-- Offline access ----------------------------------------------------------
 
+	-- Derived fields are computed, so they are absent from stored data -- including
+	-- LiveData, which is the persisted store only. Both branches of GetOffline
+	-- therefore fill them in, for the root-level fields whose every input persists
+	-- (Derived.OfflineComputable); anything reading a Session field has no value to
+	-- read in a profile snapshot and is left out rather than filled with a default
+	-- computed from data that is not there.
+	local function deriveOffline(snapshot: { [string]: any })
+		if #compiled.DerivedNodes == 0 then
+			return
+		end
+		DerivedModule.EvaluateInto(compiled, snapshot, function(node)
+			return node.Derived.OfflineComputable
+		end)
+	end
+
 	function self.GetOffline(userId: number): { [string]: any }?
 		local entry = self.EntryForUserId(userId)
 		if entry and entry.State == "Ready" and entry.LiveData then
-			return Util.deepClone(entry.LiveData)
+			local live = Util.deepClone(entry.LiveData)
+			deriveOffline(live)
+			return live
 		end
 		local ok, profile = pcall(function()
 			return store:GetAsync(self.KeyFor(userId))
@@ -1632,6 +1744,7 @@ function Persistence.new(ctx: any)
 		-- fine. Coerce the copy, not the store's table.
 		local snapshot = Util.deepClone(profile.Data)
 		Template.CoerceMapKeys(compiled, snapshot)
+		deriveOffline(snapshot)
 		return snapshot
 	end
 
@@ -1794,9 +1907,11 @@ function Persistence.new(ctx: any)
 		if not profile then
 			return nil -- version genuinely not found
 		end
-		-- Same integer-key coercion as GetOffline: this is a raw DataStore read.
+		-- Same integer-key coercion and derived fill as GetOffline: this is a raw
+		-- DataStore read, so it carries stored fields only.
 		local snapshot = Util.deepClone(profile.Data)
 		Template.CoerceMapKeys(compiled, snapshot)
+		deriveOffline(snapshot)
 		return snapshot
 	end
 
@@ -1927,7 +2042,7 @@ function Persistence.new(ctx: any)
 	-- budget. Exposed separately so the test harness can simulate shutdown.
 	function self.Shutdown(budget: number?)
 		self.Closing = true
-		local sessionCount = Util.count(self.Entries)
+		local sessionCount = self.EntryCount
 		Log.Info("Persistence", "SHUTDOWN_FLUSH", "shutting down; draining saves and leaderboards", {
 			Sessions = sessionCount,
 		})
@@ -1968,7 +2083,7 @@ function Persistence.new(ctx: any)
 			task.wait(0.2)
 		end
 		Log.Info("Persistence", "SHUTDOWN_DONE", "shutdown drain complete", {
-			Remaining = Util.count(self.Entries),
+			Remaining = self.EntryCount,
 		})
 	end
 

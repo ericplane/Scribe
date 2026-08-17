@@ -32,6 +32,9 @@ local MIN_REFRESH_INTERVAL = 60
 -- allowance with headroom for the write pacer.
 local MAX_REFRESH_PER_MINUTE = 12
 local QUEUE_CAP = 1000
+-- Seconds between LB_QUEUE_OVERFLOW warns; drops in between are counted and
+-- reported on the next one rather than each getting their own line.
+local OVERFLOW_LOG_INTERVAL = 30
 local NAME_TTL = 900
 local NAME_NEGATIVE_TTL = 120
 local NAME_CACHE_CAP = 4096 -- bound the resolved-name cache; entries are re-resolvable
@@ -138,6 +141,12 @@ function Leaderboards.new(ctx: any)
 
 	local writeQueue: { { Board: Board, UserId: number, Score: number, Attempts: number } } = {}
 	local writeQueueMap: { [string]: { Board: Board, UserId: number, Score: number, Attempts: number } } = {}
+	-- Overflow-log throttle. Once the queue is over cap, an evicted player's next
+	-- stat change mints a fresh key and evicts again, so the warn rate tracks the
+	-- stat-change rate of every out-of-queue player -- enough to flood the console
+	-- and roll the log ring. The counter still increments on every drop.
+	local lastOverflowLog: number? = nil
+	local overflowSinceLog = 0
 	-- GDPR tombstones: an erased userId is suppressed in the pacer until this
 	-- clock time, long enough to outlive any in-flight write plus its retries.
 	local erasedUsers: { [number]: number } = {}
@@ -198,11 +207,26 @@ function Leaderboards.new(ctx: any)
 			)
 		end
 		-- A board's entries live in an OrderedDataStore that outlives the session,
-		-- but a Scribe.Session field is rebuilt from its default every session and
-		-- is never in LiveData, which is where the refresh cycle reads scores from.
-		-- The path resolves, so nothing downstream complains: the board just stays
-		-- empty forever. Refuse at boot instead.
-		if walkNode.Persist == false then
+		-- but a Scribe.Session field is rebuilt from its default every session, so
+		-- the path resolves, nothing downstream complains, and the board just stays
+		-- empty (or ranks a default) forever. Refuse at boot instead.
+		--
+		-- A Scribe.Derived field does not persist either, and is rankable anyway when
+		-- it is a pure function of fields that DO: the value is reproduced exactly on
+		-- every load, which is the property the board actually needs. That is the same
+		-- predicate offline reads use. One that reads a Session field is refused with
+		-- everything else, for the original reason.
+		local derived = walkNode.Derived
+		if derived ~= nil then
+			if not derived.OfflineComputable then
+				error(
+					`Scribe: leaderboard "{name}" Stat "{config.Stat}" is a derived field that reads `
+						.. "session-only state, so its value is not reproducible across sessions and a board "
+						.. "cannot rank it. Derive the stat from persisted fields instead",
+					0
+				)
+			end
+		elseif walkNode.Persist == false then
 			error(
 				`Scribe: leaderboard "{name}" Stat "{config.Stat}" is a Scribe.Session field, which never `
 					.. "persists and resets every session, so there is nothing for a board to rank",
@@ -413,6 +437,32 @@ function Leaderboards.new(ctx: any)
 		return copy
 	end
 
+	-- A player's current value for a board's Stat. Reads through the accessor tree,
+	-- which is the only view that sees every declared field: LiveData is the
+	-- PERSISTED store alone, so a Stat naming a Session field or a Scribe.Derived one
+	-- reads nil there while OnLoad's accessor subscription reports it fine. Falls
+	-- back to LiveData if the tree is gone (teardown races the leave flush).
+	local function readStat(entry: any, board: Board): any
+		local tree = entry.Tree
+		if tree ~= nil and not tree.Dead then
+			local ok, value = pcall(function()
+				local accessor = tree.Accessor
+				for _, segment in board.StatPath do
+					accessor = accessor[segment]
+				end
+				return accessor.Get()
+			end)
+			if ok then
+				return value
+			end
+		end
+		local value: any = entry.LiveData
+		for _, segment in board.StatPath do
+			value = if type(value) == "table" then value[segment] else nil
+		end
+		return value
+	end
+
 	local function unpackBig(board: Board, key: number): any
 		local stride = board.BigStride
 		-- The zero sentinel, plus the legacy 0 that boards written before it used.
@@ -486,7 +536,19 @@ function Leaderboards.new(ctx: any)
 				writeQueueMap[`{dropped.Board.Name}|{dropped.UserId}`] = nil
 			end
 			Metrics.Add("LbQueueOverflow")
-			Log.Warn("Leaderboards", "LB_QUEUE_OVERFLOW", "write queue overflow; dropped oldest entry", {})
+			overflowSinceLog += 1
+			local now = os.clock()
+			if lastOverflowLog == nil or now - lastOverflowLog >= OVERFLOW_LOG_INTERVAL then
+				lastOverflowLog = now
+				Log.Warn(
+					"Leaderboards",
+					"LB_QUEUE_OVERFLOW",
+					`write queue overflow; dropped the oldest entry ({overflowSinceLog} drop(s) since the last of these). `
+						.. "Scores are being produced faster than the write pacer drains them",
+					{ Dropped = overflowSinceLog, Depth = #writeQueue }
+				)
+				overflowSinceLog = 0
+			end
 		end
 		local item = { Board = board, UserId = userId, Score = scaled, Attempts = 0 }
 		table.insert(writeQueue, item)
@@ -720,10 +782,7 @@ function Leaderboards.new(ctx: any)
 		-- Each online player's own rank/score, computed on the refresh cycle.
 		for _, entry in ctx.Persistence.Entries do
 			if entry.State == "Ready" and entry.LiveData then
-				local value: any = entry.LiveData
-				for _, segment in board.StatPath do
-					value = if type(value) == "table" then value[segment] else nil
-				end
+				local value: any = readStat(entry, board)
 				board.MyScores[entry.UserId] = if board.IsBig or type(value) == "number" then value else nil
 				board.MyRanks[entry.UserId] = rankByUserId[entry.UserId]
 			end
@@ -765,13 +824,21 @@ function Leaderboards.new(ctx: any)
 		task.spawn(refreshLoop)
 	end
 
-	-- Refresh one board (or all) immediately instead of waiting for the cycle.
 	-- The OrderedDataStore a board reads and writes. Exposed so a test can pin the
 	-- SigFigs namespacing, which is what keeps two key formats out of one store.
 	function self.BoardStoreName(name: string): string?
 		local board = boards[name]
 		return if board then board.StoreName else nil
 	end
+
+	-- Whether boards resolved to the in-memory mock store rather than a real
+	-- OrderedDataStore. Exposed for the same reason as BoardStoreName: it lets a
+	-- test assert that Leaderboards read the RESOLVED Mode (the bug this guards
+	-- against was reading options.UseMock, so a Mode = "Mock" bundle still wrote to
+	-- live boards). Asserting on board CONTENTS cannot check this outside the
+	-- headless runner, where reaching a real store happens to fail and leave the
+	-- board empty; in Studio the write lands and the board is legitimately full.
+	self.UsesMockStore = useMock
 
 	function self.RefreshNow(name: string?)
 		if name then
@@ -849,10 +916,7 @@ function Leaderboards.new(ctx: any)
 		-- Flush the player's latest scores on leave.
 		if entry.LiveData then
 			for _, board in boards do
-				local value: any = entry.LiveData
-				for _, segment in board.StatPath do
-					value = if type(value) == "table" then value[segment] else nil
-				end
+				local value: any = readStat(entry, board)
 				if board.IsBig or type(value) == "number" then
 					self.Enqueue(board, entry.UserId, value)
 				end

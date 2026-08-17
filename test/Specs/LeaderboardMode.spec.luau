@@ -66,11 +66,17 @@ return function()
 	it('still uses the real store under Mode = "Live"', function()
 		-- The control. Proves the two assertions above discriminate rather than
 		-- passing because the mock store is wired unconditionally.
+		--
+		-- Asserts the store CHOICE, not the board contents. Contents only
+		-- discriminate under the headless runner, where reaching a real
+		-- OrderedDataStore fails and leaves the board empty; under real TestEZ in
+		-- Studio the write lands and the board legitimately has an entry, so the old
+		-- `#readBoard(harness) == 0` could never hold there.
 		local harness = makeHarness("Live")
 		local _p, _e, data = harness.Join(99403)
 		data.Coins.Set(500)
 
-		expect(#readBoard(harness)).to.equal(0)
+		expect(harness.Ctx.Leaderboards.UsesMockStore).to.equal(false)
 
 		harness.Cleanup()
 	end)

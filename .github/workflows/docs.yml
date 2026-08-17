@@ -1,9 +1,39 @@
 name: Deploy docs
 
+# The published site should describe the RELEASED library, not whatever main
+# happens to hold. Those diverge as soon as a version's work starts landing:
+# wally.toml is bumped at the top of a cycle (CI's version-check ties it to
+# src/Internal/Version.luau), so main can carry a version's guides for days or
+# weeks before that version is released.
+#
+# Deploying on every push to main therefore published unreleased documentation.
+# But deploying ONLY on release is not the fix either: a docs hotfix for the
+# CURRENT release lands on main, and by then main may already be ahead, so a
+# manual "just deploy it" would drag the unreleased material along with it. The
+# trigger is not what distinguishes the two cases -- the CONTENT is.
+#
+# So the gate is a version comparison: deploy when wally.toml matches the latest
+# published release, skip when main is ahead of it.
+#
+#   main at 1.4.0, latest release v1.3.2  -> skipped (1.4.0 docs stay unpublished)
+#   release v1.4.0 published              -> deploys, from the tag
+#   docs hotfix pushed to main            -> deploys (1.4.0 == v1.4.0)
+#   wally.toml bumped to 1.5.0            -> skipped again, automatically
+#
+# The version bump is already the signal that a cycle has started, so this needs
+# no new discipline: no extra branch, no manual step, and no way to forget.
+
 on:
+  release:
+    types: [published]
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Deploy even if wally.toml is ahead of the latest release"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,7 +46,66 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Decides whether this ref is publishable. Split into its own job so the skip
+  # reason is visible in the run summary rather than buried in a build log.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.check.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # A release publishes itself: github.ref is the tag, so the build below
+          # checks out exactly the released tree. Nothing to compare.
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "Release event: deploying the released tag."
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "::warning::Forced deploy: publishing this ref without checking it against the latest release."
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"
+          # /releases/latest is the right endpoint rather than listing tags or
+          # releases: it excludes drafts and prereleases by definition, so a
+          # pre-release cut mid-cycle cannot accidentally unblock the site. It
+          # 404s when the repo has no published release, hence the fallback.
+          TAG="$(gh api "repos/${{ github.repository }}/releases/latest" \
+                   --jq .tag_name 2>/dev/null || echo "")"
+          LATEST="${TAG#v}"
+
+          echo "wally.toml: ${VER}"
+          echo "latest release: ${TAG:-<none>}"
+
+          # Fail CLOSED. If the latest release cannot be determined, publishing
+          # anyway is the exact mistake this gate exists to prevent; re-run with
+          # force once you have confirmed the ref is the right one.
+          if [ -z "$LATEST" ]; then
+            echo "::notice::No published release found, so there is nothing to match. Skipping (re-run with force to override)."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$VER" = "$LATEST" ]; then
+            echo "::notice::${VER} is the current release: deploying."
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::wally.toml is ${VER} but the latest release is ${TAG}. Skipping: the site would document an unreleased version. It will publish automatically when ${VER} is released."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: gate
+    if: needs.gate.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -26,7 +115,7 @@ jobs:
       - name: Install docs dependencies
         run: pip install -r requirements-docs.txt
       - name: Build site
-        run: mkdocs build --strict   # runs docgen/gen.py via the mkdocs hook
+        run: mkdocs build --strict # runs docgen/gen.py via the mkdocs hook
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site

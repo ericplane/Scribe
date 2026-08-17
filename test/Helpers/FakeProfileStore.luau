@@ -73,6 +73,29 @@ function FakeProfileStore.new()
 		fake.Constants[name] = value
 	end
 
+	--- Simulate ANOTHER SERVER force-loading `profileKey` and taking the session
+	--- lock. The incumbent (if any) is dropped without a final save and its
+	--- OnSessionEnd fires, exactly as ProfileStore does to a superseded session;
+	--- the key is then free for the next StartSessionAsync to claim.
+	--- Returns true if a live session was actually stolen.
+	---
+	--- Only reachable when two harnesses share one fake (TestCtx.make{ Fake = ... }):
+	--- with a private fake per harness there is no second server to do the stealing.
+	function fake.StealSession(profileKey: string, storeName: string?): boolean
+		local key = `{storeName or "Default"}/{profileKey}`
+		local profile = fake.ActiveProfiles[key]
+		if not profile then
+			return false
+		end
+		profile._steal()
+		return true
+	end
+
+	--- Is `profileKey` currently session-locked by anyone on this shared disk?
+	function fake.IsLocked(profileKey: string, storeName: string?): boolean
+		return fake.ActiveProfiles[`{storeName or "Default"}/{profileKey}`] ~= nil
+	end
+
 	function fake.New(storeName: string, template: AnyTable?)
 		local store = {} :: any
 		store.Name = storeName
@@ -256,6 +279,25 @@ function FakeProfileStore.new()
 			end
 
 			profile._deliver = deliver
+
+			-- End this session the way ANOTHER SERVER stealing the lock does, as
+			-- opposed to profile:EndSession() (which is this server letting go). Real
+			-- ProfileStore drops the session and fires OnSessionEnd WITHOUT a final
+			-- save: the thief now owns the key, so writing here would clobber it. That
+			-- asymmetry is the whole point -- Scribe distinguishes the two with
+			-- entry.LocalSessionEnd, and nothing in the suite could reach the remote
+			-- branch before shared-disk harnesses existed.
+			function profile._steal()
+				if not active then
+					return
+				end
+				active = false
+				if fake.ActiveProfiles[key] == profile then
+					fake.ActiveProfiles[key] = nil
+				end
+				profile.OnSessionEnd:Fire()
+			end
+
 			return profile
 		end
 

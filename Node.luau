@@ -73,15 +73,6 @@ export type Tree = typeof(setmetatable(
 		-- path array for each listener'd pathKey, so the Init replay can read a
 		-- node's value without reversing the (lossy) pathKey string.
 		_paths: { [string]: { string | number } },
-		-- ancestor pathKey -> set of listener'd pathKeys strictly below it, so a
-		-- container write finds its descendant listeners by lookup instead of
-		-- sweeping every registered path.
-		_descendants: { [string]: { [string]: boolean } },
-		-- Stored packed subtree table -> its frozen unpacked read view. WEAK-KEYED:
-		-- a subtree that is replaced or removed becomes unreachable and takes its
-		-- entry with it, so the cache is bounded by the LIVE store shape rather
-		-- than by how many distinct paths were ever read.
-		_unpacked: { [any]: any },
 		-- true only while replaying the initial snapshot: suppresses per-op fires
 		-- so descendants can be fired once, together, afterwards.
 		_replaying: boolean,
@@ -95,7 +86,6 @@ export type Tree = typeof(setmetatable(
 		_pendingAncestorOrder: { string }?,
 		_txn: {
 			Snapshots: { [string]: { Path: { string | number }, Value: any } },
-			Below: { [string]: { [string]: boolean } },
 			Ops: { { Op: Op, Schema: SchemaNode? } },
 			Created: { { string | number } },
 			RawRestores: { [string]: { Store: { [string]: any }, Value: any } },
@@ -134,11 +124,6 @@ function Node.NewTree(params: TreeParams): Tree
 		Dead = false,
 		_listeners = {},
 		_paths = {},
-		_descendants = {},
-		-- Luau has no ephemerons: a weak-keyed entry whose VALUE can reach its KEY
-		-- is never collected. Safe here because a view holds only DESCENDANTS of the
-		-- source table, never the source itself.
-		_unpacked = setmetatable({}, { __mode = "k" }) :: any,
 		_replaying = false,
 		_batchDepth = 0,
 		_pendingAncestors = nil,
@@ -192,37 +177,6 @@ end
 -- which is also what makes Remove()'s string/number dispatch correct by construction.
 -- Untyped containers (a plain `{}` template field) have no Container and are
 -- unaffected, keeping exactly the behavior they have today.
--- Drop the cached view of every container along `path`, plus the value at its end.
---
--- Only IDENTITY-PRESERVING mutations need this: a write below a container,
--- table.clear, an array op. A mutation that REPLACES or removes a subtree needs no
--- help at all -- the cache is weak-keyed by the stored table, so the old table
--- becoming unreachable takes its entry with it. That is what makes descendants
--- safe: keying by pathKey used to strand one strong entry per previously-read
--- child on every subtree replacement, and each stranded entry then held the dead
--- store table alive.
-local function invalidateUnpacked(tree: Tree, path: { string | number })
-	local cache = tree._unpacked
-	if next(cache) == nil then
-		return -- nothing packed has been read; the whole mechanism costs one lookup
-	end
-	local rootKey = path[1]
-	if rootKey == nil then
-		return
-	end
-	local node: any = storeFor(tree, rootKey)
-	for i = 1, #path do
-		if type(node) ~= "table" then
-			return
-		end
-		cache[node] = nil
-		node = node[path[i]]
-	end
-	if type(node) == "table" then
-		cache[node] = nil
-	end
-end
-
 -- Container memos -------------------------------------------------------------
 --
 -- Two per-container facts used to be re-derived by walking the whole table on
@@ -238,10 +192,10 @@ end
 -- The memos are maintained where a container is ASSIGNED INTO, not where a write
 -- is validated -- NoValidate and FromRemote writes skip validation entirely and
 -- would silently desync a cache kept in checkContainerKey.
-local containerCounts: { [any]: number } = setmetatable({}, { __mode = "k" }) :: any
+local containerCounts: { [any]: number } = (setmetatable({}, { __mode = "k" }) :: any)
 -- The offending string key of an integer-keyed container, or `false` for
 -- "walked it, there is none".
-local stringKeyed: { [any]: any } = setmetatable({}, { __mode = "k" }) :: any
+local stringKeyed: { [any]: any } = (setmetatable({}, { __mode = "k" }) :: any)
 
 local function countKeysExact(container: any): number
 	local n = 0
@@ -559,50 +513,10 @@ local function listenersFor(tree: Tree, pathKey: string, event: string, create: 
 	return list
 end
 
--- Calls `fn` with every STRICT ancestor pathKey of `pathKey`, outermost first.
--- pathKeys are segments joined by \31, and a segment can never contain \31 (control
--- characters are refused at write time), so a prefix ending at a separator is
--- exactly an ancestor -- no false matches are possible.
-local function forEachAncestorKey(pathKey: string, fn: (string) -> ())
-	local at = string.find(pathKey, "\31", 1, true)
-	while at do
-		fn(string.sub(pathKey, 1, at - 1))
-		at = string.find(pathKey, "\31", at + 1, true)
-	end
-end
-
--- Register/unregister `pathKey` under each of its ancestors, so a write at an
--- ancestor can find everything listening below it without sweeping every path.
-local function indexDescendant(tree: Tree, pathKey: string)
-	forEachAncestorKey(pathKey, function(ancestor)
-		local set = tree._descendants[ancestor]
-		if set == nil then
-			set = {}
-			tree._descendants[ancestor] = set
-		end
-		set[pathKey] = true
-	end)
-end
-
-local function unindexDescendant(tree: Tree, pathKey: string)
-	forEachAncestorKey(pathKey, function(ancestor)
-		local set = tree._descendants[ancestor]
-		if set ~= nil then
-			set[pathKey] = nil
-			if next(set) == nil then
-				tree._descendants[ancestor] = nil
-			end
-		end
-	end)
-end
-
 local function connect(tree: Tree, path: { string | number }, event: string, fn: (...any) -> ()): () -> ()
 	assertAlive(tree)
 	local pathKey = Util.pathKey(path)
 	local list = listenersFor(tree, pathKey, event, true) :: { [any]: (...any) -> () }
-	if tree._paths[pathKey] == nil then
-		indexDescendant(tree, pathKey)
-	end
 	tree._paths[pathKey] = path
 	local token = {}
 	list[token] = fn
@@ -618,7 +532,6 @@ local function connect(tree: Tree, path: { string | number }, event: string, fn:
 				if next(byEvent) == nil then
 					tree._listeners[pathKey] = nil
 					tree._paths[pathKey] = nil
-					unindexDescendant(tree, pathKey)
 				end
 			end
 		end
@@ -825,20 +738,14 @@ local function snapshotDescendants(tree: Tree, pathKey: string): { [string]: any
 	if next(tree._listeners) == nil then
 		return nil
 	end
-	-- Indexed, not swept. This used to walk EVERY registered listener path on every
-	-- container write and prefix-match each one, so the cost of one write scaled
-	-- with how many distinct paths the game happened to be listening to anywhere in
-	-- the tree. _descendants answers the same question in one lookup.
-	local below = tree._descendants[pathKey]
-	if below == nil then
-		return nil
-	end
+	-- Root writes are rejected upstream, so pathKey is never "" here; a non-empty
+	-- prefix plus the separator cannot match the written path itself.
+	local prefix = pathKey .. "\31"
 	local olds: { [string]: any }? = nil
-	for key in below do
-		local byEvent = tree._listeners[key]
-		if byEvent and byEvent.Changed then
-			local path = tree._paths[key]
-			if path then
+	for key, path in tree._paths do
+		if #key > #prefix and string.sub(key, 1, #prefix) == prefix then
+			local byEvent = tree._listeners[key]
+			if byEvent and byEvent.Changed then
 				olds = olds or {}
 				(olds :: { [string]: any })[key] = readValue(tree, path)
 			end
@@ -1344,32 +1251,6 @@ local function settleAfterWrite(tree: Tree)
 end
 
 -- Whether `a` is a strict ancestor path of `b` (a shorter, matching prefix).
--- Per-transaction mirror of the tree's _descendants index: ancestor pathKey -> the
--- snapshot keys strictly below it. Lets a snapshot absorb the ones underneath it
--- without scanning every snapshot in the transaction.
-local function indexSnapshot(txn: any, pathKey: string)
-	forEachAncestorKey(pathKey, function(ancestor)
-		local set = txn.Below[ancestor]
-		if set == nil then
-			set = {}
-			txn.Below[ancestor] = set
-		end
-		set[pathKey] = true
-	end)
-end
-
-local function unindexSnapshot(txn: any, pathKey: string)
-	forEachAncestorKey(pathKey, function(ancestor)
-		local set = txn.Below[ancestor]
-		if set ~= nil then
-			set[pathKey] = nil
-			if next(set) == nil then
-				txn.Below[ancestor] = nil
-			end
-		end
-	end)
-end
-
 local function pathIsStrictAncestor(a: { string | number }, b: { string | number }): boolean
 	if #a >= #b then
 		return false
@@ -1426,50 +1307,26 @@ local function snapshotForTxn(tree: Tree, path: { string | number }, pathKey: st
 	if not txn or txn.Snapshots[pathKey] ~= nil then
 		return
 	end
-	-- Already covered by an ancestor snapshot? Walk THIS path's ancestor keys
-	-- rather than every snapshot taken so far. The old scan ran on every write to
-	-- a new path, which made a transaction quadratic in the number of distinct
-	-- paths it touched (2,000 writes measured at 168 ms, 4,000 at 1.24 s).
-	--
-	-- pathKey is 1:1 with path in any tree that passed validation -- the numeric
-	-- vs string key form that could alias two paths is refused at the write -- but
-	-- the real comparison still runs on a hit. It is O(depth), and it decides
-	-- whether a rollback restores the correct subtree.
-	local at = string.find(pathKey, "\31", 1, true)
-	while at do
-		local ancestorSnap = txn.Snapshots[string.sub(pathKey, 1, at - 1)]
-		if ancestorSnap ~= nil and pathIsStrictAncestor(ancestorSnap.Path, path) then
+	for _, snap in txn.Snapshots do
+		if pathIsStrictAncestor(snap.Path, path) then
 			return
 		end
-		at = string.find(pathKey, "\31", at + 1, true)
 	end
 	local value = Util.deepClone(oldValue)
 	-- Track which descendant snapshots get overlaid: each one is the AUTHORITATIVE
 	-- pre-txn state at its path (first-write-wins), which the Created-strip below
 	-- must not undo.
 	local overlaid: { { string | number } }? = nil
-	-- Snapshots strictly BELOW this path, by lookup rather than by scanning them
-	-- all. Collected first because absorbing one removes it from the same index
-	-- being iterated.
-	local belowSet = txn.Below[pathKey]
-	if belowSet ~= nil then
-		local descKeys: { string } = {}
-		for descKey in belowSet do
-			descKeys[#descKeys + 1] = descKey
-		end
-		for _, descKey in descKeys do
-			local snap = txn.Snapshots[descKey]
-			if snap ~= nil and pathIsStrictAncestor(path, snap.Path) then
-				if type(value) ~= "table" then
-					value = {}
-				end
-				local relPath = table.move(snap.Path, #path + 1, #snap.Path, 1, table.create(#snap.Path - #path))
-				setNested(value, relPath, snap.Value)
-				overlaid = overlaid or {}
-				table.insert(overlaid :: { { string | number } }, snap.Path)
-				txn.Snapshots[descKey] = nil
-				unindexSnapshot(txn, descKey)
+	for descKey, snap in txn.Snapshots do
+		if pathIsStrictAncestor(path, snap.Path) then
+			if type(value) ~= "table" then
+				value = {}
 			end
+			local relPath = table.move(snap.Path, #path + 1, #snap.Path, 1, table.create(#snap.Path - #path))
+			setNested(value, relPath, snap.Value)
+			overlaid = overlaid or {}
+			table.insert(overlaid :: { { string | number } }, snap.Path)
+			txn.Snapshots[descKey] = nil
 		end
 	end
 	-- Reconcile the reconstruction with containers materialized during this txn
@@ -1535,7 +1392,6 @@ local function snapshotForTxn(tree: Tree, path: { string | number }, pathKey: st
 		end
 	end
 	txn.Snapshots[pathKey] = { Path = table.clone(path), Value = value }
-	indexSnapshot(txn, pathKey)
 end
 
 local applySet: (Tree, { string | number }, SchemaNode?, any, WriteOpts) -> any
@@ -1719,17 +1575,6 @@ function applySet(tree: Tree, path: { string | number }, schema: SchemaNode?, va
 	-- After the no-op early-out, so an unchanged write never triggers a recompute,
 	-- and before the fires, so a listener reading a derived field sees it settled.
 	markDerivedDirty(tree, pathKey)
-	invalidateUnpacked(tree, path)
-	if type(old) == "table" then
-		-- Replacing or removing a whole subtree orphans every table inside it, and
-		-- those are precisely the keys cached views are stored under. The weak keys
-		-- make them COLLECTABLE, but collectable is not collected: nothing promises
-		-- when a GC pass runs, and until one does the cache is the sole owner of
-		-- data the store has already dropped. Evicting wholesale here is O(1), runs
-		-- only on a write that was already discarding a subtree, and makes the
-		-- release immediate rather than eventual. The weak keys stay as a backstop.
-		table.clear(tree._unpacked)
-	end
 	snapshotForTxn(tree, path, pathKey, old)
 	-- Snapshot observed descendants BEFORE the write; a whole-table Set changes
 	-- every leaf beneath this path and only this pass can report it.
@@ -1907,7 +1752,6 @@ local function applyInsert(
 	-- BEFORE the snapshot so intermediate declared elements replicate as real ops.
 	seedMissingElements(tree, path, schema, opts)
 	markDerivedDirty(tree, pathKey)
-	invalidateUnpacked(tree, path)
 	snapshotForTxn(tree, path, pathKey, preValue)
 
 	local arr = ensureContainerValue(tree, path, schema)
@@ -1953,14 +1797,8 @@ function applyArrayRemove(
 
 	local pathKey = Util.pathKey(path)
 	markDerivedDirty(tree, pathKey)
-	invalidateUnpacked(tree, path)
 	snapshotForTxn(tree, path, pathKey, arr)
 	local item = table.remove(arr, index)
-	if type(item) == "table" then
-		-- Same reasoning as the subtree replacement in applySet: the removed element
-		-- is orphaned now, and a cached view keyed by it should not outlive it.
-		table.clear(tree._unpacked)
-	end
 
 	emitOp(tree, { Kind = "Remove", Path = table.clone(path), Index = index }, schema, opts)
 	fire(tree, pathKey, "OnRemove", item, index)
@@ -1997,17 +1835,10 @@ local function applyClear(tree: Tree, path: { string | number }, schema: SchemaN
 	-- its declared children -- so this is the one non-Set path that can blank an
 	-- input (data.Stats.Clear() takes Stats.PoliceXP with it).
 	markDerivedDirty(tree, pathKey)
-	invalidateUnpacked(tree, path)
 	snapshotForTxn(tree, path, pathKey, value)
 	local descendantOlds = snapshotDescendants(tree, pathKey)
 	table.clear(value)
 	noteContainerCleared(value)
-	-- Clear orphans every child table at once, and those children are exactly the
-	-- tables cached views are keyed by. The weak keys would get there eventually,
-	-- but "eventually" is a GC pass away and a wiped inventory should not stay
-	-- resident until one happens; a bulk operation can afford a bulk eviction, and
-	-- the rollback path already takes the same trade.
-	table.clear(tree._unpacked)
 
 	emitOp(tree, { Kind = "Clear", Path = table.clone(path) }, schema, opts)
 	-- Bulk semantics: parent Changed fires once; per-entry key events don't. A
@@ -2325,7 +2156,7 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 	if self._txn then
 		error("Scribe: transactions do not nest", 2)
 	end
-	self._txn = { Snapshots = {}, Below = {}, Ops = {}, Created = {}, RawRestores = {}, Economy = {} }
+	self._txn = { Snapshots = {}, Ops = {}, Created = {}, RawRestores = {}, Economy = {} }
 	-- Everything already queued belongs to an enclosing batch, not to this
 	-- transaction, so a rollback must leave it alone.
 	local outerOrder = self._pendingAncestorOrder
@@ -2477,13 +2308,6 @@ function Tree.RunTransaction(self: Tree, fn: () -> ()): (boolean, string?)
 	-- the body dirtied a field and every restore happened to be a no-op: the marks
 	-- would otherwise sit unclaimed until the next unrelated write.
 	settleDerived(self)
-	-- Drop every cached unpacked view wholesale. The restores above route through
-	-- applySet and invalidate as they go, but a rollback also writes to the store
-	-- DIRECTLY (RawRestores, e.g. _Scribe.Timed expiries), and reasoning case by
-	-- case about which of those could leave a stale view is a poor trade against
-	-- one table.clear on a path that only runs when a transaction has already
-	-- failed. A stale read here would be silent, so this end is the cheap one.
-	table.clear(self._unpacked)
 	return false, tostring(err)
 end
 
@@ -2495,8 +2319,6 @@ function Tree.Destroy(self: Tree)
 	-- were still connected kept every listened path array alive. Accessors need no
 	-- equivalent sweep: the per-parent _children caches are weak-valued.
 	table.clear(self._paths)
-	table.clear(self._descendants)
-	table.clear(self._unpacked)
 end
 
 -- Accessor methods -----------------------------------------------------------------
@@ -2534,14 +2356,6 @@ end
 	shared by reference. Mutating what `Get` hands you edits authoritative state with
 	no validation and no replication, so treat it as read-only and use [Value.Clone]
 	when you intend to mutate.
-
-	A subtree that *does* contain a datatype or a [Scribe.Big] comes back **frozen**,
-	and the same view is reused until something writes to that subtree. The rebuild
-	those fields need is expensive on a large container, and it used to run on every
-	read and every fire — including fires caused by writes to unrelated fields. Since
-	the view is now shared between readers, it is frozen so one caller's edit cannot
-	leak into another's read; `Get()` at the root has always been frozen for the same
-	reason. Use [Value.Clone] for a mutable copy.
 
 	:::note The root is a special case
 	`Data[player].Get()` is the one read that does not hand back the store. It
@@ -2997,13 +2811,7 @@ end
 -- subtrees are shared by reference (same as a plain container read today) and
 -- containers with nothing packed below return unchanged: no walk, no allocation for
 -- the overwhelming common case.
--- Nodes rebuilt by the current unpackRead walk, read by unpackCached's cost
--- gate. A plain counter rather than a threaded parameter: unpackRead is
--- recursive and already on an O(n) path, and every caller is single-threaded.
-local unpackNodes = 0
-
 local function unpackRead(schema: SchemaNode?, value: any): any
-	unpackNodes += 1
 	-- A big value is STORED as { mantissa, exponent } and READ as the object with
 	-- arithmetic on it, the same split datatype fields use.
 	if schema and schema.ValueType == "big" then
@@ -3165,51 +2973,6 @@ end
 -- Scribe's own internals stay reachable by indexing the accessor
 -- (`data._Scribe.Perks`), which is how the server layers read them; this only
 -- changes what a whole-data read hands back.
--- Cached unpacked read views ---------------------------------------------------
---
--- A PACKED subtree (one holding a Scribe.CFrame, a Scribe.Big, or any datatype
--- anywhere below it) has to be rebuilt key by key to be read, because the stored
--- form is packed. That rebuild ran on every Get, every container Changed fire and
--- every root Observe fire, so a template with 3,000 packed elements paid ~9 ms of
--- it per write -- including writes to a completely unrelated field, because a root
--- Observe re-reads every root.
---
--- Each entry remembers the exact table it was built from. A whole-table Set
--- installs a DIFFERENT table, so that case invalidates itself on identity and
--- needs no bookkeeping at all; the same is true of a subtree that was replaced or
--- removed above. Explicit invalidation is therefore only needed for mutations that
--- KEEP the identity -- a write below the container, table.clear, an array op --
--- which is why the hook walks ancestors and nothing else.
---
--- The view is frozen. It is shared between readers now, so handing back a mutable
--- one would let one caller's edit leak into every later read. Root Get() has
--- always been frozen for exactly this reason; this makes containers agree with it.
--- Below this many rebuilt nodes a miss is cheap enough that caching it costs more
--- memory than it saves time. Measured rebuild rate is ~2.8 us per element record,
--- so a 64-node floor caps an uncached miss at roughly 180 us while every entry
--- that does get stored is saving milliseconds. Without a gate, a game reading
--- thousands of SMALL packed records (an inventory keyed by item id) retained one
--- copy each and got nothing back for it.
-local MIN_CACHED_NODES = 64
-
-local function unpackCached(tree: Tree, schema: SchemaNode?, value: any): any
-	if type(value) ~= "table" or not Template.IsPacked(schema) then
-		-- Nothing to rebuild: unpackRead hands a non-packed table straight back
-		-- (it is the live store table) and only converts packed leaves.
-		return unpackRead(schema, value)
-	end
-	local hit = tree._unpacked[value]
-	if hit ~= nil then
-		return hit
-	end
-	unpackNodes = 0
-	local view = table.freeze(unpackRead(schema, value))
-	if unpackNodes >= MIN_CACHED_NODES then
-		tree._unpacked[value] = view
-	end
-	return view
-end
-
 local function rootShell(tree: Tree, clone: boolean): { [string]: any }
 	local out: { [string]: any } = {}
 	local children = tree.Compiled.Root.Children
@@ -3225,7 +2988,7 @@ local function rootShell(tree: Tree, clone: boolean): { [string]: any }
 			continue
 		end
 		if not clone then
-			out[key] = unpackCached(tree, childSchema, value)
+			out[key] = unpackRead(childSchema, value)
 		elseif Template.IsPacked(childSchema) then
 			out[key] = cloneUnpack(childSchema, value)
 		else
@@ -3283,7 +3046,7 @@ METHOD_FACTORIES.Get = function(accessor)
 			-- template happened to declare a datatype field somewhere.
 			return frozenRootShell(tree)
 		end
-		return unpackCached(tree, accessorSchema(accessor), readValue(tree, path))
+		return unpackRead(accessorSchema(accessor), readValue(tree, path))
 	end
 end
 
@@ -3709,7 +3472,7 @@ METHOD_FACTORIES.Changed = function(accessor)
 		if Template.IsPacked(schema) then
 			local inner = fn
 			fn = function(newValue, oldValue)
-				local newUnpacked = unpackCached(tree, schema, newValue)
+				local newUnpacked = unpackRead(schema, newValue)
 				-- An ancestor container fire passes the SAME reference for new and old;
 				-- reuse the unpacked value to skip a second walk and to preserve
 				-- reference-equality for a listener's `if new == old then return` guard.
@@ -3729,10 +3492,10 @@ METHOD_FACTORIES.Observe = function(accessor)
 		local path = accessorPath(accessor)
 		local isRoot = #path == 0
 		local disconnect = connect(tree, path, "Changed", function(newValue)
-			fn(if isRoot then frozenRootShell(tree) else unpackCached(tree, schema, newValue))
+			fn(if isRoot then frozenRootShell(tree) else unpackRead(schema, newValue))
 		end)
 		local ok, err = xpcall(function()
-			fn(if isRoot then frozenRootShell(tree) else unpackCached(tree, schema, readValue(tree, path)))
+			fn(if isRoot then frozenRootShell(tree) else unpackRead(schema, readValue(tree, path)))
 		end, function(e)
 			return debug.traceback(tostring(e), 2)
 		end)

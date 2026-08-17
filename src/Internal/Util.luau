@@ -46,9 +46,25 @@ export type Unpersistable = {
 -- key is reported before recursing under it, so `Path` never embeds bad bytes),
 -- or nil when the whole structure is DataStore-safe. Buffers and finite
 -- numbers/booleans/strings are DataStore-safe and pass.
-function Util.findUnpersistable(value: any, path: { string | number }?, depth: number?): Unpersistable?
+-- `stats`, when supplied, collects the deepest table nesting reached. Stored data
+-- can legally be nested deeper than a WRITE is allowed to reach (MAX_VALUE_DEPTH):
+-- such a profile loads and reads cleanly and only refuses writes to its deepest
+-- leaves, at the first Set, long after load. Riding along on this walk reports it
+-- at load instead, and costs one comparison per table rather than a second pass
+-- over the whole profile. It is only as complete as the walk: a scan that returns
+-- early on an offender leaves MaxDepth partial, which is fine because that path
+-- already fails loudly.
+function Util.findUnpersistable(
+	value: any,
+	path: { string | number }?,
+	depth: number?,
+	stats: { MaxDepth: number }?
+): Unpersistable?
 	local at = path or {}
 	local d = depth or 0
+	if stats and d > stats.MaxDepth then
+		stats.MaxDepth = d
+	end
 	-- Checked FIRST, on typeof rather than type: a Roblox datatype IS storable,
 	-- just not raw, and reaching this scan means it was written around the accessor
 	-- (OnPlayerInit, a migration, an offline draft) so nothing packed it. Ahead of
@@ -107,7 +123,7 @@ function Util.findUnpersistable(value: any, path: { string | number }?, depth: n
 			end
 			local childPath = table.clone(at)
 			table.insert(childPath, k)
-			local found = Util.findUnpersistable(v, childPath, d + 1)
+			local found = Util.findUnpersistable(v, childPath, d + 1, stats)
 			if found ~= nil then
 				return found
 			end

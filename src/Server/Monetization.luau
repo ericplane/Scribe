@@ -1367,14 +1367,21 @@ function Monetization.new(ctx: any)
 			return false, "data services are experiencing issues; try again later"
 		end
 
+		-- Charge the sender's cooldown BEFORE the first expensive step, not after it.
+		-- recipientAlreadyOwns issues a full-profile GetAsync for an offline
+		-- recipient (plus a MarketplaceService call when the perk is a registered
+		-- pass), and the stamp used to sit below it -- so every PromptGift refused
+		-- with "recipient already owns this" did that work and left the cooldown
+		-- unspent, letting one sender repeat it without limit. The checks above this
+		-- point are all local and cheap, so they deliberately still cost nothing.
+		entry.GiftLastAt = now
+
 		-- Step 1: duplicate guard.
 		if product.Grants and not allowDuplicateGifts then
 			if recipientAlreadyOwns(recipientUserId, product.Grants) then
 				return false, "recipient already owns this"
 			end
 		end
-
-		entry.GiftLastAt = now
 
 		-- Step 2: credit consumption — no purchase prompt, no charge.
 		local reserved = reservedRaw(entry.LiveData)

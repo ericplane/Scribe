@@ -3,6 +3,8 @@
 -- fake ProfileStore and a stub transport (via Server.build), plus helpers for
 -- driving the player lifecycle and decoding captured wire frames.
 
+local RunService = game:GetService("RunService")
+
 local ScribeRoot = script.Parent.Parent.Parent.Scribe
 
 local Scribe = require(ScribeRoot) :: any
@@ -44,6 +46,8 @@ export type Harness = {
 	Compiled: Template.Compiled,
 	Options: { [string]: any },
 	Join: (userId: number?) -> (any, any, any), -- (player, entry, data accessor)
+	TryJoin: (userId: number?) -> (any, any, any, string?), -- load may fail (locked)
+	Step: () -> (), -- drive one real PostSimulation replication flush
 	Leave: (player: any) -> (),
 	SendHello: (player: any) -> (),
 	DecodeFrame: (bytes: buffer) -> { [string]: any },
@@ -52,10 +56,20 @@ export type Harness = {
 }
 
 function TestCtx.make(
-	config: { Template: { [string]: any }?, Options: { [string]: any }?, AutoPump: boolean? }?
+	config: {
+		Template: { [string]: any }?,
+		Options: { [string]: any }?,
+		AutoPump: boolean?,
+		-- Reuse an existing FakeProfileStore instead of minting a private one, so
+		-- two harnesses model two SERVERS sharing one DataStore: same Persisted,
+		-- same ActiveProfiles (so the session lock is real across them), same
+		-- Mailboxes (so cross-server messages actually arrive). Without this every
+		-- harness gets its own disk and no spec can express a two-server hazard.
+		Fake: any?,
+	}?
 ): Harness
 	local cfg = config or {}
-	local fake = FakeProfileStore.new()
+	local fake = cfg.Fake or FakeProfileStore.new()
 	local transport = StubTransport.new({ AutoPump = cfg.AutoPump })
 
 	local options: { [string]: any } = {
@@ -107,6 +121,35 @@ function TestCtx.make(
 		end
 		local entry = ctx.Persistence.EntryFor(player)
 		return player, entry, accessor
+	end
+
+	--- Join without asserting success. Returns (player, entry, accessor, reason);
+	--- accessor is nil when the load failed (e.g. the profile is session-locked by
+	--- another harness sharing this fake).
+	function harness.TryJoin(userId: number?): (any, any, any, string?)
+		local player = FakePlayer.new(userId)
+		table.insert(joined, player)
+		ctx.Persistence.OnPlayerAdded(player)
+		local accessor, reason = ctx.Persistence.WaitForData(player)
+		return player, ctx.Persistence.EntryFor(player), accessor, reason
+	end
+
+	--- Drive one frame of Scribe's REAL replication flush loop, the
+	--- RunService.PostSimulation handler at src/Server/Replication.luau. Specs used
+	--- to hand-call ctx.Replication.FlushEntry, which meant the production loop --
+	--- including its iteration over every entry -- executed zero times under the
+	--- whole suite. Portable across both runners, but the test has to be on the
+	--- SIGNAL'S TYPE, not on whether it has a Fire member: reading an unknown member
+	--- off a real RBXScriptSignal RAISES ("Fire is not a valid member of
+	--- RBXScriptSignal") rather than returning nil, so probing for `.Fire` is itself
+	--- what breaks under Studio. `typeof` answers it without touching the member.
+	function harness.Step()
+		local signal = RunService.PostSimulation :: any
+		if typeof(signal) == "RBXScriptSignal" then
+			task.wait() -- real engine: it fires PostSimulation itself, once a frame
+		else
+			signal:Fire(1 / 60) -- headless shim: a FakeSignal we drive ourselves
+		end
 	end
 
 	function harness.Leave(player: any)

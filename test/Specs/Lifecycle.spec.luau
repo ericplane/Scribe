@@ -83,9 +83,12 @@ return function()
 		expect(ok).to.equal(false)
 		expect(string.find(tostring(err), "unloaded") ~= nil).to.equal(true)
 
-		-- Listener/accessor maps cleared.
+		-- Listener maps cleared. _paths is asserted alongside _listeners because the
+		-- two are populated together, one entry per listened path; this replaces an
+		-- assertion on a _accessors field that was never written to and so could not
+		-- fail. The accessor cache itself is the weak-valued per-parent _children.
 		expect(next(tree._listeners)).to.equal(nil)
-		expect(next(tree._accessors)).to.equal(nil)
+		expect(next(tree._paths)).to.equal(nil)
 	end)
 
 	it("leaks nothing across many load/unload cycles", function()

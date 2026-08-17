@@ -15,6 +15,7 @@ export type MarkerKind =
 	| "Timed"
 	| "Datatype"
 	| "Dynamic"
+	| "Derived"
 	| "Optional"
 	| "ArrayOf"
 	| "SetOf"
@@ -31,6 +32,8 @@ export type Meta = {
 	Members: { string }?,
 	Datatype: string?, -- typeof() name for Datatype markers (e.g. "Vector3")
 	Factory: (() -> any)?, -- Dynamic markers: produces the per-new-profile default
+	Inputs: { string }?, -- Derived markers: dotted paths of the fields it reads
+	Compute: ((...any) -> any)?, -- Derived markers: pure function of those inputs
 	Element: any?, -- ArrayOf/DictOf markers: the raw element shape, compiled into AnyChild
 	MaxItems: number?, -- ArrayOf: cardinality cap
 	Evict: string?, -- ArrayOf: "Front" or "Back", which end an Insert at the cap drops

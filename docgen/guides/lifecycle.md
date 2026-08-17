@@ -69,6 +69,8 @@ end,
 
 The table you get is the raw profile data, not the accessor tree, so writes here bypass the usual validation: Scribe scans it afterwards and reports anything unstorable as `PROFILE_UNPERSISTABLE`. For a value that depends only on the profile itself (a creation timestamp, a seed), prefer [`Scribe.Dynamic`](./templates), which is declared in the template and runs per profile automatically.
 
+Because it is the raw table, [derived fields](./derived) are not in it — they are computed, never stored, and Scribe evaluates them right after this hook, before the session is Ready. A value you would otherwise compute here and write is usually a derived field: declare it once and it stays correct for the life of the profile, including after you change the formula.
+
 :::caution Datatype fields need packing here
 Bypassing the accessor also bypasses [datatype packing](./templates#roblox-datatype-fields). A `Scribe.DateTime`, `Scribe.Vector3`, or `Scribe.CFrame` field stores a packed buffer, and the accessor converts for you, but a raw assignment stores the userdata itself, which no DataStore can serialize:
 
@@ -118,6 +120,15 @@ By default each write replicates on the next frame. Two server helpers change th
 
 - **`Batch`** coalesces every write inside it into a **single replication flush**, so the client gets one update instead of many, and collapses each **container** `Changed` to one fire carrying the batch's end state. Leaf `Changed`, `OnChildChanged`, `OnInsert` and `OnRemove` are transitions and still fire once per write. Reach for it on bulk updates. **It must not yield**, and unlike `Transaction` below, nothing detects it when it does: a `task.wait` or DataStore call inside a batch holds that player's replication flush and every coalesced container `Changed` until the batch returns, and any unrelated write landing on the same tree in the meantime is swept into the same flush.
 - **`Transaction`** runs writes **atomically**: if the function throws, every write inside is rolled back and it returns `(false, error)`; on success, `(true, nil)`. It also batches, so it is already a single flush. The function **must not yield** (no `task.wait`, DataStore, or MarketplaceService calls inside it): a yield is refused with `(false, error)` and rolled back, because a concurrent write landing during the yield could be pulled into the transaction. Do any async work before or after. A rollback also drops the economy events a tagged `Increment` / `Decrement` inside it would have logged, so a reverted transaction never reaches your analytics. A plain `Batch` gives you none of that: it defers the replication flush, but a throw inside it leaves every write that already ran in place.
+
+!!! warning "`Transaction` is atomic in memory, not on the DataStore"
+
+    "Atomic" here means the writes land on **one player's in-memory tree** all together or not at all. It does **not** mean durable, and it is not a database transaction:
+
+    - **Commit is not a save.** When `Transaction` returns `true` the writes are in memory and queued for the next save like any other write. A server crash before that save loses them. To tie a transaction to durability, follow it with [`AwaitSave`](/api/Server#AwaitSave) and only treat the operation as complete once that returns — this is exactly what the [monetization](./monetization) receipt path does before it reports `PurchaseGranted`.
+    - **One player only.** There is no cross-player or cross-key transaction. A trade between two players is **not** expressible as a single `Transaction`: each side is a separate tree with a separate DataStore key, so one side can save while the other does not. If you build trading, design for that — stage the transfer through a durable record (a pending-gift style entry committed on the recipient's own key) rather than assuming two `Transaction` calls succeed or fail together.
+
+    Cost scales with the number of **distinct paths** the transaction touches, not the size of the profile. A few hundred paths is sub-millisecond; several thousand in one transaction is a measurable hitch.
 
 ```lua
 -- Batch: one replication flush and one Changed for a bulk update

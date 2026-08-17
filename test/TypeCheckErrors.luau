@@ -4,7 +4,7 @@
 -- exactly EXPECTED_ERRORS diagnostics — if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
--- EXPECTED_ERRORS: 23
+-- EXPECTED_ERRORS: 26
 
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -20,6 +20,9 @@ local template = {
 		Cf = Scribe.CFrame(CFrame.identity),
 		Note = Scribe.Optional(Scribe.String("")),
 	}),
+	Doubled = Scribe.Derived(Scribe.Int(0), { "Coins" }, function(coins: number): number
+		return coins * 2
+	end),
 }
 
 type T = typeof(template)
@@ -172,7 +175,19 @@ local function badMapContainer(player: Player)
 	return data.Tags.Get()
 end
 
+local function badDerived(player: Player)
+	local data = bundle.Server[player]
+	-- 24) A derived field is computed, so the mutators are absent from its type.
+	data.Doubled.Set(10) -- TypeError: Set is not on a derived node
+	-- 25) Including the numeric ones.
+	data.Doubled.Increment(1) -- TypeError: Increment is not on a derived node
+	-- 26) It still reads as its output declarator, so this assignment is wrong.
+	local wrong: string = data.Doubled.Get() -- TypeError: number vs string
+	return wrong
+end
+
 return {
+	badDerived,
 	badBoards,
 	badStat,
 	badProducts,

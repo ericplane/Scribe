@@ -35,6 +35,7 @@ export type LogCategory =
 	| "Gifting"
 	| "Integrity"
 	| "Lifecycle"
+	| "Derived"
 
 export type LogCode =
 	-- Persistence
@@ -75,6 +76,8 @@ export type LogCode =
 	| "ANOMALY"
 	| "ECONOMY_FIELDS_OVERFLOW"
 	| "ECONOMY_FIELD_UNDECLARED"
+	| "PROFILE_OVERWRITTEN"
+	| "PROFILE_TOO_DEEP"
 	| "TIMED_SWEEP_FAIL"
 	| "WIPE_GUARD_BLOCKED"
 	| "WIPE_GUARD_CLEARED"
@@ -145,6 +148,10 @@ export type LogCode =
 	| "LB_WRITE_DROPPED"
 	| "LB_WRITE_FAIL"
 	| "SIM_LB_FLUSH"
+	-- Derived
+	| "DERIVED_ERROR"
+	| "DERIVED_FEEDBACK"
+	| "DERIVED_MISMATCH"
 	-- Lifecycle
 	| "API_NAME_COLLISION"
 	| "DEBUG_HOOK_ATTACHED"

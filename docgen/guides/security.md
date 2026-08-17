@@ -57,6 +57,12 @@ Visibility is a compile-time property of each root, and `ServerOnly` data never 
 - The library-owned `_Scribe` root is `ServerOnly` by default. Only `Perks` and `GiftCredits` replicate; purchase logs are opt-in per kind, and the receipt de-duplication ring never leaves the server.
 - `ServerOnly` fields are absent from the **client type**, so reading one there is a build error rather than a `nil` at runtime.
 
+### Derived projections
+
+A [derived field](./derived) is the one sanctioned way `ServerOnly` data can influence what a client receives. When its inputs are all visible to its audience the value is computed locally and nothing is sent, but a replicated field reading a `ServerOnly` input **is** transmitted — deliberately, because that is the only way the client could have it.
+
+That makes the compute function part of your trust boundary. `Watchlisted = suspicion >= 80` leaks one bit, which is usually the intent. `math.floor(suspicion / 10)` leaks most of the value, and an exploiter reading the client mirror gets it for free. Bucket deliberately, and keep the projection as coarse as the UI actually needs.
+
 ## Monetization
 
 - Receipts **fail closed**: `PurchaseGranted` only after a durable commit. Anything else answers `NotProcessedYet` so Roblox retries, and Robux are never eaten.

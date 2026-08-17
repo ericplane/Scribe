@@ -22,6 +22,8 @@ local template = {
 
 `Shared` and `Session` are **root-only** wrappers. `ServerOnly` may also wrap a nested field to keep just that subtree server-side while its siblings replicate.
 
+A [derived field](./derived) sits on the same axes and adds one rule of its own: since your template module runs on both realms, a value whose inputs are all visible to its audience is **computed** by each realm rather than sent, and only a field reading something its audience cannot see crosses the wire. Wrap it in `ServerOnly` or `Shared` exactly as you would any other field.
+
 ### Combining wrappers
 
 Saving and replication are **independent**, so one wrapper from each axis combines:

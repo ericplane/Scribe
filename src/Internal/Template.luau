@@ -9,6 +9,7 @@ local Util = require(script.Parent.Util)
 local Marker = require(script.Parent.Marker)
 local Big = require(script.Parent.Big)
 local Datatypes = require(script.Parent.Datatypes)
+local DerivedModule = require(script.Parent.Derived)
 
 export type Visibility = "Replicated" | "ServerOnly" | "Shared"
 
@@ -39,6 +40,17 @@ export type SchemaNode = {
 	MemberIndex: { [string]: number }?, -- 0-based, for u8 packing
 	Default: any,
 	Factory: (() -> any)?, -- Scribe.Dynamic: seeds this field on a brand-new profile
+	-- Scribe.Derived: the field is computed from other declared fields and never
+	-- accepts a write. Resolved in a post-pass (see Compile), because an input may
+	-- name a root that has not been built yet when this node is created.
+	Derived: {
+		Inputs: { SchemaNode },
+		InputPaths: { { string } },
+		Compute: (...any) -> any,
+		Transmit: boolean, -- server computes and REPLICATES (an input the audience cannot see)
+		OfflineComputable: boolean, -- root-level, and every input persists
+		Label: string,
+	}?,
 	Children: { [string]: SchemaNode }?,
 	ChildOrder: { string }?, -- sorted; ordinal i encodes child ChildOrder[i]
 	ChildOrdinal: { [string]: number }?,
@@ -78,7 +90,18 @@ export type Compiled = {
 	NodeCount: number,
 	Hash: number,
 	RootOrder: { string },
+	-- Does the template declare ANY Scribe.Shared root? Scribe.Shared is rejected
+	-- below the root (compileError at "Scribe.Shared is only supported on root
+	-- fields"), so a scan of the root's children is exhaustive. Replication uses
+	-- this to skip the per-player work that only Shared data can justify: without
+	-- it, a template with no Shared field still paid an O(N) broadcast on every
+	-- leave and an O(N) entry scan on every join, i.e. O(N^2) across a server.
+	HasShared: boolean,
 	DynamicNodes: { SchemaNode }, -- fields with a Scribe.Dynamic factory, in id order
+	DerivedNodes: { SchemaNode }, -- Scribe.Derived fields in topological order
+	-- pathKey of an input (or any ancestor of one) -> the fields to recompute. A
+	-- write looks up its own pathKey and finds every dependent in one hop.
+	DerivedByWrite: { [string]: { SchemaNode } },
 	Config: CompileConfig,
 }
 
@@ -143,6 +166,9 @@ local FORBIDDEN_IN_ELEMENT: { [string]: string } = {
 		.. " on the element instead",
 	Dynamic = "a Scribe.Dynamic factory seeds a field once per brand-new profile, and elements do not exist"
 		.. " then; generate per-element values at Insert time",
+	Derived = "a derived field reads a fixed set of declared paths, and element paths are positional (an array"
+		.. " index shifts on every insert or remove), so its inputs would name a different entry after every"
+		.. " structural write; derive at the root from a field the element writes instead",
 	Shared = "Scribe.Shared is only supported on root fields",
 	Session = "Scribe.Session is only supported on root fields",
 }
@@ -281,8 +307,13 @@ local function checkDefaultValue(path: { string }, value: any)
 end
 
 -- Builds one schema node from a (possibly marker-wrapped) template value.
+type PendingDerived = { Node: SchemaNode, InputPaths: { string }, Compute: (...any) -> any }
+-- `Derived` is absent on the throwaway state an element shape compiles against; a
+-- derived field is refused inside an element shape before it could be reached.
+type CompileState = { NextId: number, ById: { [number]: SchemaNode }, Derived: { PendingDerived }? }
+
 local function buildNode(
-	state: { NextId: number, ById: { [number]: SchemaNode } },
+	state: CompileState,
 	name: string?,
 	rawValue: any,
 	path: { string },
@@ -307,6 +338,9 @@ local function buildNode(
 	local replicationSeen: string? = nil
 	local sessionSeen = false
 	local timed = false
+	local derivedInputs: { string }? = nil
+	local derivedCompute: ((...any) -> any)? = nil
+	local dynamicSeen = false
 	local meta: Marker.Meta? = nil
 	local valueType: string? = nil
 	local containerKind: ("Array" | "Dict")? = nil
@@ -384,7 +418,39 @@ local function buildNode(
 			-- author about Scribe.ArrayOf, a declarator they never used.
 			containerDeclarator = `Scribe.{kind}`
 			meta = markerMeta
+		elseif kind == "Derived" then
+			-- A derived field is computed, never written, and never persisted. Its
+			-- Default is the OUTPUT declarator, so the loop keeps unwrapping into it
+			-- and the type/bounds machinery below is reached unchanged; the input
+			-- paths are resolved in Compile's post-pass, once every root exists.
+			if derivedInputs ~= nil then
+				compileError(path, "Scribe.Derived is already applied to this field")
+			end
+			local inputs = if markerMeta then markerMeta.Inputs else nil
+			local compute = if markerMeta then markerMeta.Compute else nil
+			if type(inputs) ~= "table" then
+				compileError(path, "Scribe.Derived requires a table of input paths")
+			end
+			if type(compute) ~= "function" then
+				compileError(path, "Scribe.Derived requires a compute function")
+			end
+			-- Persistence is per ROOT (see Node.storeFor), so a derived field under a
+			-- persisted root would be written into profile.Data and saved -- the one
+			-- thing a computed field must never be. A root field becomes non-persisted
+			-- here, exactly as Scribe.Session would; anything deeper has to already be.
+			if #path == 1 then
+				persist = false
+			elseif persist then
+				compileError(
+					path,
+					`a derived field is never persisted, so it must be a root field or live inside a `
+						.. `Scribe.Session root ("{path[1]}" is persisted)`
+				)
+			end
+			derivedInputs = inputs :: { string }
+			derivedCompute = compute :: (...any) -> any
 		elseif kind == "Dynamic" then
+			dynamicSeen = true
 			-- `default` is the sample (the factory ran once at declaration). Infer
 			-- the field type from it and carry the factory forward; it seeds the
 			-- field per brand-new profile.
@@ -414,6 +480,37 @@ local function buildNode(
 			end
 		end
 		value = default
+	end
+
+	-- Wrapper combinations that contradict what a derived field IS. Checked after the
+	-- unwrap loop so the order the user wrote them in does not matter.
+	if derivedInputs ~= nil then
+		if sessionSeen then
+			compileError(path, "Scribe.Session is redundant on a derived field: a derived field never persists")
+		end
+		if timed then
+			compileError(path, "Scribe.Timed cannot wrap a derived field: a derived value has no expiry, only inputs")
+		end
+		if dynamicSeen then
+			compileError(
+				path,
+				"Scribe.Dynamic cannot wrap a derived field: a factory seeds a stored value, and a derived field "
+					.. "stores nothing"
+			)
+		end
+		if nullable then
+			compileError(
+				path,
+				"Scribe.Optional cannot wrap a derived field: its value is whatever the compute function returns"
+			)
+		end
+		if containerKind ~= nil then
+			compileError(
+				path,
+				`Scribe.Derived cannot wrap {containerDeclarator or "a container"}: a derived field produces one `
+					.. "scalar value"
+			)
+		end
 	end
 
 	-- Scribe.ArrayOf / Scribe.DictOf: a dynamic container carrying a COMPILED element
@@ -768,6 +865,20 @@ local function buildNode(
 		node.Default = value
 	end
 
+	-- Collected, not resolved: an input may name a root this walk has not reached
+	-- yet, so Compile finishes the job once every node exists.
+	if derivedInputs ~= nil then
+		local collected = state.Derived
+		if collected == nil then
+			compileError(path, "Scribe.Derived is not supported here")
+		end
+		table.insert(collected :: any, {
+			Node = node,
+			InputPaths = derivedInputs :: { string },
+			Compute = derivedCompute :: (...any) -> any,
+		})
+	end
+
 	-- Scribe.Optional: the inner declarator supplied the type and its bounds; the
 	-- default is dropped so the field is neither seeded into a new profile nor
 	-- filled into a partial element write. Absence is the point.
@@ -921,7 +1032,10 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		end
 	end
 
-	local state = { NextId = 1, ById = {} :: { [number]: SchemaNode } }
+	-- Held separately as well as on `state`, so the post-pass below reads it without
+	-- the optionality buildNode's signature needs for the element-shape case.
+	local pendingDerived: { PendingDerived } = {}
+	local state: CompileState = { NextId = 1, ById = {} :: { [number]: SchemaNode }, Derived = pendingDerived }
 	local root: SchemaNode = {
 		Id = 0,
 		Name = nil,
@@ -970,6 +1084,56 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 	end
 	root.HasPacked = rootHasPacked
 
+	-- Scribe.Shared cannot appear below a root field, so this scan is exhaustive.
+	local hasShared = false
+	for _, child in children do
+		if child.Visibility == "Shared" then
+			hasShared = true
+			break
+		end
+	end
+
+	-- Derived fields, once every node they could name exists: resolve the input
+	-- paths, order the graph, decide who computes each field, and seed the defaults.
+	-- Before the hash fold, which folds the result.
+	local derivedNodes: { SchemaNode } = {}
+	local derivedByWrite: { [string]: { SchemaNode } } = {}
+	if #pendingDerived > 0 then
+		local reservedRoots = { [RESERVED_ROOT] = true, [SESSION_ROOT] = true }
+		derivedNodes, derivedByWrite =
+			DerivedModule.Resolve(root, pendingDerived :: any, reservedRoots, compileError :: any)
+		DerivedModule.SeedDefaults(derivedNodes :: any, compileError :: any)
+		-- A record's Default table was composed from its children while they were
+		-- built, so a nested derived field's freshly seeded default has to be written
+		-- back up. BuildDefaults recurses and would be fine either way, but anything
+		-- reading a record's Default directly would otherwise see the output
+		-- declarator's default rather than the computed one.
+		for _, node in derivedNodes do
+			local child = node
+			local parent = node.Parent
+			while parent ~= nil and type(parent.Default) == "table" and child.Name ~= nil do
+				(parent.Default :: { [string]: any })[child.Name :: string] = child.Default
+				child = parent
+				parent = parent.Parent
+			end
+		end
+	end
+
+	-- Folded into the schema hash below: Transmit decides whether the field crosses
+	-- the wire at all, and the input set decides what a locally computing client
+	-- reads, so a drift in either has to fail the handshake rather than diverge.
+	local function derivedSig(node: SchemaNode): string
+		local spec = node.Derived
+		if spec == nil then
+			return "nil"
+		end
+		local ids = table.create(#spec.Inputs)
+		for i, input in spec.Inputs do
+			ids[i] = tostring(input.Id)
+		end
+		return `d{if spec.Transmit then "1" else "0"}:{table.concat(ids, ",")}`
+	end
+
 	-- The hash must fold every field that affects the wire byte layout, or a
 	-- server/client schema drift decodes silently wrong. Min/Max drive int
 	-- width; Members drive enum indexing; Datatype/MaxLength are semantic.
@@ -993,7 +1157,8 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 					.. `:{node.Min or "nil"}:{node.Max or "nil"}:{node.MaxLength or "nil"}`
 					.. `:{node.Datatype or "nil"}:{members}:{node.Container or "nil"}`
 					.. `:{node.MaxItems or "nil"}:{node.Evict or "nil"}:{if node.Unique then "u" else "nil"}:{node.KeyType or "nil"}:{node.MaxKeys or "nil"}:{node.MaxKeyLength or "nil"}`
-					.. `:{node.Nullable == true}:{if node.ChildOrder then #node.ChildOrder else -1}`,
+					.. `:{node.Nullable == true}:{if node.ChildOrder then #node.ChildOrder else -1}`
+					.. `:{derivedSig(node)}`,
 				hash
 			)
 		end
@@ -1087,7 +1252,10 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		NodeCount = state.NextId,
 		Hash = hash,
 		RootOrder = order,
+		HasShared = hasShared,
 		DynamicNodes = dynamicNodes,
+		DerivedNodes = derivedNodes,
+		DerivedByWrite = derivedByWrite,
 		Config = cfg,
 	}
 end
@@ -1231,6 +1399,13 @@ end
 -- keep their visible children; returns nil only when nothing is visible AND
 -- the node itself is ServerOnly.
 function Template.CloneVisible(node: SchemaNode, value: any): any
+	-- A locally computed derived field is never sent: every realm that receives it
+	-- can also see all of its inputs (that is what Transmit = false means), so the
+	-- client recomputes it from its own mirror instead of receiving a copy.
+	local derived = node.Derived
+	if derived ~= nil and not derived.Transmit then
+		return nil
+	end
 	if type(value) ~= "table" then
 		if node.Visibility == "ServerOnly" then
 			return nil

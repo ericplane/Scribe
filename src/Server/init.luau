@@ -245,7 +245,15 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		work before or after.
 		Tagged `Increment` / `Decrement` calls inside `fn` defer their economy event
 		to commit and drop it on rollback, so a failed transaction never logs a
-		balance change that did not stick.	]=]
+		balance change that did not stick.
+
+		**Atomic in memory, not on the DataStore.** A `true` return means the writes
+		landed on this player's tree together, not that they are saved: they queue for
+		the next save like any other write, and a crash before it loses them. Pair it
+		with `AwaitSave` when the operation must be durable before you acknowledge it.
+		There is also no cross-player or cross-key transaction: a trade spanning two
+		players is two independent trees and two independent keys, so one side can
+		persist while the other does not.	]=]
 	function Data.Transaction(player: Player, fn: () -> ()): (boolean, string?)
 		local entry = entryOrError(player, "Data.Transaction")
 		return entry.Tree:RunTransaction(fn)

@@ -30,6 +30,17 @@ local template = {
 	Resources = Scribe.DictOf(Scribe.Int(0, { Min = 0 }), { MaxKeys = 64 }),
 	Secret = Scribe.ServerOnly({ Flagged = false }),
 	Runtime = Scribe.Session({ InCombat = false }),
+	-- Scribe.Derived: reads as its output declarator, with no mutators on the node.
+	Rank = Scribe.Derived(
+		Scribe.Enum("Recruit", { "Recruit", "Officer" }),
+		{ "Team", "Stats.Kills" },
+		function(team: string, kills: number): string
+			return if team ~= "Civilian" and kills > 10 then "Officer" else "Recruit"
+		end
+	),
+	DoubledWins = Scribe.Derived(Scribe.Int(0), { "Wins" }, function(wins: number): number
+		return wins * 2
+	end),
 }
 
 type T = typeof(template)
@@ -39,6 +50,9 @@ type T = typeof(template)
 local boards: { [string]: Scribe.LeaderboardConfig<T> } = {
 	TopCoins = { Stat = "Coins", Limit = 100, Replicate = true },
 	TopKills = { Stat = "Stats.Kills" },
+	-- A derived numeric field is a valid stat: boards read through the accessor
+	-- tree, which computes it like any other field.
+	TopDoubled = { Stat = "DoubledWins" },
 }
 
 local products: { [string]: Scribe.ProductConfig<T> } = {
@@ -138,6 +152,23 @@ local function serverUsage(player: Player)
 	local everything = data.Get()
 	local wholeBooster: boolean = everything.XPBooster
 	local wholeSecret: boolean = everything.Secret.Flagged
+	-- Scribe.Derived is the third such wrapper: it reads as its output type, and a
+	-- whole-subtree read must not show `{ __scribeDerived: string }` either.
+	local wholeRank: string = everything.Rank
+
+	-- A derived field reads like any other node; its inputs' declared types are the
+	-- annotation the compute function carries, since a list of path strings cannot
+	-- produce an argument tuple at the type level.
+	local rank: string = data.Rank.Get()
+	data.Rank.Observe(function(value: string)
+		print(value)
+	end)
+	data.Rank.Changed(function(new: string, old: string)
+		print(new, old)
+	end)
+	local rankDefault: string = data.Rank.Default()
+	local doubled: number = data.DoubledWins.Get()
+	local doubledMin: number? = data.DoubledWins.Min()
 
 	local tree, reason = Data.WaitForData(player)
 	if tree then
@@ -204,7 +235,12 @@ local function serverUsage(player: Player)
 		placedCount,
 		snapshot,
 		wood,
-		dropped
+		dropped,
+		wholeRank,
+		rank,
+		rankDefault,
+		doubled,
+		doubledMin
 end
 
 local ClientData = bundle.Client

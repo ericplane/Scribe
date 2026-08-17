@@ -34,6 +34,7 @@ A plain value (`Wins = 0`, `Settings = { ... }`) is the simplest way to declare 
 | [`Scribe.Timed(default)`](/api/Scribe#Timed) | Fields that expire (boosters, buffs) |
 | [`Scribe.Flags(members)`](/api/Scribe#Flags) | A fixed set of named booleans, up to 32, in one field |
 | [`Scribe.Dynamic(factory)`](/api/Scribe#Dynamic) | A default computed per profile (creation timestamps, seeds) |
+| [`Scribe.Derived(output, inputs, compute)`](/api/Scribe#Derived) | A read-only field computed from other fields ([derived fields](./derived)) |
 | [`Scribe.ArrayOf(shape, { MaxItems, Evict })`](/api/Scribe#ArrayOf) | A list whose entries have a schema ([typed containers](#typed-containers)), optionally a [rolling window](#rolling-windows) |
 | [`Scribe.SetOf(element, { MaxItems })`](/api/Scribe#SetOf) | A collection of unique entries: membership, not order |
 | [`Scribe.DictOf(shape, { MaxKeys, MaxKeyLength })`](/api/Scribe#DictOf) | A string-keyed map whose values have a schema |

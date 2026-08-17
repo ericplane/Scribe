@@ -21,6 +21,10 @@ Check **File → Experience Settings → Security → "Enable Studio Access to A
 
 When `RunService:IsRunning()` is false (a UI Labs / Hoarcekat storybook, or the command bar), the client module skips the transport and handshake entirely and initializes **instantly** to template defaults. `Observe` and `Changed` work normally, so Scribe-backed components render and live-update without a running server.
 
+A story requires the same shared bundle module a live client does — `require(ReplicatedStorage.Source.Data).Client` — and gets the client half. Edit mode reports `RunService:IsServer()` as **true**, so `Scribe(options)` treats `IsRunning` as the deciding signal: with nothing running there is no server to build, no `ScribeTransport` folder is created in `ReplicatedStorage`, and touching `.Server` errors with an edit-mode message rather than starting a session.
+
+[Derived fields](./derived) need nothing extra here: seed their inputs and the computed value follows, because the edit-mode client runs the same recompute the server does.
+
 Seed realistic state with the mock helpers (edit mode only):
 
 ```lua

@@ -11,6 +11,7 @@ local Node = require(Internal.Node)
 local Wire = require(Internal.Wire)
 local Template = require(Internal.Template)
 local TransportModule = require(Internal.Transport)
+local DerivedModule = require(Internal.Derived)
 local Version = require(Internal.Version)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
@@ -110,9 +111,20 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		LogError = function(message)
 			Log.Error("Lifecycle", "LISTENER_ERROR", message, {})
 		end,
+		OnDerivedIssue = function(code, field, detail)
+			-- A MISMATCH means the server (in dev mode) computed a different value
+			-- than this realm did, which is an impure compute function rather than a
+			-- live fault. The server's value wins; the log is how you find out.
+			local report = if code == "DERIVED_MISMATCH" then Log.Warn else Log.Error
+			report("Derived", code :: any, `"{field}": {detail}`, { Field = field })
+		end,
 	})
 
 	local sharedMirrors: { [number]: { [string]: any } } = {}
+	-- Derived fields another player's mirror has to compute for itself.
+	local function isSharedLocalDerived(node: any): boolean
+		return node.Visibility == "Shared" and not node.Derived.Transmit
+	end
 	local leaderboardCache: { [string]: { Entries: { any }, MyRank: number?, MyScore: number? } } = {}
 	local mockCommands: { [string]: (...any) -> ...any } = {}
 	local mockLeaderboards: { [string]: { any } } = {}
@@ -232,6 +244,12 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			for _, op in ops do
 				applyPlainOp(shared, op)
 			end
+			-- A Shared derived field the server did not send is one every client
+			-- computes for itself, and a foreign mirror is a plain table with no
+			-- accessor tree to settle it. Recompute here, BEFORE the change event, so
+			-- a listener never sees the mirror without its derived fields. The
+			-- transmit rule guarantees the inputs are Shared too, so they are present.
+			DerivedModule.EvaluateInto(compiled, shared, isSharedLocalDerived)
 			-- One event per update carrying the current shared data (a clone, so
 			-- listeners can't mutate the mirror); nil is reserved for SharedGone.
 			-- CloneUnpack also converts any datatype fields from their packed wire

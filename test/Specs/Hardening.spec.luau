@@ -7,6 +7,7 @@ return function()
 	local Scribe = require(Root.Scribe)
 	local Wire = require(Root.Scribe.Internal.Wire)
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
+	local Log = require(Root.Scribe.Internal.Log)
 
 	describe("OnPlayerInit isNewProfile", function()
 		it("is true for a brand-new profile and false for a returning one", function()
@@ -234,6 +235,91 @@ return function()
 			harness.Data.Flush(player)
 			conn:Disconnect()
 			expect(sawTooLarge).to.equal(true)
+			harness.Cleanup()
+		end)
+	end)
+
+	-- Stored data can be nested deeper than a WRITE is allowed to reach. Such a
+	-- profile loads and reads cleanly, then refuses every write to its deepest
+	-- leaves at the first Set -- previously with nothing at load hinting at it.
+	describe("over-deep stored data", function()
+		local function nest(levels: number): { [string]: any }
+			local root: { [string]: any } = {}
+			local at = root
+			for _ = 1, levels do
+				local child: { [string]: any } = {}
+				at.L = child
+				at = child
+			end
+			at.Leaf = 7
+			return root
+		end
+
+		-- Read the ring rather than Scribe.OnIssue: OnIssue is documented to fire for
+		-- Error/Fatal only, and this is a Warn (the data loads and reads correctly;
+		-- it is the shape that is a problem), the same level as PROFILE_SIZE.
+		local function loadWithDepth(levels: number, userId: number): boolean
+			local harness = TestCtx.make()
+			harness.Fake.Persisted[`Default/PLAYER_{userId}`] = { Inventory = nest(levels) }
+			local before = #Log.GetRecent({ Code = "PROFILE_TOO_DEEP" })
+			harness.Join(userId)
+			local after = Log.GetRecent({ Code = "PROFILE_TOO_DEEP" })
+			harness.Cleanup()
+			return #after > before
+		end
+
+		it("warns at load when the stored shape is past the write-depth limit", function()
+			expect(loadWithDepth(40, 91001)).to.equal(true)
+		end)
+
+		it("stays quiet for a shape a write can actually reach", function()
+			expect(loadWithDepth(3, 91002)).to.equal(false)
+		end)
+	end)
+
+	-- ProfileStore silently replaces a stored value it cannot recognise as a
+	-- profile with a fresh template and fires OnOverwrite. Scribe did not connect
+	-- that signal, so the loudest possible data-loss event produced no log, no
+	-- anomaly and no metric.
+	describe("corrupted-profile overwrite", function()
+		it("logs PROFILE_OVERWRITTEN and fires an anomaly when ProfileStore overwrites a corrupt key", function()
+			local harness = TestCtx.make()
+			local _, entry = harness.Join()
+			local sawLog = false
+			local anomalyReason: string? = nil
+			local conn = Scribe.OnIssue:Connect(function(logEntry)
+				if logEntry.Code == "PROFILE_OVERWRITTEN" then
+					sawLog = true
+				end
+			end)
+			harness.Ctx.Signals.OnAnomaly:Connect(function(info)
+				if info.Reason == "ProfileOverwritten" then
+					anomalyReason = info.Reason
+				end
+			end)
+
+			harness.Fake.OnOverwrite:Fire("Default", entry.Key)
+
+			conn:Disconnect()
+			expect(sawLog).to.equal(true)
+			expect(anomalyReason).to.equal("ProfileOverwritten")
+			harness.Cleanup()
+		end)
+
+		it("ignores an overwrite reported for a different store", function()
+			local harness = TestCtx.make()
+			local _, entry = harness.Join()
+			local sawLog = false
+			local conn = Scribe.OnIssue:Connect(function(logEntry)
+				if logEntry.Code == "PROFILE_OVERWRITTEN" then
+					sawLog = true
+				end
+			end)
+
+			harness.Fake.OnOverwrite:Fire("SomeOtherStore", entry.Key)
+
+			conn:Disconnect()
+			expect(sawLog).to.equal(false)
 			harness.Cleanup()
 		end)
 	end)
