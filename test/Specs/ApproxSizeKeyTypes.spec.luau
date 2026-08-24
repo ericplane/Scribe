@@ -138,7 +138,9 @@ return function()
 			expect(stillCounts("beside", { Coins = 1250, [true] = 1 }, { Coins = 1250 })).to.equal("beside: ok")
 			local big = string.rep("x", 4096)
 			expect(stillCounts("aboveIt", { Blob = big, Bag = { [true] = 1 } }, { Blob = big })).to.equal("aboveIt: ok")
-			expect(stillCounts("belowIt", { Bag = { [true] = { Blob = big } } }, { Blob = big })).to.equal("belowIt: ok")
+			expect(stillCounts("belowIt", { Bag = { [true] = { Blob = big } } }, { Blob = big })).to.equal(
+				"belowIt: ok"
+			)
 		end)
 
 		it("leaves findUnpersistable as the thing that says it cannot be saved", function()

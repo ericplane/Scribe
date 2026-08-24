@@ -193,8 +193,10 @@ return function()
 				-- Installed by Persistence during the build, before any spec code runs.
 				out.Installed = type(module.ClassifyError) == "function"
 				out.ClassOf301 = tostring(
-					module.ClassifyError("301: GetAsync request dropped. Request was throttled, "
-						.. "but throttled request queue was full.")
+					module.ClassifyError(
+						"301: GetAsync request dropped. Request was throttled, "
+							.. "but throttled request queue was full."
+					)
 				)
 
 				out.FillA = store:MessageAsync("INV_HOOK_A", { Seq = 0 })

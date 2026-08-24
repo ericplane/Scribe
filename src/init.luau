@@ -1346,7 +1346,7 @@ export type Bundle<T> = {
 	.Kind ("Robux" | "InGame")? -- Robux receipts, soft-currency purchases, or both when omitted
 	.Category string? -- match the Category recorded on the purchase
 	.ItemId string? -- match a single item id
-	.Since number? -- only entries at or after this os.time() stamp
+	.Since number? -- only entries at or after this Unix timestamp, in seconds
 	.Limit number? -- the most recent N matches
 	@tag Monetization
 	The optional filter you pass [Server.GetPurchases] or [Client.GetPurchases].
@@ -1385,7 +1385,7 @@ export type Bundle<T> = {
 --[=[
 	@interface SaveInfo
 	.Dirty boolean -- true when there are writes that have not reached the DataStore
-	.LastSaveAt number? -- os.time() of the last successful save; nil before the first
+	.LastSaveAt number? -- Unix timestamp of the last successful save, in seconds; nil before the first
 	.LastResult ("Ok" | "Fail")? -- how the last save attempt ended
 	.Size number? -- approximate bytes written by the last successful save
 	@tag Diagnostics
@@ -1400,7 +1400,7 @@ export type Bundle<T> = {
 	.Available boolean -- false when the engine could not be asked at all
 	.Reason string? -- why not, when Available is false
 	.Budgets { [string]: number } -- remaining requests, keyed by DataStoreRequestType name
-	.At number -- os.time() the snapshot was taken
+	.At number -- Unix timestamp when the snapshot was taken, in seconds
 	@tag Diagnostics
 	What [Scribe.GetBudgetSnapshot] returns. It is resolved per call and never
 	cached, and a server with no DataStoreService at all, such as a simulated
@@ -1410,7 +1410,7 @@ export type Bundle<T> = {
 
 --[=[
 	@interface LogEntry
-	.At number -- os.time() the entry was recorded
+	.At number -- Unix timestamp when the entry was recorded, in seconds
 	.Level LogLevel -- Debug through Fatal
 	.Category LogCategory -- which subsystem emitted it
 	.Code LogCode -- the stable identifier you branch on

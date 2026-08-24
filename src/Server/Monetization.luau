@@ -2021,14 +2021,8 @@ function Monetization.new(ctx: any)
 			-- spent with no refund, no log and a script error in the buyer's remote
 			-- handler. It is caught here and read as AMBIGUOUS, because a raise can come
 			-- from before the grant or after it.
-			local deliveryOk, applied, _, refundable = pcall(
-				deliverGift,
-				product,
-				recipientUserId,
-				`credit:{giftId}`,
-				giftId,
-				entry.UserId
-			)
+			local deliveryOk, applied, _, refundable =
+				pcall(deliverGift, product, recipientUserId, `credit:{giftId}`, giftId, entry.UserId)
 			local deliveryError = if deliveryOk then nil else tostring(applied)
 			if not deliveryOk then
 				-- `applied` currently holds the error message, which is truthy. Both values
