@@ -435,6 +435,100 @@ return function()
 		harness.Cleanup()
 	end)
 
+	describe("a declared bound that cannot bound anything", function()
+		-- A numeric literal above ~1.8e308 IS math.huge, so `Max = 1e400` declares a
+		-- ceiling no value can ever reach: the bound is accepted and then does
+		-- nothing. NaN is worse -- every comparison against it is false, so a NaN Min
+		-- never fires either.
+		--
+		-- Scribe.Int and Scribe.Big already refuse both (an integer test and a
+		-- Big.from parse respectively). Scribe.Number was the one that did not, and
+		-- the three are asserted together here so the rule reads as one rule rather
+		-- than as three coincidences.
+		local function compiles(field)
+			return function()
+				TestCtx.make({ Template = { N = field } }).Cleanup()
+			end
+		end
+
+		it("refuses an infinite Min or Max on Scribe.Number", function()
+			expect(compiles(Scribe.Number(0, { Max = 1e400 }))).to.throw()
+			expect(compiles(Scribe.Number(0, { Min = -1e400 }))).to.throw()
+			expect(compiles(Scribe.Number(0, { Min = 0, Max = math.huge }))).to.throw()
+		end)
+
+		it("refuses a NaN Min or Max on Scribe.Number", function()
+			-- Not merely a no-op: `value < nan` and `value > nan` are both false, so a
+			-- NaN bound silently disables the check it was written to add.
+			expect(compiles(Scribe.Number(0, { Min = 0 / 0 }))).to.throw()
+			expect(compiles(Scribe.Number(0, { Max = 0 / 0 }))).to.throw()
+		end)
+
+		it("still accepts ordinary finite bounds", function()
+			-- The control. A guard that refuses everything is not a guard.
+			expect(compiles(Scribe.Number(0, { Min = 0, Max = 10 }))).never.to.throw()
+			expect(compiles(Scribe.Number(0, { Min = -1e308, Max = 1e308 }))).never.to.throw()
+			expect(compiles(Scribe.Number(0))).never.to.throw()
+		end)
+
+		it("still refuses a default of the wrong type, on every declarator", function()
+			-- A REGRESSION GUARD, and it exists because adding the finite-bound branch
+			-- above silently broke this. The declarator-sanity chain is one if/elseif,
+			-- and its tail carried `elseif ValueType == "number" and type(value) ~=
+			-- "number"`. A new `elseif ValueType == "number"` branch inserted earlier
+			-- matches every number node, so the tail clause became unreachable and
+			-- `Scribe.Number("hello")` compiled. The whole suite stayed green: nothing
+			-- pinned it.
+			--
+			-- Each declarator now owns exactly one branch, checking its default and its
+			-- bounds together, so the shadowing cannot recur.
+			expect(compiles(Scribe.Number("hello" :: any))).to.throw()
+			expect(compiles(Scribe.String(5 :: any))).to.throw()
+			expect(compiles(Scribe.Int("hello" :: any))).to.throw()
+			expect(compiles(Scribe.Big({} :: any))).to.throw()
+		end)
+
+		it("refuses a MaxLength that cannot bound anything", function()
+			-- Same rule as the numeric bounds, and MaxLength has more ways to be
+			-- nonsense because it is a LENGTH rather than a comparison operand.
+			expect(compiles(Scribe.String("", { MaxLength = 1e400 }))).to.throw()
+			expect(compiles(Scribe.String("", { MaxLength = math.huge }))).to.throw()
+			expect(compiles(Scribe.String("", { MaxLength = 0 / 0 }))).to.throw()
+			expect(compiles(Scribe.String("", { MaxLength = 4.5 }))).to.throw()
+		end)
+
+		it("refuses a NEGATIVE MaxLength, which silently mangled instead of no-opping", function()
+			-- The sharpest of them. truncateUtf8 ends in `string.sub(s, 1, cut)`, and a
+			-- negative index counts from the END in Lua -- so `MaxLength = -5` on a
+			-- ten-byte string stored SIX bytes. Not a cap that never fires: an
+			-- unrelated rule that quietly deletes the tail of every string.
+			expect(compiles(Scribe.String("", { MaxLength = -5 }))).to.throw()
+			expect(compiles(Scribe.String("", { MaxLength = -1 }))).to.throw()
+		end)
+
+		it("still accepts an ordinary MaxLength, and still truncates on it", function()
+			-- The control, and it goes through a real write rather than a compile, so a
+			-- guard that accidentally disabled truncation would fail here.
+			expect(compiles(Scribe.String("", { MaxLength = 4 }))).never.to.throw()
+			expect(compiles(Scribe.String("", { MaxLength = 0 }))).never.to.throw()
+			local harness = TestCtx.make({ Template = { S = Scribe.String("", { MaxLength = 4 }) } })
+			local _p, _e, data = harness.Join()
+			data.S.Set("abcdefghij")
+			expect(data.S.Get()).to.equal("abcd")
+			harness.Cleanup()
+		end)
+
+		it("refuses the same thing on Scribe.Int and Scribe.Big, as it already did", function()
+			expect(compiles(Scribe.Int(0, { Max = 1e400 }))).to.throw()
+			expect(compiles(Scribe.Int(0, { Max = 0 / 0 }))).to.throw()
+			expect(compiles(Scribe.Big(0, { Max = 1e400 }))).to.throw()
+			expect(compiles(Scribe.Big(0, { Max = 0 / 0 }))).to.throw()
+			-- ...and a Big bound past the double range still has to work, written the
+			-- one way it can be: as a string.
+			expect(compiles(Scribe.Big(0, { Min = 0, Max = "1e600" }))).never.to.throw()
+		end)
+	end)
+
 	describe("declarator inside an array-like container", function()
 		it("names the declarator rather than blaming its default value's type", function()
 			-- Regression: a datatype declarator's default is itself non-persistable, so

@@ -13,6 +13,7 @@ return function()
 	local ScribeRoot = Root.Scribe
 	local Scribe = require(ScribeRoot)
 	local Client = require(ScribeRoot.Client)
+	local Wire = require(ScribeRoot.Internal.Wire)
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
 
 	local itRunning = if RunService:IsRunning() then it else itSKIP
@@ -162,6 +163,152 @@ return function()
 		expect(table.concat(data.Log.Get(), ",")).to.equal("6,1")
 
 		harness.Cleanup()
+	end)
+
+	it("fires OnRemove for the evicted entry before OnInsert for the new one", function()
+		-- Pins the ORDER on the successful path, so that moving the eviction to the
+		-- far side of validation can be shown not to have changed it. Nothing else
+		-- in the suite constrains these two relative to each other.
+		local harness = evicting(2)
+		local _player, _entry, data = harness.Join(96009)
+		data.Log.Insert(1)
+		data.Log.Insert(2)
+
+		local order = {}
+		data.Log.OnRemove(function(value)
+			table.insert(order, `-{value}`)
+		end)
+		data.Log.OnInsert(function(value)
+			table.insert(order, `+{value}`)
+		end)
+
+		data.Log.Insert(3)
+
+		expect(table.concat(order, ",")).to.equal("-1,+3")
+		harness.Cleanup()
+	end)
+
+	describe("a refused Insert changes nothing", function()
+		-- The eviction block used to run BEFORE the nil check, the position check and
+		-- validateWrite. So a refused Insert on a full array still raised AND destroyed
+		-- the oldest element, fired OnRemove, and replicated a Remove op to every
+		-- mirror -- draining the array one entry per rejected call. Every other refused
+		-- write in Scribe leaves the value byte-identical; this is that guarantee.
+		local function fullArray(userId: number)
+			local harness = TestCtx.make({
+				AutoPump = true,
+				Template = { Log = Scribe.ArrayOf(Scribe.Int(0, { Max = 500 }), { MaxItems = 3, Evict = "Front" }) },
+			})
+			local player, entry, data = harness.Join(userId)
+			for i = 1, 3 do
+				data.Log.Insert(i)
+			end
+			local events = {}
+			data.Log.OnRemove(function(value)
+				table.insert(events, `-{value}`)
+			end)
+			data.Log.OnInsert(function(value)
+				table.insert(events, `+{value}`)
+			end)
+			return harness, player, entry, data, events
+		end
+
+		--- Every Insert/Remove op that reached the wire after `entry` was flushed.
+		local function opsFor(harness, player, entry)
+			harness.Ctx.Replication.FlushEntry(entry)
+			task.wait()
+			local out = {}
+			for _, frame in harness.FramesFor(player, Wire.Frames.Diff) do
+				for _, op in frame.Ops do
+					if op.Kind == "Insert" or op.Kind == "Remove" or op.Kind == "Clear" then
+						table.insert(out, op.Kind)
+					end
+				end
+			end
+			return table.concat(out, ",")
+		end
+
+		local function refuses(userId, attempt)
+			local harness, player, entry, data, events = fullArray(userId)
+			expect(attempt(data)).to.throw()
+			expect(`n={data.Log.Count()} v={table.concat(data.Log.Get(), ",")} e={table.concat(events, ",")}`).to.equal(
+				"n=3 v=1,2,3 e="
+			)
+			expect(opsFor(harness, player, entry)).to.equal("")
+			harness.Cleanup()
+		end
+
+		it("refuses a nil item without evicting", function()
+			refuses(96010, function(data)
+				return function()
+					data.Log.Insert(nil)
+				end
+			end)
+		end)
+
+		it("refuses a fractional position without evicting", function()
+			refuses(96011, function(data)
+				return function()
+					data.Log.Insert(9, 1.5)
+				end
+			end)
+		end)
+
+		it("refuses an item the element schema rejects without evicting", function()
+			-- validateWrite sits even further past the eviction block than the nil
+			-- check, so a bad element destroyed an entry too. A wrong TYPE is the
+			-- refusal to test here: declared numeric bounds and MaxLength clamp rather
+			-- than throw, so they are not refusals at all (measured: Insert(9999) into
+			-- an element capped at 500 stores 500).
+			refuses(96012, function(data)
+				return function()
+					data.Log.Insert("not an int")
+				end
+			end)
+		end)
+
+		it("costs an array already over cap every surplus entry at once", function()
+			-- The worst single call, and a correction to the framing that "repeated
+			-- rejected inserts drain the array one element at a time". They do not:
+			-- after the first rejection the array sits at MaxItems - 1, the
+			-- `existingLength >= MaxItems` guard stops firing, and further rejections
+			-- are free. The real compounding is here -- the eviction loop runs
+			-- `existingLength - MaxItems + 1` times, so ONE rejected Insert on an
+			-- array that is already over cap (a lowered MaxItems, or data from before
+			-- the cap existed) destroyed four entries.
+			local harness = TestCtx.make({
+				Template = { Log = Scribe.ArrayOf(Scribe.Int(0), { MaxItems = 2, Evict = "Front" }) },
+			})
+			local _player, entry, data = harness.Join(96014)
+			entry.LiveData.Log = { 1, 2, 3, 4, 5 }
+
+			expect(function()
+				data.Log.Insert(nil)
+			end).to.throw()
+
+			expect(`n={data.Log.Count()} v={table.concat(data.Log.Get(), ",")}`).to.equal("n=5 v=1,2,3,4,5")
+			harness.Cleanup()
+		end)
+
+		it("still reports the cap, not the item, on a full array without Evict", function()
+			-- Precedence control. The cap refusal has to stay with the other refusals
+			-- rather than travel with the eviction, or `Insert(nil)` on a full
+			-- non-evicting array stops saying "at its MaxItems N" -- which is the
+			-- message ContainerBehavior.spec matches on.
+			local harness = TestCtx.make({
+				Template = { Log = Scribe.ArrayOf(Scribe.Int(0), { MaxItems = 2 }) },
+			})
+			local _player, _entry, data = harness.Join(96015)
+			data.Log.Insert(1)
+			data.Log.Insert(2)
+
+			local ok, err = pcall(function()
+				data.Log.Insert(nil)
+			end)
+			expect(ok).to.equal(false)
+			expect(string.find(tostring(err), "MaxItems 2", 1, true) ~= nil).to.equal(true)
+			harness.Cleanup()
+		end)
 	end)
 
 	itRunning("keeps the client mirror in step with the eviction", function()

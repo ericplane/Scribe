@@ -179,6 +179,12 @@ local function serverUsage(player: Player)
 		return true
 	end)
 
+	-- ImportLegacyData returns an optional raw table: a table to adopt, nil for
+	-- "nothing to carry over".
+	local _importer: (Player, number) -> { [string]: any }? = function(_p: Player, _userId: number)
+		return { Coins = 1 }
+	end
+
 	-- The lifecycle reason is a typed union, not a bare string.
 	local _tree, waitReason = Data.WaitForData(player, 30)
 	local lifecycleReason: Scribe.LifecycleReason? = waitReason
@@ -187,6 +193,10 @@ local function serverUsage(player: Player)
 	end
 
 	local _flushed: boolean = Data.Flush(player, { Force = true, Timeout = 5 })
+	-- RestoreVersion's options table is optional, and the opt-in that rolls the
+	-- reserved `_Scribe` root back with the rest is typed rather than `any`.
+	local _restoredPlain: boolean, _restoreReason: string? = Data.RestoreVersion(12345, "version-id")
+	local _restoredRolled: boolean = Data.RestoreVersion(12345, "version-id", { RollBackReserved = true })
 	local owns: boolean = Data.Owns(player, "VIP")
 	local ownsAsync: boolean = Data.OwnsAsync(player, "VIP")
 	local ok, err = Data.PromptGift(player, "GiftVIP", 12345)
@@ -356,6 +366,62 @@ local function containerDeclarators(player: Player)
 		defaultBig
 end
 
+-- NARROWED FLOATS get their own small template, for the reason the container
+-- template gives above: the main one is at the new solver's complexity budget and
+-- three more roots on it tipped the whole file into "Code is too complex to
+-- typecheck", which silently stops checking everything else here. (Measured, not
+-- assumed -- adding them there is what produced that diagnostic.)
+local floatTemplate = {
+	-- Both spellings of Precision, so FloatMeta cannot drift from what the
+	-- template compiler accepts at runtime.
+	Velocity = Scribe.Number(0, { Min = -1000, Max = 1000, Precision = "f32" }),
+	Health = Scribe.Number(100, { Min = 0, Max = 100, Precision = 0.5 }),
+	Unnarrowed = Scribe.Number(0, { Min = 0, Max = 1 }),
+	-- The OTHER direction of the same knob: on a CFrame, Precision widens. Here
+	-- rather than on the main template for the complexity reason noted above.
+	Aim = Scribe.CFrame(CFrame.identity, { Precision = "exact" }),
+	Placed = Scribe.CFrame(CFrame.identity),
+}
+
+local floatBundle = Scribe({
+	Template = floatTemplate,
+	ProfileStoreIndex = "F",
+	ProfileKeyPrefix = "F_",
+	Banner = false,
+})
+
+local function narrowedFloats(player: Player)
+	local data = floatBundle.Server[player]
+
+	-- THE POINT OF THIS BLOCK. A narrowed float is still a plain `number` to the
+	-- game, carrying the ordinary number accessors. Precision decides what the wire
+	-- spends and must not leak into the type: a field that typed differently once
+	-- narrowed would be unadoptable on an existing template, which is the opposite
+	-- of what an opt-in is for.
+	local velocity: number = data.Velocity.Get()
+	local health: number = data.Health.Increment(-2.5)
+	local healthMin: number? = data.Health.Min()
+	local healthMax: number? = data.Health.Max()
+	local healthDefault: number = data.Health.Default()
+	data.Velocity.Set(12.5)
+
+	-- And the undeclared one is the same type as the narrowed ones, which is what
+	-- makes adding Precision to a live field a wire change and nothing more.
+	local plain: number = data.Unnarrowed.Get()
+	local whole = data.Get()
+	local wholeVelocity: number = whole.Velocity
+
+	-- Same argument, CFrame edition: an exact CFrame is still a plain `CFrame` to
+	-- the game and types identically to an undeclared one, so `Precision` can be
+	-- added to a live field without touching a single call site.
+	local aim: CFrame = data.Aim.Get()
+	local placed: CFrame = data.Placed.Get()
+	data.Aim.Set(CFrame.identity)
+	local wholeAim: CFrame = whole.Aim
+
+	return velocity, health, healthMin, healthMax, healthDefault, plain, wholeVelocity, aim, placed, wholeAim
+end
+
 -- Every operator the Scribe.Big docstring promises, across TWO different big fields
 -- and against plain operands. Its own template because it needs a second big root
 -- and containerTemplate is already at the complexity budget.
@@ -404,6 +470,14 @@ local function bigOperators(player: Player)
 	local shown: string = summed:Short()
 	local lossy: number = negated:ToNumber()
 
+	-- Pow returns the big type ITSELF, which is why it is attached with setproperty on the
+	-- live type object rather than written into the props table: ts.newtable snapshots that
+	-- table, so a self-referential entry added afterwards reads as a missing key. Chaining
+	-- into Short and feeding the result back into Set is what proves it round-trips.
+	local raised: string = data.Wealth.Get():Pow(3):Short()
+	local exponent: number = data.Wealth.Get():Log10()
+	data.Wealth.Set(data.Wealth.Get():Pow(2))
+
 	-- A WHOLE-SUBTREE read must show the value, not the declarator's internal label.
 	-- Scribe.Big's label lives in its metatable rather than in its fields precisely
 	-- so this works: a label written as a field travels with the type into every
@@ -423,7 +497,19 @@ local function bigOperators(player: Player)
 		rendered = if type(score) == "number" then tostring(score) else score:Short()
 	end
 
-	return divided, ordered, chained, same, asText, shown, lossy, rendered, viaRoot, viaOther, viaClone
+	return divided,
+		ordered,
+		chained,
+		same,
+		asText,
+		shown,
+		lossy,
+		rendered,
+		viaRoot,
+		viaOther,
+		viaClone,
+		raised,
+		exponent
 end
 
 -- Scribe.ServerOnly wrapping a declarator gets its own template, again for the
@@ -480,7 +566,10 @@ local function clientUsage()
 	local owns: boolean = ClientData.Owns("VIP")
 	local ownsAsync: boolean = ClientData.OwnsAsync("VIP")
 	local requestOk = ClientData.Request("EquipItem", "Sword_001")
-	return rank, owns, ownsAsync, requestOk, ready, music, inCombat
+	-- RequestOnce takes the idempotency key as a required second string, then the
+	-- command's own arguments.
+	local requestOnceOk = ClientData.RequestOnce("EquipItem", "click-1", "Sword_001")
+	return rank, owns, ownsAsync, requestOk, requestOnceOk, ready, music, inCombat
 end
 
 local function diagnosticsUsage()
@@ -493,7 +582,13 @@ local function diagnosticsUsage()
 			local _cat: Scribe.LogCategory = entry.Category
 		end
 	end)
-	return count
+	-- The budget snapshot is a typed record, and Available is what gates the
+	-- numbers: "could not ask" is not an allowance of zero.
+	local budget: Scribe.BudgetSnapshot = Scribe.GetBudgetSnapshot()
+	local available: boolean = budget.Available
+	local budgetReason: string? = budget.Reason
+	local updates: number? = budget.Budgets.UpdateAsync
+	return count, available, budgetReason, updates
 end
 
 local function typedApis(player: Player)
@@ -504,6 +599,72 @@ local function typedApis(player: Player)
 	Data.Command("Buy", { Args = { "string" } }, function(_p: Player, _item)
 		return true, "ok"
 	end)
+	-- Idempotent is part of the spec shape, on its own and alongside Args.
+	Data.Command("ClaimDaily", { Idempotent = true }, function(_p: Player)
+		return true
+	end)
+	Data.Command("Spend", { Args = { "number" }, Idempotent = true }, function(_p: Player, _amount)
+		return true
+	end)
+
+	-- EVERY DOCUMENTED Args FORM, and that is the point of listing them out.
+	-- Commands.Register accepts a type string, ANY of ten Scribe declarators, or a
+	-- shape table -- commands.md says so and security.md's headline example uses a
+	-- declarator. The exported type said `{ string }`, so eight of the ten
+	-- declarators and the shape form were type errors under --!strict with the new
+	-- solver: a strict author copying the recommended-secure pattern got a red
+	-- squiggle on it, and the obvious way to silence that is to fall back to the
+	-- bare `"number"` form that commands.md itself calls "the half of the check
+	-- that never catches anything interesting".
+	Data.Command("ArgsString", { Args = { "string" } }, function(_p: Player, _a)
+		return true
+	end)
+	Data.Command("ArgsScribeString", { Args = { Scribe.String("") } }, function(_p: Player, _a)
+		return true
+	end)
+	Data.Command("ArgsEnum", { Args = { Scribe.Enum("H", { "H", "M" }) } }, function(_p: Player, _a)
+		return true
+	end)
+	Data.Command("ArgsInt", { Args = { Scribe.Int(1, { Min = 1, Max = 10 }) } }, function(_p: Player, _a)
+		return true
+	end)
+	Data.Command("ArgsNumber", { Args = { Scribe.Number(1) } }, function(_p: Player, _a)
+		return true
+	end)
+	Data.Command("ArgsFlags", { Args = { Scribe.Flags({ "A", "B" }) } }, function(_p: Player, _a)
+		return true
+	end)
+	Data.Command("ArgsOptional", { Args = { Scribe.Optional(Scribe.String("")) } }, function(_p: Player, _a)
+		return true
+	end)
+	Data.Command("ArgsArrayOf", { Args = { Scribe.ArrayOf(Scribe.String("")) } }, function(_p: Player, _a)
+		return true
+	end)
+	Data.Command("ArgsSetOf", { Args = { Scribe.SetOf(Scribe.String("")) } }, function(_p: Player, _a)
+		return true
+	end)
+	Data.Command("ArgsDictOf", { Args = { Scribe.DictOf(Scribe.Int(0)) } }, function(_p: Player, _a)
+		return true
+	end)
+	Data.Command("ArgsMapOf", { Args = { Scribe.MapOf("integer", Scribe.Int(0)) } }, function(_p: Player, _a)
+		return true
+	end)
+	-- The shape-table form, from commands.md's "Table payloads".
+	Data.Command(
+		"ArgsShape",
+		{ Args = { { ItemId = "string", Count = "number?", Reagents = { "string" } } } },
+		function(_p: Player, _order)
+			return true
+		end
+	)
+	-- Mixed, which is what a real command looks like.
+	Data.Command(
+		"ArgsMixed",
+		{ Args = { "string", Scribe.Int(1, { Min = 1, Max = 10 }) }, Idempotent = true },
+		function(_p: Player, _a, _b)
+			return true
+		end
+	)
 
 	-- GetPurchases: the filter is a typed record (not a { [string]: any } bag).
 	local purchases = Data.GetPurchases(player, { Kind = "Robux", Category = "Gems", Limit = 5 })
@@ -514,6 +675,12 @@ local function typedApis(player: Player)
 
 	-- GetMetrics values are number | { Count, Average, Max }.
 	local metrics = Scribe.GetMetrics()
+
+	-- GetPercentiles is keyed by metric name and each record is three numbers, so
+	-- indexing straight into P99 must type-check without a cast.
+	local percentiles = Scribe.GetPercentiles()
+	local saveDuration = percentiles.SaveDuration
+	local saveP99: number? = if saveDuration then saveDuration.P99 else nil
 
 	-- Top-level signals carry typed payloads.
 	Scribe.OnStatusChanged:Connect(function(newStatus, _old)
@@ -528,7 +695,7 @@ local function typedApis(player: Player)
 	Data.OnMessage:Connect(function(_p, _msg) end)
 	local _store = Data.ProfileStore
 
-	return purchases, lastResult, metrics, sent
+	return purchases, lastResult, metrics, sent, saveP99
 end
 
 -- The exported strict config type: annotate a local (outside the Scribe literal)
@@ -578,6 +745,7 @@ return {
 	economyUsage = economyUsage,
 	playerDataAlias = playerDataAlias,
 	containerDeclarators = containerDeclarators,
+	narrowedFloats = narrowedFloats,
 	serverOnlyWrappers = serverOnlyWrappers,
 	bigOperators = bigOperators,
 	signalSurface = signalSurface,

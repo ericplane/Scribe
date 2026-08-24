@@ -34,3 +34,5 @@ __pycache__/
 # Local design notes, not part of the shipped docs
 /*.md
 .DS_Store
+!README.md
+!CHANGELOG.md

@@ -31,6 +31,46 @@ return function()
 		harness.Cleanup()
 	end)
 
+	it("persists what the hook writes when the server shuts down instead", function()
+		-- The same guarantee, reached through completely different code. The drain
+		-- has its own call site for the hook, and until this spec nothing in the
+		-- suite executed it: the one shutdown test below arrives with LeavingHookRan
+		-- already true and exercises only the early return. So "the hook's writes
+		-- land in the final save" was proven for a player who leaves and assumed for
+		-- a server that closes.
+		local harness = harnessWith(function(_player, data)
+			data.Playtime.Increment(42)
+		end)
+		local _player, _entry, data = harness.Join(97607)
+		data.Playtime.Set(10)
+		harness.Ctx.Persistence.Shutdown(5)
+
+		expect(harness.Fake.Persisted["Default/PLAYER_97607"].Playtime).to.equal(52)
+
+		harness.Cleanup()
+	end)
+
+	it("distinguishes a shutdown from a player walking out", function()
+		-- The reason is how a game skips expensive work when the whole server is
+		-- closing, which the lifecycle guide advertises as the mitigation for a slow
+		-- hook. It is computed on the leave path and hardcoded on the drain, so a
+		-- refactor that unified the two call sites would flatten it -- and no
+		-- assertion anywhere looked at the value.
+		local seen = {}
+		local harness = harnessWith(function(player, _data, reason)
+			seen[player.UserId] = reason
+		end)
+		local leaver = harness.Join(97608)
+		harness.Join(97609)
+		harness.Leave(leaver)
+		harness.Ctx.Persistence.Shutdown(5)
+
+		expect(seen[97608]).to.equal("player-left")
+		expect(seen[97609]).to.equal("shutdown")
+
+		harness.Cleanup()
+	end)
+
 	it("hands over the typed accessor, so writes are validated", function()
 		local seenPlayer, seenReason
 		local harness = harnessWith(function(player, data, reason)

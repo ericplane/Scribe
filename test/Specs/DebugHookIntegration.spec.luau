@@ -5,6 +5,7 @@
 -- transport, and a regression here breaks the real game, not just the plugin.
 
 return function()
+	local RunService = game:GetService("RunService")
 	local Root = script.Parent.Parent.Parent
 	local ScribeRoot = Root.Scribe
 	local Wire = require(ScribeRoot.Internal.Wire)
@@ -15,12 +16,42 @@ return function()
 		-- Attach exactly like Server.new does after Server.build. DebugHook.Attach is
 		-- called directly here, so no RunService gate needs faking; patching the real
 		-- service Instance is illegal and made this spec unrunnable in Studio.
+		--
+		-- A PRIVATE COPY OF THE MODULE, and this is the load-bearing part in Studio.
+		-- `Attach` closes a once-per-process latch that `detach` deliberately never
+		-- reopens, so exactly one spec in a run can exercise the real attach path. This
+		-- node does not measure the attach -- it measures that everything AROUND a
+		-- boot-attached hook still works -- while DebugHookTeardown measures nothing
+		-- else. Headless the difference is invisible, because IsStudio is pinned false
+		-- and Attach returns before the latch; in Studio it is genuinely true for every
+		-- spec, so whichever file sorted first silently took the latch and the one that
+		-- needed it reported a hook that never attached. A copy costs one module load
+		-- and removes the ordering dependency entirely.
+		-- RENAMED BEFORE IT IS PARENTED, and that is not cosmetic. `Server.new` reaches
+		-- its own hook as `script.DebugHook`, and a name lookup with two children of
+		-- that name returns whichever the engine feels like -- so a copy left under the
+		-- original name would silently become the module the LIBRARY loads. It has to
+		-- live under Scribe.Server all the same: DebugHook resolves everything it needs
+		-- through `script.Parent.Parent`, so the copy only works where the original did.
+		local hookModule = ScribeRoot.Server.DebugHook:Clone()
+		hookModule.Name = "DebugHookIntegrationCopy"
+		hookModule.Parent = ScribeRoot.Server
 		local harness = TestCtx.make({ Options = { DevMode = true } })
+		local detach = nil
 		local attachOk, attachErr = pcall(function()
-			(require(ScribeRoot.Server.DebugHook) :: any).Attach(harness.Data, harness.Ctx)
+			detach = (require(hookModule) :: any).Attach(harness.Data, harness.Ctx)
 		end)
 		if not attachOk then
 			error(`DebugHook.Attach failed at boot: {tostring(attachErr)}`)
+		end
+		-- THE CALIBRATION, and it is new. Everything below asserts that the wrapped
+		-- paths still behave; none of it can tell a correctly-wrapped bundle from an
+		-- unwrapped one. Headless the hook cannot attach at all -- IsStudio is pinned
+		-- false and this spec deliberately does not fake it, because patching the real
+		-- service Instance is illegal in Studio -- so the check is on the gate rather
+		-- than on the host, and it is what proves the copy above is doing its job.
+		if RunService:IsStudio() then
+			expect(type(detach)).to.equal("function")
 		end
 
 		-- Client handshake flows through the wrapped transport.
@@ -62,6 +93,16 @@ return function()
 		expect(#lateInits).to.equal(1)
 
 		local _ = otherEntry
+		-- Give back what the hook took. `detach` releases the Log sink, the Health
+		-- listener and the ServerStorage container -- all process singletons, all of
+		-- which used to outlive this node, and the container is itself half of Attach's
+		-- duplicate guard. Unparenting the copy afterwards leaves the module tree as it
+		-- was found; `Parent = nil` rather than `Destroy` because it means the same
+		-- thing on both runners.
+		if type(detach) == "function" then
+			detach()
+		end
+		hookModule.Parent = nil
 		harness.Cleanup()
 	end)
 

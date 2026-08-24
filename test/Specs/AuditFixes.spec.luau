@@ -78,13 +78,206 @@ return function()
 			harness.Transport.LocalPlayer = player
 			Client.new(harness.Options, harness.Compiled)
 
+			-- Before the expects, not after: an assertion that throws would otherwise
+			-- leak this sink into the rest of the run. (It used to be unconditionally
+			-- leaked -- Scribe.AddLogSink returned nothing, so the guard this replaces
+			-- was dead code that only looked like a teardown.)
+			unsubscribe()
+
 			expect(table.find(codes, "Owns") ~= nil).to.equal(true)
 			expect(table.find(levels, "Error") ~= nil).to.equal(true)
 
-			if unsubscribe then
-				unsubscribe()
-			end
 			harness.Cleanup()
+		end)
+	end)
+
+	describe("client API name collision, for keys assigned late", function()
+		-- The scan is `for key in Data do`, so it can only see the keys that EXIST
+		-- when it runs -- and some are assigned after it. `Data.Raw = Data` sits
+		-- below the loop on both realms, and `Data.Stop` below it on the server, so
+		-- a template root with either name was shadowed in complete silence.
+		--
+		-- That made docgen/guides/templates.md:47 false in as many words: it names
+		-- `Raw` as one of four client names to avoid and promises "Scribe logs
+		-- API_NAME_COLLISION at startup if it happens, on live servers as well as in
+		-- Studio". The fix is to scan LAST rather than to hoist the two keys, so a
+		-- key added at the end of construction later cannot reopen this.
+		local Client = require(Root.Scribe.Client)
+
+		local function collisionsFor(template, options)
+			local seen = {}
+			local unsubscribe = Scribe.AddLogSink(function(entry)
+				if entry.Code == "API_NAME_COLLISION" and entry.Context then
+					seen[tostring(entry.Context.Field)] = entry.Level
+				end
+			end)
+			local harness = TestCtx.make({ Template = template, Options = options })
+			local player = harness.Join()
+			harness.Transport.LocalPlayer = player
+			Client.new(harness.Options, harness.Compiled)
+			unsubscribe()
+			harness.Cleanup()
+			return seen
+		end
+
+		it("reports `Raw`, which is assigned below the scan on the client", function()
+			local template = TestCtx.defaultTemplate()
+			template.Raw = 0
+			local seen = collisionsFor(template, nil)
+			-- Error, not Warn: the client scan is ungated so a shipped game upgrading
+			-- into a collision hears about it in production, which is the whole point
+			-- of the surrounding comment.
+			expect(`Raw={tostring(seen.Raw)}`).to.equal("Raw=Error")
+		end)
+
+		it("still reports `Owns`, which is assigned above it", function()
+			-- The pre-existing case, kept as the control: moving the scan must not
+			-- lose what it already caught.
+			local template = TestCtx.defaultTemplate()
+			template.Owns = 0
+			expect(`Owns={tostring(collisionsFor(template, nil).Owns)}`).to.equal("Owns=Error")
+		end)
+	end)
+
+	describe("server API name collision, for keys assigned late", function()
+		-- The server scan is DevMode-gated and warns rather than errors, and it sits
+		-- even further from the end of construction: `Data.Raw` AND `Data.Stop` are
+		-- both defined below it.
+		local function serverCollisions(template)
+			local seen = {}
+			local unsubscribe = Scribe.AddLogSink(function(entry)
+				if entry.Code == "API_NAME_COLLISION" and entry.Context then
+					seen[tostring(entry.Context.Field)] = entry.Level
+				end
+			end)
+			local harness = TestCtx.make({ Template = template, Options = { DevMode = true } })
+			unsubscribe()
+			harness.Cleanup()
+			return seen
+		end
+
+		it("reports `Raw` and `Stop`, both assigned below the scan", function()
+			local template = TestCtx.defaultTemplate()
+			template.Raw = 0
+			template.Stop = 0
+			local seen = serverCollisions(template)
+			expect(`Raw={tostring(seen.Raw)} Stop={tostring(seen.Stop)}`).to.equal("Raw=Warn Stop=Warn")
+		end)
+
+		it("still reports a name assigned above it", function()
+			local template = TestCtx.defaultTemplate()
+			template.Flush = 0 -- Data.Flush, defined early in Server.build
+			expect(`Flush={tostring(serverCollisions(template).Flush)}`).to.equal("Flush=Warn")
+		end)
+
+		it("stays DevMode-gated, unlike the client half", function()
+			-- The server loop used to inherit its gate from an enclosing
+			-- `if ctx.DevMode then` block that also holds the accessor-method walk.
+			-- Moving it to the end of build meant re-adding that gate by hand, and
+			-- every test above passes DevMode explicitly, so none of them would
+			-- notice it going missing. configuration.md documents the asymmetry --
+			-- DevMode gates the SERVER scan; the client one is ungated and Errors on
+			-- live servers -- so an accidental ungating is a documented-behaviour
+			-- change that nothing else here would catch.
+			local template = TestCtx.defaultTemplate()
+			template.Raw = 0
+			local seen = {}
+			local unsubscribe = Scribe.AddLogSink(function(entry)
+				if entry.Code == "API_NAME_COLLISION" and entry.Context then
+					seen[tostring(entry.Context.Field)] = entry.Level
+				end
+			end)
+			-- IsStudio is pinned false in this harness, so DevMode is off by default.
+			local harness = TestCtx.make({ Template = template, Options = { DevMode = false } })
+			unsubscribe()
+			harness.Cleanup()
+			expect(`Raw={tostring(seen.Raw)}`).to.equal("Raw=nil")
+		end)
+	end)
+
+	describe("API name collision, the invariant rather than the symptom", function()
+		-- The tests above name `Raw`, `Stop`, `Owns` and `Flush` -- names that happen
+		-- to sit where they do TODAY. They would all stay green if someone added a
+		-- new key below the scan next year, which is the identical hole this change
+		-- exists to close. "KEEP THIS LAST" is a comment, and a comment is not a gate.
+		--
+		-- So: ask the running bundle what its public keys ARE, declare every one of
+		-- them as a template root, and require the scan to report every one. That
+		-- fails for any key the scan cannot see, whatever it is called and whenever
+		-- it was added.
+		local Client = require(Root.Scribe.Client)
+
+		local function apiKeysOf(data): { string }
+			local keys = {}
+			for key in data do
+				-- Scribe's own reserved roots are not declarable in a template.
+				if type(key) == "string" and string.sub(key, 1, 1) ~= "_" then
+					table.insert(keys, key)
+				end
+			end
+			table.sort(keys)
+			return keys
+		end
+
+		local function templateOf(keys: { string })
+			local template = { Coins = Scribe.Int(0, { Min = 0 }) }
+			for _, key in keys do
+				template[key] = 0
+			end
+			return template
+		end
+
+		local function missing(keys: { string }, seen): string
+			local out = {}
+			for _, key in keys do
+				if seen[key] == nil then
+					table.insert(out, key)
+				end
+			end
+			return if #out == 0 then "none" else table.concat(out, ",")
+		end
+
+		it("reports EVERY key of the server Data table", function()
+			local probe = TestCtx.make({})
+			local keys = apiKeysOf(probe.Data)
+			probe.Cleanup()
+
+			local seen = {}
+			local unsubscribe = Scribe.AddLogSink(function(entry)
+				if entry.Code == "API_NAME_COLLISION" and entry.Context then
+					seen[tostring(entry.Context.Field)] = true
+				end
+			end)
+			local harness = TestCtx.make({ Template = templateOf(keys), Options = { DevMode = true } })
+			unsubscribe()
+			harness.Cleanup()
+
+			-- #keys is asserted too: a bundle that somehow exposed nothing would make
+			-- "missing=none" vacuously true.
+			expect(`n>20={#keys > 20} missing={missing(keys, seen)}`).to.equal("n>20=true missing=none")
+		end)
+
+		it("reports EVERY key of the client Data table", function()
+			local probe = TestCtx.make({})
+			local probePlayer = probe.Join()
+			probe.Transport.LocalPlayer = probePlayer
+			local keys = apiKeysOf(Client.new(probe.Options, probe.Compiled))
+			probe.Cleanup()
+
+			local seen = {}
+			local unsubscribe = Scribe.AddLogSink(function(entry)
+				if entry.Code == "API_NAME_COLLISION" and entry.Context then
+					seen[tostring(entry.Context.Field)] = true
+				end
+			end)
+			local harness = TestCtx.make({ Template = templateOf(keys) })
+			local player = harness.Join()
+			harness.Transport.LocalPlayer = player
+			Client.new(harness.Options, harness.Compiled)
+			unsubscribe()
+			harness.Cleanup()
+
+			expect(`n>15={#keys > 15} missing={missing(keys, seen)}`).to.equal("n>15=true missing=none")
 		end)
 	end)
 
@@ -173,10 +366,17 @@ return function()
 			reset()
 			Scribe.Configure({ AutoSaveInterval = 60 })
 			local codes = {}
-			Scribe.AddLogSink(function(entry)
+			-- Detached below. The sink list is a process singleton and `codes` closes
+			-- over a table this test keeps appending to, so leaving it attached costs
+			-- every later spec a spawn per log entry and grows the table for the rest
+			-- of the run.
+			local unsubscribe = Scribe.AddLogSink(function(entry)
 				table.insert(codes, entry.Code)
 			end)
 			local harness = TestCtx.make({ Options = { SaveInterval = 90, LogLevel = "Debug" } })
+			-- Detached before the first expect: a failing assertion would otherwise
+			-- skip the removal and leak the sink into every spec that runs after.
+			unsubscribe()
 			-- SaveInterval is applied last, so it wins, exactly as before.
 			expect(harness.Fake.Constants.AUTO_SAVE_PERIOD).to.equal(90)
 			expect(table.find(codes, "SAVE_INTERVAL_CONFLICT") ~= nil).to.equal(true)
@@ -510,7 +710,7 @@ return function()
 			})
 			local buyer = harness.Join(70001)
 			-- Seed a gift credit directly on the reserved root.
-			harness.Ctx.Persistence.EntryFor(buyer).Tree.Accessor._Scribe.GiftCredits.GiftVIP.Set(1)
+			harness.Ctx.Persistence.EntryFor(buyer).Tree.Reserved.GiftCredits.GiftVIP.Set(1)
 
 			harness.Fake.FailSaves = true
 			local ok, reason = harness.Data.PromptGift(buyer, "GiftVIP", 70002)
@@ -877,30 +1077,49 @@ return function()
 			harness.Cleanup()
 		end)
 
-		it("AwaitSave is not acked by a save whose payload predates the wait (save generations)", function()
+		it("AwaitSave reports THIS call's outcome, not whatever save happened to finish", function()
+			-- Was: "not acked by a save whose payload predates the wait (save
+			-- generations)". That spec drove OnSave/OnAfterSave by hand to exercise a
+			-- generation counter which no longer exists -- AwaitSave asks the store
+			-- what happened to its own save now, so a completion it did not start
+			-- cannot answer it at all, and the scenario is unrepresentable rather than
+			-- merely handled.
+			--
+			-- The property survives its mechanism, so it is asserted directly here.
+			-- The OVERLAPPING-save case that motivated it needs a store with saves
+			-- genuinely in flight, which the fake (synchronous persist) cannot model:
+			-- that lives in StoreSaveOutcome.spec, against the real vendored store.
 			local harness = TestCtx.make()
 			local _player, entry = harness.Join()
 			local profile = entry.Profile
-			local realSave = profile.Save
-			profile.Save = function() end -- drive the save cycle manually
+			local realSaveAwait = profile.SaveAwait
 
-			profile.OnSave:Fire() -- an in-flight save whose payload predates the wait below
-			local result: boolean? = nil
-			task.spawn(function()
-				result = harness.Ctx.Persistence.AwaitSave(entry, 5)
-			end)
-			task.wait() -- let the waiter register
-			profile.OnAfterSave:Fire(profile.Data) -- completes the PRE-registration save
-			task.wait()
-			-- Must NOT be acked: this save serialized before the caller registered, so
-			-- acking would report durability for data that may only exist in memory.
-			expect(result).to.equal(nil)
+			profile.SaveAwait = function()
+				return "Failed", {}
+			end
+			expect(harness.Ctx.Persistence.AwaitSave(entry, 5)).to.equal(false)
 
-			profile.OnSave:Fire() -- a save STARTED after registration covers the waiter
-			profile.OnAfterSave:Fire(profile.Data)
-			task.wait()
-			expect(result).to.equal(true)
-			profile.Save = realSave
+			-- A successful DataStore round trip whose transform declined to write,
+			-- because the session was superseded. Acking this is how a receipt gets
+			-- granted for data nobody stored.
+			profile.SaveAwait = function()
+				return "NotOwned", {}
+			end
+			expect(harness.Ctx.Persistence.AwaitSave(entry, 5)).to.equal(false)
+
+			-- Saved, but the wipe guard substituted the last-good snapshot: something
+			-- persisted, just not what the caller wrote.
+			profile.SaveAwait = function()
+				return "Saved", { Blocked = true }
+			end
+			expect(harness.Ctx.Persistence.AwaitSave(entry, 5)).to.equal(false)
+
+			profile.SaveAwait = function()
+				return "Saved", {}
+			end
+			expect(harness.Ctx.Persistence.AwaitSave(entry, 5)).to.equal(true)
+
+			profile.SaveAwait = realSaveAwait
 			harness.Cleanup()
 		end)
 

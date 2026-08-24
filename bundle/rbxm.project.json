@@ -6,10 +6,6 @@
     "Packages": {
       "$className": "Folder",
       "Scribe": { "$path": "../src" }
-    },
-    "ServerPackages": {
-      "$className": "Folder",
-      "ProfileStore": { "$path": "deps/ProfileStore.luau" }
     }
   }
 }

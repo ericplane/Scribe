@@ -293,6 +293,18 @@
 .md-typeset .api-signature pre {
   overflow-x: auto; /* still scrolls if a single token really is too wide */
 }
+/* The type names inside a signature cannot be links: nothing in a fenced code
+   block can be. gen.py emits them as a short line directly beneath the fence
+   instead, which only works if it reads as an annotation on the signature rather
+   than as the first line of the description. Pull it up tight under the block and
+   set it small and quiet. */
+.md-typeset .api-typerefs {
+  margin: -0.6rem 0 0.9rem;
+  font-size: 0.72rem;
+  color: var(--md-default-fg-color--light);
+}
+.md-typeset .api-typerefs code { font-size: 0.95em; }
+
 .md-typeset .api-signature code {
   white-space: pre-wrap;
   /* Hanging indent, ADDED to Material's own left padding rather than replacing

@@ -16,6 +16,7 @@ local Server = require(ScribeRoot.Server) :: any
 local FakeProfileStore = require(script.Parent.FakeProfileStore)
 local StubTransport = require(script.Parent.StubTransport)
 local FakePlayer = require(script.Parent.FakePlayer)
+local Reassemble = require(script.Parent.Reassemble)
 
 local TestCtx = {}
 
@@ -46,7 +47,7 @@ export type Harness = {
 	Compiled: Template.Compiled,
 	Options: { [string]: any },
 	Join: (userId: number?) -> (any, any, any), -- (player, entry, data accessor)
-	TryJoin: (userId: number?) -> (any, any, any, string?), -- load may fail (locked)
+	TryJoin: (userId: number?, timeout: number?) -> (any, any, any, string?), -- load may fail (locked)
 	Step: () -> (), -- drive one real PostSimulation replication flush
 	Leave: (player: any) -> (),
 	SendHello: (player: any) -> (),
@@ -66,11 +67,17 @@ function TestCtx.make(
 		-- Mailboxes (so cross-server messages actually arrive). Without this every
 		-- harness gets its own disk and no spec can express a two-server hazard.
 		Fake: any?,
+		-- Supply the loopback transport instead of letting the harness mint one, so
+		-- a spec can set a field Scribe reads at CONSTRUCTION -- MaxFrameBytes is
+		-- read once inside Replication.new, before any spec could reach
+		-- harness.Transport to set it. harness.Transport is then this table, so
+		-- FramesFor and the pump helpers all work unchanged.
+		Transport: any?,
 	}?
 ): Harness
 	local cfg = config or {}
 	local fake = cfg.Fake or FakeProfileStore.new()
-	local transport = StubTransport.new({ AutoPump = cfg.AutoPump })
+	local transport = cfg.Transport or StubTransport.new({ AutoPump = cfg.AutoPump })
 
 	local options: { [string]: any } = {
 		Template = cfg.Template or TestCtx.defaultTemplate(),
@@ -89,6 +96,24 @@ function TestCtx.make(
 	}
 	for key, value in cfg.Options or {} do
 		options[key] = value
+	end
+
+	-- SCRIBE_FRAGMENT_ALL=1 drives the WHOLE suite through Wire.Fragment by making
+	-- the outbound budget smaller than any frame Scribe produces.
+	--
+	-- It exists because the honest objection to fragmentation is that it is
+	-- unreachable: every frame the fixtures emit is far under the 65536 default
+	-- (measured across a full run: 11,942 outbound frames, largest 39,920 bytes,
+	-- none over the budget), so "the existing assertions still pass" says nothing
+	-- about the new code. Under this switch every assertion in the suite is an
+	-- assertion about a reassembled frame. A spec that sets MaxOutboundBytes itself
+	-- keeps its own value, since it is testing the budget rather than living under
+	-- one. Read through the harness escape hatch: @lune/process is unreachable from
+	-- a shim-loaded module, and a pcall'd require there would fail silently, which
+	-- is how a switch quietly stops switching anything.
+	local fragmentAll = __SimHost ~= nil and __SimHost.Env ~= nil and __SimHost.Env.SCRIBE_FRAGMENT_ALL == "1"
+	if fragmentAll and options.MaxOutboundBytes == nil then
+		options.MaxOutboundBytes = 256
 	end
 
 	-- Mirror src/init.luau's compile config: purchase logs are opt-in.
@@ -126,11 +151,18 @@ function TestCtx.make(
 	--- Join without asserting success. Returns (player, entry, accessor, reason);
 	--- accessor is nil when the load failed (e.g. the profile is session-locked by
 	--- another harness sharing this fake).
-	function harness.TryJoin(userId: number?): (any, any, any, string?)
+	---
+	--- `timeout` bounds the WaitForData, and exists for specs that assert a load was
+	--- REFUSED. A refusal reaches WaitForData through the stored end reason, so under
+	--- correct code it returns immediately whatever the timeout is; a load that
+	--- instead hangs (the failure mode a spec asserting on `entry == nil` cannot
+	--- distinguish from a clean refusal) then answers "timeout" promptly, and the
+	--- spec fails on its own assertion rather than on the runner's per-test budget.
+	function harness.TryJoin(userId: number?, timeout: number?): (any, any, any, string?)
 		local player = FakePlayer.new(userId)
 		table.insert(joined, player)
 		ctx.Persistence.OnPlayerAdded(player)
-		local accessor, reason = ctx.Persistence.WaitForData(player)
+		local accessor, reason = ctx.Persistence.WaitForData(player, timeout)
 		return player, ctx.Persistence.EntryFor(player), accessor, reason
 	end
 
@@ -169,7 +201,12 @@ function TestCtx.make(
 		local reader = Wire.NewReader(bytes)
 		local frameType = Wire.RU8(reader)
 		local frame: { [string]: any } = { Type = frameType }
-		if frameType == Wire.Frames.Init or frameType == Wire.Frames.Diff then
+		if frameType == Wire.Frames.Fragment then
+			-- A lone fragment carries no decodable frame, and returning { Type = 11 }
+			-- would let `FramesFor(player, Frames.Init)` answer an empty list for a
+			-- snapshot that was sent perfectly well. Fail loudly instead.
+			error("TestCtx.DecodeFrame: got a Fragment; use FramesFor, which reassembles", 2)
+		elseif frameType == Wire.Frames.Init or frameType == Wire.Frames.Diff then
 			frame.Ops = Wire.DecodeOps(reader, compiled)
 		elseif frameType == Wire.Frames.SharedInit or frameType == Wire.Frames.SharedDiff then
 			frame.UserId = Wire.RF64(reader)
@@ -212,7 +249,10 @@ function TestCtx.make(
 	--- frame type.
 	function harness.FramesFor(player: any?, frameType: number?): { { [string]: any } }
 		local out = {}
-		for _, sent in transport:FramesFor(player) do
+		-- Reassembled first: a frame over MaxOutboundBytes reaches the log as several
+		-- Fragment frames, and every assertion in the suite is written about logical
+		-- frames.
+		for _, sent in Reassemble.Logical(transport:FramesFor(player)) do
 			local frame = harness.DecodeFrame(sent.Bytes)
 			if frameType == nil or frame.Type == frameType then
 				table.insert(out, frame)
@@ -227,6 +267,22 @@ function TestCtx.make(
 				harness.Leave(player)
 			end
 		end
+		-- Release the bundle. A harness builds a whole Scribe instance, and a bundle
+		-- registers on process globals -- a Health.OnStatusChanged listener and a
+		-- RunService.PostSimulation handler -- so without this every harness in a run
+		-- left a dead pump on the frame signal, one per make(), driving replication
+		-- work for a bundle nothing holds.
+		--
+		-- AFTER the leave loop, so the release/save path runs against a live bundle.
+		-- Measured: swapping the two leaves the whole suite green today, because a
+		-- leave still reaches EndSession and the store still writes. Kept in this
+		-- order anyway -- releasing players through a bundle that has been stopped is
+		-- not something any spec should be relying on, and the day one does, the
+		-- failure would look like a persistence bug rather than a harness one.
+		--
+		-- pcall'd and idempotent, because specs call Cleanup on early-return paths and
+		-- again at the end.
+		pcall(Data.Stop)
 		-- The Health singleton is shared across harnesses: walk it back to
 		-- Healthy so failure-injection tests don't poison later specs.
 		Health.SetCritical(false)

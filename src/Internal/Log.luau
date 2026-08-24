@@ -10,10 +10,14 @@ local Util = require(script.Parent.Util)
 local Signal = require(script.Parent.Signal)
 local Types = require(script.Parent.Parent.Types)
 local Clock = require(script.Parent.Clock)
+local Sched = require(script.Parent.Sched)
 
 type LogEntry = Types.LogEntry
 
-local RING_SIZE = 512
+-- Default entries retained for Log.GetRecent; the bundle option LogRingSize
+-- raises it for runs long enough that 512 truncates the interesting part.
+local DEFAULT_RING_SIZE = 512
+local ringSize = DEFAULT_RING_SIZE
 local MAX_STRUCTURED_CONTEXT_BYTES = 1000 -- keep structured-log context under ~1 KiB
 
 local LEVEL_ORDER: { [string]: number } = {
@@ -29,14 +33,12 @@ local Log = {}
 Log.OnIssue = Signal.new() :: Signal.Signal<Types.LogEntry> -- fires (entry) for every Error/Fatal entry
 
 local minLevel = if RunService:IsStudio() then LEVEL_ORDER.Debug else LEVEL_ORDER.Warn
-local ring: { LogEntry } = table.create(RING_SIZE) :: any
+local ring: { LogEntry } = table.create(ringSize) :: any
 local ringNext = 1
 local ringCount = 0
 local sinks: { (entry: LogEntry) -> () } = {}
 
--- LogService structured logging (full release June 2026): one stable template
--- per code so Creator Analytics aggregates by code. Feature-detected with a
--- print/warn fallback.
+-- LogService structured logging, feature-detected with a print/warn fallback.
 local structuredAvailable = pcall(function()
 	return typeof((LogService :: any).Output) == "function"
 end) and typeof((LogService :: any).Output) == "function"
@@ -65,9 +67,8 @@ local function trimContext(context: { [string]: any }?): { [string]: any }?
 end
 
 local function defaultSink(entry: LogEntry)
-	-- Stable template per code (no dynamic Message) so Creator Analytics
-	-- aggregates by code and an attacker-controlled string can never mint
-	-- unbounded template cardinality. The message travels in the context.
+	-- Stable template per code, never the message: Creator Analytics aggregates by
+	-- template, and a caller-supplied string would mint unbounded cardinality.
 	local template = `Scribe {entry.Code}`
 	if structuredAvailable then
 		local context: { [string]: any } = trimContext(entry.Context) or {}
@@ -129,15 +130,15 @@ local function emit(
 
 	-- Ring buffer always records the full, untrimmed entry.
 	ring[ringNext] = entry
-	ringNext = (ringNext % RING_SIZE) + 1
-	ringCount = math.min(ringCount + 1, RING_SIZE)
+	ringNext = (ringNext % ringSize) + 1
+	ringCount = math.min(ringCount + 1, ringSize)
 
 	if LEVEL_ORDER[level] >= minLevel then
 		defaultSink(entry)
 	end
 
 	for _, sink in sinks do
-		task.spawn(function()
+		Sched.Spawn(function()
 			local ok, err = pcall(sink :: any, entry)
 			if not ok then
 				warn(`[Scribe] log sink error: {err}`)
@@ -174,8 +175,20 @@ function Log.Fatal(category: Types.LogCategory, code: Types.LogCode, message: st
 	emit("Fatal", category, code, message, context)
 end
 
-function Log.AddSink(fn: (entry: LogEntry) -> ())
+--- Register a sink, and hand back a function that removes it. Every entry spawns
+--- one thread per sink, so a sink nobody detaches keeps costing on the hottest
+--- failure path.
+---
+--- The remover is idempotent: calling it twice is a no-op rather than removing
+--- whatever has since taken that index.
+function Log.AddSink(fn: (entry: LogEntry) -> ()): () -> ()
 	table.insert(sinks, fn)
+	return function()
+		local index = table.find(sinks, fn)
+		if index ~= nil then
+			table.remove(sinks, index)
+		end
+	end
 end
 
 export type LogFilter = {
@@ -185,13 +198,46 @@ export type LogFilter = {
 	Limit: number?,
 }
 
--- Recent entries, newest last. Optional filter by minimum level, category, code.
+--- Resize the retained-entry ring, keeping the most recent entries. A resize is a
+--- configuration change, not a request to forget what already happened.
+function Log.SetRingSize(size: number?)
+	local next = if type(size) == "number" and size >= 1 then math.floor(size) else DEFAULT_RING_SIZE
+	if next == ringSize then
+		return
+	end
+
+	local kept: { LogEntry } = {}
+	for i = 1, ringCount do
+		local idx = ((ringNext - 1 - ringCount + i - 1) % ringSize) + 1
+		local entry = ring[idx]
+		if entry then
+			table.insert(kept, entry)
+		end
+	end
+	while #kept > next do
+		table.remove(kept, 1) -- drop oldest first
+	end
+
+	ringSize = next
+	ring = table.create(ringSize) :: any
+	for i, entry in kept do
+		ring[i] = entry
+	end
+	ringCount = #kept
+	ringNext = (#kept % ringSize) + 1
+end
+
+--- Entries currently retained, and the configured capacity.
+function Log.RingInfo(): { Size: number, Count: number }
+	return { Size = ringSize, Count = ringCount }
+end
+-- Retained entries, oldest first, optionally filtered by level, category or code.
 function Log.GetRecent(filter: LogFilter?): { LogEntry }
 	local out = {}
 	local minFilter = if filter and filter.Level then LEVEL_ORDER[filter.Level] else nil
 	for i = 1, ringCount do
 		-- Oldest first: start after the write cursor.
-		local idx = ((ringNext - 1 - ringCount + i - 1) % RING_SIZE) + 1
+		local idx = ((ringNext - 1 - ringCount + i - 1) % ringSize) + 1
 		local entry = ring[idx]
 		if entry then
 			if minFilter and LEVEL_ORDER[entry.Level] < minFilter then

@@ -1,196 +1,299 @@
-# Monetization & Gifting
+# Monetization
 
-Scribe's monetization layer lives inside the data service because correct receipt handling needs exactly what Scribe owns: durable saving, player lifecycle, and idempotency. The overriding rule is **never eat Robux**.
+Emberfall sells coin packs and gem packs for Robux, and it sells a VIP pass. Scribe handles the Roblox side of that for you: it listens for receipts, applies the purchase to the player's saved profile, and only tells Roblox the sale went through once the data is durable. The rule the whole system is built around is that a player never pays Robux and gets nothing.
 
-## Configuring products and passes
+This page covers products, passes, perks, ownership checks, and spending soft currency. Sending a purchase to someone else lives in [Gifting](./gifting).
+
+## Selling a coin pack
+
+Declare your products and passes in the shared module, next to the template. A product's `Grant` receives the buyer's accessor tree.
 
 ```lua
 Products = {
-    Coins1000 = { Id = 111, Category = "Currency",
-        Grant = function(data) data.Coins.Increment(1000, { Source = "Purchase" }) end },
-    GiftVIP = { Id = 222, Category = "Gamepass", Grants = "VIP" },
+    CoinPack500 = {
+        Id = 1234567890,
+        Category = "Currency",
+        Grant = function(data)
+            data.Coins.Increment(500, {
+                TransactionType = Enum.AnalyticsEconomyTransactionType.IAP,
+                ItemSku = "CoinPack500",
+            })
+        end,
+    },
 },
-Passes = { VIP = { Id = 333 } },
+
+Passes = { VIP = { Id = 987654321 } },
 ```
 
-Scribe binds `MarketplaceService.ProcessReceipt` automatically and runs everything Robux-driven off it: developer-product grants, gifting delivery, idempotency, and the Robux purchase log.
+That is the entire setup. When a server script first requires the shared module, Scribe takes over `MarketplaceService.ProcessReceipt` and runs every Robux purchase through it. Prompt the sale however you like, with `MarketplaceService:PromptProductPurchase(player, 1234567890)`, and Scribe does the rest: it grants the coins, writes a Robux purchase-log entry, and waits for the save to confirm before answering `PurchaseGranted`. If anything fails, it answers `NotProcessedYet` and Roblox retries later.
 
-:::caution Already have a `ProcessReceipt`? Set `OwnReceipts = false`
-Roblox allows exactly **one** `ProcessReceipt` callback. Scribe installs its own during `Data.Start()` whenever you register `Products`, which **silently overrides any receipt handler your game already has** (a pass-only or data-only game is left alone; a second Scribe bundle instead errors loudly at startup). If your game already handles receipts, pick one of these:
+The meta table on `Increment` is optional. It makes the grant show up in Roblox's economy dashboard, which is worth having for your largest source of currency. See [Economy Analytics](./economy).
 
-- **Let Scribe take over (recommended).** Move your developer products into `Products`, passes into `Passes`, and gifting into [`PromptGift`](/api/Server#PromptGift). Scribe's receipt path survives cross-server hops and offline recipients, which is genuinely hard to get right by hand.
-- **Keep your own handler.** Set `OwnReceipts = false`, then call [`Data.TryHandleReceipt(receiptInfo)`](/api/Server#TryHandleReceipt) from your `ProcessReceipt`. It returns a decision for a Scribe product and `nil` for anything else, so you can fall through to your own handling without maintaining a second list of product IDs:
+???+ warning "A `Grant` must never yield"
+    No `task.wait`, no DataStore call, no `MarketplaceService` call inside a `Grant`. Scribe runs the callback inside a transaction so that a `Grant` which throws part-way is rolled back completely, and a transaction cannot survive a yield.
 
-    ```lua
-    MarketplaceService.ProcessReceipt = function(receiptInfo)
-        local decision = Data.TryHandleReceipt(receiptInfo)
-        if decision then
-            return decision
-        end
-        return myOwnHandler(receiptInfo)
-    end
-    ```
+    A product `Grant` that yields is logged as `GRANT_FAIL` and then run anyway, without rollback, because refusing it forever would mean taking the player's Robux and never delivering. If it throws after yielding you get `GRANT_PARTIAL` instead: the writes it already made stand, the receipt settles once, and an operator has to compensate by hand.
 
-    [`HandleReceipt`](/api/Server#HandleReceipt) is the stricter variant: it answers `NotProcessedYet` for an unknown product, which is right when Scribe owns `ProcessReceipt` but would stall one of **your** purchases in a permanent retry loop if you routed everything through it. Call it yourself only when Scribe is the **last** handler in your chain, which is exactly what the second-bundle startup error asks for: set `OwnReceipts = false` on the secondary bundle and route its receipts through `Data.HandleReceipt`.
+    A soft-currency [`Purchase`](/api/Server#Purchase) `Grant` that yields is refused outright. Nothing is debited and nothing is granted.
 
-If you set `OwnReceipts = false` and **don't** route receipts to Scribe, everything on the receipt path goes dark: **developer-product grants, `PromptGift` delivery, and receipt-driven Robux log entries never fire.** Perk ownership, game pass ownership and its Robux log entries, and soft-currency [`Purchase`](/api/Server#Purchase) keep working, since none of those touch receipts.
+    Do the async work before you show the prompt, or afterwards from a signal.
 
-Order matters too, and nothing warns you about it: Scribe assigns `ProcessReceipt` during `Data.Start()`, so a handler your game assigns **after** that call silently wins and every Scribe product goes dark. Don't rely on assignment order, set `OwnReceipts = false` and route explicitly.
-:::
+## Checking what a player owns
 
-Receipts are **idempotent by `PurchaseId`** and **fail-closed**: `PurchaseGranted` is returned only after the grant is durably committed; otherwise `NotProcessedYet`, so Roblox retries.
-
-That retry rule is also what handles a buyer who left between paying and the receipt arriving, and **product shape decides how fast delivery is**. A perk-only product (`Grants` with no `Grant`) commits offline and delivers immediately. A `Grant` callback needs a live accessor tree, so for an offline buyer Scribe answers `NotProcessedYet` and waits for Roblox to retry, possibly not until that player's next session. Nothing is lost either way, but prefer a perk when delivery timing matters.
-
-:::caution A `Grant` callback runs inside a transaction, so it must not yield
-No `task.wait`, DataStore, or `MarketplaceService` calls inside a `Grant`. Do the async work before the prompt, or afterwards from a signal. The two failure modes differ, and both are loud:
-
-- A **product** `Grant` that yields cannot be made atomic, so Scribe logs a `GRANT_FAIL` error and runs it anyway, **without rollback**. If it then throws part-way, its partial writes stay and Roblox re-applies them on every receipt retry.
-- A soft-currency [`Purchase`](/api/Server#Purchase) `Grant` that yields is refused outright: nothing is debited, nothing is granted, and `Purchase` returns `(false, error)`.
-:::
-
-## Perks
-
-A **perk** is a saved boolean flag on a player, and it's usually what a developer product or game pass unlocks. A product's `Grants = "VIP"` sets it, as do [`Data.GrantPerk`](/api/Server#GrantPerk) / [`RevokePerk`](/api/Server#RevokePerk) and [gifting](#gifting). Perks persist with the profile and are read through [`Owns`](/api/Server#Owns).
-
-Declaring `Perks` is **optional**, a typo-guard rather than a requirement: granting or checking any perk name works without it. If you do list your perk names, Scribe logs a dev-mode warning (`UNDECLARED_PERK`) for a perk name outside the list: at **startup** for a product whose `Grants` key isn't in `Perks` (the typo that would otherwise surface only after a player has spent Robux), and at grant time from [`GrantPerk`](/api/Server#GrantPerk) or a product's `Grants`. Ownership checks warn under a different code, `UNKNOWN_OWNS_KEY`, covered under [Ownership](#ownership). `RevokePerk` is exempt, since revoking a name you never granted is harmless:
-
-```lua
-Perks = { "VIP", "DoubleXP", "StarterPack" },
-```
-
-:::note Which monetization calls need a Ready player
-The **writing** ones error if the profile isn't Ready: [`GrantPerk`](/api/Server#GrantPerk), [`RevokePerk`](/api/Server#RevokePerk), [`ObserveOwned`](/api/Server#ObserveOwned), and [`RecordPurchase`](/api/Server#RecordPurchase). Wire them behind [`WaitForData`](/api/Server#WaitForData) rather than calling them straight out of `PlayerAdded`.
-
-The **reading** ones are tolerant: `Owns`, `OwnsAsync`, `GetPurchases`, and `GetGiftCredits` answer `false`/`{}`, and `Purchase` and `PromptGift` refuse with `(false, "player data not loaded")` and `(false, "buyer data not loaded")`. Tolerant is not the same as correct, though: a VIP owner reads as a non-owner until their profile lands, so gate ownership logic on readiness too.
-:::
-
-## Ownership
-
-There are two ownership checks, and both pass for a granted perk, an owned game pass, or RobloxPlus. Prefer [`OwnsAsync`](/api/Server#OwnsAsync) by default: on the server it verifies live against `UserOwnsGamePassAsync` whenever the cache does not already say owned, so it is authoritative including for a pass bought moments ago. It still needs a loaded profile, so gate it behind `WaitForData` on join. [`Owns`](/api/Server#Owns) is the non-yielding version for hot paths where the data is already warm, such as a button click or a mid-session gate.
-
-Non-yielding is a **server** property only. The client's [`Owns`](/api/Client#Owns) yields until the first snapshot arrives, and that wait is **untimed**, so a UI script that calls it before the first sync blocks for as long as loading takes. Gate client startup reads on `Data.IsReady()` or `Data.WaitForData(timeout)` (see [Session Lifecycle](./lifecycle#on-the-client)) rather than expecting `Owns` to return promptly.
+Perks, passes and Roblox Premium all answer to the same key. In Emberfall, `"VIP"` is the pass name, so `Owns(player, "VIP")` is true whether the player bought the pass or was handed the perk by staff.
 
 ```lua
 -- server
-if Data.OwnsAsync(player, "VIP") then ... end   -- preferred, verifies live
-if Data.Owns(player, "VIP") then ... end         -- fast, non-yielding
-
--- client
-if Data.OwnsAsync("VIP") then ... end            -- preferred, waits for the replicated flag
-if Data.Owns("VIP") then storeButton.Visible = false end   -- yields until the first snapshot
+if Data.OwnsAsync(player, "VIP") then
+    giveVipKit(player)
+end
 ```
 
-This matters because perks and gifts resolve the instant a player is Ready, while real game pass ownership is filled by an asynchronous refresh kicked off at load. `Owns` reads that cache, so a genuinely-owned pass can briefly read `false` right after join, and that is the gap `OwnsAsync` closes. Once the cache says owned it is trusted without a re-check, since pass ownership only ever gains within a session. The client version instead waits on a replicated ownership-synced flag.
+[`OwnsAsync`](/api/Server#OwnsAsync) is the one to reach for by default. If the cache does not already say owned, it re-checks live with `UserOwnsGamePassAsync`, so a pass bought thirty seconds ago is reflected immediately. [`Owns`](/api/Server#Owns) is the non-yielding version for a hot path where the data is already warm, such as a button click mid-session.
 
-Gate grants on the **server's** `Owns` or `OwnsAsync`, never the client's. The client versions are only reads of the replicated mirror, so an exploiter can make them return `true` locally; only the server's `OwnsAsync`, backed by `UserOwnsGamePassAsync`, is authoritative. In DevMode, calling either with a key that is not a registered pass, declared perk, or product grant logs `UNKNOWN_OWNS_KEY`, since it would otherwise silently return `false` forever.
+Gate a grant on the **server's** check, never the client's. The client's `Owns` and `OwnsAsync` read a replicated mirror, and an exploiter can make a mirror say anything.
 
-### RobloxPlus
-
-`"RobloxPlus"` is a **built-in ownership key**. You never declare it in `Passes` or `Perks`: it is always available and resolves from the player's Roblox subscription, so you can gate a subscriber perk without wiring anything up.
+`"RobloxPlus"` is built in. You never declare it, and it resolves from the player's Roblox subscription:
 
 ```lua
--- server
 if Data.OwnsAsync(player, "RobloxPlus") then
-    grantDailyBonus(player)
+    Data[player].Coins.Increment(100)
 end
-
--- client
-Data.ObserveOwned("RobloxPlus", function(subscribed)
-    subscriberBadge.Visible = subscribed
-end)
 ```
 
-Because it is an ordinary ownership key, it works everywhere the others do (`Owns`, `OwnsAsync`, `ObserveOwned`, `OnOwnershipChanged`, on both realms) and it never triggers the `UNKNOWN_OWNS_KEY` warning. On the server it is read from the live player property, so it is correct even before the ownership cache is populated; the client reads the replicated value.
+### Reacting to a purchase
 
-It is also the one ownership key that reliably changes in **both** directions during a session. Scribe seeds it at load and keeps it current from `Players.PlayerMembershipChanged`, so a player who subscribes or lapses mid-session fires `OnOwnershipChanged` in the matching direction. Game pass ownership, by contrast, only ever gains within a session.
-
-### Reacting to ownership changes
-
-To run something the moment a player gains a pass or perk, react instead of polling. `OnOwnershipChanged` covers every key at once, which is what you want for applying effects on purchase:
+Do not poll. `OnOwnershipChanged` fires for every key, which is what you want when a purchase should change something in the world:
 
 ```lua
--- server
 Data.OnOwnershipChanged:Connect(function(player, key, owned)
-    if key == "VIP" and owned then giveVipKit(player) end
+    if key == "VIP" and owned then
+        openVipDoor(player)
+    end
 end)
-
--- one specific key, with the current value delivered immediately
--- (server-side ObserveOwned errors unless the player is Ready)
-if Data.WaitForData(player) then
-    local disconnect = Data.ObserveOwned(player, "VIP", function(owned)
-        vipDoor:SetEnabled(owned)
-    end)
-end
 ```
 
-Both exist on the client too (`Data.OnOwnershipChanged` fires `(key, owned)` for the local player, and `Data.ObserveOwned(key, callback)`), which is the easy way to toggle a "buy" button the instant a purchase completes. Ownership already held when the player joined is the baseline and does not fire.
+For a single key with the current value delivered up front, use [`ObserveOwned`](/api/Server#ObserveOwned). It needs a Ready profile on the server, so put it behind [`WaitForData`](/api/Server#WaitForData). Both signals exist on the client too, and the client versions are the easy way to hide a "buy VIP" button the instant the sale completes.
 
-These cover purchases, grants, gift deliveries, and revokes. They do **not** fire for a game pass refund mid-session, because ownership only ever gains within a session: a cached `true` is never re-verified. A refund is picked up on the player's next join.
+??? note "Why `Owns` can say false right after a player joins"
+    Perks and gift deliveries resolve the moment a profile is Ready, but real game-pass ownership is filled in by an asynchronous refresh that starts at load. `Owns` reads that cache, so a genuinely-owned pass can read `false` for a moment right after join. `OwnsAsync` closes that gap by verifying live.
+
+    Once the cache says owned it is trusted without re-checking, because pass ownership only ever gains during a session. A refund is picked up on the player's next join, not mid-session.
+
+    `"RobloxPlus"` is the exception that moves both ways. Scribe keeps it current from `Players.PlayerMembershipChanged`, so a player who subscribes or lapses mid-session fires `OnOwnershipChanged` in the matching direction.
+
+??? note "Which monetization calls need a Ready player"
+    Four of them error if the profile is not Ready: [`GrantPerk`](/api/Server#GrantPerk), [`RevokePerk`](/api/Server#RevokePerk), [`ObserveOwned`](/api/Server#ObserveOwned), and [`RecordPurchase`](/api/Server#RecordPurchase). Wire those behind [`WaitForData`](/api/Server#WaitForData) rather than calling them straight out of `PlayerAdded`.
+
+    The reading calls are tolerant instead. `Owns`, `OwnsAsync`, `GetPurchases` and `GetGiftCredits` answer `false` or an empty table, and `Purchase` and `PromptGift` refuse with a reason. Tolerant is not the same as correct: a VIP owner reads as a non-owner until their profile lands, so gate ownership logic on readiness too.
+
+## Granting a perk yourself
+
+A perk is a saved boolean on the player. Products set one with `Grants`, and you can set one directly for a contest prize, a support refund, or an admin command:
+
+```lua
+Data.GrantPerk(player, "VIP")     -- Owns(player, "VIP") is now true
+Data.RevokePerk(player, "VIP")
+```
+
+Declaring your perk names is optional and buys you a typo guard:
+
+```lua
+Perks = { "VIP" },
+```
+
+With the list present, Scribe logs `UNDECLARED_PERK` for a perk name outside it, both at startup (for a product whose `Grants` key is misspelled, which would otherwise surface only after a player has spent Robux) and at grant time. `RevokePerk` is exempt, since revoking a name you never granted is harmless. Ownership checks warn under their own code, `UNKNOWN_OWNS_KEY`.
 
 ## Soft-currency purchases
 
-[`Purchase`](/api/Server#Purchase) is atomic: debit, grant, and log succeed or roll back together. Insufficient funds or a throwing `Grant` leaves everything untouched:
+[`Purchase`](/api/Server#Purchase) is the shop-side twin of a product: it debits a currency, runs a grant, and writes a log entry, all or nothing.
 
 ```lua
-Data.Purchase(player, {
-    Cost = { Path = "Coins", Amount = 45000 },
-    Category = "Vehicle", ItemId = "Police01",
-    Grant = function(data) data.Vehicles.Insert("Police01") end,
+local ok, reason = Data.Purchase(player, {
+    Cost = { Path = "Coins", Amount = 250 },
+    Category = "Item",
+    ItemId = "EmberLantern",
+    Grant = function(data)
+        data.Inventory.EmberLantern.Set({ Qty = 1, Rarity = "Rare" })
+    end,
 })
-```
 
-`Cost.Path` names any numeric field, and the field's declarator does the work: a `Scribe.Int` currency refuses a fractional `Amount`, and its `Min` is the floor the debit may not cross.
-
-For a **fixed** set of currencies, declare them as ordinary fields. A typo in `Cost.Path` then returns `(false, "invalid cost path")` instead of silently debiting somewhere else:
-
-```lua
-Wallet = { Gold = Scribe.Int(100, { Min = 0 }), Gems = Scribe.Int(0, { Min = 0 }) },
--- Cost = { Path = "Wallet.Gold", Amount = 30 }   -- 100 -> 70
-```
-
-`Cost.Path` may also descend into a [typed container](./templates#typed-containers), which is the right shape when the currency keys are **open-ended** (a data-driven resource catalog, say). Note the trade-off: a `DictOf` accepts *any* string key by design, so `Wallet.Glod` is a valid path rather than an error, and it spends from the element's declared default. That is fine for a catalog whose keys you cannot enumerate, and wrong for a wallet whose currencies you can.
-
-The atomicity also covers a `Grant` that writes into a capped container: an `Insert` past `MaxItems` throws, so the debit rolls back with it and `Purchase` returns `false` plus the error naming the field and the cap. A full inventory is a clean refusal rather than currency taken for an item the player never received.
-
-## Gifting
-
-There's no native "gift a game pass" API, so gifting sells a developer product and grants the recipient a saved **perk**. [`PromptGift`](/api/Server#PromptGift) records a durable intent _before_ money moves, and delivery survives cross-server hops and offline recipients.
-
-`PromptGift` **yields** (it waits for a durable save of the intent) and returns `(boolean, string?)`. Always handle the `false` branch: refusal is routine, not exceptional. `"gift cooldown"` alone (5 seconds per sender by default) will fire on any button a player can double-click, and the other refusals cover an unknown product, buyer data not loaded, an invalid recipient, gifting yourself, too many pending gifts, a data outage, the recipient already owning it, and a failed prompt or intent write.
-
-```lua
-local ok, reason = Data.PromptGift(buyer, "GiftVIP", recipientUserId)
 if not ok then
-    showToast(buyer, reason)
+    showToast(player, reason)
 end
 ```
 
-Note what `true` does **not** tell you. It means one of two things: a Robux prompt was shown, and nothing has been delivered yet, or a held gift credit was consumed and the gift went out immediately at no charge. To know a gift actually landed, react to a signal instead of the return value.
+If the player has 200 coins, nothing happens at all: no debit, no lantern, and `reason` is `"insufficient funds"`. If the `Grant` throws, the debit rolls back with it. There is no window in which the coins are gone and the item is missing.
 
-Recipient ownership is checked twice: at prompt time (refused with `"recipient already owns this"`) **and again at receipt time**. If the recipient acquired the perk while the buyer sat on the purchase dialog, the payment converts to a re-aimable **gift credit** for the buyer instead of a no-op delivery. A pending credit is consumed by a future `PromptGift` with **no charge**.
+`Cost.Path` names any numeric field in your template, and that field's declarator does the work. `Coins` is a `Scribe.Int` with `Min = 0`, so a fractional `Amount` is refused and the balance can never go below zero. A path that names no declared field returns `(false, "invalid cost path")` rather than debiting somewhere unexpected. A path that names a field which exists but is not a spendable number -- a `Scribe.Big`, a string, an enum, a container -- is refused too, with `(false, "cost path is not a spendable number")`, so the two mistakes do not read the same. `Scribe.Big` is the one worth calling out: it holds a balance, but `Cost` does plain arithmetic on a plain number, so a Big field cannot be spent from directly.
 
-### Reacting to gifts
+`Cost.Path` may also point into a typed container, such as a `Scribe.DictOf` key like `"Wallet.Gold"`, and the element's own `Min` floor and int rule apply to the debit exactly as a plain currency field's would. A dictionary accepts any key, though, so a typo there does **not** report an invalid cost path: `"Wallet.Glod"` resolves, spends the element default as a balance nobody granted, and leaves the phantom key behind. Point costs at declared fields unless the currency set is genuinely open-ended.
 
-Delivery can happen on another server, or out of the offline mailbox on the recipient's next join, so a signal is the only correct way to react to one.
+Notice the grant uses a whole-element `Set` rather than `data.Inventory.EmberLantern.Qty.Increment(1)`. Both work, but `Set` states plainly that a new element is being created, and it keeps the seeded-element warning below quiet.
+
+:::danger A grant that writes through an unresolved key takes the Robux and delivers nothing
+
+A container key that names no element is **created** by a write rather than refused. So the obvious way to write an upgrade grant succeeds end to end, even when `itemId` names nothing the player owns:
 
 ```lua
--- server, on the RECIPIENT: the only place the sender and gift id are available
-Data.OnGiftReceived:Connect(function(player, info)
-    -- info = { FromUserId, Product, GiftId }
-    announce(player, `a gift from {info.FromUserId}!`)
-end)
-
--- server, on the BUYER: their purchase became a re-aimable credit
-Data.OnGiftCredit:Connect(function(player, productName)
-    showToast(player, `your {productName} gift is unclaimed, pick someone else`)
-end)
+-- itemId came from the shop UI, so the player chose it
+Grant = function(data)
+    data.Inventory[itemId].Qty.Increment(1) -- no error, ever
+end,
 ```
 
-For a plain "do they own VIP now" reaction, don't use `OnGiftReceived`: [`OnOwnershipChanged` / `ObserveOwned`](#reacting-to-ownership-changes) already cover gift deliveries alongside purchases and grants, and fire whatever the delivery route was.
+The element materialises from its declared defaults, the transaction commits, the profile saves, and the purchase reports success. The player paid, and the item sits on a key no UI will ever show.
 
-To show the pending balance, read [`Data.GetGiftCredits(player)`](/api/Server#GetGiftCredits) on the server or [`Data.GetGiftCredits()`](/api/Client#GetGiftCredits) on the client. Both return a `{ [productName]: count }` map, and credits replicate to their owner by default, so a client gift UI needs no opt-in.
+Resolve the id before you spend it. A `Grant` that throws is rolled back in full, so the coins stay in the player's pocket:
 
-## Purchase logs
+```lua
+Grant = function(data)
+    if data.Inventory[itemId].Qty.Get() == nil then
+        error(`Emberfall: no inventory entry "{itemId}" to upgrade`)
+    end
+    data.Inventory[itemId].Qty.Increment(1)
+end,
+```
 
-Two capped logs live per player: `Robux` (written only by Scribe, from the receipt path and from completed game pass purchases; game code can't forge entries) and `InGame` (yours, via [`RecordPurchase`](/api/Server#RecordPurchase)). Query with [`GetPurchases`](/api/Server#GetPurchases). Both are **server-only by default**, and each opts in **separately**: `PurchaseLog = { ReplicateRobux = true, ReplicateInGame = true }`. A client purchase-history UI usually wants both, since `ReplicateRobux` alone sends Robux receipts and leaves out every entry written by `RecordPurchase` and by soft-currency [`Purchase`](/api/Server#Purchase).
+`Get()` on an unwritten key is `nil` and reading never creates the key, so the check costs nothing. The rule generalises: inside a `Grant`, treat any id that came from a client or from stored data as unresolved until you have checked it. On the receipt path the same mistake costs Robux instead of coins, and the receipt still settles as `PurchaseGranted`.
+
+In DevMode Scribe warns about the first shape with [`GRANT_SEEDED_ELEMENT`](./log-codes#monetization), naming the product and the path. It is a warning and not a refusal because Scribe cannot tell a dangling id from one you just minted.
+:::
+
+### Making a purchase idempotent
+
+A double-clicked button, a re-fired RemoteEvent, or a client that reconnected mid-request will debit twice. Pass an `IdempotencyKey` and the repeat is free:
+
+```lua
+Data.Purchase(player, {
+    Cost = { Path = "Coins", Amount = 250 },
+    Category = "Item",
+    ItemId = "EmberLantern",
+    IdempotencyKey = `buy:{orderId}`,   -- your id for this one intent
+    Grant = function(data)
+        data.Inventory.EmberLantern.Set({ Qty = 1, Rarity = "Rare" })
+    end,
+})
+```
+
+A repeat under the same key returns exactly what the first call returned and spends nothing. The caller needs no special case: the "this was a duplicate" signal goes to the `PURCHASE_DUPLICATE` log code and the `PurchasesDuplicate` counter, not into the return value. The key is up to 64 bytes of valid UTF-8, and it is yours to choose. Anything stable for one intent and unique across intents will do.
+
+The claim is persisted, so it survives a rejoin, and it is taken inside the transaction, so a `Grant` that throws rolls the claim back and a genuine retry still works.
+
+??? note "What the claims cost, and the two knobs that bound it"
+    Two options under [Configuration](./configuration) govern how long the bookkeeping lives.
+
+    `PurchaseClaimTTL` is how long a claim is remembered. It defaults to `PurchaseIdTTL`, seven days, which is generous: that figure is sized for Roblox's receipt retry window, while your own retry window is usually seconds. Shorten it if you make a lot of keyed purchases.
+
+    `MaxPurchaseClaims` caps live claims per profile at 1000. Claims expire on their own, so this only matters for a player buying faster than the TTL drains. Reaching it drops the claim nearest to expiring and logs `PURCHASE_CLAIM_EVICTED`, because a dropped claim means a retry can apply that purchase a second time. If you see it, shorten the TTL rather than raising the cap.
+
+    Claims live in Scribe's own reserved namespace, so they never appear in [`OnCooldownEnded`](/api/Server#OnCooldownEnded) and cannot be cleared with `ClearCooldown`.
+
+### Reading the refusal
+
+`Purchase` returns `(false, reason)` for six fixed refusals, and Scribe exports them as a frozen table so you can branch on them without pasting strings:
+
+| `Scribe.PurchaseReason` member | The string |
+| --- | --- |
+| `DataNotLoaded` | `"player data not loaded"` |
+| `InvalidCostSpec` | `"invalid Cost spec"` |
+| `InvalidCostAmount` | `"invalid Cost amount"` |
+| `InvalidCostPath` | `"invalid cost path"` |
+| `CostPathNotSpendable` | `"cost path is not a spendable number"` |
+| `InsufficientFunds` | `"insufficient funds"` |
+
+```lua
+local ok, reason = Data.Purchase(player, spec)
+if not ok then
+    if reason == Scribe.PurchaseReason.InsufficientFunds then
+        openCoinShop(player)
+    else
+        warn(`Emberfall shop refused a purchase: {reason}`)
+    end
+end
+```
+
+Anything outside that table is your `Grant`'s own error text passing through, which means the grant threw. The five refusals other than `InsufficientFunds` are bugs in your call site, so treat them as something to fix rather than something to show a player.
+
+## Purchase history
+
+Every player carries two capped logs. The `Robux` log is written only by Scribe, from the receipt path and from completed pass purchases, so game code cannot forge an entry. The `InGame` log is yours, and `Data.Purchase` writes into it automatically.
+
+Add your own entries for anything Scribe did not process, such as a quest reward or a trade:
+
+```lua
+Data.RecordPurchase(player, {
+    Category = "Quest",
+    ItemId = "EmberLantern",
+    Currency = "Coins",
+    Amount = 0,
+    Meta = { Quest = "TheFirstEmber" },
+})
+```
+
+The entry table is yours to shape. Scribe stamps `Ts` for you if you leave it out, and in DevMode it warns with `UNDECLARED_CATEGORY` when `Category` is not in `PurchaseLog.PurchaseLogCategories`, if you declared that list.
+
+Read both logs back with [`GetPurchases`](/api/Server#GetPurchases), newest first:
+
+```lua
+for _, record in Data.GetPurchases(player, { Kind = "Robux", Limit = 10 }) do
+    print(record.Ts, record.Product, record.PriceInRobux)
+end
+```
+
+The filter accepts `Kind`, `Category`, `ItemId`, `Since` and `Limit`, and it is exported as `Scribe.PurchaseFilter`. Every record carries a `Kind` field of `"Robux"` or `"InGame"` so you can render one mixed list.
+
+??? note "Showing purchase history to the player"
+    Both logs are server-only by default, and each opts in separately:
+
+    ```lua
+    PurchaseLog = { ReplicateRobux = true, ReplicateInGame = true },
+    ```
+
+    A client history UI usually wants both. `ReplicateRobux` on its own sends the Robux receipts and leaves out every entry written by `RecordPurchase` and by soft-currency `Purchase`, which is most of what an Emberfall player did.
+
+    `RobuxCap` and `InGameCap` bound each ring at 100 entries by default, oldest dropped.
+
+## If your game already handles receipts
+
+:::caution Roblox allows exactly one `ProcessReceipt` callback
+Scribe installs its own the moment a server script requires the shared module, whenever you have declared any `Products`. That **silently overrides a receipt handler your game already had**. A pass-only or data-only game is left alone, and a second Scribe bundle errors loudly at startup instead. Assignment order is not a safe fix either: a handler your game assigns afterwards silently wins, and every Scribe product goes dark with no warning.
+:::
+
+You have two ways out, and the first is usually better.
+
+**Let Scribe take over.** Move your developer products into `Products`, your passes into `Passes`, and your gifting into [`PromptGift`](/api/Server#PromptGift). Scribe's receipt path already survives cross-server hops and offline recipients, which is genuinely hard to get right by hand.
+
+**Keep your own handler.** Set `OwnReceipts = false` and call [`TryHandleReceipt`](/api/Server#TryHandleReceipt) from your callback. It returns a decision for a Scribe product and `nil` for anything else, so you fall through to your own handling without maintaining a second list of product ids:
+
+```lua
+MarketplaceService.ProcessReceipt = function(receiptInfo)
+    local decision = Data.TryHandleReceipt(receiptInfo)
+    if decision then
+        return decision
+    end
+    return myOwnHandler(receiptInfo)
+end
+```
+
+If you set `OwnReceipts = false` and then never route receipts to Scribe, everything on the receipt path goes dark: developer-product grants, gift delivery, and receipt-driven Robux log entries. Perks, pass ownership and soft-currency `Purchase` keep working, because none of those touch receipts.
+
+??? note "When to use `HandleReceipt` instead"
+    [`HandleReceipt`](/api/Server#HandleReceipt) is the stricter variant. It answers `NotProcessedYet` for an unknown product rather than `nil`, which is right when Scribe owns the callback but would stall one of *your* purchases in a permanent retry loop if you routed everything through it.
+
+    Call it yourself only when Scribe is the **last** handler in your chain. That is exactly what the second-bundle startup error asks for: set `OwnReceipts = false` on the secondary bundle and route its receipts through `HandleReceipt`.
+
+??? note "Why a receipt sometimes waits for the player's next session"
+    Receipts are idempotent by `PurchaseId` and fail-closed. `PurchaseGranted` is returned only after the grant is durably committed, and `NotProcessedYet` otherwise, so Roblox retries.
+
+    That same rule handles a buyer who left between paying and the receipt arriving, and the product's shape decides how fast delivery is. A perk-only product (`Grants` with no `Grant`) commits against the offline profile and delivers straight away. A `Grant` callback needs a live accessor tree, so for an offline buyer Scribe answers `NotProcessedYet` and waits for Roblox to retry, which may not be until that player's next session.
+
+    Nothing is lost either way. Prefer a perk when delivery timing matters.
+
+## Where to next
+
+- [Gifting](./gifting) for sending a product to another player, including one who is offline.
+- [Economy Analytics](./economy) for getting these purchases onto Roblox's economy dashboard.
+- [Cross-Key Transactions](./transactions) for a trade that has to move value between two players at once.
+- [Configuration](./configuration) for the full list of monetization and gifting options.
+- [Log Code Reference](./log-codes#monetization) for every code the receipt path can emit.

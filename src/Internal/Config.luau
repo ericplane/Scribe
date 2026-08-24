@@ -2,10 +2,9 @@
 -- Process-scoped configuration.
 --
 -- ProfileStore's AUTO_SAVE_PERIOD is a module-wide constant, not a per-store one,
--- so the autosave cadence belongs to the PROCESS rather than to any one Scribe
--- bundle. Keeping the resolved value here (instead of only inside a bundle's
--- options) is what lets Scribe notice that two bundles asked for different
--- cadences, which previously resolved as a silent last-writer-wins.
+-- so the autosave cadence belongs to the process rather than to any one bundle.
+-- Keeping the resolved value here is what lets Scribe notice two bundles asking
+-- for different cadences instead of silently taking the last.
 
 local Config = {}
 

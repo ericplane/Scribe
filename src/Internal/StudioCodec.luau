@@ -6,9 +6,8 @@
 -- cross-VM reflection can carry.
 --
 -- Shared by the server hook (Server/DebugHook.luau) and the client hook
--- (Client/DebugHook.luau). Byte-compatible with the Scribe Studio plugin's
--- copy (src/Codec.luau) and versioned by the hooks' PROTOCOL_VERSIONs —
--- change them together.
+-- (Client/DebugHook.luau). Byte-compatible with the Scribe Studio plugin's copy
+-- (src/Codec.luau) and versioned by the hooks' PROTOCOL_VERSIONs; change together.
 
 local StudioCodec = {}
 
@@ -18,7 +17,7 @@ local function encodeNumber(n: number): string
 	elseif n == math.huge then
 		return "N+"
 	elseif n == -math.huge then
-		-- "~" — a "-" sentinel would collide with negative number literals.
+		-- A "-" sentinel would collide with negative number literals.
 		return "N~"
 	elseif n % 1 == 0 and math.abs(n) < 2 ^ 53 then
 		return `I{n};`

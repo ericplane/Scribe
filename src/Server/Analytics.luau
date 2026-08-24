@@ -82,9 +82,8 @@ function Analytics.new(ctx: any)
 		slotKeys[i] = (Enum.AnalyticsCustomFieldKeys :: any)[string.format("CustomField%02d", i)].Name
 	end
 
-	-- Precompile each currency's ordered {Name, Prefix} slot specs (capped at the
-	-- 3 hard Roblox slots), a declared-name set for typo warnings, the optional
-	-- label override, and the optional currency-specific resolver.
+	-- Precompile each currency's ordered slot specs (capped at the Roblox slots), a
+	-- declared-name set for typo warnings, and its label and resolver overrides.
 	local currencies: { [string]: Currency } = {}
 	for name, raw in (economy.Currencies or {}) :: { [string]: any } do
 		local fields: { FieldSpec } = {}
@@ -190,12 +189,9 @@ function Analytics.new(ctx: any)
 		-- caller-supplied Currency is the value that threw.
 		local currencyLabel = fieldName
 
-		-- FORMAT every caller-supplied value, build the custom fields, AND log inside
-		-- one guard. Formatting a user-supplied value (a `__tostring` that throws, a
-		-- resolver whose returned table has a throwing `__iter`) must never escape into
-		-- the Increment/Decrement caller and abort gameplay after the write already
-		-- applied. Currency, TransactionType, Source, ItemSku, and Item are all
-		-- caller-supplied, so their tostring calls belong inside the guard too.
+		-- Formatting, field building and the log all sit inside one guard: every value
+		-- here is caller-supplied, and a throwing `__tostring` or `__iter` must not
+		-- escape into the Increment/Decrement caller after the write already applied.
 		local ok, err = pcall(function()
 			currencyLabel = tostring(tags.Currency or (currency and currency.Label) or fieldName)
 			local transactionType = txnName(if tags.TransactionType ~= nil then tags.TransactionType else tags.Source)
@@ -216,9 +212,8 @@ function Analytics.new(ctx: any)
 		if ok then
 			Metrics.Add("EconomyEvents") -- count successes, not attempts
 		else
-			-- A systematically failing analytics pipeline is a system fault, not
-			-- routine noise: surface a failure counter (Debug logs are suppressed
-			-- in production) so operators can see the dashboards go dark.
+			-- Debug logs are suppressed in production, so the counter is what makes a
+			-- systematically failing pipeline visible.
 			Metrics.Add("EconomyEventFailures")
 			Log.Debug("Integrity", "ANALYTICS_FAIL", tostring(err), { Player = player, Currency = currencyLabel })
 		end

@@ -142,7 +142,7 @@ return function()
 		expect(reason).to.equal(nil)
 	end)
 
-	it("WaitForData honors its timeout for a player with no session", function()
+	it("WaitForData reports timeout for a player Scribe has no session for", function()
 		local FakePlayer = require(Root.Test.Helpers.FakePlayer)
 		local player = FakePlayer.new() -- never passed to OnPlayerAdded: no entry
 		local startedAt = os.clock()
@@ -152,7 +152,7 @@ return function()
 		expect(os.clock() - startedAt < 5).to.equal(true)
 	end)
 
-	it("WaitForData honors its timeout while an entry is stuck Loading (Wait policy)", function()
+	it("WaitForData reports still-loading while an entry is stuck Loading (Wait policy)", function()
 		local waitHarness = TestCtx.make({ Options = { LoadFailurePolicy = "Wait" } })
 		waitHarness.Fake.FailNextLoad = true
 		local FakePlayer = require(Root.Test.Helpers.FakePlayer)
@@ -165,7 +165,9 @@ return function()
 		local startedAt = os.clock()
 		local data, reason = waitHarness.Ctx.Persistence.WaitForData(player, 0.25)
 		expect(data).to.equal(nil)
-		expect(reason).to.equal("timeout")
+		-- Not "timeout": the load is still in flight and will very likely succeed.
+		-- The wait is still bounded -- that is the point of the assertion below.
+		expect(reason).to.equal("still-loading")
 		expect(os.clock() - startedAt < 5).to.equal(true)
 		FakePlayer.leave(player) -- the retry tears the entry down when it wakes
 	end)
@@ -173,7 +175,13 @@ return function()
 	it("Flush honors a custom Timeout when the save never confirms", function()
 		local player, entry = harness.Join()
 		-- A save that neither confirms nor errors: AwaitSave can only time out.
-		entry.Profile.Save = function() end
+		-- SaveAwait, not Save -- AwaitSave asks the store for this call's outcome now
+		-- rather than watching OnAfterSave, so stubbing Save would leave the real
+		-- SaveAwait running and the wait would be answered normally.
+		entry.Profile.SaveAwait = function()
+			coroutine.yield() -- never returns, never errors
+			return "Saved", {}
+		end
 		local startedAt = os.clock()
 		expect(harness.Data.Flush(player, { Timeout = 0.2 })).to.equal(false)
 		expect(os.clock() - startedAt < 5).to.equal(true)

@@ -36,3 +36,16 @@ globals:
   expect:
     args:
       - type: "..."
+  # Handed down by lune/run-tests.luau so test/Sim can load modules outside the
+  # harness cache (each simulated server needs its own copy of every module).
+  # Declared here rather than made a real global: it exists only under the
+  # headless runner, and nothing in src/ may touch it.
+  __SimHost:
+    property: read-only
+  # Wildcard: the escape hatch grows as the simulation needs more from the host,
+  # and enumerating its fields here would mean two places to update for every one.
+  __SimHost.*:
+    property: read-only
+  # Env is a plain map of process variables, so its keys are arbitrary too.
+  __SimHost.Env.*:
+    property: read-only

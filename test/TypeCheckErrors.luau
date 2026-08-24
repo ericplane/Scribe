@@ -4,7 +4,7 @@
 -- exactly EXPECTED_ERRORS diagnostics — if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
--- EXPECTED_ERRORS: 26
+-- EXPECTED_ERRORS: 27
 
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -87,6 +87,9 @@ local badLog = Scribe.GetRecentLogs({ Code = "NOT_A_REAL_CODE" }) -- TypeError: 
 local function badTypedApis(player: Player)
 	-- 10) Command's 2nd arg must be a spec table or a handler function.
 	Data.Command("X", 123) -- TypeError: 123 is neither a spec nor a handler
+	-- 10b) Idempotent is a boolean. A truthy string would opt the command IN at the
+	-- call site and OUT of the `== true` check, so commands would silently run twice.
+	Data.Command("Y", { Idempotent = "yes" }, function(_p: Player) end) -- TypeError: string vs boolean?
 	-- 11) GetPurchases filter Kind must be "Robux" | "InGame".
 	Data.GetPurchases(player, { Kind = "Bitcoin" }) -- TypeError: Kind not "Robux" | "InGame"
 	-- 12) SendMessage's userId must be a number.

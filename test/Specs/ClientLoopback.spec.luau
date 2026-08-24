@@ -592,6 +592,7 @@ return function()
 			Wire.U32(w, 1) -- correlation
 			Wire.Str(w, "Ping")
 			Wire.U8(w, 1) -- argc
+			Wire.Str(w, "") -- no idempotency key
 			Wire.U8(w, 200) -- not a generic tag
 			return Wire.Finish(w)
 		end
@@ -629,6 +630,61 @@ return function()
 		expect(os.clock() - started >= 0.2).to.equal(true)
 
 		harness.Transport.AutoPump = true
+		harness.Cleanup()
+	end)
+
+	itRunning("tells its own refusal apart from a handler that returns the same two values", function()
+		-- The collision, and then the discriminator.
+		--
+		-- Every framework refusal resolves as (false, sentinel). A handler's return
+		-- values are passed through VERBATIM, so a handler that returns
+		-- `false, "timeout"` hands the caller two values byte-identical to Scribe's
+		-- own timeout -- with the reply frame's `ok` byte, which already carries the
+		-- answer, decoded on the client and then thrown away.
+		--
+		-- The third return is a frozen table Scribe owns. Identity is the whole
+		-- point: a handler's values cross the wire, Wire.EncodeGeneric serialises
+		-- tables BY VALUE, so no server-side value can decode to this reference.
+		local harness, _, _, _, clientData = makeLoopback()
+
+		harness.Data.Command("Impostor", nil, function()
+			-- A handler deliberately returning Scribe's own sentinel, plus a table
+			-- of its own in the third slot -- the closest a handler can get.
+			return false, "timeout", { NotTheMarker = true }
+		end)
+
+		local hOk, hReason, hThird = clientData.Request("Impostor")
+		-- Unchanged: the handler's values still arrive verbatim, all three of them.
+		expect(`ok={hOk} reason={hReason} third={typeof(hThird)}`).to.equal("ok=false reason=timeout third=table")
+		-- ...and it is NOT the marker, because it came over the wire.
+		expect(hThird == Scribe.RequestFailed).to.equal(false)
+
+		-- A real framework refusal, same two leading values.
+		local fOk, fReason, fThird = clientData.Request("NoSuchCommandAtAll")
+		expect(`ok={fOk} reason={fReason}`).to.equal("ok=false reason=unknown-command")
+		expect(`{typeof(fThird)}/{fThird == Scribe.RequestFailed}`).to.equal("table/true")
+
+		-- The marker is frozen and module-owned, so a consumer cannot corrupt it for
+		-- everyone, and it is the SAME reference on both refusal shapes.
+		expect(table.isfrozen(Scribe.RequestFailed)).to.equal(true)
+
+		harness.Cleanup()
+	end)
+
+	itRunning("marks the four client-local refusals too, where there is no reply frame", function()
+		-- timeout, send-failed, edit-mode and mock-error are synthesised on the
+		-- client with no frame in hand, so they have no `ok` byte to read. They are
+		-- framework refusals all the same and must carry the marker, or a caller
+		-- that trusts it learns the wrong thing on the paths most likely to fire.
+		local harness, _, _, _, clientData = makeLoopback()
+		harness.Transport.AutoPump = false -- swallow the command frame
+
+		local ok, reason, third = clientData.Request("Anything")
+		harness.Transport.AutoPump = true
+
+		expect(`ok={ok} reason={reason} marked={typeof(third)}/{third == Scribe.RequestFailed}`).to.equal(
+			"ok=false reason=timeout marked=table/true"
+		)
 		harness.Cleanup()
 	end)
 
@@ -677,5 +733,49 @@ return function()
 		expect(last.Shared.Pub.Title).to.equal("HelloFromB")
 
 		harness.Cleanup()
+	end)
+	itRunning("a rolled-back transaction corrects a client that wrote optimistically", function()
+		-- Pins the rollback restore's EMISSION -- `applySet(..., { NoValidate = true })`
+		-- in Node's rollback path, with no NoOp. Re-adding NoOp was a surviving
+		-- mutation: it left 1345/0.
+		--
+		-- Node argues its own case beside that call ("Suppressing them (the old NoOp)
+		-- left the client holding the listener's value while the server kept the
+		-- restore: a silent mirror divergence") and nothing enforced it.
+		--
+		-- The shape that makes it load-bearing is the optimistic-UI contract, not a
+		-- listener: a client's own Set is LOCAL ONLY, and server ops always win, so a
+		-- server op for that path is the only thing that can ever put the mirror back.
+		-- A transaction that touches the path and then rolls back emits exactly one --
+		-- and suppressing it leaves the client permanently wrong about a value the
+		-- server never agreed to.
+		local harness, player, _entry, serverData, clientData = makeLoopback()
+
+		serverData.Coins.Set(100)
+		harness.Step()
+		expect(clientData.Coins.Get()).to.equal(100)
+
+		-- The client predicts a purchase locally. Nothing is sent; the server has
+		-- never heard of 500.
+		clientData.Coins.Set(500)
+		expect(clientData.Coins.Get()).to.equal(500)
+
+		-- The server attempts the same change and aborts. The rollback restores 100 --
+		-- the value the mirror ALREADY had before the client's prediction, so the
+		-- restore is a no-op on the server and the only thing it can possibly be for
+		-- is the client.
+		local ok = harness.Data.Transaction(player, function()
+			serverData.Coins.Set(999)
+			error("aborted")
+		end)
+		harness.Step()
+
+		-- Read, then tear down, then assert. A failing assertion here would otherwise
+		-- skip Cleanup and leave a live entry for the rest of the run to trip over --
+		-- which it did: the first version of this test made FlushCost fail as
+		-- collateral whenever the mutation it pins was applied.
+		local summary = `txnOk={tostring(ok)} server={serverData.Coins.Get()} client={clientData.Coins.Get()}`
+		harness.Cleanup()
+		expect(summary).to.equal("txnOk=false server=100 client=100")
 	end)
 end

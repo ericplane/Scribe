@@ -14,9 +14,6 @@
         },
         "DevPackages": {
           "$path": "DevPackages"
-        },
-        "ServerPackages": {
-          "$path": "ServerPackages"
         }
       }
     },

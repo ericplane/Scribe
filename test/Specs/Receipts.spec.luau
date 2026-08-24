@@ -33,7 +33,12 @@ return function()
 		for key, value in extraOptions or {} do
 			options[key] = value
 		end
-		return TestCtx.make({ Options = options })
+		local make: { [string]: any } = { Options = options }
+		if extraOptions and extraOptions.Fake then
+			make.Fake = extraOptions.Fake
+			options.Fake = nil
+		end
+		return TestCtx.make(make)
 	end
 
 	-- The dedupe ring stores `{ Id, At }`, and still has to read bare strings
@@ -56,6 +61,157 @@ return function()
 			PlaceIdWherePurchased = 0,
 		}
 	end
+
+	it("grants an offline receipt once when another server commits between the two reads", function()
+		-- The offline path decides from a GetOffline snapshot and then commits through
+		-- UpdateOffline, which takes its OWN read inside the compare-and-set. Two
+		-- reads, and the ordering that bites is the one in between:
+		--
+		--   B reads to decide      -> no marker, so B will grant
+		--   A grants and commits   -> marker written, fingerprint moved
+		--   B reads to commit      -> the marker IS in B's draft, and the fingerprint
+		--                             B compares against is the FRESH one, so the CAS
+		--                             passes and B grants again
+		--
+		-- The compare-and-set cannot catch this: B's fingerprint is current by the
+		-- time it commits. Only re-reading the dedupe marker INSIDE the transaction
+		-- can. (The other ordering -- B taking its commit read BEFORE A lands -- IS
+		-- caught by the CAS, refuses, and Roblox retries into the snapshot check.)
+		--
+		-- The second grant is not a second perk: the in-transaction check that DOES
+		-- exist sees the perk already set and mints a GIFT CREDIT instead. So the
+		-- damage is a credit the player never paid for, which is what this asserts.
+		--
+		-- Only a perk product is expressible offline at all -- a Grant callback needs
+		-- a live accessor tree -- so 222 rather than 111.
+		local FakeProfileStore = require(Root.Test.Helpers.FakeProfileStore)
+		local fake = FakeProfileStore.new()
+		local a = makeHarness({ Fake = fake })
+		local b = makeHarness({ Fake = fake })
+
+		local seeded = a.Join(70013)
+		a.Data.Flush(seeded)
+		a.Leave(seeded)
+
+		local reads = 0
+		fake.MidRead = function()
+			reads += 1
+			if reads == 2 then
+				-- B is about to take its COMMIT read. A's whole receipt lands first.
+				fake.MidRead = nil
+				a.Data.HandleReceipt(receipt(70013, 222, "pid-offline-race"))
+			end
+		end
+		local decision = b.Data.HandleReceipt(receipt(70013, 222, "pid-offline-race"))
+		fake.MidRead = nil
+
+		local reserved = fake.Persisted["Default/PLAYER_70013"]._Scribe
+		local credits = 0
+		for _, n in reserved.GiftCredits or {} do
+			credits += tonumber(n) or 0
+		end
+		local markers = 0
+		for _, id in processedIds(reserved.ProcessedPurchaseIds) do
+			if id == "pid-offline-race" then
+				markers += 1
+			end
+		end
+
+		expect(`granted={decision == GRANTED} credits={credits} markers={markers}`).to.equal(
+			"granted=true credits=0 markers=1"
+		)
+
+		b.Cleanup()
+		a.Cleanup()
+	end)
+
+	-- The same race, on the two GIFT commit closures. The test above drives only the
+	-- PERK closure -- a gift needs a live intent, which it never creates -- so
+	-- dropping the re-check from either gift closure alone left the suite green.
+	-- Measured, both individually: 1351/0.
+	--
+	-- Shared setup: the buyer creates a live gift intent and then LEAVES, so the
+	-- receipt arrives on the offline path with an intent waiting for it.
+	local function offlineGiftRace(purchaseId: string, buyerId: number, recipientId: number, seedRecipient: boolean?)
+		local FakeProfileStore = require(Root.Test.Helpers.FakeProfileStore)
+		local fake = FakeProfileStore.new()
+		local a = makeHarness({ Fake = fake })
+		local b = makeHarness({ Fake = fake })
+
+		local buyer = a.Join(buyerId)
+		if a.Data.PromptGift(buyer, "GiftVIP", recipientId) ~= true then
+			error("offlineGiftRace: PromptGift did not create an intent", 2)
+		end
+		a.Data.Flush(buyer)
+		a.Leave(buyer)
+
+		if seedRecipient then
+			-- The recipient acquires the perk AFTER the intent exists -- which is the
+			-- only order that reaches the already-owns branch, because PromptGift
+			-- refuses to create an intent for something the recipient already has.
+			local recipient = a.Join(recipientId)
+			a.Data.HandleReceipt(receipt(recipientId, 222, `{purchaseId}-seed`))
+			a.Data.Flush(recipient)
+			a.Leave(recipient)
+		end
+
+		-- Fire A's identical receipt on B's COMMIT read of the buyer's key -- the one
+		-- ordering the compare-and-set cannot catch, because by then B's fingerprint
+		-- is the fresh one.
+		local key = `PLAYER_{buyerId}`
+		local reads = 0
+		fake.MidRead = function(profileKey: string)
+			if profileKey ~= key then
+				return
+			end
+			reads += 1
+			if reads == 2 then
+				fake.MidRead = nil
+				a.Data.HandleReceipt(receipt(buyerId, 222, purchaseId))
+			end
+		end
+		local decision = b.Data.HandleReceipt(receipt(buyerId, 222, purchaseId))
+		fake.MidRead = nil
+
+		local reserved = fake.Persisted[`Default/PLAYER_{buyerId}`]._Scribe
+		local markers = 0
+		for _, id in processedIds(reserved.ProcessedPurchaseIds) do
+			if id == purchaseId then
+				markers += 1
+			end
+		end
+		local credits = 0
+		for _, n in reserved.GiftCredits or {} do
+			credits += tonumber(n) or 0
+		end
+		local sends = 0
+		for _, line in reserved.PurchaseLogs and reserved.PurchaseLogs.Robux or {} do
+			if line.PurchaseId == purchaseId then
+				sends += 1
+			end
+		end
+		b.Cleanup()
+		a.Cleanup()
+		return decision, markers, credits, sends
+	end
+
+	it("grants an offline GIFT receipt once when another server commits between the two reads", function()
+		-- Pins the in-transaction re-check in the gift DELIVERY closure.
+		local decision, markers, credits, sends = offlineGiftRace("pid-gift-race", 70021, 70022)
+		expect(`granted={decision == GRANTED} markers={markers} credits={credits} logged={sends}`).to.equal(
+			"granted=true markers=1 credits=0 logged=1"
+		)
+	end)
+
+	it("mints one gift credit, not two, when the recipient already owns it and two servers race", function()
+		-- Pins the in-transaction re-check in the already-owns closure. Without it the
+		-- buyer is handed a second credit they never paid for -- the same damage the
+		-- perk-path test above measures, on a different closure.
+		local decision, markers, credits, sends = offlineGiftRace("pid-owned-race", 70031, 70032, true)
+		expect(`granted={decision == GRANTED} markers={markers} credits={credits} logged={sends}`).to.equal(
+			"granted=true markers=1 credits=1 logged=1"
+		)
+	end)
 
 	it("TryHandleReceipt falls through on an unknown product, HandleReceipt does not", function()
 		local harness = makeHarness({ OwnReceipts = false })
@@ -452,6 +608,81 @@ return function()
 		task.wait()
 		expect(creditEvent).to.be.ok()
 		expect(creditEvent.Product).to.equal("GiftVIP")
+
+		harness.Cleanup()
+	end)
+
+	it("keeps a paid gift retryable when the recipient's message queue is full", function()
+		-- The escrow protocol's whole point, and the half that was broken: delivery to
+		-- an offline recipient goes through MessageAsync, which used to answer TRUE
+		-- after silently dropping the recipient's OLDEST queued message. deliverGift
+		-- treats that true as durable and CLEARS the buyer's escrow intent -- so a
+		-- gift the player paid Robux for was destroyed, with nothing anywhere
+		-- recording it.
+		--
+		-- The brief asks for this to be verified rather than assumed, so it is: the
+		-- intent must SURVIVE the refusal, the receipt must answer NotProcessedYet
+		-- (which is what makes Roblox retry -- `Monetization.OnLoad` only EXPIRES
+		-- intents, it does not re-send), and the retry must then deliver.
+		local harness = makeHarness()
+		harness.Fake.Constants.MAX_MESSAGE_QUEUE = 1
+
+		local buyer = harness.Join(4501)
+		expect(harness.Data.PromptGift(buyer, "GiftVIP", 4502)).to.equal(true)
+
+		-- Fill the (offline) recipient's inbox to the cap with something else.
+		expect(harness.Data.SendMessage(4502, { Kind = "Filler" })).to.equal(true)
+		expect(harness.Data.SendMessage(4502, { Kind = "Overflow" })).to.equal(false)
+
+		local refused = harness.Data.HandleReceipt(receipt(4501, 222, "gift-queue-full"))
+		local escrow = harness.Ctx.Persistence.EntryForUserId(4501).LiveData._Scribe.PendingGifts["222"]
+		expect(`decision={refused == NOT_PROCESSED} escrowKept={escrow ~= nil}`).to.equal(
+			"decision=true escrowKept=true"
+		)
+
+		-- The inbox drains, and Roblox retries the same receipt.
+		harness.Fake.Mailboxes["Default/PLAYER_4502"] = {}
+		local retried = harness.Data.HandleReceipt(receipt(4501, 222, "gift-queue-full"))
+		local mailbox = harness.Fake.Mailboxes["Default/PLAYER_4502"] or {}
+		local escrowAfter = harness.Ctx.Persistence.EntryForUserId(4501).LiveData._Scribe.PendingGifts["222"]
+		expect(
+			`decision={retried == GRANTED} queued={#mailbox} isGift={mailbox[1] ~= nil and mailbox[1].ScribeGift == true} `
+				.. `escrowCleared={escrowAfter == nil}`
+		).to.equal("decision=true queued=1 isGift=true escrowCleared=true")
+
+		harness.Cleanup()
+	end)
+
+	it("does not degrade service health when a recipient's queue is full", function()
+		-- A full inbox belongs to ONE player's profile; it is not a DataStore fault.
+		-- Reporting it through Failure.Report would call Health.ReportFailure, and a
+		-- server pushed to Outage refuses every Robux grant -- including the retry
+		-- that is the only thing that ever delivers the blocked gift. Persistence
+		-- draws the same line with updateOfflineProfile's `dataStoreFailed` return.
+		local Health = require(Root.Scribe.Internal.Health)
+		local harness = makeHarness()
+		harness.Fake.Constants.MAX_MESSAGE_QUEUE = 1
+
+		expect(harness.Data.SendMessage(5601, { Kind = "Filler" })).to.equal(true)
+		local before = Health.GetStatus()
+		local failuresBefore = Scribe.GetMetrics().HealthFailures or 0
+
+		-- Enough refusals to cross any reasonable failure threshold.
+		local refusals = 0
+		for _ = 1, 12 do
+			if harness.Data.SendMessage(5601, { Kind = "Overflow" }) == false then
+				refusals += 1
+			end
+		end
+		local buyer = harness.Join(5602)
+		expect(harness.Data.PromptGift(buyer, "GiftVIP", 5601)).to.equal(true)
+		expect(harness.Data.HandleReceipt(receipt(5602, 222, "gift-health"))).to.equal(NOT_PROCESSED)
+
+		expect(
+			`refusals={refusals} status={Health.GetStatus()} was={before} `
+				.. `healthFailures={(Scribe.GetMetrics().HealthFailures or 0) - failuresBefore} `
+				.. `queueFull={(Scribe.GetMetrics().MessageQueueFull or 0) > 0}`
+		).to.equal("refusals=12 status=Healthy was=Healthy healthFailures=0 queueFull=true")
 
 		harness.Cleanup()
 	end)

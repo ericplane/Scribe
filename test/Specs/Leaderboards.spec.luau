@@ -115,6 +115,41 @@ return function()
 		harness.Cleanup()
 	end)
 
+	it("resends a board the transport refused, instead of recording it as delivered", function()
+		-- SentState is broadcastBoard's dedup key: it records what each client was
+		-- last SENT, and a board is only re-sent when the signature or that client's
+		-- own rank/score differs from it. Stamping it for a frame the transport
+		-- REFUSED therefore made the refusal permanent -- the client sat on whatever
+		-- board it had until the content changed again, which on a quiet leaderboard
+		-- can be never.
+		local harness = makeHarness()
+		local player, _, data = harness.Join(8009)
+		data.Coins.Set(100)
+		harness.Ctx.Leaderboards.FlushAllBlocking(1)
+		harness.SendHello(player)
+		harness.Ctx.Leaderboards.RefreshNow()
+		local baseline = #boardFrames(harness, player)
+
+		-- One refused refresh cycle...
+		local real = harness.Transport.SendToClient
+		harness.Transport.SendToClient = function()
+			error("transport adapter: refused", 0)
+		end
+		data.Coins.Set(250)
+		harness.Ctx.Leaderboards.FlushAllBlocking(1)
+		harness.Ctx.Leaderboards.RefreshNow()
+		harness.Transport.SendToClient = real
+
+		-- ...and the NEXT cycle changes nothing about the board, so only an unstamped
+		-- SentState can cause a resend.
+		harness.Ctx.Leaderboards.RefreshNow()
+
+		local frames = boardFrames(harness, player)
+		expect(`extra={#frames - baseline}`).to.equal("extra=1")
+		expect(frames[#frames].Entries[1].Score).to.equal(250)
+		harness.Cleanup()
+	end)
+
 	it("stays server-only by default: no frames, but server reads work", function()
 		local harness = TestCtx.make({
 			Options = {

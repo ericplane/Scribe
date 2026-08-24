@@ -5,13 +5,10 @@
 --
 -- This module owns the compile-time half (resolve input paths, order the graph,
 -- decide who computes, build the write index) and a realm-agnostic evaluator used
--- by three readers that have nothing else in common: the accessor tree, the
--- client's plain Shared mirrors, and offline profile snapshots.
+-- by the accessor tree, the client's Shared mirrors and offline profile snapshots.
 --
 -- Schema nodes are typed `any` throughout: Template requires this module for its
--- post-compile pass, so importing Template's SchemaNode back would be a require
--- cycle. The fields touched here (Kind, ValueType, Path, Children, Visibility,
--- Persist, Derived) are the stable ones.
+-- post-compile pass, so importing Template's SchemaNode back would be a cycle.
 
 local Big = require(script.Parent.Big)
 local Datatypes = require(script.Parent.Datatypes)
@@ -20,8 +17,8 @@ local Util = require(script.Parent.Util)
 local Derived = {}
 
 -- Read form must be a plain, immutable scalar: the value is handed to user code on
--- every recompute, so a mutable read shape (a Flags member list, a buffer) would
--- let a compute function mutate live state through its own argument.
+-- every recompute, so a mutable shape would let a compute function mutate live
+-- state through its own argument.
 local ALLOWED_INPUT_TYPES: { [string]: boolean } = {
 	int = true,
 	number = true,
@@ -32,10 +29,9 @@ local ALLOWED_INPUT_TYPES: { [string]: boolean } = {
 	datatype = true,
 }
 
--- Outputs are narrower than inputs: a derived field's compile-time default is
--- computed by this module, and big/datatype defaults would have to be converted to
--- their STORED form (a mantissa pair, a packed buffer) and bounds-checked, which is
--- validateWrite's job on the runtime path. Kept out of v1 rather than duplicated.
+-- Outputs are narrower than inputs: this module computes the compile-time default,
+-- and a big/datatype default would have to be converted to its stored form and
+-- bounds-checked, which is validateWrite's job on the runtime path.
 local ALLOWED_OUTPUT_TYPES: { [string]: boolean } = {
 	int = true,
 	number = true,
@@ -202,9 +198,8 @@ function Derived.Resolve(
 		}
 	end
 
-	-- Topological order over derived -> derived edges. Iterative-free DFS with a
-	-- three-colour mark; `pending` is built in sorted template order, so the result
-	-- is identical on the server and the client.
+	-- Topological order over derived -> derived edges, three-colour DFS. `pending`
+	-- is in sorted template order, so server and client end up with the same order.
 	local ordered: { any } = {}
 	local mark: { [any]: string } = {}
 	local stack: { any } = {}
@@ -257,11 +252,10 @@ function Derived.Resolve(
 		end
 		node.Derived.Transmit = transmit
 
-		-- Offline reads see stored data only: a root-level field whose every input
-		-- persists can be computed over a profile snapshot; anything else has no
-		-- value to read there. A derived INPUT never persists either, but it is
-		-- filled in first (this loop and the offline pass both run in topological
-		-- order), so it counts as available exactly when it is itself computable.
+		-- Offline reads see stored data only, so a root-level field whose every
+		-- input persists can be computed over a snapshot. A derived input never
+		-- persists but is filled in first (both passes run in topological order),
+		-- so it counts as available exactly when it is itself computable.
 		local offline = #node.Path == 1
 		if offline then
 			for _, input in node.Derived.Inputs do

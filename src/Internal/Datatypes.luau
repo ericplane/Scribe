@@ -5,19 +5,19 @@
 -- the node accessor converts at the boundary (Set packs, Get unpacks).
 --
 -- Roblox stores these types as f32 internally, so f32 packing is lossless.
--- Sizes (raw; DataStores keep buffers as base64, ~4/3 of raw):
---   Vector3 12, Vector2 8, Vector3int16 6, Vector2int16 4
---   CFrame 13 (axis-aligned rotation) / 29 (quaternion)
---   Color3 4 (exact-RGB) / 13 (f32), BrickColor 2, UDim 8, UDim2 16
---   Rect 16, NumberRange 8, NumberSequence 1+12/keypoint
---   ColorSequence 1+16/keypoint, DateTime 8, EnumItem 5+name, Font 3+family
---   PhysicalProperties 20
+-- DataStores keep buffers as base64, about 4/3 of the raw size.
 
 local Datatypes = {}
 
 type Codec = {
-	Pack: (value: any) -> buffer,
+	-- The field's declared Scribe Precision, threaded through from the schema. nil
+	-- is the default form and what every codec that ignores the argument produces.
+	Pack: (value: any, precision: (string | number)?) -> buffer,
 	Unpack: (b: buffer) -> any,
+	-- The Precision values this codec accepts, as a set. nil means no Precision
+	-- option at all, which is every codec but CFrame. The template compiler reads
+	-- this to refuse a bad declaration at startup rather than at the first write.
+	Precisions: { [string]: true }?,
 }
 
 local codecs: { [string]: Codec } = {}
@@ -28,10 +28,9 @@ local function checkLen(b: buffer, expected: number, name: string)
 	end
 end
 
--- Checked f32 writer: rejects NaN/inf components so a corrupt datatype can
--- never be silently persisted (the plain number path guards the same way).
--- The `NONFINITE` prefix lets validateWrite convert this into a clean,
--- path-tagged validation error.
+-- Checked f32 writer: rejects NaN/inf components so a corrupt datatype can never
+-- be silently persisted. The `NONFINITE` prefix lets validateWrite turn this into
+-- a path-tagged validation error.
 local NONFINITE = "Scribe:nonfinite:"
 
 local function wf32(b: buffer, offset: number, value: number)
@@ -100,12 +99,31 @@ codecs.Vector2int16 = {
 }
 
 -- CFrame ------------------------------------------------------------------------
--- Layout: [u8 rotation tag][3xf32 position][4xf32 quaternion when tag == 255].
--- Placed structures are overwhelmingly rotated in 90-degree steps; the 24
--- axis-aligned orientations encode as rightAxisCode * 6 + upAxisCode (< 36),
--- costing one byte instead of sixteen.
+-- Layout: [u8 rotation tag][3xf32 position][rotation payload chosen by the tag].
+--
+--   tag < 36    13 bytes. One of the 24 axis-aligned orientations, encoded as
+--               rightAxisCode * 6 + upAxisCode. The common case for placed parts.
+--   tag == 254  49 bytes. Opt-in, Precision = "exact": the nine rotation
+--               components verbatim. See CFRAME_FULL below.
+--   tag == 255  29 bytes. Quaternion. The default for any other rotation.
+--
+-- 36..253 are unassigned and decode as a malformed orientation.
 
 local AXIS_EPSILON = 1e-4
+
+-- Full-precision CFrame, opt-in via Precision = "exact". 49 bytes:
+-- [u8 254][3xf32 position][9xf32 rotation, in GetComponents order].
+--
+-- The 29-byte default re-derives nine rotation components from four, so a stored
+-- orientation comes back slightly turned; the loss is the re-derivation, not the
+-- float width, so widening the quaternion cannot close it. Roblox stores CFrame
+-- components as f32, which is what makes all twelve as f32 a bit-for-bit round
+-- trip.
+--
+-- Tag 254 sits just below the quaternion's 255, leaving 36..253 contiguous for a
+-- future compact orientation code. No buffer written before it existed carries tag
+-- 254 or is 49 bytes long, so old data stays distinguishable.
+local CFRAME_FULL = 254
 
 -- Returns 0-5 (axis index * 2 + negative bit) when the vector is a unit axis.
 local function unitAxisCode(x: number, y: number, z: number): number?
@@ -132,8 +150,33 @@ local function axisFromCode(code: number): Vector3
 end
 
 codecs.CFrame = {
-	Pack = function(cf: CFrame): buffer
+	Precisions = { exact = true },
+	Pack = function(cf: CFrame, precision: (string | number)?): buffer
 		local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
+
+		-- Declared exact always writes 49 bytes, even where the 13-byte path would
+		-- fit: that path snaps. unitAxisCode accepts an axis within AXIS_EPSILON of
+		-- a unit axis and then rebuilds the exact axis, so a rotation a fraction of
+		-- a degree off square silently becomes square, a larger loss than the
+		-- quaternion's. A flat width is also a cost a developer can budget.
+		if precision == "exact" then
+			local b = buffer.create(49)
+			buffer.writeu8(b, 0, CFRAME_FULL)
+			wf32(b, 1, x)
+			wf32(b, 5, y)
+			wf32(b, 9, z)
+			wf32(b, 13, r00)
+			wf32(b, 17, r01)
+			wf32(b, 21, r02)
+			wf32(b, 25, r10)
+			wf32(b, 29, r11)
+			wf32(b, 33, r12)
+			wf32(b, 37, r20)
+			wf32(b, 41, r21)
+			wf32(b, 45, r22)
+			return b
+		end
+
 		local rightCode = unitAxisCode(r00, r10, r20)
 		local upCode = unitAxisCode(r01, r11, r21)
 		if rightCode and upCode and math.floor(rightCode / 2) ~= math.floor(upCode / 2) then
@@ -189,6 +232,29 @@ codecs.CFrame = {
 		checkLen(b, 13, "CFrame")
 		local tag = buffer.readu8(b, 0)
 		local position = Vector3.new(buffer.readf32(b, 1), buffer.readf32(b, 5), buffer.readf32(b, 9))
+		if tag == CFRAME_FULL then
+			-- Re-check before reading the 36-byte rotation payload: a truncated or
+			-- hostile buffer must fail as a clean malformed-CFrame error, not an
+			-- out-of-bounds read.
+			checkLen(b, 49, "CFrame")
+			-- The twelve-argument CFrame.new is the exact inverse of GetComponents
+			-- and does not re-orthonormalize, which is what makes the round trip
+			-- the identity.
+			return CFrame.new(
+				position.X,
+				position.Y,
+				position.Z,
+				buffer.readf32(b, 13),
+				buffer.readf32(b, 17),
+				buffer.readf32(b, 21),
+				buffer.readf32(b, 25),
+				buffer.readf32(b, 29),
+				buffer.readf32(b, 33),
+				buffer.readf32(b, 37),
+				buffer.readf32(b, 41),
+				buffer.readf32(b, 45)
+			)
+		end
 		if tag == 255 then
 			checkLen(b, 29, "CFrame")
 			return CFrame.new(
@@ -216,9 +282,9 @@ codecs.CFrame = {
 local function packColor3Into(b: buffer, offset: number, color: Color3): number
 	local r255, g255, b255 = color.R * 255, color.G * 255, color.B * 255
 	local function exact(n: number): boolean
-		-- Only components that round to a whole 0-255 byte qualify for the
-		-- compact u8 mode; HDR/negative values fall through to f32 so
-		-- writeu8's mod-256 wrap can never corrupt them.
+		-- Only components that round to a whole 0-255 byte take the compact u8
+		-- mode; HDR/negative values fall through to f32 so writeu8's mod-256
+		-- wrap cannot corrupt them.
 		return math.abs(n - math.round(n)) < 1e-4 and n >= -1e-4 and n <= 255 + 1e-4
 	end
 	if exact(r255) and exact(g255) and exact(b255) then
@@ -258,11 +324,10 @@ codecs.Color3 = {
 	end,
 	Unpack = function(b: buffer): Color3
 		checkLen(b, 4, "Color3")
-		-- The f32 mode reads 13 bytes; checkLen(4) only covers the mode byte + the
-		-- RGB (mode 0) path. unpackColor3From takes the 13-byte branch for ANY
-		-- non-zero mode, so re-check on `~= 0` (not `== 1`): a truncated/hostile
-		-- buffer with mode 2..255 must fail as a clean malformed-Color3 error, not
-		-- an out-of-bounds read at Get() time (mirrors the CFrame extended-tag check).
+		-- checkLen(4) only covers the mode byte plus the mode-0 RGB path, and
+		-- unpackColor3From takes the 13-byte branch for any non-zero mode, so
+		-- re-check on `~= 0` rather than `== 1`: a hostile buffer with mode 2..255
+		-- must fail as a clean malformed-Color3 error, not an out-of-bounds read.
 		if buffer.readu8(b, 0) ~= 0 then
 			checkLen(b, 13, "Color3")
 		end
@@ -448,16 +513,15 @@ end
 
 local function readShortString(b: buffer, offset: number): (string, number)
 	local length = buffer.readu8(b, offset)
-	-- Bounds-check the declared string before reading it, so a truncated/hostile
-	-- buffer fails as a clean malformed error rather than a raw out-of-bounds read.
+	-- Bounds-check the declared length before reading, so a truncated buffer fails
+	-- as a clean malformed error rather than a raw out-of-bounds read.
 	checkLen(b, offset + 1 + length, "string")
 	return buffer.readstring(b, offset + 1, length), offset + 1 + length
 end
 
 local function enumItemFromValue(enumTypeName: string, value: number): EnumItem
-	-- Indexing Enum with an unknown name THROWS a raw Roblox error, so a corrupt/
-	-- crafted buffer's enum type name would escape the "Scribe:"-prefixed malformed
-	-- contract. Resolve it under pcall and fail as a clean, path-taggable error.
+	-- Indexing Enum with an unknown name throws a raw Roblox error, which would
+	-- escape the "Scribe:"-prefixed malformed contract, so resolve it under pcall.
 	local gotType, enumType = pcall(function()
 		return (Enum :: any)[enumTypeName]
 	end)
@@ -492,8 +556,7 @@ codecs.EnumItem = {
 	Unpack = function(b: buffer): EnumItem
 		checkLen(b, 5, "EnumItem")
 		local typeName, offset = readShortString(b, 0)
-		-- Re-check for the u32 value that follows the variable-length type name
-		-- (mirrors the CFrame/Color3 extended-tag re-checks).
+		-- Re-check for the u32 value that follows the variable-length type name.
 		checkLen(b, offset + 4, "EnumItem")
 		return enumItemFromValue(typeName, buffer.readu32(b, offset))
 	end,
@@ -550,12 +613,42 @@ function Datatypes.IsSupported(name: string): boolean
 	return codecs[name] ~= nil
 end
 
-function Datatypes.Pack(name: string, value: any): buffer
+--- The Precision values `name` accepts, sorted, or nil when it accepts none.
+--- The template compiler reads this to refuse a bad declaration at startup.
+function Datatypes.PrecisionValues(name: string): { string }?
+	local codec = codecs[name]
+	local accepted = codec and codec.Precisions
+	if not accepted then
+		return nil
+	end
+	local out: { string } = {}
+	for value in accepted do
+		table.insert(out, value)
+	end
+	table.sort(out)
+	return out
+end
+
+--- Packs `value` as `name`. `precision` is optional; omitted, every datatype packs
+--- its default form. Validated here rather than inside each codec so a codec with
+--- no Precision option gets the refusal for free, and so a typo is reported
+--- instead of quietly yielding the default form.
+function Datatypes.Pack(name: string, value: any, precision: (string | number)?): buffer
 	local codec = codecs[name]
 	if not codec then
 		error(`Scribe: unsupported datatype "{name}"`, 2)
 	end
-	return codec.Pack(value)
+	if precision ~= nil then
+		local accepted = codec.Precisions
+		if type(precision) ~= "string" or not accepted or not accepted[precision] then
+			local values = Datatypes.PrecisionValues(name)
+			local detail = if values
+				then `it accepts "{table.concat(values, '", "')}"`
+				else `datatype "{name}" has no Precision option`
+			error(`Scribe: invalid Precision {tostring(precision)} for {name} ({detail})`, 2)
+		end
+	end
+	return codec.Pack(value, precision)
 end
 
 function Datatypes.Unpack(name: string, b: buffer): any

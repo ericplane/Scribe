@@ -6,6 +6,7 @@ return function()
 	local Root = script.Parent.Parent.Parent
 	local ScribeRoot = Root.Scribe
 	local Wire = require(ScribeRoot.Internal.Wire)
+	local Log = require(ScribeRoot.Internal.Log)
 	local Scribe = require(ScribeRoot)
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
 	local deepEquals = require(Root.Test.Helpers.DeepEquals)
@@ -311,7 +312,14 @@ return function()
 			return g
 		end
 
-		it("throttles the anomaly/log under a flood but still counts every frame", function()
+		it("throttles the anomaly AND the log together under a flood, counting every frame", function()
+			-- The anomaly and the log share ONE gate, deliberately: MALFORMED_FRAME's
+			-- throttle window wraps both the Log.Warn and the OnAnomaly:Fire, so a
+			-- crafted-frame flood can spam neither the diagnostic ring nor a game's
+			-- OnAnomaly handler. Only the anomaly half was asserted, which left the log
+			-- half free to drift out of the gate -- and that is exactly the coupling any
+			-- future merge of these throttles into a shared helper would have to keep,
+			-- since a helper that only wraps the log cannot gate the anomaly with it.
 			local player, entry = joinAndHandshake()
 			local anomalies = 0
 			harness.Ctx.Signals.OnAnomaly:Connect(function(info)
@@ -319,12 +327,16 @@ return function()
 					anomalies += 1
 				end
 			end)
+			-- The log ring is a process singleton; count the delta across the window.
+			local logsBefore = #Log.GetRecent({ Code = "MALFORMED_FRAME" })
 			for _ = 1, 5 do
 				harness.Transport:InjectToServer(player, garbageFrame())
 			end
 			task.wait()
+			local logged = #Log.GetRecent({ Code = "MALFORMED_FRAME" }) - logsBefore
 			expect(entry.MalformedCount).to.equal(5)
-			expect(anomalies).to.equal(1) -- throttled within the interval, not one per frame
+			-- Both throttled to one, and both counted -- the metric still sees all five.
+			expect(`anomalies={anomalies} logged={logged}`).to.equal("anomalies=1 logged=1")
 		end)
 
 		it("stops dispatching a player's frames after too many malformed frames", function()
@@ -414,6 +426,102 @@ return function()
 			task.wait()
 			expect(entry.HelloReceived).never.to.equal(true)
 			expect(#harness.FramesFor(player, Wire.Frames.Init)).to.equal(0)
+		end)
+
+		it("refuses a Hello whose protocol version differs, and still serves a matching one", function()
+			-- R3, DRIVEN RATHER THAN ASSERTED. Two other specs pin
+			-- `Wire.PROTOCOL_VERSION == N` as a constant, and a constant is exactly
+			-- the kind of pin whoever changes the layout re-pins in the same edit
+			-- without the refusal ever executing. Nothing in the repo drove a
+			-- MISMATCHED version through the real onHello: deleting the whole
+			-- `if protocolVersion ~= Wire.PROTOCOL_VERSION` block left the suite
+			-- green, which means a drifted client would have decoded a v(N-1) frame
+			-- against a vN reader instead of failing closed.
+			--
+			-- Both halves matter. The refusal alone would pass against a handshake
+			-- that refused EVERY Hello, so the same harness then sends a matching
+			-- version and is required to load.
+			local player, entry = harness.Join()
+			local function hello(version)
+				local w = Wire.NewWriter(8)
+				Wire.U8(w, Wire.Frames.Hello)
+				Wire.U32(w, harness.Compiled.Hash % 4294967296) -- the hash is RIGHT
+				Wire.U8(w, version)
+				harness.Transport:InjectToServer(player, Wire.Finish(w))
+				task.wait()
+			end
+
+			-- One below and one above: a `<` or `>` in place of `~=` fails on one of
+			-- them, where a single drifted value would let either through.
+			local before = Scribe.GetMetrics().ProtocolMismatch or 0
+			hello(Wire.PROTOCOL_VERSION - 1)
+			hello(Wire.PROTOCOL_VERSION + 1)
+			expect(entry.HelloReceived).never.to.equal(true)
+			expect(#harness.FramesFor(player, Wire.Frames.Init)).to.equal(0)
+			expect((Scribe.GetMetrics().ProtocolMismatch or 0) - before).to.equal(2)
+
+			hello(Wire.PROTOCOL_VERSION)
+			expect(entry.HelloReceived).to.equal(true)
+			expect(#harness.FramesFor(player, Wire.Frames.Init)).to.equal(1)
+			expect((Scribe.GetMetrics().ProtocolMismatch or 0) - before).to.equal(2)
+		end)
+	end)
+	describe("the Shared queue at handshake", function()
+		it("does not re-broadcast, as a diff, ops the SharedInit snapshot already carries", function()
+			-- Pins `entry.SharedQueue = {}` in OnEntryReady, which was a surviving
+			-- mutation: deleting it left 1345/0.
+			--
+			-- Reaching it at all takes a write into a Shared root BEFORE OnEntryReady
+			-- runs, and no test template produced one -- measured, by counting the queue
+			-- at that line across a whole run: 0 occurrences in 1,346 tests. The seam
+			-- that does reach it is SeedDerived, which Persistence runs before every
+			-- subsystem hook precisely so the Init snapshot carries real values: a
+			-- Shared derived field whose stored input differs from the template default
+			-- recomputes there, and that recompute is a replicated write, so it lands in
+			-- SharedQueue while the snapshot has not been taken yet.
+			--
+			-- The snapshot then carries the same value, so without the clear the next
+			-- flush broadcasts it AGAIN as a SharedDiff to the same recipients (both
+			-- pass exceptEntry = entry). Harmless for this Set and permanently wrong for
+			-- an Insert, which is what the code comment warns about -- but the redundant
+			-- frame is the same defect either way, and it is the half that can be
+			-- observed without a non-idempotent op.
+			local h = TestCtx.make({
+				AutoPump = false,
+				Template = {
+					Score = Scribe.Int(0, { Min = 0 }),
+					Pub = Scribe.Shared(Scribe.Derived(Scribe.Int(0), { "Score" }, function(score: number): number
+						return score * 2
+					end)),
+				},
+			})
+			-- B is ready first, so it is a recipient of whatever A broadcasts.
+			local playerB = h.Join(77002)
+			h.SendHello(playerB)
+
+			-- A first session stores Score = 7, so the rejoin's SeedDerived has
+			-- something to recompute. Pub is derived, so it is never written directly.
+			local playerA0, _entryA0, dataA0 = h.Join(77001)
+			dataA0.Score.Set(7)
+			h.Leave(playerA0)
+			h.Step()
+
+			local before = #h.Transport.SentToClientLog
+			local _playerA = h.Join(77001)
+			h.Step()
+			local shared = { Init = 0, Diff = 0 }
+			for i = before + 1, #h.Transport.SentToClientLog do
+				local frame = h.Transport.SentToClientLog[i]
+				local kind = buffer.readu8(frame.Bytes, 0)
+				if kind == Wire.Frames.SharedInit then
+					shared.Init += 1
+				elseif kind == Wire.Frames.SharedDiff then
+					shared.Diff += 1
+				end
+			end
+			-- One snapshot, and no diff repeating it.
+			expect(`sharedInit={shared.Init} sharedDiff={shared.Diff}`).to.equal("sharedInit=1 sharedDiff=0")
+			h.Cleanup()
 		end)
 	end)
 end

@@ -1,7 +1,6 @@
 --!strict
--- Client assembly: local mirror tree, Hello/Init handshake, diff
--- application, command RPC, leaderboard/status/shared mirrors, and the
--- always-on edit-mode fallback with mock helpers.
+-- Client assembly: local mirror tree, Hello/Init handshake, diff application,
+-- command RPC, leaderboard/status/shared mirrors, and the edit-mode fallback.
 
 local RunService = game:GetService("RunService")
 
@@ -18,10 +17,18 @@ local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
 local Signal = require(Internal.Signal)
 local Clock = require(script.Parent.Internal.Clock)
+local Rng = require(script.Parent.Internal.Rng)
+local Sched = require(Internal.Sched)
+-- For RequestFailed only: the identity Request appends to its own refusals.
+local Types = require(script.Parent.Types)
 
 local Client = {}
 
 local ID_TO_STATUS: { [number]: string } = { [0] = "Healthy", [1] = "Degraded", [2] = "Outage" }
+
+-- The placeholder a request slot carries until it is settled. Frozen and shared
+-- because it is never read or written; one allocation for the whole module.
+local NO_RESULTS: { any } = table.freeze({})
 
 -- Applies a decoded op to a plain table (other players' Shared mirrors).
 local function applyPlainOp(root: { [any]: any }, op: Wire.Op)
@@ -33,11 +40,10 @@ local function applyPlainOp(root: { [any]: any }, op: Wire.Op)
 			if op.Kind == "Remove" then
 				return -- array removals always ship alongside their creating Insert
 			end
-			-- Materialize intermediates for Set (any value) and Clear too: the
-			-- server only emits an op when the parent chain existed at emission, so
-			-- a missing parent here means its creating op was coalesced away in the
-			-- same flush while the server still holds the (possibly empty)
-			-- container. Creating it keeps existence parity with the server.
+			-- Materialize intermediates for Set and Clear too: a missing parent
+			-- means its creating op was coalesced away in the same flush while
+			-- the server still holds the container, so creating it here keeps
+			-- existence parity with the server.
 			nextContainer = {}
 			container[segment] = nextContainer
 		end
@@ -63,23 +69,25 @@ local function applyPlainOp(root: { [any]: any }, op: Wire.Op)
 		if type(value) == "table" then
 			table.clear(value)
 		else
-			-- A Clear only emits for a container that existed server-side; if its
-			-- creating op was coalesced away, materialize the cleared {} here.
+			-- A Clear only emits for a container that existed server-side, so if
+			-- its creating op was coalesced away, materialize the cleared {}.
 			container[key] = {}
 		end
 	end
 end
 
 function Client.new(options: any, compiled: Template.Compiled): any
-	-- Advanced/test seams. Patching RunService itself works on a mock table but is
-	-- illegal on a real service Instance, so without these no spec that needs edit
-	-- mode or the Studio hook can run in Studio at all.
+	-- Test seams: patching RunService itself is illegal on a real service Instance,
+	-- so without these nothing needing edit mode or the Studio hook runs in Studio.
 	local isRunning = if options.IsRunning ~= nil then options.IsRunning == true else RunService:IsRunning()
 	local devMode = if options.DevMode ~= nil then options.DevMode == true else RunService:IsStudio()
 	local editMode = not isRunning
 
 	if options.LogLevel then
 		Log.SetLevel(options.LogLevel)
+	end
+	if options.LogRingSize ~= nil then
+		Log.SetRingSize(options.LogRingSize)
 	end
 
 	local mirror: { [string]: any } = Template.BuildDefaults(compiled, "Client")
@@ -113,9 +121,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			Log.Error("Lifecycle", "LISTENER_ERROR", message, {})
 		end,
 		OnDerivedIssue = function(code, field, detail)
-			-- A MISMATCH means the server (in dev mode) computed a different value
-			-- than this realm did, which is an impure compute function rather than a
-			-- live fault. The server's value wins; the log is how you find out.
+			-- A mismatch means the server computed a different value than this realm,
+			-- so the compute function is impure rather than the fault being live. The
+			-- server's value wins; the log is how you find out.
 			local report = if code == "DERIVED_MISMATCH" then Log.Warn else Log.Error
 			report("Derived", code :: any, `"{field}": {detail}`, { Field = field })
 		end,
@@ -136,8 +144,59 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	local OnLeaderboard = Signal.new()
 
 	local transport: any = nil
-	local requestWaiters: { [number]: thread } = {}
+	-- One in-flight Client.Request. The slot carries the answer; the resumption
+	-- carries nothing. Sched.Resume is task.spawn, so a synchronous loopback can
+	-- settle the slot from inside the send while the requester is still running, and
+	-- resuming a running thread is a hard error: the answer is recorded here instead
+	-- and collected without a yield. Nothing below resumes from a deferred callback,
+	-- which would promote the requester one re-entrancy generation per round trip.
+	--
+	-- Two mutable fields, one writer each:
+	--
+	--   Parked   written only by the requester, on the statements either side of
+	--            coroutine.yield(), so it is never true while the requester runs.
+	--            coroutine.status is not a substitute: a transport that yields inside
+	--            SendToServer leaves the requester suspended somewhere that is not its
+	--            reply yield, and a status-keyed resume would then deliver the reply
+	--            out of the transport's own yield expression.
+	--   Settled  an answer has been claimed. Written only by settleRequest, with
+	--            Results/Count, which are meaningless until then. The reply, the
+	--            timeout and a throwing send race for it; the first one wins.
+	--
+	-- Results carries an explicit Count because a handler may return nils and `#` on
+	-- a table with a hole is undefined, while RPC arity is part of the contract.
+	type RequestSlot = {
+		Correlation: number,
+		Thread: thread,
+		Parked: boolean,
+		Settled: boolean,
+		Results: { any },
+		Count: number,
+	}
+	local requestWaiters: { [number]: RequestSlot } = {}
 	local nextCorrelation = 0
+
+	-- The one place a request is answered and the one place a slot leaves the map, so
+	-- "exactly one of the reply, the timeout and a failed send wins" is a single
+	-- guard. Nothing between the guard and the write yields.
+	local function settleRequest(slot: RequestSlot, results: { any }, count: number)
+		if slot.Settled then
+			return
+		end
+		slot.Settled = true
+		slot.Results = results
+		slot.Count = count
+		-- Cleared by identity, never by presence: correlations wrap at 2^32, so a dead
+		-- request's timer must not evict the slot that inherited its number.
+		if requestWaiters[slot.Correlation] == slot then
+			requestWaiters[slot.Correlation] = nil
+		end
+		-- No values passed: the requester reads the slot, so a resumed request and one
+		-- answered before it yielded cannot disagree about arity.
+		if slot.Parked then
+			Sched.Resume(slot.Thread)
+		end
+	end
 
 	local function waitForLoaded()
 		while not loaded do
@@ -159,10 +218,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		local ok, err = pcall(function()
 			transport:SendToServer(Wire.Finish(w))
 		end)
-		-- A dropped Hello leaves the client stuck at defaults (the server logs
-		-- CLIENT_HANDSHAKE_TIMEOUT), so surface the underlying send error once
-		-- instead of retrying it silently forever. A Sandboxed Scribe fails here
-		-- ("cannot fire ... the calling thread is sandboxed").
+		-- A dropped Hello leaves the client stuck at defaults, so surface the send
+		-- error once instead of retrying silently forever. A sandboxed calling thread
+		-- fails here.
 		if not ok and not helloSendFailLogged then
 			helloSendFailLogged = true
 			Log.Warn("Transport", "SEND_FAIL", `client could not send its Hello handshake: {tostring(err)}`, {})
@@ -173,10 +231,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		local ops = Wire.DecodeOps(reader, compiled)
 		-- The snapshot supersedes local state: reset to defaults, then apply.
 		local defaults = Template.BuildDefaults(compiled, "Client")
-		-- Do the reset + apply INSIDE ReplayFire so that on a re-Init (a second
-		-- snapshot after a resync) Changed listeners see their true pre-snapshot
-		-- value as `old`. ReplayFire snapshots olds before running this closure;
-		-- resetting the mirror outside it would make every `old` the default.
+		-- Reset and apply inside ReplayFire so that on a re-Init, Changed listeners see
+		-- their true pre-snapshot value as `old`: ReplayFire snapshots olds before
+		-- running this closure, so resetting outside it makes every `old` the default.
 		tree:ReplayFire(function()
 			table.clear(mirror)
 			for key, value in defaults do
@@ -186,6 +243,13 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				tree:ApplyOp(op)
 			end
 		end)
+		-- Foreign mirrors are superseded too. sendInit re-sends a SharedInit for every
+		-- player still on the server right after this frame, so what does not come
+		-- back is what left; this is the only way a client that missed a SharedGone
+		-- drops that ghost. Cleared silently, because at this moment a player who left
+		-- and one whose SharedInit is a frame away are indistinguishable, and firing
+		-- would report every still-present player as gone and then back.
+		table.clear(sharedMirrors)
 		if not loaded then
 			loaded = true
 			loadedSignal:Fire()
@@ -193,9 +257,97 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Log.Debug("Replication", "INIT_APPLIED", "initial snapshot applied", {})
 	end
 
+	-- Fragment reassembly ------------------------------------------------------
+	--
+	-- The server splits any frame larger than its MaxOutboundBytes; everything below
+	-- this point sees only whole logical frames, so a snapshot still lands in exactly
+	-- one ReplayFire.
+	--
+	-- Not a security boundary: only the server can raise OnClientEvent on the Down
+	-- remote, which is also why the decoder below has no object budget. The ceiling
+	-- only stops a corrupted length field turning into a multi-gigabyte allocation,
+	-- and sits far above anything a real profile produces.
+	local MAX_REASSEMBLY_BYTES = 64 * 1024 * 1024
+	local fragBuf: buffer? = nil
+	local fragSeq, fragTotal, fragWritten, fragExpected = -1, 0, 0, 0
+	-- Set whenever a fragment lands, cleared by the handshake retry loop. It stops the
+	-- retry asking for a new snapshot while the current one is still arriving: a Hello
+	-- sent midway makes the server throw it away and encode the whole profile again.
+	local fragProgress = false
+
+	local function resetFragments()
+		fragBuf, fragSeq, fragTotal, fragWritten, fragExpected = nil, -1, 0, 0, 0
+	end
+
+	-- Refusals are counted, not just dropped: a gap, a replayed piece or a forged
+	-- length is otherwise indistinguishable from an unfinished frame, which is all a
+	-- mirror assertion can see.
+	local function refuseFragment(reason: string): buffer?
+		resetFragments()
+		Metrics.Add("FragmentsRefused")
+		Log.Debug("Replication", "FRAGMENT_REFUSED", reason, {})
+		return nil
+	end
+
+	local function acceptFragment(bytes: buffer): buffer?
+		local size = buffer.len(bytes)
+		if size < Wire.FRAGMENT_HEADER then
+			return refuseFragment("fragment shorter than its header")
+		end
+		local seq = buffer.readu16(bytes, 1)
+		local declared = buffer.readu32(bytes, 3)
+		local index = buffer.readu16(bytes, 7)
+		local payload = size - Wire.FRAGMENT_HEADER
+		if index == 0 then
+			resetFragments()
+			if declared == 0 or payload == 0 then
+				return refuseFragment("empty fragment")
+			end
+			if declared > MAX_REASSEMBLY_BYTES then
+				return refuseFragment("declared length is not a plausible frame")
+			end
+			fragBuf, fragSeq, fragTotal, fragWritten, fragExpected = buffer.create(declared), seq, declared, 0, 0
+		end
+		local dest = fragBuf
+		if dest == nil then
+			-- Not an error and deliberately not counted: a fragment arriving with
+			-- nothing in flight is the tail of a frame whose head was lost.
+			return nil
+		end
+		if seq ~= fragSeq or index ~= fragExpected or declared ~= fragTotal or payload == 0 then
+			return refuseFragment("fragment does not continue the frame in progress")
+		end
+		if fragWritten + payload > fragTotal then
+			return refuseFragment("fragment overruns the declared length")
+		end
+		buffer.copy(dest, fragWritten, bytes, Wire.FRAGMENT_HEADER, payload)
+		fragWritten += payload
+		fragExpected += 1
+		fragProgress = true
+		if fragWritten < fragTotal then
+			return nil
+		end
+		resetFragments()
+		-- A reassembled frame is never itself a fragment; refusing it stops a malformed
+		-- stream re-entering the dispatcher without bound.
+		if buffer.readu8(dest, 0) == Wire.Frames.Fragment then
+			return refuseFragment("reassembled frame is itself a fragment")
+		end
+		Metrics.Add("FramesReassembled")
+		return dest
+	end
+
 	local function handleFrame(bytes: buffer)
 		local reader = Wire.NewReader(bytes)
 		local frameType = Wire.RU8(reader)
+
+		if frameType == Wire.Frames.Fragment then
+			local whole = acceptFragment(bytes)
+			if whole ~= nil then
+				handleFrame(whole)
+			end
+			return
+		end
 
 		if frameType == Wire.Frames.Init then
 			applyInit(reader)
@@ -219,15 +371,19 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			for i = 1, count do
 				results[i] = Wire.DecodeGeneric(reader)
 			end
-			local thread = requestWaiters[correlation]
-			if thread then
-				requestWaiters[correlation] = nil
+			local slot = requestWaiters[correlation]
+			if slot then
 				if ok then
-					-- Transparent RPC: the handler's return values ARE the
-					-- Request results`).
-					task.spawn(thread, table.unpack(results, 1, count))
+					-- Transparent RPC: the handler's return values are the Request
+					-- results. `results` is handed over by reference with the frame's
+					-- own count byte, so nothing is copied or re-measured with `#`.
+					settleRequest(slot, results, count)
 				else
-					task.spawn(thread, false, results[1])
+					-- ok == 0: the framework refused, so results[1] is a sentinel and
+					-- never a handler value, and the appended marker is what makes that
+					-- distinguishable. The count is spelled out because a malformed
+					-- reply can leave results[1] nil and `#` would then report 0.
+					settleRequest(slot, { false, results[1], Types.RequestFailed }, 3)
 				end
 			end
 		elseif frameType == Wire.Frames.Status then
@@ -245,19 +401,14 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			for _, op in ops do
 				applyPlainOp(shared, op)
 			end
-			-- A Shared derived field the server did not send is one every client
-			-- computes for itself, and a foreign mirror is a plain table with no
-			-- accessor tree to settle it. Recompute here, BEFORE the change event, so
-			-- a listener never sees the mirror without its derived fields. The
-			-- transmit rule guarantees the inputs are Shared too, so they are present.
+			-- A Shared derived field the server did not send is computed per client,
+			-- and a foreign mirror is a plain table with no accessor tree to settle it.
+			-- Recompute before the change event so a listener never sees the mirror
+			-- without its derived fields.
 			DerivedModule.EvaluateInto(compiled, shared, isSharedLocalDerived)
-			-- One event per update carrying the current shared data (a clone, so
-			-- listeners can't mutate the mirror); nil is reserved for SharedGone.
-			-- CloneUnpack also converts any datatype fields from their packed wire
-			-- buffer back to the real datatype (the Shared mirror has no accessor
-			-- tree to do this on read). Only pay for that full-mirror unpack+clone
-			-- when something is actually listening: a game that reads Shared data via
-			-- Data.GetShared (pull) instead of OnSharedChanged (push) then skips it.
+			-- One event per update carrying a clone of the shared data; nil is reserved
+			-- for SharedGone. CloneUnpack also converts packed datatype fields back to
+			-- the real datatype, so only pay for it when something is listening.
 			if OnSharedChanged:HasListeners() then
 				OnSharedChanged:Fire(userId, Node.CloneUnpack(compiled.Root, shared))
 			end
@@ -282,17 +433,12 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				cache.MyScore = Wire.RF64(reader)
 			end
 			leaderboardCache[name] = cache
-			-- The prop doc and the leaderboards guide both promise (boardName,
-			-- entries), and the entries were decoded immediately above, so passing
-			-- only the name forced every listener into a redundant GetLeaderboard.
 			OnLeaderboard:Fire(name, entries)
 		end
 	end
 
-	-- Studio-only client debug hook for the Scribe Studio plugin's client
-	-- view. Attached before the transport connects so the Init snapshot
-	-- application is captured too. Read-only by construction; outside Studio
-	-- the branch is never taken and the hook does not exist.
+	-- Studio-only client debug hook for the Scribe Studio plugin. Attached before the
+	-- transport connects so the Init snapshot application is captured too.
 	if isRunning and devMode and (options.IsClient == true or RunService:IsClient()) then
 		local hookOk, hookErr = pcall(function()
 			(require(script.DebugHook) :: any).Attach({
@@ -310,7 +456,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	end
 
 	if isRunning then
-		task.spawn(function()
+		Sched.Spawn(function()
 			transport = TransportModule.Resolve(options.Transport, options.TransportChannel)
 			transport:ListenClient(function(bytes: buffer)
 				local ok, err = pcall(handleFrame :: any, bytes)
@@ -323,9 +469,22 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			sendHello()
 			local delaySeconds = 2
 			while not loaded do
-				Clock.Wait(delaySeconds)
+				-- The retry delay only. The first sendHello above stays immediate:
+				-- delaying it would slow every ordinary join to fix a problem only a
+				-- mass rejoin has.
+				Clock.Wait(Rng.Jitter(delaySeconds))
 				if loaded then
 					break
+				end
+				if fragProgress then
+					-- A snapshot is arriving, one fragment at a time. Asking again is
+					-- harmful, not just wasteful: the server answers a Hello by re-encoding
+					-- the whole profile, so a large Init would keep restarting and never
+					-- complete. Clearing the flag keeps a stalled sequence from blocking
+					-- retries forever.
+					fragProgress = false
+					delaySeconds = 2
+					continue
 				end
 				sendHello()
 				delaySeconds = math.min(delaySeconds * 1.5, 10)
@@ -388,7 +547,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		local function resume(result: boolean)
 			if not settled then
 				settled = true
-				task.spawn(thread, result)
+				Sched.Resume(thread, result)
 			end
 		end
 		local conn = loadedSignal:Connect(function()
@@ -402,6 +561,94 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		return result
 	end
 
+	-- The body behind Request and RequestOnce. `idemKey` is nil for a plain request
+	-- and ships as an empty string, which the server reads as "no key", so a command
+	-- frame has one layout rather than two. `level` keeps the argument-count error
+	-- pointing at the caller rather than at this shared body.
+	local function dispatchRequest(name: string, idemKey: string?, args: { n: number, [number]: any }, level: number)
+		if editMode then
+			local mock = mockCommands[name]
+			if mock then
+				local results
+				local ok = pcall(function()
+					results = table.pack(mock(table.unpack(args, 1, args.n)))
+				end)
+				if ok and results then
+					return table.unpack(results, 1, results.n)
+				end
+				return false, "mock-error", Types.RequestFailed
+			end
+			return false, "edit-mode", Types.RequestFailed
+		end
+		-- Fail loud rather than clamping: dropping the extras here would run the
+		-- handler with missing trailing arguments instead of the server's refusal.
+		if args.n > Wire.MAX_COMMAND_ARGS then
+			error(`Scribe: a command takes at most {Wire.MAX_COMMAND_ARGS} arguments (got {args.n})`, level)
+		end
+		-- No transport check here: waitForLoaded only returns once an Init frame
+		-- arrived, which requires the transport. A nil transport is still caught by
+		-- the pcall around SendToServer below, surfacing as "send-failed".
+		waitForLoaded()
+		nextCorrelation = (nextCorrelation + 1) % 4294967296
+		local correlation = nextCorrelation
+		local w = Wire.NewWriter(64)
+		Wire.U8(w, Wire.Frames.Command)
+		Wire.U32(w, correlation)
+		Wire.Str(w, name)
+		Wire.U8(w, args.n)
+		-- Ahead of the arguments, so the server can refuse an unusable key before it
+		-- decodes anything attacker-sized.
+		Wire.Str(w, idemKey or "")
+		for i = 1, args.n do
+			Wire.EncodeGeneric(w, args[i])
+		end
+
+		local slot: RequestSlot = {
+			Correlation = correlation,
+			Thread = coroutine.running(),
+			Parked = false,
+			Settled = false,
+			Results = NO_RESULTS,
+			Count = 0,
+		}
+		requestWaiters[correlation] = slot
+		-- Armed before the send so the deadline covers the send itself, which matters
+		-- if the spawn below ever goes and the send parks the requester directly.
+		-- Clock.Delay cannot be cancelled, so the callback always fires and
+		-- settleRequest is what makes a late one a no-op.
+		Clock.Delay(options.RequestTimeout or 10, function()
+			settleRequest(slot, { false, "timeout", Types.RequestFailed }, 3)
+		end)
+		-- Spawned, not deferred. Sched.Spawn runs the send immediately on this stack,
+		-- so a synchronous loopback closes the whole round trip before this line
+		-- returns and the requester never parks. A Sched.Defer would put the reply's
+		-- resume inside a deferred callback, promoting the requester one re-entrancy
+		-- generation per round trip until it hangs. The spawn also means a
+		-- SendToServer that never returns hangs its own coroutine rather than the
+		-- requester, so the timeout can still answer.
+		local bytes = Wire.Finish(w)
+		Sched.Spawn(function()
+			local ok = pcall(function()
+				transport:SendToServer(bytes)
+			end)
+			if not ok then
+				-- Reached synchronously for a throwing send, so the requester is still
+				-- running and this records rather than resumes; after a yield it wakes a
+				-- parked one.
+				settleRequest(slot, { false, "send-failed", Types.RequestFailed }, 3)
+			end
+		end)
+		-- A loop rather than an `if`, so a stray resume from outside Scribe re-parks
+		-- instead of returning an unsettled slot. It cannot spin forever: only Settled
+		-- exits, and the timeout above always arrives.
+		while not slot.Settled do
+			slot.Parked = true
+			coroutine.yield()
+			slot.Parked = false
+		end
+		return table.unpack(slot.Results, 1, slot.Count)
+	end
+
 	--[=[
 		@within Client
 		@tag Commands
@@ -410,71 +657,55 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@param name string
 		@param ... any
 		@return ...any
-		Calls a server command registered with [Server.Command] and returns its
-		results. Yields until the reply arrives (or times out → `false, "timeout"`).
-		This is the one way clients change data authoritatively.
+		Calls a server command registered with [Server.Command] and returns whatever
+		its handler returned. It yields until the reply arrives, and resolves
+		`false, "timeout"` if none comes within `RequestTimeout`. This is the one way
+		a client changes data authoritatively.
+
+		When Scribe refuses rather than your handler, the result is `false`, one
+		[Scribe.RequestReason], and [Scribe.RequestFailed] in a third slot. Test that
+		third value, because a handler may return `false, "timeout"` of its own. A
+		retry after a timeout runs the handler a second time, so reach for
+		[Client.RequestOnce] when that is not safe. See
+		[Commands & Requests](../commands.md#what-the-caller-gets-back-on-failure).
 	]=]
 	function Data.Request(name: string, ...: any): ...any
-		if editMode then
-			local mock = mockCommands[name]
-			if mock then
-				local args = table.pack(...)
-				local results
-				local ok = pcall(function()
-					results = table.pack(mock(table.unpack(args, 1, args.n)))
-				end)
-				if ok and results then
-					return table.unpack(results, 1, results.n)
-				end
-				return false, "mock-error"
-			end
-			return false, "edit-mode"
-		end
-		-- No transport check here: waitForLoaded only returns once an Init frame
-		-- arrived, which requires the transport. Edit mode returns above instead,
-		-- and if Resolve throws, loaded never flips and this blocks rather than
-		-- falling through. A nil transport would still be caught by the pcall
-		-- around SendToServer below, surfacing as "send-failed".
-		waitForLoaded()
-		nextCorrelation = (nextCorrelation + 1) % 4294967296
-		local correlation = nextCorrelation
-		local args = table.pack(...)
-		-- Fail loud rather than clamping: a silent clamp here would drop the extras
-		-- before the server ever saw them, so the handler would run with missing
-		-- trailing arguments instead of the server's "too many command arguments".
-		if args.n > Wire.MAX_COMMAND_ARGS then
-			error(`Scribe: a command takes at most {Wire.MAX_COMMAND_ARGS} arguments (got {args.n})`, 2)
-		end
-		local w = Wire.NewWriter(64)
-		Wire.U8(w, Wire.Frames.Command)
-		Wire.U32(w, correlation)
-		Wire.Str(w, name)
-		Wire.U8(w, args.n)
-		for i = 1, args.n do
-			Wire.EncodeGeneric(w, args[i])
-		end
+		return dispatchRequest(name, nil, table.pack(...), 3)
+	end
 
-		local thread = coroutine.running()
-		requestWaiters[correlation] = thread
-		Clock.Delay(options.RequestTimeout or 10, function()
-			if requestWaiters[correlation] == thread then
-				requestWaiters[correlation] = nil
-				task.spawn(thread, false, "timeout")
-			end
-		end)
-		-- Deferred so the requester is already suspended when a synchronous
-		-- (loopback) transport delivers the reply.
-		local bytes = Wire.Finish(w)
-		task.defer(function()
-			local ok = pcall(function()
-				transport:SendToServer(bytes)
-			end)
-			if not ok and requestWaiters[correlation] == thread then
-				requestWaiters[correlation] = nil
-				task.spawn(thread, false, "send-failed")
-			end
-		end)
-		return coroutine.yield()
+	--[=[
+		@within Client
+		@tag Commands
+		@client
+		@yields
+		@param name string
+		@param key string
+		@param ... any
+		@return ...any
+		Like [Client.Request], but tagged with an idempotency `key`: the server runs
+		the handler at most once per key and replays its original reply, byte for
+		byte, to every repeat. Use it for anything a retry must not do twice, and
+		generate the key once per intent rather than once per attempt.
+
+		The command must be registered `Idempotent = true`, and a key sent to one that
+		is not, or a keyless [Client.Request] to one that is, is refused with
+		`"bad-idempotency-key"`. A key must be non-empty, valid UTF-8, and at most 64
+		bytes, and this call raises on your own thread rather than send one that is
+		not. See
+		[Running a command at most once](../commands.md#running-a-command-at-most-once).
+	]=]
+	function Data.RequestOnce(name: string, key: string, ...: any): ...any
+		-- Rejected here rather than at the server: an unusable key is a caller mistake,
+		-- and a round trip would return it in a form the caller has to tell apart from
+		-- a genuine handler refusal.
+		if type(key) ~= "string" or key == "" or #key > Wire.MAX_IDEMPOTENCY_KEY_BYTES or not utf8.len(key) then
+			error(
+				`Scribe: RequestOnce needs a non-empty idempotency key of at most `
+					.. `{Wire.MAX_IDEMPOTENCY_KEY_BYTES} valid UTF-8 bytes`,
+				2
+			)
+		end
+		return dispatchRequest(name, key, table.pack(...), 3)
 	end
 
 	--[=[
@@ -522,6 +753,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@client
 		@prop OnLeaderboard Signal
 		Fires `(boardName, entries)` whenever a replicated board updates.
+
+		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
 	Data.OnLeaderboard = OnLeaderboard
 
@@ -543,6 +776,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@client
 		@prop OnServiceStatus Signal
 		Fires with the new status whenever service health changes.
+
+		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
 	Data.OnServiceStatus = OnServiceStatus
 
@@ -575,6 +810,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@client
 		@prop OnSharedChanged Signal
 		Fires `(userId, sharedData)` when another player's Shared data changes.
+
+		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
 	Data.OnSharedChanged = OnSharedChanged
 	--[=[
@@ -586,6 +823,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		actually changes. Ownership already held at load is the baseline and does not
 		fire. Use [Client.ObserveOwned] instead when you care about one specific key
 		and want the current value immediately.
+
+		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
 	Data.OnOwnershipChanged = OnOwnershipChanged
 
@@ -653,7 +892,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 					if disconnect then
 						disconnect()
 					end
-					task.spawn(thread)
+					Sched.Resume(thread)
 				end
 			end
 			disconnect = tree.Accessor[Template.SESSION_ROOT].OwnsSynced.Changed(function(v)
@@ -662,8 +901,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				end
 			end)
 			Clock.Delay(timeout or 10, wake)
-			-- If the flag arrived between the check and the connect, clean up and
-			-- skip the yield -- never task.spawn a thread that has not yielded.
+			-- If the flag arrived between the check and the connect, clean up and skip
+			-- the yield: never task.spawn a thread that has not yielded.
 			if ownsSyncedFromMirror() then
 				settled = true
 				if disconnect then
@@ -676,8 +915,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		return ownsFromMirror(key)
 	end
 
-	-- Drives OnOwnershipChanged. Mirrors ObserveOwned's dedupe, but across every key
-	-- the mirror actually holds, so a listener does not have to know keys up front.
+	-- Drives OnOwnershipChanged. Dedupes like ObserveOwned, but across every key the
+	-- mirror holds, so a listener does not have to know keys up front.
 	local ownsLast: { [string]: boolean } = {}
 	local ownsWatched = false
 	local function scanOwnership(silent: boolean?)
@@ -717,7 +956,10 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		waitForLoaded()
 		scanOwnership(true) -- baseline: current ownership is not a "change"
 		local accessor = tree.Accessor
-		accessor[Template.RESERVED_ROOT].Perks.Changed(function()
+		-- Through the privileged handle, not the public child: a read of the reserved
+		-- root through a public accessor hands back a detached deep copy (readOut in
+		-- Node.luau), which this callback would pay for and ignore.
+		tree.Reserved.Perks.Changed(function()
 			scanOwnership()
 		end)
 		accessor[Template.SESSION_ROOT].OwnsCache.Changed(function()
@@ -744,11 +986,12 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			local owned = ownsFromMirror(key)
 			if owned ~= last then
 				last = owned
-				task.spawn(callback, owned)
+				Sched.Spawn(callback, owned)
 			end
 		end
 		local accessor = tree.Accessor
-		local disconnectPerk = accessor[Template.RESERVED_ROOT].Perks.Changed(push)
+		-- Privileged handle: see the note in ensureOwnershipWatched.
+		local disconnectPerk = tree.Reserved.Perks.Changed(push)
 		local disconnectCache = accessor[Template.SESSION_ROOT].OwnsCache.Changed(push)
 		push()
 		return function()
@@ -896,7 +1139,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				end
 			end
 			if scribeState then
-				local reservedAccessor = tree.Accessor[Template.RESERVED_ROOT]
+				-- The privileged handle: Data.Mock seeds Scribe's own ledgers, which the
+				-- public accessor refuses to write.
+				local reservedAccessor = tree.Reserved
 				if scribeState.Perks then
 					for _, perk in scribeState.Perks :: { string } do
 						reservedAccessor.Perks[perk].Set(true)
@@ -937,34 +1182,10 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		mockCommands[name] = handler
 	end
 
-	-- A root field named like a client Data API/signal is silently shadowed by
-	-- that real key (a real key always wins over __index), so the field is
-	-- unreachable through `Data.<name>` on the client.
-	--
-	-- Reported ALWAYS, not just in Studio, and at Error level so it reaches
-	-- Scribe.OnIssue. The case worth catching is not someone authoring a template
-	-- (they would notice), it is a shipped game upgrading into a collision because
-	-- a newer Scribe added a method matching a field they already store: their
-	-- `Data.<name>` silently turns from an accessor into a function, in
-	-- production, where nobody is watching a Studio-only warning.
-	local rootChildren = compiled.Root.Children :: { [string]: any }
-	for key in Data do
-		if type(key) == "string" and rootChildren[key] then
-			Log.Error(
-				"Lifecycle",
-				"API_NAME_COLLISION",
-				`template root field "{key}" collides with a client Data API name, so it is unreachable as `
-					.. `Data.{key} on the client. Rename the field, or read it through the accessor tree.`,
-				{ Field = key }
-			)
-		end
-	end
-
-	-- Data.<rootField> resolves through the mirror tree. Returns the accessor
-	-- immediately — reads yield template defaults until the Init snapshot lands,
-	-- then Observe/Changed fire with the real values. (A metamethod must never
-	-- yield: `Data.Coins` before Init would otherwise error "attempt to yield
-	-- across metamethod/C-call boundary".)
+	-- Data.<rootField> resolves through the mirror tree, returning the accessor
+	-- immediately: reads give template defaults until the Init snapshot lands. A
+	-- metamethod must never yield, so waiting for Init here would error with
+	-- "attempt to yield across metamethod/C-call boundary".
 	setmetatable(Data :: any, {
 		__index = function(_, key: any)
 			if type(key) ~= "string" then
@@ -984,15 +1205,35 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	]=]
 	Data.Raw = Data
 
-	-- Load banner: one clean line confirming the bundle initialized
-	-- (Banner = false to silence).
+	-- One line confirming the bundle initialized (Banner = false to silence).
 	if options.Banner ~= false then
 		print(`Running Scribe v{Version} by ericplane — client is now initialized`)
 	end
 
-	-- Drive OnOwnershipChanged once the first snapshot lands. Two listeners plus a
-	-- small scan over the keys the mirror holds, so the cost is negligible.
-	task.spawn(ensureOwnershipWatched)
+	-- Drive OnOwnershipChanged once the first snapshot lands.
+	Sched.Spawn(ensureOwnershipWatched)
+
+	-- A root field named like a client Data API is silently shadowed by that real key
+	-- (a real key always wins over __index), so it is unreachable as `Data.<name>`.
+	-- Reported always rather than only in Studio, and at Error level so it reaches
+	-- Scribe.OnIssue: the case worth catching is a shipped game upgrading into a
+	-- collision because a newer Scribe added a method matching a field it stores.
+	--
+	-- Keep this last. `for key in Data` sees only the keys that exist when it runs, so
+	-- anything assigned after it is exempt. Raw iteration, so the metatable installed
+	-- above is not consulted and only real keys are judged.
+	local rootChildren = compiled.Root.Children :: { [string]: any }
+	for key in Data do
+		if type(key) == "string" and rootChildren[key] then
+			Log.Error(
+				"Lifecycle",
+				"API_NAME_COLLISION",
+				`template root field "{key}" collides with a client Data API name, so it is unreachable as `
+					.. `Data.{key} on the client. Rename the field, or read it through the accessor tree.`,
+				{ Field = key }
+			)
+		end
+	end
 
 	return Data
 end

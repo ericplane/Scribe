@@ -13,52 +13,57 @@ local Template = require(Internal.Template)
 local Big = require(Internal.Big)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
-local Health = require(Internal.Health)
 local Clock = require(Internal.Clock)
+local Sched = require(Internal.Sched)
+local Budget = require(Internal.Budget)
+local Rng = require(Internal.Rng)
+local Failure = require(Internal.Failure)
 
 local Leaderboards = {}
 
 local WRITE_INTERVAL = 1.5
+-- Ceiling on what one tick may drain once the queue has backed up. Every write
+-- yields, so without a bound a deep queue turns the pacer into the unpaced flush it
+-- exists to prevent.
+local MAX_WRITES_PER_TICK = 8
 local REFRESH_INTERVAL = 60
 -- Floor on a per-board RefreshInterval. GetSortedAsync's request budget scales with
--- player count, so the worst case is a near-empty server: it has the smallest budget
--- while still refreshing every board on the same schedule. Going FASTER than the
--- default is also usually the wrong tool. A sub-minute board is almost always an
--- in-server live scoreboard, which belongs in Scribe.Shared at zero DataStore cost;
--- these boards are global and all-time. So the option exists to go slower.
+-- player count, so a near-empty server is the worst case. A sub-minute board is
+-- almost always an in-server scoreboard, which belongs in Scribe.Shared at no
+-- DataStore cost, so the option exists to go slower rather than faster.
 local MIN_REFRESH_INTERVAL = 60
--- Boot guard on the AGGREGATE rate, which is what actually burns budget: ten boards
--- at 60s costs more than one board at 15s, and a flat floor permits the former while
--- blocking the latter. Conservative enough to stay inside a low-population server's
--- allowance with headroom for the write pacer.
+-- Boot guard on the aggregate rate, which is what actually burns budget: ten boards
+-- at 60s cost more than one at 15s, and the flat floor above permits exactly that.
 local MAX_REFRESH_PER_MINUTE = 12
 local QUEUE_CAP = 1000
+-- Requests left in reserve when BudgetPolicy defers. Not zero: the ungated shutdown
+-- drain writes to the same Sorted pool, so the background loops stop one short of
+-- emptying it.
+local BUDGET_RESERVE = 1
+-- Seconds between LB_BUDGET_DEFERRED warns. Deferral is normal and self-correcting,
+-- so only a sustained one should be visible.
+local BUDGET_LOG_INTERVAL = 30
 -- Seconds between LB_QUEUE_OVERFLOW warns; drops in between are counted and
 -- reported on the next one rather than each getting their own line.
 local OVERFLOW_LOG_INTERVAL = 30
+-- Seconds between store-failure warns of the same code. Failures arrive once per
+-- queued write and once per board refresh, so an outage otherwise produces a line per
+-- attempt for as long as it lasts.
+local FAILURE_LOG_INTERVAL = 30
 local NAME_TTL = 900
 local NAME_NEGATIVE_TTL = 120
 local NAME_CACHE_CAP = 4096 -- bound the resolved-name cache; entries are re-resolvable
 
 -- Scribe.Big leaderboards ----------------------------------------------------------
 --
--- An OrderedDataStore key is an integer, and a Luau number stops being an exact
--- integer at 2^53, so a big value cannot be stored raw. It does not need to be: a
--- big is already normalized to 1 <= |m| < 10 with an integer exponent, so packing
--- exponent-major preserves the ordering EXACTLY, with no logarithm.
+-- An OrderedDataStore key is an integer, so a big is packed exponent-major:
 --
 --   key = e * stride + floor(m * mantissaScale)
 --
--- with stride = 10^SigFigs and mantissaScale = 10^(SigFigs - 1), so the mantissa
--- lands in [mantissaScale, stride) and can never spill into the next exponent's
--- slot. Exponent dominates, mantissa breaks ties, which is a big's own comparison
--- order.
---
--- SigFigs is per board, because the whole key has to stay under 2^53 and the two
--- halves compete for it: every extra significant figure costs a factor of ten of
--- exponent range. A prestige currency that needs to separate 1.23456789012345e900
--- from its neighbour wants more; a gem counter that only needs a rough ordering
--- over an enormous range wants fewer.
+-- with stride = 10^SigFigs and mantissaScale = 10^(SigFigs - 1). The mantissa lands
+-- in [mantissaScale, stride) and can never spill into the next exponent's slot, so
+-- the ordering is exact. SigFigs is per board because the key must stay under 2^53
+-- and every extra significant figure costs a factor of ten of exponent range.
 local BIG_DEFAULT_SIG_FIGS = 12
 local BIG_MIN_SIG_FIGS = 1
 -- Past 15 the mantissa slot itself passes 2^53, so floor() would no longer be exact
@@ -128,11 +133,9 @@ end
 function Leaderboards.new(ctx: any)
 	local self = {} :: any
 	local options = ctx.Options
-	-- Read the RESOLVED mode, not the legacy flags. Persistence resolves Mode into
-	-- its own fields and never writes it back into options, so reading UseMock here
-	-- meant a Mode = "Mock" bundle still hit real OrderedDataStores. NoSave mocks
-	-- too: it promises nothing can be written back, and a board write is a write.
-	-- Persistence is built before Leaderboards, so Mode is set by now.
+	-- Read the resolved mode, not options.UseMock: Persistence resolves Mode into its
+	-- own fields and never writes it back, so a Mode = "Mock" bundle would otherwise
+	-- hit real OrderedDataStores. NoSave mocks too, since a board write is a write.
 	local mode: string = ctx.Persistence.Mode
 	local useMock: boolean = mode == "Mock" or mode == "NoSave"
 
@@ -145,12 +148,75 @@ function Leaderboards.new(ctx: any)
 	local refreshThread: thread? = nil
 	local writeQueue: { { Board: Board, UserId: number, Score: number, Attempts: number } } = {}
 	local writeQueueMap: { [string]: { Board: Board, UserId: number, Score: number, Attempts: number } } = {}
-	-- Overflow-log throttle. Once the queue is over cap, an evicted player's next
-	-- stat change mints a fresh key and evicts again, so the warn rate tracks the
-	-- stat-change rate of every out-of-queue player -- enough to flood the console
-	-- and roll the log ring. The counter still increments on every drop.
+	-- Overflow-log throttle: once the queue is over cap the warn rate tracks the
+	-- stat-change rate of every out-of-queue player, enough to roll the log ring.
+	-- The counter still increments on every drop.
 	local lastOverflowLog: number? = nil
 	local overflowSinceLog = 0
+	-- Budget-aware admission for the two background loops, opt-in and off when absent.
+	-- Mock modes never touch a real DataStore, so asking would only stall the loops
+	-- behind an environment that answers nothing.
+	local budgetPolicy: boolean = options.BudgetPolicy == "Defer" and not useMock
+	local lastBudgetLog: number? = nil
+
+	-- Store-failure reporting -------------------------------------------------------
+
+	local failureLog: { [string]: { Last: number?, Since: number } } = {}
+	-- Studio with API access off refuses every store call for the whole session. It is
+	-- a setting rather than an outage, so it is reported once and then silenced.
+	local apiAccessReported = false
+
+	--- Is this Studio refusing the call because API access is off, rather than a store
+	--- problem? Matched on the two phrasings Roblox uses. A miss costs nothing: the
+	--- caller still throttles.
+	local function isStudioApiDisabled(text: string): boolean
+		local lower = string.lower(text)
+		return string.find(lower, "studio access to apis", 1, true) ~= nil
+			or string.find(lower, "api access is not enabled", 1, true) ~= nil
+	end
+
+	--- One line per failure code per interval, with the suppressed count carried onto
+	--- the next one. Callers have already counted their own metric, which is what stays
+	--- accurate while this is quiet.
+	local function reportStoreFailure(code: string, err: any, context: { [string]: any })
+		-- Once the Studio setting has been named, every later failure has that same
+		-- cause and adds nothing to it.
+		if apiAccessReported then
+			return
+		end
+		local text = tostring(err)
+		if isStudioApiDisabled(text) then
+			apiAccessReported = true
+			Log.Warn(
+				"Leaderboards",
+				code :: any,
+				"leaderboard store calls are being refused because Studio API access is off, so boards "
+					.. "will neither read nor write for this session. Turn on File > Game Settings > "
+					.. "Security > Enable Studio Access to API Services (the place must be published). "
+					.. "Reported once; further failures are counted in LbReadFailures and LbWriteFailures",
+				context
+			)
+			return
+		end
+		local state = failureLog[code]
+		if state == nil then
+			state = { Last = nil, Since = 0 }
+			failureLog[code] = state
+		end
+		state.Since += 1
+		local now = Clock.Monotonic()
+		if state.Last == nil or now - state.Last >= FAILURE_LOG_INTERVAL then
+			state.Last = now
+			local suppressed = state.Since - 1
+			state.Since = 0
+			Log.Warn(
+				"Leaderboards",
+				code :: any,
+				if suppressed > 0 then `{text} ({suppressed} more since the last of these)` else text,
+				context
+			)
+		end
+	end
 	-- GDPR tombstones: an erased userId is suppressed in the pacer until this
 	-- clock time, long enough to outlive any in-flight write plus its retries.
 	local erasedUsers: { [number]: number } = {}
@@ -175,18 +241,15 @@ function Leaderboards.new(ctx: any)
 		if config.Period ~= nil and config.Period ~= "AllTime" then
 			error(`Scribe: leaderboard "{name}": only all-time leaderboards are supported`, 0)
 		end
-		-- Fail fast on a Stat path that descends through a leaf field: at runtime
-		-- it would throw on every player load (after Ready), skipping cross-server
-		-- gift-message registration for the whole session. Paths into dynamic
-		-- ("any") subtables are legitimate and pass.
+		-- Fail fast on a Stat path that descends through a leaf field: at runtime it
+		-- throws on every player load, after Ready, skipping the rest of that load's
+		-- wiring. Paths into dynamic ("any") subtables are legitimate and pass.
 		local statPath = Util.parsePath(config.Stat)
 		local walkNode: any = ctx.Compiled.Root
 		for i, segment in statPath do
 			if walkNode == nil then
-				-- ChildSchema only returns nil for an undeclared field of a closed
-				-- element shape (open containers synthesize a generic child), so this
-				-- Stat can never resolve: fail at boot instead of throwing on every
-				-- player load.
+				-- ChildSchema returns nil only for an undeclared field of a closed
+				-- element shape, so this Stat can never resolve.
 				error(
 					`Scribe: leaderboard "{name}" Stat "{config.Stat}": `
 						.. `"{tostring(statPath[i - 1])}" has no declared field "{tostring(segment)}"`,
@@ -210,16 +273,11 @@ function Leaderboards.new(ctx: any)
 				0
 			)
 		end
-		-- A board's entries live in an OrderedDataStore that outlives the session,
-		-- but a Scribe.Session field is rebuilt from its default every session, so
-		-- the path resolves, nothing downstream complains, and the board just stays
-		-- empty (or ranks a default) forever. Refuse at boot instead.
-		--
-		-- A Scribe.Derived field does not persist either, and is rankable anyway when
-		-- it is a pure function of fields that DO: the value is reproduced exactly on
-		-- every load, which is the property the board actually needs. That is the same
-		-- predicate offline reads use. One that reads a Session field is refused with
-		-- everything else, for the original reason.
+		-- A board outlives the session but a Scribe.Session field is rebuilt from its
+		-- default every session, so the path resolves and the board ranks a default
+		-- forever. A Scribe.Derived field does not persist either, but is rankable
+		-- when it is a pure function of fields that do, which is exactly the
+		-- OfflineComputable predicate.
 		local derived = walkNode.Derived
 		if derived ~= nil then
 			if not derived.OfflineComputable then
@@ -237,10 +295,9 @@ function Leaderboards.new(ctx: any)
 				0
 			)
 		end
-		-- The score becomes the OrderedDataStore key, so a non-numeric stat has
-		-- nothing to rank. The refresh cycle already drops it, silently, leaving an
-		-- empty board and no error anywhere. "any" is a dynamic subtree whose type
-		-- is unknowable at boot, so it stays allowed.
+		-- The score becomes the OrderedDataStore key, so a non-numeric stat has nothing
+		-- to rank and the refresh cycle would silently drop it. "any" is a dynamic
+		-- subtree whose type is unknowable at boot, so it stays allowed.
 		local statType = walkNode.ValueType
 		if statType ~= "number" and statType ~= "int" and statType ~= "big" and statType ~= "any" then
 			error(
@@ -250,16 +307,13 @@ function Leaderboards.new(ctx: any)
 			)
 		end
 		-- Scale multiplies into the stored integer and divides back out on read, so a
-		-- zero divides by zero (NaN scores served to every client), a negative one
-		-- silently inverts the ordering against the descending query, and a
-		-- non-finite one makes every write a guaranteed OrderedDataStore rejection.
-		-- Fail fast like Stat/Period rather than serving nonsense at runtime.
+		-- zero serves NaN, a negative inverts the ordering against the descending
+		-- query, and a non-finite makes every write a guaranteed rejection.
 		if config.Replicate == true and walkNode ~= nil and walkNode.ValueType == "big" then
-			-- The board frame writes each Score as an f64, and a big Score is a table.
+			-- The board frame writes each Score as an f64 and a big Score is a table.
 			-- Sending one throws inside broadcastBoard, which runs under the inbound
-			-- frame pcall during a client Hello: the joining player is counted as a
-			-- malformed frame and silently loses every other player's Shared data.
-			-- Refuse it at boot rather than shipping a board that breaks the handshake.
+			-- frame pcall during a client Hello, breaking the joining player's
+			-- handshake. Refuse it at boot instead.
 			error(
 				`Scribe: leaderboard "{name}" Stat "{config.Stat}" is a Scribe.Big, which cannot be `
 					.. "replicated yet; read it on the server with GetLeaderboard or OnLeaderboard",
@@ -282,9 +336,8 @@ function Leaderboards.new(ctx: any)
 		local isBig = walkNode ~= nil and walkNode.ValueType == "big"
 		local sigFigs = BIG_DEFAULT_SIG_FIGS
 		if config.SigFigs ~= nil then
-			-- SigFigs is the big packing's own dial. On a plain numeric stat the key IS
-			-- the value and Scale is the dial, so accepting it there would silently do
-			-- nothing.
+			-- SigFigs is the big packing's dial; on a plain numeric stat the key is the
+			-- value and Scale is the dial, so accepting SigFigs there would do nothing.
 			if not isBig then
 				error(
 					`Scribe: leaderboard "{name}" Stat "{config.Stat}" is not a Scribe.Big; SigFigs only applies `
@@ -308,15 +361,12 @@ function Leaderboards.new(ctx: any)
 			sigFigs = requested
 		end
 		local bigStride = 10 ^ sigFigs
-		-- No boot warning for a narrowed exponent range. The developer chose this
-		-- deliberately, nothing is wrong yet, and warning every server start forever
-		-- is how a diagnostic becomes background noise. LB_SCORE_OUT_OF_RANGE already
-		-- names the cap and the SigFigs that set it, at the moment a score is actually
-		-- dropped, which is when there is something to act on.
+		-- No boot warning for a narrowed exponent range: LB_SCORE_OUT_OF_RANGE names
+		-- the cap and the SigFigs that set it when a score is actually dropped, which
+		-- is the point at which there is something to act on.
 		local maxExponent = bigMaxExponent(bigStride)
-		-- Opt-in slower refresh. Clamped up rather than rejected so an existing config
-		-- keeps working, but the clamp is reported: silently running 6x slower than
-		-- asked would be its own bug.
+		-- Clamped up rather than rejected so an existing config keeps working, but the
+		-- clamp is reported: silently running slower than asked is its own bug.
 		local refreshInterval = REFRESH_INTERVAL
 		if config.RefreshInterval ~= nil then
 			local requested = config.RefreshInterval
@@ -348,19 +398,11 @@ function Leaderboards.new(ctx: any)
 			BigMantissaScale = bigStride / 10,
 			BigMaxExponent = maxExponent,
 			Replicate = config.Replicate == true,
-			-- EVERY big board gets its own store, including one at the default
-			-- SigFigs. A big is packed exponent-major and a plain numeric stat is
-			-- packed as itself, so they are two key LAYOUTS, and a board name is all
-			-- that separates one store from another. Sharing `LB_<name>` meant that
-			-- retyping a stat from Scribe.Int to Scribe.Big (which needs no migration
-			-- and produces no warning) silently reinterpreted every key already
-			-- written: a legacy 9e11 decodes as 9, so a brand-new account with 100
-			-- outranks it, and a legacy 3.5e12 is bit-identical to the new-format key
-			-- for 5000, so no repair pass could ever separate them.
-			--
-			-- SigFigs is in the name because it changes the layout again, for the same
-			-- reason. An explicit StoreName still wins: that caller is managing the
-			-- namespace themselves.
+			-- Every big board gets its own store, with SigFigs in the name. Big and
+			-- plain keys are different layouts, so sharing `LB_<name>` would silently
+			-- reinterpret every key already written when a stat is retyped to
+			-- Scribe.Big or its SigFigs change, with no repair pass able to separate
+			-- the two formats afterwards. An explicit StoreName still wins.
 			StoreName = if type(config.StoreName) == "string"
 				then config.StoreName
 				elseif isBig then `LB_{name}_big{sigFigs}`
@@ -373,10 +415,9 @@ function Leaderboards.new(ctx: any)
 		}
 	end
 
-	-- Aggregate budget guard. A flat per-board floor permits ten boards at 60s (10
-	-- reads/min) while blocking one board at 15s (4 reads/min), so the floor alone
-	-- controls the wrong thing. Fail at boot like Stat/Scale/Period rather than
-	-- surfacing as mystery throttling in production.
+	-- Aggregate budget guard: the per-board floor alone permits ten boards at 60s
+	-- while blocking one at 15s, so it controls the wrong thing. Fail at boot rather
+	-- than surfacing as mystery throttling in production.
 	do
 		local perMinute = 0
 		for _, board in boards do
@@ -415,10 +456,8 @@ function Leaderboards.new(ctx: any)
 			return nil
 		end
 		if big.M == 0 then
-			-- Below every representable key, NOT 0. A value in (0, 1) has a negative
-			-- exponent and therefore a negative key, so mapping zero to 0 ranked an
-			-- empty balance above every fractional one. The lowest real key is
-			-- -maxExponent * stride + mantissaScale, so this sits strictly under it.
+			-- Below every representable key, not 0: a value in (0, 1) has a negative
+			-- exponent and so a negative key, which a zero mapped to 0 would outrank.
 			return -board.BigMaxExponent * board.BigStride
 		end
 		-- The packing has no room for a sign, and silently mis-ranking negatives is
@@ -429,10 +468,9 @@ function Leaderboards.new(ctx: any)
 		return big.E * board.BigStride + math.floor(big.M * board.BigMantissaScale)
 	end
 
-	-- A handed-out entry is a copy, because both docs invite the caller to keep or
-	-- mutate it. table.clone is SHALLOW, so a big board's Score would still alias the
-	-- object in the cache and a caller writing to it would corrupt every later read
-	-- until the next refresh. Rebuild the big instead.
+	-- Copy a handed-out entry, since the caller is invited to keep or mutate it.
+	-- table.clone is shallow, so a big board's Score would still alias the cached
+	-- object; rebuild the big instead.
 	local function copyEntry(board: Board, item: any): any
 		local copy = table.clone(item)
 		if board.IsBig and copy.Score ~= nil then
@@ -442,10 +480,8 @@ function Leaderboards.new(ctx: any)
 	end
 
 	-- A player's current value for a board's Stat. Reads through the accessor tree,
-	-- which is the only view that sees every declared field: LiveData is the
-	-- PERSISTED store alone, so a Stat naming a Session field or a Scribe.Derived one
-	-- reads nil there while OnLoad's accessor subscription reports it fine. Falls
-	-- back to LiveData if the tree is gone (teardown races the leave flush).
+	-- the only view that sees Session and Derived fields; LiveData is the persisted
+	-- store alone, and is the fallback when teardown races the leave flush.
 	local function readStat(entry: any, board: Board): any
 		local tree = entry.Tree
 		if tree ~= nil and not tree.Dead then
@@ -473,12 +509,9 @@ function Leaderboards.new(ctx: any)
 		if key == 0 or key <= -board.BigMaxExponent * stride then
 			return Big.from(0)
 		end
-		-- The division cannot round up into the next exponent, which would decode a
-		-- score at the wrong magnitude. The true quotient is e + mantissa/stride, so
-		-- rounding up needs the gap to 1 (at least 1/stride) to fall inside half an
-		-- ulp of e, which is at most e * 2^-53. That needs e * stride >= 2^53, and
-		-- bigMaxExponent caps e strictly below that. Widening the cap would break
-		-- this, so keep the two together.
+		-- The division cannot round up into the next exponent, which would decode the
+		-- score at the wrong magnitude: that needs e * stride >= 2^53, and
+		-- bigMaxExponent caps e strictly below it. Widening that cap breaks this.
 		local exponent = math.floor(key / stride)
 		return Big.normalize((key - exponent * stride) / board.BigMantissaScale, exponent)
 	end
@@ -491,7 +524,7 @@ function Leaderboards.new(ctx: any)
 		end
 		local scaled: number
 		if board.IsBig then
-			-- Scale does not apply: the packing IS the mapping into the key space.
+			-- Scale does not apply: the packing is the mapping into the key space.
 			local packed = packBig(board, score)
 			if packed == nil then
 				Metrics.Add("LbScoreOutOfRange")
@@ -511,12 +544,9 @@ function Leaderboards.new(ctx: any)
 			end
 			scaled = math.floor(score * board.Scale + 0.5)
 		end
-		-- OrderedDataStore only accepts a signed 64-bit integer. A scaled value past
-		-- that (an idle-game currency, an unbounded stat, an aggressive Scale) is
-		-- rejected by SetAsync EVERY time, and the value is re-enqueued on every
-		-- Changed and again on unload, so it becomes a permanent failure stream.
-		-- Drop it here, loudly and once per (board, user), instead of queueing a write
-		-- that cannot succeed.
+		-- A scaled value outside the exact integer range is rejected by SetAsync every
+		-- time and re-enqueued on every Changed, so it becomes a permanent failure
+		-- stream. Drop it here instead of queueing a write that cannot succeed.
 		if scaled ~= scaled or math.abs(scaled) > 9007199254740992 then
 			Metrics.Add("LbScoreOutOfRange")
 			Log.Warn(
@@ -568,14 +598,12 @@ function Leaderboards.new(ctx: any)
 		if ok then
 			Metrics.Add("LbWrites")
 		else
-			-- Deliberately NOT Health.ReportFailure: OrderedDataStore writes are the
-			-- highest-volume, least-critical DataStore traffic Scribe generates and are
-			-- routinely throttled under load. Feeding them into the shared health budget
-			-- let ordinary leaderboard throttling flip the GLOBAL status to Outage,
-			-- which makes ProcessReceipt return NotProcessedYet and blocks Robux
-			-- purchases. LbWriteFailures + LB_WRITE_FAIL are the fail-loud signal here.
+			-- Deliberately not Health.ReportFailure: board writes are routinely throttled
+			-- under load, and feeding them into the shared health budget flips the global
+			-- status to Outage, which blocks Robux receipts. LbWriteFailures and
+			-- LB_WRITE_FAIL are the fail-loud signal here instead.
 			Metrics.Add("LbWriteFailures")
-			Log.Warn("Leaderboards", "LB_WRITE_FAIL", tostring(err), {
+			reportStoreFailure("LB_WRITE_FAIL", err, {
 				Board = board.Name,
 				UserId = item.UserId,
 				Score = item.Score,
@@ -584,11 +612,78 @@ function Leaderboards.new(ctx: any)
 		return ok
 	end
 
+	-- Should a deferrable background request wait for allowance? Returns the reading
+	-- alongside the verdict, so a caller that wants the number does not ask twice:
+	-- two queries in one tick can disagree. `nil` from Budget.Remaining means the
+	-- engine could not be asked, which is no opinion rather than an empty allowance;
+	-- reading it as exhausted would park both loops for the life of the process.
+	local function shouldDefer(requestType: string, what: string): (boolean, number?)
+		if not budgetPolicy then
+			return false, nil
+		end
+		local remaining = Budget.Remaining(requestType)
+		if remaining == nil or remaining > BUDGET_RESERVE then
+			return false, remaining
+		end
+		Metrics.Add("LbBudgetDeferred")
+		local now = Clock.Monotonic()
+		if lastBudgetLog == nil or now - lastBudgetLog >= BUDGET_LOG_INTERVAL then
+			lastBudgetLog = now
+			Log.Warn(
+				"Leaderboards",
+				"LB_BUDGET_DEFERRED",
+				`{what} is waiting on the {requestType} request budget ({remaining} left). `
+					.. "Nothing is dropped -- writes stay queued and refreshes retry on the next tick -- but "
+					.. "boards update more slowly while this lasts",
+				{ RequestType = requestType, Remaining = remaining }
+			)
+		end
+		return true, remaining
+	end
+
+	-- How many queued writes one tick may drain: one, unless the queue has genuinely
+	-- backed up and the engine reports allowance to spare. With no backlog the pacer
+	-- behaves as it always has, which is what preserves the dedup window that
+	-- collapses a burst of score changes into a single write.
+	local function drainAllowance(remaining: number?): number
+		-- nil is "could not ask" and infinity is "no meaningful limit"; neither is
+		-- licence to drain faster. A simulation with budgets disabled answers infinity,
+		-- and reading that as headroom empties the queue in one tick.
+		if remaining == nil or remaining == math.huge then
+			return 1
+		end
+		local spare = math.floor(remaining) - BUDGET_RESERVE
+		if spare <= 1 then
+			return 1
+		end
+		-- Bounding by the current queue length is what keeps a failed write's retries
+		-- spaced: a failure re-inserts at the tail, behind everything this tick was
+		-- already going to drain. Without it one tick burns all three attempts and
+		-- abandons the item.
+		return math.min(MAX_WRITES_PER_TICK, spare, #writeQueue)
+	end
+
 	local function writePacerLoop()
 		while not stopped do
-			Clock.Wait(WRITE_INTERVAL)
-			local item = table.remove(writeQueue, 1)
-			if item then
+			-- Jittered above the gate and the dequeue, so it only moves when the tick
+			-- happens, never whether a queued write survives it.
+			Clock.Wait(Rng.Jitter(WRITE_INTERVAL))
+			-- Gated before the dequeue: below the table.remove the item is already out
+			-- of the queue, so deferring there would drop the write, not postpone it.
+			local defer, remaining = shouldDefer("SetIncrementSortedAsync", "the leaderboard write queue")
+			if defer then
+				continue
+			end
+			-- Bounded drain rather than a fixed one per tick, so `continue` below skips
+			-- one item rather than a whole tick.
+			for _ = 1, drainAllowance(remaining) do
+				if stopped then
+					break
+				end
+				local item = table.remove(writeQueue, 1)
+				if item == nil then
+					break
+				end
 				local key = `{item.Board.Name}|{item.UserId}`
 				writeQueueMap[key] = nil
 				Metrics.Set("LbQueueDepth", #writeQueue)
@@ -598,9 +693,8 @@ function Leaderboards.new(ctx: any)
 					continue
 				end
 				local wrote = performWrite(item)
-				-- performWrite's SetAsync yields; if EraseUser ran during that yield,
-				-- this write resurrected the score past its RemoveAsync. Re-check and
-				-- undo just this board's write so the erase holds.
+				-- SetAsync yields, so an EraseUser during it would have been resurrected
+				-- by this write. Undo just this board's write so the erase holds.
 				if wrote and isErased(item.UserId) then
 					pcall(function()
 						orderedStore(item.Board.StoreName):RemoveAsync(tostring(item.UserId))
@@ -615,7 +709,7 @@ function Leaderboards.new(ctx: any)
 						table.insert(writeQueue, item)
 						writeQueueMap[key] = item
 					elseif item.Attempts >= 3 and writeQueueMap[key] == nil then
-						Log.Warn("Leaderboards", "LB_WRITE_DROPPED", "leaderboard write abandoned after retries", {
+						reportStoreFailure("LB_WRITE_DROPPED", "leaderboard write abandoned after retries", {
 							Board = item.Board.Name,
 							UserId = item.UserId,
 							Score = item.Score,
@@ -628,10 +722,9 @@ function Leaderboards.new(ctx: any)
 
 	-- Reads + refresh cycle -----------------------------------------------------------
 
-	-- Cache a resolved name, keeping the map bounded: names are re-resolvable, so
-	-- once the cache fills, drop entries whose TTL has lapsed. Without this it
-	-- grows one entry per distinct userId ever seen in any board's top-N, for the
-	-- server's whole lifetime.
+	-- Cache a resolved name, keeping the map bounded: once the cache fills, drop
+	-- entries whose TTL has lapsed. Unbounded it grows one entry per distinct userId
+	-- ever seen in a board's top-N, for the server's whole lifetime.
 	local nameCacheCount = 0
 	local function cacheName(userId: number, entry: { Name: string?, At: number })
 		if nameCache[userId] == nil then
@@ -650,11 +743,9 @@ function Leaderboards.new(ctx: any)
 				end
 			end
 			nameCacheCount = kept
-			-- TTL eviction alone does not bound the map when distinct-user inflow
-			-- outpaces expiry (all entries still fresh). Fall back to evicting the
-			-- oldest-by-refresh-time entries down to half the cap, so the cache is
-			-- hard-bounded regardless of freshness and this O(n log n) pass amortizes
-			-- across the next ~cap/2 inserts.
+			-- TTL eviction alone does not bound the map when inflow outpaces expiry and
+			-- every entry is still fresh, so fall back to dropping the oldest down to
+			-- half the cap. That amortizes this sort over the next cap/2 inserts.
 			if nameCacheCount >= NAME_CACHE_CAP then
 				local ordered: { { Id: number, At: number } } = {}
 				for id, c in nameCache do
@@ -713,8 +804,12 @@ function Leaderboards.new(ctx: any)
 		else
 			Wire.U8(w, 0)
 		end
-		ctx.Replication.SendTo(entry, Wire.Finish(w))
-		board.SentState[entry.UserId] = { Sig = board.Signature, Rank = myRank, Score = myScore }
+		-- Only stamp what actually left: SentState is broadcastBoard's dedup key, so a
+		-- refused board recorded as delivered is never resent until its content
+		-- changes again.
+		if ctx.Replication.SendTo(entry, Wire.Finish(w)) then
+			board.SentState[entry.UserId] = { Sig = board.Signature, Rank = myRank, Score = myScore }
+		end
 	end
 
 	-- Change-driven: a client only receives the board when its content or their
@@ -747,7 +842,7 @@ function Leaderboards.new(ctx: any)
 			-- Same reasoning as performWrite: a throttled board read is routine and must
 			-- not drive the global health gate that receipts key off.
 			Metrics.Add("LbReadFailures")
-			Log.Warn("Leaderboards", "LB_READ_FAIL", tostring(page), { Board = board.Name })
+			reportStoreFailure("LB_READ_FAIL", page, { Board = board.Name })
 			return
 		end
 
@@ -770,11 +865,10 @@ function Leaderboards.new(ctx: any)
 		local previousSignature = board.Signature
 		board.Signature = table.concat(signatureParts, "|")
 
-		-- Fire BEFORE broadcastBoard, which returns immediately for a board without
-		-- Replicate. Server-only is the default, so those boards otherwise have no way
-		-- at all to observe a refresh and the only option is polling on a timer that
-		-- cannot align with this schedule. Entries are cloned: handing over the live
-		-- cache would let a listener mutate what every later read serves.
+		-- Fire before broadcastBoard, which returns immediately for a non-replicated
+		-- board: server-only is the default, and those boards would otherwise have no
+		-- way to observe a refresh. Entries are cloned so a listener cannot mutate
+		-- what every later read serves.
 		if board.Signature ~= previousSignature then
 			local snapshot = table.create(#board.Cache.Entries)
 			for _, item in board.Cache.Entries do
@@ -795,11 +889,14 @@ function Leaderboards.new(ctx: any)
 		broadcastBoard(board)
 	end
 
-	-- Each board is now on its own cadence, so the single shared cycle is replaced by
-	-- a due-time scheduler. Initial due times are staggered across the first cycle so
-	-- boot does not fire every board in the same instant.
+	-- Due-time scheduler: each board runs on its own cadence, and the initial due
+	-- times are staggered across the first cycle so boot does not fire every board in
+	-- the same instant.
 	local function refreshLoop()
-		Clock.Wait(5)
+		-- The jittered warm-up spreads the first refresh across a fleet booted by one
+		-- deploy; the stagger below spreads boards within one server. Both are needed,
+		-- and replacing the stagger with jitter would re-collide a server's own boards.
+		Clock.Wait(Rng.Jitter(5))
 		local dueAt: { [string]: number } = {}
 		local index = 0
 		local count = math.max(Util.count(boards), 1)
@@ -812,25 +909,33 @@ function Leaderboards.new(ctx: any)
 			for boardName, board in boards do
 				local due = dueAt[boardName]
 				if due == nil or now >= due then
+					-- Gated before dueAt is advanced: below that line a deferral costs a
+					-- whole RefreshInterval instead of one tick. Left here the board
+					-- stays due and retries on the next tick.
+					if shouldDefer("GetSortedAsync", `refreshing board "{boardName}"`) then
+						continue
+					end
 					dueAt[boardName] = now + board.RefreshInterval
-					task.spawn(refreshBoard, board)
+					Sched.Spawn(refreshBoard, board)
 				end
 			end
-			Clock.Wait(1)
+			-- One draw per tick, on the tick rather than the re-arm. Drawing inside the
+			-- board loop above would make the sequence depend on `boards` hash order,
+			-- and jittering the tick decorrelates the re-arm anyway, since `dueAt`
+			-- inherits the per-server drift in `now`.
+			Clock.Wait(Rng.Jitter(1))
 		end
 	end
 
-	-- Called by Server.build once the full ctx is assembled, so the paced
-	-- write queue and refresh cycle never run against a half-constructed
-	-- context.
+	-- Called by Server.build once the full ctx is assembled, so neither loop ever runs
+	-- against a half-constructed context.
 	function self.Start()
-		pacerThread = task.spawn(writePacerLoop)
-		refreshThread = task.spawn(refreshLoop)
+		pacerThread = Sched.Spawn(writePacerLoop)
+		refreshThread = Sched.Spawn(refreshLoop)
 	end
 
-	-- Release both loops. Cancelled as well as flagged: the pacer parks for
-	-- WRITE_INTERVAL and the refresh cycle for a second, so a flag alone would keep
-	-- two threads alive per bundle for as long as that.
+	-- Release both loops. Cancelled as well as flagged, because a parked loop would
+	-- otherwise keep a thread alive per bundle until its next wake.
 	function self.Stop()
 		if stopped then
 			return
@@ -850,13 +955,20 @@ function Leaderboards.new(ctx: any)
 	end
 
 	-- Whether boards resolved to the in-memory mock store rather than a real
-	-- OrderedDataStore. Exposed for the same reason as BoardStoreName: it lets a
-	-- test assert that Leaderboards read the RESOLVED Mode (the bug this guards
-	-- against was reading options.UseMock, so a Mode = "Mock" bundle still wrote to
-	-- live boards). Asserting on board CONTENTS cannot check this outside the
-	-- headless runner, where reaching a real store happens to fail and leave the
-	-- board empty; in Studio the write lands and the board is legitimately full.
+	-- OrderedDataStore. Exposed so a test can assert Leaderboards read the resolved
+	-- Mode; board contents cannot check that, since a real store only happens to fail
+	-- under the headless runner and in Studio the write lands.
 	self.UsesMockStore = useMock
+
+	--- The mock ordered store behind a board, so a test can make its calls fail. Mock
+	--- mode only: nil on a real store, which no test may reach.
+	function self.MockStoreFor(name: string): any?
+		if not useMock then
+			return nil
+		end
+		local storeName = self.BoardStoreName(name)
+		return if storeName then orderedStore(storeName) else nil
+	end
 
 	function self.RefreshNow(name: string?)
 		if name then
@@ -926,10 +1038,16 @@ function Leaderboards.new(ctx: any)
 				disconnect()
 			end
 		end
-		for _, board in boards do
-			board.MyRanks[entry.UserId] = nil
-			board.MyScores[entry.UserId] = nil
-			board.SentState[entry.UserId] = nil
+		-- Only if this is still the live entry for that user id. The caches below are
+		-- keyed by user id, and TargetUserId points every session at one profile, so
+		-- two entries can share an id and either leaving would blank the other's rank
+		-- and score. EntriesByUserId still points here when teardown calls in.
+		if ctx.Persistence.EntriesByUserId[entry.UserId] == entry then
+			for _, board in boards do
+				board.MyRanks[entry.UserId] = nil
+				board.MyScores[entry.UserId] = nil
+				board.SentState[entry.UserId] = nil
+			end
 		end
 		-- Flush the player's latest scores on leave.
 		if entry.LiveData then
@@ -944,7 +1062,7 @@ function Leaderboards.new(ctx: any)
 
 	-- Public API --------------------------------------------------------------------------
 
-	-- An unknown board name returns empty/nil with no other signal, and the names are
+	-- An unknown board name returns empty with no other signal, and names are
 	-- case-sensitive, so a typo looks exactly like a board that has not refreshed yet.
 	-- Warn once per name in Studio, matching checkOwnsKey in Monetization.
 	local warnedBoardNames: { [string]: boolean } = {}
@@ -996,9 +1114,8 @@ function Leaderboards.new(ctx: any)
 			end
 			writeQueueMap[`{item.Board.Name}|{item.UserId}`] = nil
 			flushed += 1
-			-- Mirror the pacer's GDPR guard: skip a user erased before the write, and
-			-- undo a write whose SetAsync yield raced a concurrent EraseUser (which
-			-- would otherwise resurrect the score past its RemoveAsync).
+			-- Mirror the pacer's GDPR guard: skip an erased user, and undo a write whose
+			-- SetAsync yield raced a concurrent EraseUser.
 			if isErased(item.UserId) then
 				continue
 			end
@@ -1018,9 +1135,8 @@ function Leaderboards.new(ctx: any)
 	-- GDPR: remove the user from every board. Returns (ok, err); a false ok
 	-- means at least one board's RemoveAsync failed and the caller must retry.
 	function self.EraseUser(userId: number): (boolean, string?)
-		-- Tombstone first so an in-flight pacer write (already dequeued) cannot
-		-- resurrect the score after we RemoveAsync it. Kept for a few minutes,
-		-- enough to outlive the in-flight write plus its retries.
+		-- Tombstone first, so an already-dequeued pacer write cannot resurrect the score
+		-- after RemoveAsync. Held long enough to outlive that write plus its retries.
 		erasedUsers[userId] = Clock.Monotonic() + 300
 
 		-- Drop any still-queued writes for this user, or the pacer would
@@ -1036,6 +1152,10 @@ function Leaderboards.new(ctx: any)
 
 		local key = tostring(userId)
 		local failed: string? = nil
+		-- Collected, then reported once below rather than per board: the log folds by
+		-- subject, so N per-board lines would collapse into the first one, and a GDPR
+		-- erase needs one entry naming every board that still holds the data.
+		local failedBoards: { string }? = nil
 		for _, board in boards do
 			local ok, err = pcall(function()
 				orderedStore(board.StoreName):RemoveAsync(key)
@@ -1044,15 +1164,14 @@ function Leaderboards.new(ctx: any)
 				-- Attempt every board, but remember the failure so erase can't
 				-- report success while personal data is retained.
 				failed = tostring(err)
-				Health.ReportFailure("Leaderboards")
-				Log.Error("Leaderboards", "LB_ERASE_FAIL", tostring(err), { Board = board.Name, UserId = userId })
+				failedBoards = failedBoards or {}
+				table.insert(failedBoards :: { string }, board.Name)
 			end
 			board.MyRanks[userId] = nil
 			board.MyScores[userId] = nil
 			board.SentState[userId] = nil
-			-- Also drop the erased user from the in-memory cache so their userId /
-			-- resolved Name / Score are not served (GetLeaderboard) or freshly pushed
-			-- to a client completing the handshake before the next refreshBoard.
+			-- Drop the erased user from the in-memory cache too, so nothing is served or
+			-- pushed to a client completing the handshake before the next refreshBoard.
 			local entries = board.Cache.Entries
 			local pruned = false
 			for i = #entries, 1, -1 do
@@ -1062,22 +1181,37 @@ function Leaderboards.new(ctx: any)
 				end
 			end
 			if pruned then
-				-- Renumber so GetLeaderboard serves a contiguous rank sequence rather
-				-- than a gapped one (1, 3, 4, ...) until the next refresh. Then
-				-- recompute the signature (same format as refreshBoard) so the change
-				-- broadcasts and stale SentState entries do not suppress the update.
+				-- Renumber so GetLeaderboard serves a contiguous rank sequence until the
+				-- next refresh, then recompute the signature (same format as
+				-- refreshBoard) so stale SentState does not suppress the update.
 				local signatureParts = {}
 				for i, item in entries do
 					item.Rank = i
 					table.insert(signatureParts, `{item.UserId}:{item.Score}`)
 				end
 				board.Signature = table.concat(signatureParts, "|")
-				-- Recomputing the signature only makes the change ELIGIBLE to send;
-				-- broadcastBoard is what actually sends it, and refreshBoard was its
-				-- only caller. Without this, connected clients kept rendering the
-				-- erased user until the next 60s refresh.
+				-- The signature only makes the change eligible to send; without this
+				-- call clients keep rendering the erased user until the next refresh.
 				broadcastBoard(board)
 			end
+		end
+		if failedBoards ~= nil then
+			-- Board names as a string, not an array: Log trims an oversized context down
+			-- to its scalar fields, so an array is the first thing dropped.
+			Failure.Report({
+				Subsystem = "Leaderboards",
+				Key = tostring(userId),
+				Error = failed,
+				Level = "Error",
+				Category = "Leaderboards",
+				Code = "LB_ERASE_FAIL",
+				Message = tostring(failed),
+				Context = {
+					UserId = userId,
+					Boards = table.concat(failedBoards :: { string }, ", "),
+					BoardCount = #(failedBoards :: { string }),
+				},
+			})
 		end
 		-- Evict the resolved name so it is neither re-served nor re-broadcast.
 		if nameCache[userId] ~= nil then

@@ -15,9 +15,9 @@ name: Deploy docs
 # So the gate is a version comparison: deploy when wally.toml matches the latest
 # published release, skip when main is ahead of it.
 #
-#   main at 1.4.0, latest release v1.3.2  -> skipped (1.4.0 docs stay unpublished)
-#   release v1.4.0 published              -> deploys, from the tag
-#   docs hotfix pushed to main            -> deploys (1.4.0 == v1.4.0)
+#   main at 2.0.0, latest release v1.3.2  -> skipped (2.0.0 docs stay unpublished)
+#   release v2.0.0 published              -> deploys, from the tag
+#   docs hotfix pushed to main            -> deploys (2.0.0 == v2.0.0)
 #   wally.toml bumped to 1.5.0            -> skipped again, automatically
 #
 # The version bump is already the signal that a cycle has started, so this needs

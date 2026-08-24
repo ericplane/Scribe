@@ -30,6 +30,21 @@ jobs:
       # The headless runner ships its own mini-TestEZ, so no `wally install` here.
       - name: Run test suite
         run: lune run lune/run-tests
+      # The same tests as the step above, with every outbound frame forced through
+      # Wire.Fragment and reassembled by the real client (TestCtx drops
+      # MaxOutboundBytes to 256 when this is set). It is not a duplicate run: the
+      # plain suite above splits 27 frames across the whole run -- 18 Diff, 9 Init
+      # -- and this one splits 51, the extra 16 being SharedInit and SharedDiff
+      # broadcasts that the plain invocation fragments ZERO times. Costs ~28s.
+      #
+      # If this ever goes red while the step above is green, that is a real
+      # finding about the fragment path and not a flake -- the run is
+      # deterministic (test/Sim seeds its own Rng; there is no wall clock in the
+      # seams). Do not paper over it by dropping this step.
+      - name: Run test suite (every frame through the fragment path)
+        run: lune run lune/run-tests
+        env:
+          SCRIBE_FRAGMENT_ALL: "1"
 
   lint:
     runs-on: ubuntu-latest
@@ -156,11 +171,19 @@ jobs:
       #
       # Fixed-string matching (-F): the patterns are literals, and a regex here
       # would only be an opportunity to mis-escape a dot.
+      # Exempt: src/Internal/Store, the vendored ProfileStore fork. It is upstream
+      # code kept line-identical so it stays diffable against upstream, and routing
+      # its 57 raw time/thread calls through the seams would rewrite it beyond
+      # recognition for no gain. It IS still virtualised, just by a different
+      # mechanism: test/Sim loads it as raw source into a per-server environment
+      # whose os/task are the simulated ones -- exactly how it behaved when it
+      # lived in ServerPackages, outside `src` altogether.
       - name: Time and waits must route through Internal/Clock
         run: |
           HITS=$(grep -rnF --include='*.luau' \
             -e 'os.time()' -e 'os.clock()' -e 'task.wait(' -e 'task.delay(' \
             src \
+            | grep -v 'src/Internal/Store/' \
             | grep -v 'src/Internal/Clock.luau' \
             | grep -v 'src/Internal/Signal.luau' \
             | grep -v 'DebugHook.luau' \
@@ -172,6 +195,76 @@ jobs:
             exit 1
           fi
           echo 'All time and wait calls route through Internal/Clock.'
+
+      # The same argument, for who runs next rather than when. A raw task.spawn
+      # starts a thread the simulation's scheduler never sees, so it cannot be
+      # interleaved, cannot be counted as live, and cannot be blamed for a
+      # deadlock -- the run just settles early and reports success.
+      #
+      # Note both overloads route, to different entries: task.spawn(fn, ...) is
+      # Sched.Spawn, task.spawn(thread, ...) is Sched.Resume. Same exemptions as
+      # above, for the same reasons.
+      - name: Thread starts must route through Internal/Sched
+        run: |
+          HITS=$(grep -rnF --include='*.luau' \
+            -e 'task.spawn(' -e 'task.defer(' \
+            src \
+            | grep -v 'src/Internal/Store/' \
+            | grep -v 'src/Internal/Sched.luau' \
+            | grep -v 'src/Internal/Signal.luau' \
+            | grep -v 'DebugHook.luau' \
+            | grep -v ':[[:space:]]*--' || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::raw task.spawn/task.defer outside Internal/Sched:"
+            echo "$HITS"
+            echo 'Use Sched.Spawn(fn, ...) / Sched.Defer(fn, ...) / Sched.Resume(thread, ...).'
+            exit 1
+          fi
+          echo 'All thread starts route through Internal/Sched.'
+
+      # The third seam, for what the value is. Jitter exists to decorrelate a
+      # fleet, so a draw the simulation cannot pin turns every replay into a
+      # different run -- and the digest specs that compare run() to run() would
+      # start failing intermittently, which reads as flakiness rather than as the
+      # missing seam it is.
+      #
+      # math.random is banned outright rather than routed: it draws from a state
+      # shared with the game, so Scribe consuming it shifts the sequence every
+      # other script sees. Random.new is banned because it does not exist off
+      # Roblox and would break the headless runner.
+      #
+      # Note these match CALL syntax, exactly as the two gates above do. That is
+      # load-bearing here: `math.random` appears as prose inside the
+      # DERIVED_MISMATCH diagnostic string at src/Internal/Node.luau:2157, on a
+      # line that begins with `..` rather than `--`, so the comment filter would
+      # not skip it. Matching `math.random(` costs nothing and keeps the largest
+      # file in the codebase inside the gate instead of exempting it wholesale.
+      - name: Random draws must route through Internal/Rng
+        run: |
+          HITS=$(grep -rnF --include='*.luau' \
+            -e 'math.random(' -e 'math.randomseed(' -e 'Random.new(' \
+            src \
+            | grep -v 'src/Internal/Store/' \
+            | grep -v 'src/Internal/Rng.luau' \
+            | grep -v 'DebugHook.luau' \
+            | grep -v ':[[:space:]]*--' || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::raw randomness outside Internal/Rng:"
+            echo "$HITS"
+            echo 'Use Rng.Next(). math.random shares its state with the game; Random.new does not exist headless.'
+            exit 1
+          fi
+          echo 'All random draws route through Internal/Rng.'
+
+      # A log code is part of the public surface twice over: games switch on
+      # Types.LogCode, and operators look codes up in the guide after seeing one
+      # in the console. Neither is enforced by anything else -- Log.Warn takes its
+      # code as a plain string, so an unregistered code type-checks perfectly, and
+      # the analyze step above covers test/TypeCheck.luau by design, which never
+      # names one. Measured decay: the four codes added by the frame-fragmentation
+      # work registered 0 of 4 in the union and 3 of 4 in the guide.
+      - name: Every emitted log code must be declared and documented
+        run: lune run lune/check-log-codes
 
   version-check:
     runs-on: ubuntu-latest

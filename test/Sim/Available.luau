@@ -1,0 +1,173 @@
+--!nonstrict
+-- What can THIS host do? One answer per capability, read by every spec that needs
+-- one, so that no spec ever grows a second spelling of the same probe.
+--
+-- Two runners execute this suite and NEITHER is a subset of the other. The headless
+-- runner can fork a simulated universe out of Scribe's own source and has no task
+-- scheduler worth measuring; the real Roblox engine is exactly the other way round.
+-- So each capability below is its own predicate with its own reason string, and a
+-- spec gates on the one it actually depends on.
+--
+-- NOT A HOST CHECK, and this is the rule every predicate here obeys.
+-- `RunService:IsStudio()` answers a different question (a live Studio session versus
+-- a live server) and gets `Ready` wrong in both directions -- it is false under Lune,
+-- where Sim works, and it would be true in a hypothetical Studio plugin context that
+-- still has no filesystem. The capability is the thing the specs actually depend on,
+-- so the capability is what is tested. Anything added below has to pass that same
+-- test.
+--
+--------------------------------------------------------------------------------
+-- Ready -- can a simulated universe be built?
+--------------------------------------------------------------------------------
+--
+-- test/Sim is a FORK LOADER, not a mock. It reads Scribe's own source off disk and
+-- loads it into a per-server environment so each simulated server gets its own copy
+-- of every module, its own clock and its own scheduler. Three capabilities make that
+-- possible and all three arrive through the single `__SimHost` table the headless
+-- runner injects (lune/run-tests.luau, "The escape hatch a simulation needs"):
+--
+--   * `ReadSource` -- raw file reads, used by Sim/Loader and Sim/Bundle;
+--   * `LoadChunk`  -- compiling a chunk against a supplied environment;
+--   * `Enum`       -- THE Enum object, which ProfileStore compares by identity.
+--
+-- Roblox has none of them. A ModuleScript cannot read its own source, `loadstring`
+-- is off by default and would not accept an environment anyway, and a place file
+-- has no filesystem to read from. This is not a gap somebody forgot to fill in --
+-- it is what a Roblox place is, so the answer here will not change.
+--
+-- WHAT THIS IS FOR. A spec that needs a simulated universe should SKIP under Studio,
+-- not fail: the run then says "this needs the headless runner" once per node instead
+-- of burying the next real bug under 260 red ones. Call sites read
+--
+--     local it = if require(Root.Test.Sim.Available).Ready then it else itSKIP
+--
+-- which leaves the node registered and reported, and costs nothing under Lune --
+-- where `Ready` is always true, so `it` stays `it` and every one of those specs runs
+-- exactly as before. That last point is the whole contract of this module: it must
+-- never be able to silence a spec on the runner that CAN run it.
+--
+-- Reading `__SimHost` is safe on both hosts: it is a plain global, so Studio
+-- resolves the name to nil rather than raising, and under Lune the shim hands it to
+-- any module whose source mentions it by name.
+--
+--------------------------------------------------------------------------------
+-- RealEngine -- is this the real Roblox task scheduler?
+--------------------------------------------------------------------------------
+--
+-- The mirror image of `Ready`, and the reason this module is not named for Sim. A
+-- few specs measure the ENGINE rather than Scribe, and the two claims about it that
+-- those specs rest on have to be kept apart, because only one of them is evidence.
+--
+--   THE ENGINE'S OWN WORDS, and citable as fact on that basis -- not on a reading
+--   anyone here took. Roblox refuses a `task.defer` issued more than 80 generations
+--   deep: the engine says so itself -- "Maximum re-entrancy depth (80) exceeded" --
+--   and Persistence.luau quotes it in the AwaitSave comment. That ceiling is the
+--   entire reason the deferred-wake bug class exists. What the string does NOT say is
+--   what the engine does next, drop the callback or raise, and that half is no longer
+--   open either: see the third reading below.
+--
+--   MEASURED, on 2026-08-23 and again on 2026-08-24, by running
+--   test/Specs/DeferredWakeHeadroom.spec.luau in Studio. Both halves of the claim this
+--   paragraph used to hedge now have an answer, and they are DIFFERENT answers:
+--
+--     * INHERITANCE IS CONFIRMED. A thread woken from inside a deferred callback is
+--       promoted by exactly one generation per wake. Three wakes moved a thread from
+--       80 rungs of headroom to 77, twice, on separate days: `perWake=1.00`. That is
+--       the mechanism both shipped fixes were reasoned from, and it is now a reading
+--       rather than an inference.
+--     * PERSISTENCE ACROSS A FRAME IS REFUTED. A climbed rung does NOT survive a
+--       `task.wait`. The reading taken one frame after three wakes was 80, identical
+--       to a fresh thread, and the reading a frame after THAT was 80 again:
+--       `afterFrame=80 survivesFrame=false repeat=80`. The scheduler re-bases a
+--       thread when it next resumes it.
+--
+--     * THE SILENT DROP IS CONFIRMED, by a separate probe on 2026-08-24 that
+--       pcall-wrapped a recursive `task.defer` in both the Edit and the Server realm:
+--       `reached=80 ok=80 raised=0 lastOk=true lastRetType=thread`. The call at the
+--       ceiling raises nothing and returns a thread exactly as a successful queue
+--       does, then never runs the callback. Nothing at the call site can detect it,
+--       which is why a barrier is needed rather than a check.
+--
+--   What follows from the second reading, and it is the useful half: this bug class is
+--   FRAME BOUNDED. Only an unbroken stretch of promoting calls can walk a thread into
+--   the ceiling.
+--
+--   BE PRECISE ABOUT WHAT BREAKS THE STRETCH, because the loose version of this
+--   sentence inverts the whole safety argument. It is NOT "any yield". A
+--   `coroutine.yield` answered by `task.spawn` from inside a deferred callback is a
+--   yield, and it COSTS a rung rather than returning one -- that is the ratchet, and
+--   it is what the perWake reading is made of. What re-bases the thread is a
+--   resumption from the scheduler's own wait queue, a `task.wait`, i.e. a frame
+--   boundary. A path that crosses one between promotions cannot accumulate however
+--   many times it runs.
+--
+--   It does NOT mean the original crash was imaginary. The shape that produced it
+--   yielded on every single call; what it lacked was a frame boundary, and that is
+--   exactly the shape that still reaches 80.
+--
+--   AND IT IS NOT WHY SITE 2 SURVIVES. `waitStateChangedUntil` still wakes from inside
+--   a `Sched.Defer` callback for a correctness reason written at that function: an
+--   inline resume would hand control back from the middle of finishLoad, before the
+--   message handler is registered, and turn ReadyOrdering red. All this reading adds
+--   is that its already-accepted cost cannot compound, because it crosses a frame on
+--   every load: `perLoad=1 slope=0.000 loadsToCeiling=inf`.
+--
+-- Lune's scheduler has no ceiling at all, and THAT is measured: with the gate below
+-- forced true, every chain in that spec ran to its own 256-link safety cap instead of
+-- stopping against anything. So headless those specs cannot measure anything, and
+-- would report their own instrument's safety cap as if it were a reading. They SKIP
+-- there. Call sites read
+--
+--     local itEngine = if require(Root.Test.Sim.Available).RealEngine then it else itSKIP
+--
+-- and, exactly as above, the node stays registered and reported rather than vanishing.
+--
+-- The one consumer today, DeferredWakeHeadroom, ANDs a second term onto that: the
+-- instrument reads the ceiling by hitting it, so a run costs nineteen engine warnings
+-- and it is opt-in even where it is capable. That second term is an opt-in rather than
+-- a capability, so it lives in the spec and not here. This predicate answers only CAN
+-- the host do it, never SHOULD it.
+--
+-- WHY NOT `IsRunning()`. Because it is not a realm gate: lune/run-tests.luau:521
+-- shims it to return true, so the `itRunning` idiom discriminates Studio EDIT mode
+-- from everything else, and all 23 specs that use it run headless today. Anyone who
+-- "simplifies" the probe below into `IsRunning()` runs an engine measurement on a
+-- scheduler that has nothing to measure.
+--
+-- WHY `typeof` AND NOT A DUCK-TYPE PROBE. This is the discriminator TestCtx.Step
+-- already uses (test/Helpers/TestCtx.luau:179-180), with the reason written there:
+-- reading an unknown member off a real RBXScriptSignal RAISES ("Fire is not a valid
+-- member of RBXScriptSignal") rather than returning nil, so probing for `.Fire` is
+-- itself what breaks under Studio. `typeof` answers without touching the member.
+-- Neither read can throw on either host: `PostSimulation` is a real member of
+-- RunService in Studio and a FakeSignal table under Lune (lune/run-tests.luau:524),
+-- and `typeof` is total on tables and on Instances alike.
+--
+-- AND NO `IsRunning()` AS A SECOND CONDITION EITHER, though edit mode is the one host
+-- where `typeof` says yes while a frame loop is arguable. Three reasons, and the
+-- first settles it: this suite cannot BE in edit mode. test.project.json mounts
+-- test/RunTests.server.luau at ServerScriptService, and a server Script does not
+-- execute until the place runs, so `IsRunning()` would be true wherever this line can
+-- be read at all. Second, TestCtx.Step already waits on real frames gated on `typeof`
+-- alone and has never needed a companion. Third, and most important, adding it would
+-- make `RealEngine` answer a host question on top of its capability question -- the
+-- exact error the NOT A HOST CHECK rule above forbids.
+
+local RunService = game:GetService("RunService")
+
+local Available = {}
+
+--- True when a simulated universe can be built.
+Available.Ready = __SimHost ~= nil
+
+--- What to tell someone reading a SKIP line and wondering what to do about it.
+Available.Reason = "needs test/Sim, which requires the headless runner (lune run lune/run-tests)"
+
+--- True when the host is the real Roblox engine, whose task scheduler has a
+--- `task.defer` re-entrancy ceiling for a spec to measure against.
+Available.RealEngine = typeof(RunService.PostSimulation) == "RBXScriptSignal"
+
+--- What to tell someone reading a SKIP line and wondering what to do about it.
+Available.RealEngineReason = "needs the real Roblox engine (rojo build test.project.json, then Run in Studio)"
+
+return Available

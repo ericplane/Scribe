@@ -1,296 +1,210 @@
 # Session Lifecycle
 
-Profiles load asynchronously and save on a cadence. Knowing the lifecycle is the difference between smooth joins and mysterious "data for X is Loading" errors.
+A player's profile does not exist the instant they join. Scribe has to fetch it from a DataStore, reconcile it against your template, and take a session lock on it, and all of that takes time. Knowing that sequence is the difference between smooth joins and a mysterious "data for Ava is Loading" error.
 
-## Loading
+This page follows one session from the moment a player arrives to the moment their last save lands.
 
-Always wait for data before reading it:
+## Waiting for data
+
+Never read a player's data before it is ready. Ask for it and handle both answers:
 
 ```lua
 Players.PlayerAdded:Connect(function(player)
     local data, reason = Data.WaitForData(player)
     if not data then
-        -- reason says why; see the table below
+        if reason ~= Scribe.Reason.PlayerLeft then
+            warn(`Emberfall: no data for {player.Name}, {reason}`)
+        end
         return
     end
-    -- ...use data...
+
+    local folder = Instance.new("Folder")
+    folder.Name = "leaderstats"
+
+    local level = Instance.new("IntValue")
+    level.Name = "Level"
+    level.Parent = folder
+
+    data.Level.Observe(function(value)
+        level.Value = value
+    end)
+
+    folder.Parent = player
 end)
 ```
 
-| API                                              | Purpose                                                                      |
-| ------------------------------------------------ | ---------------------------------------------------------------------------- |
-| [`WaitForData(player, timeout?)`](/api/Server#WaitForData) | Yields until Ready (up to `timeout` seconds, default 60); returns `(accessor?, reason?)`. Handle the `nil` branch. |
-| [`GetState(player)`](/api/Server#GetState)       | `"Loading" \| "Ready" \| "SessionEnded"`, without yielding.                  |
+[`Data.WaitForData(player, timeout?)`](/api/Server#WaitForData) yields until the profile is Ready, up to `timeout` seconds (60 by default), and returns `(accessor?, reason?)`. `Observe` fires immediately with the current value and again on every change, so the leaderstat is correct from the first frame.
 
-### Why data was unavailable
+Once a session is Ready, `Data[player]` and [`Data.Get(player)`](/api/Server#Get) hand you the same accessor without yielding. Both **error** while a profile is still Loading, so use them after `WaitForData`, or inside a [`Command`](/api/Server#Command) handler, which only runs once the caller is Ready. [`Data.GetState(player)`](/api/Server#GetState) answers `"Loading"`, `"Ready"` or `"SessionEnded"` at any moment without yielding.
 
-When `WaitForData` returns no tree, `reason` is one of exactly six values, also available as the `Scribe.LifecycleReason` type and the `Scribe.Reason` constants table. The `SessionEnded` signal carries the same set.
+## When there is no data
 
-| Reason | `Scribe.Reason` | Meaning |
-| --- | --- | --- |
-| `player-left` | `PlayerLeft` | The player left. By far the most common, and usually not an error. |
-| `timeout` | `Timeout` | The wait elapsed before the profile reached Ready. |
-| `load-failed` | `LoadFailed` | The profile could not be loaded. |
-| `migration-failed` | `MigrationFailed` | A migration errored, so the profile was released unmigrated. |
-| `session-ended` | `SessionEnded` | The session ended while the player was still in game. |
-| `shutdown` | `Shutdown` | The server is closing. |
+`reason` is one of exactly seven values, available as the `Scribe.LifecycleReason` type and the `Scribe.Reason` constants table. The `SessionEnded` signal carries the same set.
+
+| Reason | `Scribe.Reason` | Meaning | Retry? |
+| --- | --- | --- | --- |
+| `player-left` | `PlayerLeft` | The player left. By far the most common, and usually not an error. | no |
+| `still-loading` | `StillLoading` | The wait elapsed while the load was **still in flight**. Nothing has failed. | **yes** |
+| `timeout` | `Timeout` | The wait elapsed and Scribe has no session for this player at all. | no |
+| `load-failed` | `LoadFailed` | The profile could not be loaded. | no |
+| `migration-failed` | `MigrationFailed` | A migration errored, so the profile was released unmigrated. | no |
+| `session-ended` | `SessionEnded` | The session ended while the player was still in game. | no |
+| `shutdown` | `Shutdown` | The server is closing. | no |
+
+Only one of them is worth retrying:
 
 ```lua
-if reason == Scribe.Reason.PlayerLeft then
-    return -- routine
+local data, reason = Data.WaitForData(player)
+if not data and reason == Scribe.Reason.StillLoading then
+    data = Data.WaitForData(player, 60)   -- still coming, give it the rest of the load window
 end
 ```
 
-`Data[player]` and `Data.Get(player)` **error** while a profile is Loading. Use them only after `WaitForData`, or inside a [`Command`](/api/Server#Command) handler (which only runs once the caller is Ready).
+??? note "Why `still-loading` and `timeout` are different values"
+    `WaitForData` waits 60 seconds by default, while a load is given [`LoadTimeout`](./configuration) seconds, 120 by default and floored at 60. So there is a band where the default wait runs out over a load that is simply taking its time and is going to succeed. A cross-server handoff waits out ProfileStore's session-steal window, about 40 seconds, and a slow DataStore stretches that further.
 
-### On the client
+    That band used to report `timeout`, the same value a player Scribe has no session for gets, so the two were indistinguishable. The default wait was deliberately **not** raised to match the load deadline: a bounded wait that tells you the truth is worth more than a longer one that does not, and a caller who wants to wait longer can say so.
 
-The client mirror never errors: accessor reads return **template defaults** until the first snapshot arrives, then `Observe`/`Changed` fire with the real values. For reactive UI, that's all you need. To gate one-shot startup logic, use [`Data.IsReady()`](/api/Client#IsReady) (non-yielding) or [`Data.WaitForData(timeout?)`](/api/Client#WaitForData), which yields until loaded and returns `false` if it times out (default 30s), so it never hangs:
+    If you branch on `timeout` today, handle `still-loading` alongside it.
+
+## On the client
+
+The client mirror never errors. Accessor reads return **template defaults** until the first snapshot arrives, then `Observe` and `Changed` fire with the real values. For reactive UI that is all you need:
+
+```lua
+Data.Coins.Observe(function(coins)
+    coinLabel.Text = tostring(coins)
+end)
+```
+
+To gate one-shot startup logic, use [`Data.IsReady()`](/api/Client#IsReady), which does not yield, or [`Data.WaitForData(timeout?)`](/api/Client#WaitForData), which yields until loaded and returns `false` if it times out after 30 seconds by default, so it never hangs:
 
 ```lua
 if Data.WaitForData() then
-    showMainMenu(Data.Coins.Get())
+    showMainMenu(Data.Level.Get())
 end
 ```
 
 ## OnPlayerInit
 
-`OnPlayerInit` runs once per player right after their profile finishes loading and before they are Ready, receiving the Player, their **raw** data table, and whether this is a brand-new profile:
+`OnPlayerInit` runs once per player, right after their profile finishes loading and before they are Ready. It receives the Player, their **raw** data table, and whether this is a brand-new profile:
 
 ```lua
-OnPlayerInit = function(player, rawData, isNewProfile)
-    if isNewProfile then
-        rawData.Coins = 500 -- starter grant, only for a first-time player
-    end
-end,
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "EmberfallPlayerData",
+    ProfileKeyPrefix = "PLAYER_",
+
+    OnPlayerInit = function(player, rawData, isNewProfile)
+        if isNewProfile then
+            rawData.Coins = 500   -- Emberfall's starter purse
+        end
+    end,
+})
 ```
 
-`isNewProfile` is true for a genuinely new profile, a `ResetData` wipe, and a first-session crash recovery, so you can run starter kits and welcome flows without keeping your own sentinel field. Use it for per-player setup that needs the freshly loaded data, such as building leaderstats. An error it throws is caught and logged rather than blocking the load.
+`isNewProfile` is true for a genuinely new profile, a `ResetData` wipe, and a first-session crash recovery, so you can run starter kits and welcome flows without keeping your own sentinel field. An error thrown here is caught and logged rather than blocking the load.
 
-The table you get is the raw profile data, not the accessor tree, so writes here bypass the usual validation: Scribe scans it afterwards and reports anything unstorable as `PROFILE_UNPERSISTABLE`. For a value that depends only on the profile itself (a creation timestamp, a seed), prefer [`Scribe.Dynamic`](./templates), which is declared in the template and runs per profile automatically.
+The table you get is the raw profile data, not the accessor tree, so writes here bypass the usual validation. Scribe scans the result afterwards and reports anything unstorable as `PROFILE_UNPERSISTABLE`. For a value that depends only on the profile itself, such as a creation timestamp, prefer [`Scribe.Dynamic`](./templates), which is declared in the template and runs per profile automatically.
 
-Because it is the raw table, [derived fields](./derived) are not in it — they are computed, never stored, and Scribe evaluates them right after this hook, before the session is Ready. A value you would otherwise compute here and write is usually a derived field: declare it once and it stays correct for the life of the profile, including after you change the formula.
+Because it is the raw table, [derived fields](./derived) are not in it. They are computed, never stored, and Scribe evaluates them right after this hook and before the session is Ready. A value you would otherwise compute here and write is usually a derived field.
 
 :::caution Datatype fields need packing here
-Bypassing the accessor also bypasses [datatype packing](./templates#roblox-datatype-fields). A `Scribe.DateTime`, `Scribe.Vector3`, or `Scribe.CFrame` field stores a packed buffer, and the accessor converts for you, but a raw assignment stores the userdata itself, which no DataStore can serialize:
+Bypassing the accessor also bypasses [datatype packing](./datatypes). A raw assignment stores the userdata itself, which no DataStore can serialize:
 
 ```lua
 OnPlayerInit = function(player, data)
-    data.Joined = DateTime.now()                                   -- PROFILE_UNPERSISTABLE
-    data.Joined = Scribe.Datatypes.Pack("DateTime", DateTime.now()) -- correct
+    data.Checkpoint = Vector3.new(0, 12, 0)                                   -- PROFILE_UNPERSISTABLE
+    data.Checkpoint = Scribe.Datatypes.Pack("Vector3", Vector3.new(0, 12, 0))  -- correct
 end,
 ```
 
-Reads are unaffected either way: `data.Joined.Get()` still hands back a real `DateTime`. The same applies inside a [migration](#migrations), which also receives raw data. Often the simpler fix is to store the plain unix number in a `Scribe.Int` field and build the `DateTime` where you use it.
+Reads are unaffected either way: `data.Checkpoint.Get()` still hands back a real `Vector3`. The same applies inside a [migration](./profiles#migrations), which also receives raw data.
 :::
+
+## Migrations
+
+If your template has changed shape since a profile was written, Scribe runs your migration chain during the load, between reconciling the stored data and `OnPlayerInit`. Migrations are fail-closed: a step that throws ends the session with a kick and the `migration-failed` reason, and nothing is stamped or saved.
+
+Writing that chain is its own topic, because a migration step edits the stored profile rather than a live session. [Offline Profiles](./profiles#migrations) covers it.
 
 ## Saving
 
-Scribe autosaves each profile every `SaveInterval` seconds (default **300**; lower it to shrink the window of progress lost to a crash). It also saves on leave and on `BindToClose`. For a grant or purchase you don't want to lose, force a save:
+Scribe autosaves each profile every `SaveInterval` seconds, 300 by default. Lower it to shrink the window of progress a crash can cost. It also saves when a player leaves and on `BindToClose`.
+
+For a grant you do not want to lose, force a save:
 
 ```lua
 Data.Purchase(player, spec)
-Data.Flush(player, { Force = true })  -- persist immediately
+Data.Flush(player, { Force = true })   -- persist immediately
 ```
 
-`Flush` yields until the save is confirmed and returns whether it landed. `Force = true` also pushes the save through if the [wipe guard](./diagnostics#wipe-guard) had blocked it.
+[`Flush`](/api/Server#Flush) yields until the save is confirmed and returns whether it landed. `Force = true` also pushes the save through if the [wipe guard](./diagnostics) had blocked it.
 
-A `false` return does **not** mean "the save did not happen". `Flush` waits at most `Timeout` seconds (default **15**, also passed in `opts`) and then returns `false` even though the save may still complete afterwards, and it returns `false` immediately, without attempting a save at all, if the profile is not Ready (a `Flush` fired from `PlayerAdded` before `WaitForData` always does). Log it or retry the flush, but never re-grant the purchase on `false`, or you double-grant the common case.
+Flushing costs nothing when there is nothing to save. If the profile has not changed since its last successful save and none is still in flight, `Flush` answers `true` straight away with no DataStore request. So flushing on a checkpoint or a timer is cheap, and flushing after a grant still always saves, because a grant leaves the profile dirty by definition.
 
-Observe save state for "Saving… / Saved ✓" UI:
+:::caution A `false` from `Flush` does not mean the save failed
+`Flush` waits at most `Timeout` seconds, 15 by default, and then returns `false` even though the save may still complete afterwards. It also returns `false` immediately, without attempting a save at all, if the profile is not Ready, which a `Flush` fired from `PlayerAdded` before `WaitForData` always is.
+
+Log it or retry the flush. Never re-grant the purchase on `false`, or you double-grant the common case.
+:::
+
+Watch save state for "Saving... / Saved" UI:
 
 ```lua
 Data.OnSave:Connect(function(info)
     -- { Player, Ok, Duration, At }
 end)
-local info = Data.GetSaveInfo(player) -- { LastSaveAt, LastResult, Dirty, Size }
+
+local info = Data.GetSaveInfo(player)   -- { LastSaveAt, LastResult, Dirty, Size }
 ```
 
-:::note Not-ready reads return defaults
-`Owns`, `GetPurchases`, `GetGiftCredits`, and `GetSaveInfo` answer with `false`/`{}`/`{ Dirty = false }` while a profile is still Loading. Gate ownership logic behind `WaitForData` so a VIP owner isn't treated as a non-owner on join.
-:::
+??? note "Reads that answer with a default while a profile is loading"
+    `Owns`, `GetPurchases`, `GetGiftCredits` and `GetSaveInfo` answer with `false`, `{}` and `{ Dirty = false }` respectively while a profile is still Loading. Gate ownership logic behind `WaitForData` so a VIP owner is not treated as a non-owner on join.
+
+??? note "Writing a burst of changes at once"
+    Several writes in a row each replicate on their own frame. [`Data.Batch`](/api/Server#Batch) coalesces them into one flush, and [`Data.Transaction`](/api/Server#Transaction) additionally makes them all-or-nothing. Both are covered in [Cross-Key Transactions](./transactions), along with what "atomic" does and does not mean here.
 
 ## Session end
 
-When a session ends (leave, or a session stolen by another server), [`SessionEnded`](/api/Server#SessionEnded) fires with `(player, reason)`. With `KickOnSessionEnd = true` (the default) the player is also kicked, so their client can't keep acting on stale data.
-
-## Batching and transactions
-
-By default each write replicates on the next frame. Two server helpers change that for a burst of writes:
-
-- **`Batch`** coalesces every write inside it into a **single replication flush**, so the client gets one update instead of many, and collapses each **container** `Changed` to one fire carrying the batch's end state. Leaf `Changed`, `OnChildChanged`, `OnInsert` and `OnRemove` are transitions and still fire once per write. Reach for it on bulk updates. **It must not yield**, and unlike `Transaction` below, nothing detects it when it does: a `task.wait` or DataStore call inside a batch holds that player's replication flush and every coalesced container `Changed` until the batch returns, and any unrelated write landing on the same tree in the meantime is swept into the same flush.
-- **`Transaction`** runs writes **atomically**: if the function throws, every write inside is rolled back and it returns `(false, error)`; on success, `(true, nil)`. It also batches, so it is already a single flush. The function **must not yield** (no `task.wait`, DataStore, or MarketplaceService calls inside it): a yield is refused with `(false, error)` and rolled back, because a concurrent write landing during the yield could be pulled into the transaction. Do any async work before or after. A rollback also drops the economy events a tagged `Increment` / `Decrement` inside it would have logged, so a reverted transaction never reaches your analytics. A plain `Batch` gives you none of that: it defers the replication flush, but a throw inside it leaves every write that already ran in place.
-
-!!! warning "`Transaction` is atomic in memory, not on the DataStore"
-
-    "Atomic" here means the writes land on **one player's in-memory tree** all together or not at all. It does **not** mean durable, and it is not a database transaction:
-
-    - **Commit is not a save.** When `Transaction` returns `true` the writes are in memory and queued for the next save like any other write. A server crash before that save loses them. To tie a transaction to durability, follow it with [`AwaitSave`](/api/Server#AwaitSave) and only treat the operation as complete once that returns — this is exactly what the [monetization](./monetization) receipt path does before it reports `PurchaseGranted`.
-    - **One player only.** There is no cross-player or cross-key transaction. A trade between two players is **not** expressible as a single `Transaction`: each side is a separate tree with a separate DataStore key, so one side can save while the other does not. If you build trading, design for that — stage the transfer through a durable record (a pending-gift style entry committed on the recipient's own key) rather than assuming two `Transaction` calls succeed or fail together.
-
-    Cost scales with the number of **distinct paths** the transaction touches, not the size of the profile. A few hundred paths is sub-millisecond; several thousand in one transaction is a measurable hitch.
+When a session ends, whether the player left or another server stole the session, [`SessionEnded`](/api/Server#SessionEnded) fires with `(player, reason)`. With `KickOnSessionEnd = true`, the default, the player is also kicked so their client cannot keep acting on stale data.
 
 ```lua
--- Batch: one replication flush and one Changed for a bulk update
-Data.Batch(player, function()
-    for _, item in starterKit do
-        Data[player].Inventory.Insert(item)
-    end
-end)
-
--- Transaction: all-or-nothing. A throw in a later step undoes the earlier writes.
-local ok, err = Data.Transaction(player, function()
-    Data[player].Coins.Decrement(price)
-    grantItemOrThrow(player, itemId) -- if this errors, the Decrement rolls back too
-end)
-if not ok then
-    -- nothing changed; `err` explains why
-end
-```
-
-Both run synchronously on the server accessor, and transactions can't nest.
-
-For the specific economy case of spending in-game currency on an item, [`Purchase`](./monetization#soft-currency-purchases) is a purpose-built atomic transaction: it checks funds, debits, grants, and writes a purchase-log entry as one all-or-nothing step, which is why it lives with the rest of [monetization](./monetization).
-
-## Cross-server messaging
-
-Send a durable message to another player's profile from any server with [`SendMessage`](/api/Server#SendMessage). It arrives at [`OnMessage`](/api/Server#OnMessage) on whatever server that player is active on, and is queued for offline players until their next load.
-
-```lua
--- sender (any server)
-local delivered = Data.SendMessage(recipientUserId, { Kind = "TradeOffer", Item = "Sword_001" })
-if not delivered then
-    -- the offer never left this server; don't tell the sender it did
-end
-
--- recipient's server
-Data.OnMessage:Connect(function(player, message)
-    if message.Kind == "TradeOffer" then
-        -- ...
+Data.SessionEnded:Connect(function(player, reason)
+    if reason == Scribe.Reason.SessionEnded then
+        analytics:Log("session_stolen", player.UserId)
     end
 end)
 ```
 
-`SendMessage` **yields** (it is a `MessageAsync` round trip) and returns whether the message was committed. Check the return: on failure it logs [`MESSAGE_SEND_FAIL`](./log-codes) and returns `false`, and a sender UI that assumes success reports a trade offer that was never delivered.
+## Working with signals
 
-Messages ride ProfileStore's global-update channel, so keep them small and infrequent (this is for coordination, not chat). Scribe's own gift delivery uses the same channel with a separate tag, so the two never collide.
-
-### The ProfileStore escape hatch
-
-For the rare store-level operation Scribe doesn't wrap (a version query with a different sort order or date bound, a raw `MessageAsync` outside Scribe's envelope, and so on), [`Data.ProfileStore`](/api/Server#ProfileStore) exposes the underlying ProfileStore instance. It **bypasses Scribe's schema, replication, and session guarantees**, so treat it as read-mostly and never mutate an active-session profile through it. Most games never need it; prefer the typed API and `SendMessage`.
-
-## Offline profiles, version history, and erasure
-
-Support tickets ("my inventory vanished, roll me back") and GDPR requests act on a player who isn't in front of you. These take a `userId` rather than a `Player`, and **every one of them yields**, so call them from a [`Command`](/api/Server#Command) handler, an admin panel, or a batch task, never from a per-frame path. The [Studio plugin](./studio-plugin)'s Production panel wraps the same operations in UI when you'd rather click than write a command.
-
-| API | Returns | What it does |
-| --- | --- | --- |
-| [`GetOffline(userId)`](/api/Server#GetOffline) | `data?` | Read-only snapshot of the raw profile table. |
-| [`UpdateOffline(userId, fn)`](/api/Server#UpdateOffline) | `(ok, reason?)` | Runs `fn(data)` against a copy of the raw profile and saves it. |
-| [`ListVersions(userId, limit?)`](/api/Server#ListVersions) | `{ { VersionId, CreatedAt, Size } }` | Version history, newest first, up to `limit` (default **25**). `CreatedAt` is Unix seconds. |
-| [`GetVersion(userId, versionId)`](/api/Server#GetVersion) | `data?` | Raw data of one historical version, for inspection or diffing. |
-| [`RestoreVersion(userId, versionId)`](/api/Server#RestoreVersion) | `(ok, reason?)` | Rolls the live key back to that version. |
-| [`Export(userId)`](/api/Server#Export) | `json?` | The profile as a JSON string, buffers base64-encoded. |
-| [`Erase(userId)`](/api/Server#Erase) | `(ok, reason?)` | Deletes the profile and the user's leaderboard entries. |
-
-**The session lock is the rule.** Every write here (`UpdateOffline`, `RestoreVersion`, `Erase`) **fails closed** when the user has an active session, whether on this server or on any other, and returns `(false, reason)` saying which. None of them steal the lock, because stealing it would evict a player from the server they're actually playing on. `RestoreVersion` and `Erase` additionally refuse while [service health](./diagnostics#service-health) reports an `Outage`. So the operational order is: get the player out of the game, then act, then let them rejoin.
-
-**Reads don't fail closed, and `nil` is ambiguous.** `GetOffline` returns a clone of the live data when that user is already Ready on *this* server, and otherwise reads the DataStore directly, which for a player active on *another* server is the last committed bytes rather than what they're looking at right now. `Export` reads through it, so it inherits the same behaviour. It returns `nil` both for a profile that doesn't exist and for a read that errored, and only the [`OFFLINE_READ_FAIL`](./log-codes) log tells the two apart. `GetVersion` behaves the same way (`VERSION_READ_FAIL`), and `ListVersions` returns whatever it gathered before an error, so an empty list is not proof of no history (check for `VERSION_QUERY_FAIL`).
-
-### Rolling a profile back
+`OnSave` and `SessionEnded` are [signals](/api/Signal), and so is every other `On…` member on `Data`, `Client` and `Scribe`. They all work the same way:
 
 ```lua
-local versions = Data.ListVersions(userId, 10) -- newest first
-local target = versions[1]
-if not target then
-    return -- no history, or the query failed
-end
+local conn = Data.OnSave:Connect(function(info) end)   -- runs on every save
+conn:Disconnect()                                      -- stop listening
 
-local snapshot = Data.GetVersion(userId, target.VersionId)
-if not snapshot then
-    return -- version missing, or the read failed
-end
-print(`restoring {userId} to {target.VersionId}, Coins {snapshot.Coins}`)
-
-local ok, reason = Data.RestoreVersion(userId, target.VersionId)
-if not ok then
-    warn(`restore failed: {reason}`)
-end
+Data.OnSave:Once(function(info) end)                   -- runs once, then detaches
+local info = Data.OnSave:Wait()                        -- yields for the next one
 ```
 
-A restore stamps `RestoredFrom = { VersionId, At }` into the profile's reserved `_Scribe` block, so a later read shows where the data came from. It needs a live key to write over: restoring a profile that was erased fails with `no live profile exists for this user to restore over`.
-
-### Editing an offline profile
-
-`UpdateOffline` mutates the **raw** profile table, the same shape `OnPlayerInit` receives, so declarator rules (bounds, enum members, `MaxLength`, element shapes) are not enforced there, though unpersistable values are still refused outright. Your callback runs against a copy, so one that errors partway commits nothing. It cannot create a profile: a user who has never joined returns `(false, "profile does not exist")`. Same-user calls on one server are serialized so they can't clobber each other, but two servers writing the same offline profile at once still can, so run backfills from one place. [Migrating to Scribe](./migrating#backfilling-offline-players) walks through the bulk-import version.
-
-### GDPR export and erase
-
-```lua
-local json = Data.Export(userId) -- nil if missing, unreadable, or unencodable
-if json then
-    -- hand it to the requester through your own channel
-end
-
-local ok, reason = Data.Erase(userId)
-if not ok then
-    warn(`erase incomplete, retry: {reason}`)
-end
-```
-
-Export first: `Erase` removes the live key outright, and `RestoreVersion` refuses afterwards because it has nothing to restore over. `Erase` deletes the profile and then the user's leaderboard entries; if the profile is gone but a leaderboard key survived, it returns `(false, reason)` so you retry. The whole call is idempotent, so retrying it is safe.
-
-## Migrations
-
-`Migrations` evolve your **own** Scribe data shape over time (this is not how you import from another data library; see [Migrating to Scribe](./migrating) for that). When your template changes, bump the version with a migration step. Migrations are **fail-closed**: if any step throws, nothing is stamped, nothing is saved, and the session ends with a kick. A half-migrated profile can never persist.
-
-:::caution Template defaults are backfilled *before* your step runs
-Scribe reconciles the stored data against the current template first, so every missing template key already holds its default by the time step 2 sees it. A step guarded on `if data.Field == nil`, or written as `data.Field = data.Field or 0`, therefore reads the default instead of the absence and silently does nothing for returning players. Key your steps off something the reconcile cannot manufacture: a field you removed from the template, or a value only stored data could hold.
-
-Set `MigrationShadow = true` while you are writing a chain. Scribe then re-runs the same steps against the raw pre-reconcile bytes and warns under [`MIGRATION_RECONCILE_DEPENDENT`](./log-codes) wherever the two results diverge. It is opt-in, not automatic, and it **re-executes your migration bodies**, so keep them pure functions of `data` while it is on.
-:::
-
-```lua
-Migrations = {
-    -- Renaming Coins to Gems. `Coins` is gone from the template, so nothing
-    -- backfills it and its presence is a real signal; `Gems` is in the template,
-    -- so it already holds the default and has to be overwritten.
-    [2] = function(data)
-        if data.Coins ~= nil then
-            data.Gems = data.Coins
-            data.Coins = nil
-        end
-    end,
-    [3] = function(data) data.Inventory = convertLegacy(data.Inventory) end,
-},
-```
-
-Each profile stores the version its last successful run stamped, so **never renumber or remove a step you have shipped**: a profile stamped `3` resumes at step `4`, and repointing `3` at different code can no longer reach it. Following from that, the table has to be contiguous from `2` up to your highest key. A gap fails loudly at startup (`Scribe: Migrations table is missing step 3`) rather than being skipped.
-
-One exception to fail-closed: a returning profile whose stored data is still nothing but current-template defaults is loaded un-migrated and left **unstamped** rather than kicked, because it has no stored progress to protect. Its chain retries on every join and lands as soon as the migration is fixed. It still logs `MIGRATION_FAIL` at Error, plus a Warn explaining the carve-out. The consequence for testing: a broken deploy kicks players with real progress while a barely-touched test account loads normally, so "my account loaded fine" is not evidence the step ran.
-
-:::caution Staged deploys
-During a rolling deploy, a player whose data a new server already migrated can land on a still-running old server. By default (`VersionAheadPolicy = "Kick"`) Scribe fails closed there too, refusing to run old code against newer-shaped data. When you ship a migration, shut down old servers so players don't bounce between kicking instances.
-:::
-
-## Coming from another data library?
-
-If you're moving an existing game onto Scribe (from ProfileService, DataStore2, or a custom store), see [Migrating to Scribe](./migrating).
+Every handler runs on its own thread, so yielding inside one holds up neither the other handlers nor Scribe. A handler that errors is reported with its traceback and the signal keeps working, which is why a broken analytics call cannot stop a save. Do not depend on two handlers running in a particular order; if one step has to follow another, put both in the same handler.
 
 ## Writing on the way out
 
-`OnPlayerLeaving` is the counterpart to [`OnPlayerInit`](#onplayerinit). It runs **before the final save**, so whatever it writes persists. This is where the accumulate-on-exit pattern belongs:
+`OnPlayerLeaving` is the counterpart to `OnPlayerInit`. It runs **before the final save**, so whatever it writes persists. This is where the accumulate-on-exit pattern belongs:
 
 ```lua
 Scribe({
     Template = template,
-    ProfileStoreIndex = "PlayerData",
+    ProfileStoreIndex = "EmberfallPlayerData",
     ProfileKeyPrefix = "PLAYER_",
 
     OnPlayerLeaving = function(player, data, reason)
         local joined = joinedAt[player.UserId]
         if joined then
-            data.Playtime.Increment(os.time() - joined)
+            data.Stats.Playtime.Increment(os.time() - joined)
         end
     end,
 })
@@ -300,9 +214,41 @@ You get the same typed accessor as anywhere else, so writes are validated and bo
 
 Doing this from your own `Players.PlayerRemoving` handler instead is a race against Scribe's, decided by connection order, and a write that lands after teardown is silently lost.
 
-Two limits on the hook:
+**The hook must not yield.** Do the async work during the session and only write here. On a normal leave, a hook parked on a `task.wait` or a DataStore call holds that player's session open for as long as it waits.
 
-- **It must not yield.** On shutdown it runs synchronously inside the drain loop, before the final save is spawned, against a single ~25 second budget shared by every player still in the server (Scribe's slice of Roblox's ~30 second `BindToClose`). One hook parked on a `task.wait` or a DataStore call delays every other player's final save. Do the async work during the session and only write here.
-- **It does not run in every teardown.** It is skipped when the profile never reached Ready, and when another server steals the session mid-play (that path tears the entry down without a local leave, so no hook fires). Those are exactly the sessions an accumulate-on-exit counter would most want, so treat the hook as best-effort bookkeeping rather than the only place a value is ever written.
+??? note "What happens to the hook on shutdown"
+    On shutdown the hook no longer holds up anybody else. Every player's hook starts at once, and each one still runs before its own final save. But it is now bounded: the hook phase gets three quarters of Scribe's shutdown budget, which is its slice of Roblox's roughly 30 second `BindToClose` window and is 25 seconds by default. The rest belongs to the leaderboard flush.
 
-If the hook throws, the error is logged and the save continues. It costs you that hook's remaining writes, not the whole session.
+    Two things follow for a hook that runs long. Once that share is spent, remaining hooks are **skipped** so their profiles can still save. A hook already parked when the share expires is **cut off**: Scribe stops waiting and saves without it. A cut-off hook is not atomic. Whatever it wrote before the cut is already in the profile and persists, and what it writes afterwards raises into the same contained error path as a throw.
+
+    `SHUTDOWN_DONE` reports both counts, and they are also the `LeavingHooksSkipped` and `LeavingHooksTimedOut` counters in [diagnostics](./diagnostics).
+
+??? note "The hook does not run in every teardown"
+    It is skipped when the profile never reached Ready, when another server steals the session mid-play, because that path tears the entry down without a local leave, and on shutdown when the hook phase has spent its share of the budget before reaching that player.
+
+    Those are exactly the sessions an accumulate-on-exit counter would most want, so treat the hook as best-effort bookkeeping rather than the only place a value is ever written. If the hook throws, the error is logged and the save continues, costing you that hook's remaining writes rather than the whole session.
+
+??? note "Shutting a bundle down inside a test or a simulation"
+    A Scribe bundle is normally built once and lives for the whole server, so a game never needs this. A **process** that builds many bundles, such as a test suite or a simulation standing up a fleet of servers, otherwise accumulates immortal loops and listeners and ends up measuring that accumulation rather than Scribe.
+
+    [`Data.Stop()`](/api/Server#Stop) releases everything one bundle holds: the timed-field sweep, the leaderboard write pacer and refresh cycle, the per-frame replication flush, the Players and MarketplaceService listeners, the ProfileStore signal handlers, and `MarketplaceService.ProcessReceipt` if this bundle owns it.
+
+    ```lua
+    local bundle = Scribe({ Template = template, ProfileStoreIndex = "EmberfallTest", ProfileKeyPrefix = "T_" })
+    local Data = bundle.Server
+
+    -- ... run the test ...
+
+    Data.Flush(player, { Force = true })   -- Stop does NOT save
+    Data.Stop()
+    ```
+
+    It is idempotent, and it deliberately does **not** save, so flush first if the data matters. Loaded sessions are left alone: drop the bundle and they go with it. See [Testing & Edit Mode](./testing).
+
+## Where to next
+
+- [Offline Profiles](./profiles) covers everything that happens to a profile when the player is not here: version history, rollbacks, migrations, and erasure.
+- [Cross-Key Transactions](./transactions) explains `Batch`, `Transaction`, and what atomicity means for one player's tree.
+- [Configuration](./configuration) lists `SaveInterval`, `LoadTimeout`, `KickOnSessionEnd` and the rest.
+- [Diagnostics](./diagnostics) is where save failures, the wipe guard, and the shutdown counters surface.
+- [Commands & Requests](./commands) is how the client asks the server to change something after it is Ready.

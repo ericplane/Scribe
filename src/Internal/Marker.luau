@@ -28,6 +28,10 @@ export type MarkerKind =
 export type Meta = {
 	Min: number?,
 	Max: number?,
+	-- Scribe.Number only: opts the field out of f64 on the wire. "f32" selects
+	-- IEEE binary32; a positive number selects a fixed-point grid of that step
+	-- over [Min, Max]. Absent means f64, which is the default and stays it.
+	Precision: (number | string)?,
 	MaxLength: number?,
 	Members: { string }?,
 	Datatype: string?, -- typeof() name for Datatype markers (e.g. "Vector3")

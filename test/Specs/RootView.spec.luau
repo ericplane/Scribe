@@ -186,8 +186,12 @@ return function()
 		local harness = makeHarness()
 		local _player, entry, data = harness.Join(94009)
 
-		data._Scribe.Perks.VIP.Set(true)
+		-- The layers write through the library's privileged handle. The PUBLIC
+		-- accessor refuses that write (see ReservedRootGuard.spec) but still reads
+		-- the same paths, which is the reachability this test is about.
+		entry.Tree.Reserved.Perks.VIP.Set(true)
 		expect(entry.LiveData._Scribe.Perks.VIP).to.equal(true)
+		expect(data._Scribe.Perks.VIP.Get()).to.equal(true)
 		expect(data._Scribe.Version.Get()).to.be.ok()
 
 		harness.Cleanup()
@@ -203,7 +207,7 @@ return function()
 		-- accessor type omits Set and Update at the root for the same reason.
 		local harness = makeHarness()
 		local _player, entry, data = harness.Join(94011)
-		data._Scribe.Perks.VIP.Set(true)
+		entry.Tree.Reserved.Perks.VIP.Set(true)
 		data.Coins.Set(10)
 
 		expect(function()

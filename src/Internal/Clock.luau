@@ -1,36 +1,21 @@
 --!strict
 -- The clock seam: every reading of time and every timed wait in Scribe goes
--- through here, so a test or a simulation can replace them.
+-- through here, so a test or a simulation can replace them and fast-forward.
 --
--- Without this, nothing can fast-forward. A cooldown that expires in an hour, a
--- purchase-id that ages out after seven days, a leaderboard refresh cycle, a
--- retry backoff -- each of those can only be exercised by actually waiting, so in
--- practice they are exercised by reading the code and hoping. With a virtual
--- clock installed, eight hours of autosaves runs in two seconds and the horizon
--- logic becomes ordinary testable behaviour.
+-- Two clocks, because conflating them is a real bug:
 --
--- TWO CLOCKS, deliberately, because conflating them is a real bug and the names
--- should make the right one obvious:
---
---   Now()       wall time, unix seconds (os.time). Use for anything PERSISTED or
---               compared across sessions and servers: a cooldown deadline, a
---               purchase-id stamp, a gift-intent timestamp. It can jump when the
---               machine's clock is corrected, so never use it to measure an
---               interval.
+--   Now()       wall time, unix seconds (os.time). Use for anything persisted or
+--               compared across sessions and servers. It can jump when the
+--               machine's clock is corrected, so never measure an interval with it.
 --   Monotonic() a steadily-increasing process timer (os.clock). Use for measuring
---               INTERVALS inside one session: rate-limit buckets, retry backoff,
---               refresh scheduling, save durations. Never persist it -- it is
---               meaningless outside this process, and a value stored from it
---               reads as a nonsense deadline after a rejoin.
+--               intervals inside one session. Never persist it; it is meaningless
+--               outside this process.
 --
--- NOT a scheduler. task.spawn/task.defer are about concurrency rather than time
--- and stay direct: they are what Signal's runner-thread reuse is built on, and
--- rerouting them buys nothing for fast-forwarding. Deterministic scheduling (a
--- seeded interleaving of ready threads) is a separate seam if it is ever wanted.
+-- Not a scheduler. A seeded interleaving of ready threads is Internal/Sched.
 --
--- Nor does it reach ProfileStore, which keeps its own internal timers. A
--- simulation replaces ProfileStore wholesale through the `ProfileStore` option
--- rather than trying to speed up the real one.
+-- ProfileStore measures its own deadlines with its own os.clock, but it reaches
+-- the outside world only through globals, so loading it under a per-server
+-- environment (test/Sim/Env.luau) virtualises its clock without a fork.
 
 local Clock = {}
 
@@ -41,15 +26,10 @@ export type Impl = {
 	Delay: ((seconds: number, fn: (...any) -> (), ...any) -> thread)?,
 }
 
--- Held separately so Reset can restore them; the live functions are fields on the
--- module itself, which keeps a call one table index -- the same cost as any other
--- module function, so routing a hot path (a per-frame rate-limit bucket) through
--- here does not make it measurably dearer.
--- Wrapped rather than assigned directly: Roblox's os.time is `(DateTypeArg?) ->
--- number` (it optionally formats a date table), which does not satisfy `() ->
--- number`. Typing the seam to match os.time instead would drag a Roblox-specific
--- type into the public Impl and force every virtual clock to declare a parameter
--- it ignores, so the wrapper is the cheaper of the two.
+-- Held separately so Reset can restore them. os.time is wrapped rather than
+-- assigned directly because its Roblox signature is `(DateTypeArg?) -> number`,
+-- which does not satisfy `() -> number`; typing Impl to match would force every
+-- virtual clock to declare a parameter it ignores.
 local DEFAULT_NOW: () -> number = function()
 	return os.time()
 end
@@ -62,16 +42,12 @@ Clock.Monotonic = DEFAULT_MONOTONIC
 Clock.Wait = DEFAULT_WAIT
 Clock.Delay = DEFAULT_DELAY
 
---- Replace one or more of the four. Anything omitted keeps its current value, so
---- a test that only cares about wall time can install `{ Now = ... }` and leave
---- waiting real.
+--- Replace one or more of the four. Anything omitted keeps its current value.
 ---
---- A replacement `Wait` MUST STILL YIELD. Scribe's background loops are shaped
+--- A replacement `Wait` must still yield. Scribe's background loops are shaped
 --- `while ... do Clock.Wait(n) ... end`, so a Wait that returns without yielding
---- turns every one of them into a non-yielding spin: the scheduler is starved and
---- the process hangs with nothing to point at. Make it yield without sleeping the
---- requested duration (`task.wait()` with no argument is the simple version) --
---- that is what makes time cheap rather than making the loops hostile.
+--- starves the scheduler and hangs the process with nothing to point at. Yield
+--- without sleeping the requested duration instead.
 function Clock.Install(impl: Impl)
 	if impl.Now ~= nil then
 		Clock.Now = impl.Now

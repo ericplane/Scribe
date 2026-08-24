@@ -1,0 +1,21 @@
+Scribe
+Copyright (c) 2026 ericplane
+Licensed under the MIT License (see LICENSE).
+
+This product bundles a modified copy of ProfileStore v1.0.3:
+
+    ProfileStore
+    Copyright (c) loleris / MAD STUDIO
+    https://github.com/MadStudioRoblox/ProfileStore
+    Licensed under the Apache License, Version 2.0.
+
+The bundled copy lives at src/Internal/Store/ProfileStore.luau and HAS BEEN
+MODIFIED. Every modification is marked `SCRIBE PATCH` in that file and summarised
+in its header. A copy of the Apache License, Version 2.0 is included at
+licenses/ProfileStore-Apache-2.0.txt.
+
+The licence text is kept OUTSIDE src/ on purpose. Everything under src/ is packed
+into the released .rbxm, where a plain text file has no place and whose contents
+Roblox scans for off-platform links -- and the licence is full of them. Attribution
+travels with the code in the file header, which is what Apache-2.0 section 4
+actually asks for; the full text travels with the source package.

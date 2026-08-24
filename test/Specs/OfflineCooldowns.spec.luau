@@ -196,6 +196,50 @@ return function()
 		harness.Cleanup()
 	end)
 
+	it("has converted the cooldown by the instant the state says Ready", function()
+		-- The same ordering as above, pinned where it actually lives rather than
+		-- through a waiter. WaitForData used to resume from inside setState, so the
+		-- spec above could observe the pre-Ready world by reading after it returned;
+		-- the wake is deferred now, and by the time a waiter runs the conversion has
+		-- happened either way. That makes the spec above pass whether the hook is
+		-- above or below setState -- it stopped guarding anything.
+		--
+		-- StateChanged fires synchronously from inside setState, so a handler on it
+		-- reads the world at exactly the moment the state flips. That is the moment
+		-- the claim is about.
+		local harness = TestCtx.make()
+		local player = harness.Join(97717)
+		harness.Data.OnCooldown(player, "Daily", 3600, { IncludeOfflineTime = false })
+		harness.Leave(player)
+		local saved = harness.Fake.Persisted["Default/PLAYER_97717"]
+
+		local rejoined = TestCtx.make()
+		rejoined.Fake.Persisted["Default/PLAYER_97717"] = saved
+		rejoined.Fake.YieldOnSessionStart = true
+
+		local player2 = FakePlayer.new(97717)
+		local atReady = nil
+		rejoined.Ctx.Persistence.OnPlayerAdded(player2)
+		local entry = rejoined.Ctx.Persistence.EntryFor(player2)
+		entry.StateChanged:Connect(function(state)
+			if state == "Ready" and atReady == nil then
+				atReady = select(1, rejoined.Data.PeekCooldown(player2, "Daily"))
+			end
+		end)
+		for _ = 1, 200 do
+			if atReady ~= nil then
+				break
+			end
+			task.wait()
+		end
+
+		expect(`onCooldownAtReady={atReady}`).to.equal("onCooldownAtReady=true")
+
+		rejoined.Ctx.Persistence.OnPlayerRemoving(player2)
+		rejoined.Cleanup()
+		harness.Cleanup()
+	end)
+
 	it("survives two overlapping saves without persisting a deadline", function()
 		-- ProfileStore task.spawns every save and takes no per-profile lock, so an
 		-- autosave can start while a Flush is in flight. If the first save out closed

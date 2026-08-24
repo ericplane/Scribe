@@ -1,28 +1,20 @@
 --!strict
 -- Studio debug hook: the game-side half of the Scribe Studio companion plugin.
+-- Server.new gates the require on RunService:IsStudio(), so outside Studio nothing here
+-- exists for an exploiter to find.
 --
--- Exists ONLY in Studio runs — Server.new gates the require on
--- RunService:IsStudio(), so outside Studio this code path is never taken and
--- nothing is created for an exploiter to find.
+-- Transport is one BindableFunction (request/response) and one BindableEvent (stream
+-- digests) under ServerStorage._ScribeDebugHook. The plugin runs in a different Luau VM,
+-- so every variable-shaped payload crosses as a Codec-encoded string; plain-table
+-- reflection between VMs rejects mixed keys and mangles sparse arrays.
 --
--- Transport: one BindableFunction (request/response) and one BindableEvent
--- (stream digests) under ServerStorage._ScribeDebugHook. The plugin runs in a
--- different Luau VM, so every variable-shaped payload crosses the boundary as
--- a Codec-encoded string (see below) — plain-table reflection between VMs
--- rejects mixed keys and mangles sparse arrays.
+-- Reads are always available once a plugin attaches. Writes need an explicit per-session
+-- opt-in and go through the public server Value API, so the hook can never do something
+-- game code could not; receipt injection additionally requires the resolved Mode be
+-- "Mock".
 --
--- Security posture:
---  * Read streams are always available once a plugin attaches.
---  * Writes require an explicit per-session opt-in (SetWritesEnabled), and
---    every write goes through the public server Value API — validation,
---    bounds, logging and replication apply. The hook can never do something
---    game code couldn't.
---  * Receipt injection additionally requires the resolved Mode be "Mock".
---
--- Interception (op/bandwidth wrapping, log sink) installs at Attach — game
--- boot — so ops that happen before the plugin window opens are recorded into
--- a capped ring and replay into the Changes feed when a plugin subscribes.
--- (Studio-only cost: per-op record + old-value mirrors per Ready player.)
+-- Interception installs at Attach, i.e. game boot, so ops from before the plugin window
+-- opened are recorded into a capped ring and replay when a plugin subscribes.
 
 local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")
@@ -38,33 +30,22 @@ local Health = require(Internal.Health)
 
 local DebugHook = {}
 
--- v2: command console (ListCommands/InvokeCommand), leaderboards
--- (GetLeaderboards/RefreshLeaderboards/FlushLeaderboards), GetDefaults,
--- invertible Clear ops, mirror resync, per-coroutine attribution.
--- v3: buffer values ("B" codec tag) — matches core buffer support.
--- v4: schema nodes carry Datatype (packed Roblox datatype fields).
--- v5: WriteValue SetTimed/ExtendTimed/ClearTimed modes (Scribe.Timed fields).
--- v6: ops recorded from Attach (game boot) into an always-on ring; the ring
---     replays when the plugin subscribes to Ops, and op records carry HookSeq
---     so the plugin can drop duplicates across re-subscribes.
--- v7: same treatment for Logs (LogSeq), Bandwidth (SendSeq), and Metrics
---     (MetricSeq) — every stream records always and replays its ring on the
---     subscribe edge, so panels show the whole session regardless of when
---     their tab was opened.
--- v8: range handshake — the plugin declares [MinProtocolVersion, Version] and
---     the hook accepts when its own version falls inside; a newer plugin
---     emulates older hooks so games never have to update Scribe just for the
---     plugin. (Plugins older than the hook are still refused: the hook can't
---     know future semantics.)
-DebugHook.PROTOCOL_VERSION = 8
+-- Bumped whenever the request/response shapes change. The plugin declares the range
+-- [MinProtocolVersion, Version] it can speak and the hook accepts when its own version
+-- falls inside, so a newer plugin emulates older hooks and games never have to update
+-- Scribe just for the plugin. A plugin older than the hook is refused: the hook cannot
+-- know future semantics.
+-- v9 adds Derived info to schema nodes and refuses a write to a derived field. The
+-- full version history lives in the plugin's src/Protocol.luau, which is the one copy
+-- kept complete; bump both together.
+DebugHook.PROTOCOL_VERSION = 9
 DebugHook.CONTAINER_NAME = "_ScribeDebugHook"
 
 local OPS_FLUSH_HZ = 8
 local ROSTER_HZ = 1
 local METRICS_HZ = 1
--- Always-on stream rings: everything recorded before/between plugin
--- subscriptions (each kept below the pending-queue cap of MAX_BATCH * 4 so a
--- replay never drops live records).
+-- Always-on stream rings, each kept below the pending-queue cap of MAX_BATCH * 4 so a
+-- replay never drops live records.
 local RECENT_OPS_CAP = 2000
 local RECENT_LOGS_CAP = 2000
 local RECENT_SENDS_CAP = 2000
@@ -74,8 +55,8 @@ local MAX_TREE_NODES = 2000 -- ReadTree response budget
 local SIZE_RECOMPUTE_SECONDS = 5
 
 --------------------------------------------------------------------------------
--- Codec: shared with the client hook via Internal/StudioCodec (byte-compatible
--- with the plugin's Codec.luau; versioned by PROTOCOL_VERSION).
+-- Codec: shared with the client hook via Internal/StudioCodec, byte-compatible with the
+-- plugin's Codec.luau and versioned by PROTOCOL_VERSION.
 --------------------------------------------------------------------------------
 
 local StudioCodec = require(Internal.StudioCodec)
@@ -86,10 +67,9 @@ DebugHook.Encode = encode
 DebugHook.Decode = decode
 
 --------------------------------------------------------------------------------
--- Mirror: a plain-table replica of every session's data, maintained from the
--- same op stream the plugin sees. It exists to answer "what was the old
--- value" at digest time; writes with Replicate=false bypass ops and therefore
--- drift here, which is acceptable for a diagnostics view.
+-- Mirror: a plain-table replica of each session's data, built from the same op stream the
+-- plugin sees, so a digest can report the old value. Writes with Replicate=false bypass
+-- ops and drift it, which is acceptable for a diagnostics view.
 --------------------------------------------------------------------------------
 
 local function readPath(root: any, path: { string | number }): any
@@ -112,10 +92,9 @@ local function applyPlainOp(root: { [any]: any }, op: any)
 			if op.Kind == "Remove" then
 				return -- array removals always ship alongside their creating Insert
 			end
-			-- Materialize intermediates for Set(nil)/Clear too (matching the client
-			-- mirror): a removal op only emits when the parent chain existed
-			-- server-side, so a missing parent means its creating op was coalesced
-			-- away in the same flush while the container still exists live.
+			-- A removal op only emits when the parent chain existed server-side, so a
+			-- missing parent means its creating op was coalesced away in the same flush
+			-- while the container still exists live. Materialize it.
 			nextContainer = {}
 			container[seg] = nextContainer
 		end
@@ -126,7 +105,7 @@ local function applyPlainOp(root: { [any]: any }, op: any)
 		return
 	end
 	if op.Kind == "Set" then
-		-- deepClone copies tables AND buffers (both mutable).
+		-- deepClone copies tables and buffers, both mutable.
 		container[key] = Util.deepClone(op.Value)
 	elseif op.Kind == "Insert" then
 		local arr = container[key]
@@ -134,11 +113,9 @@ local function applyPlainOp(root: { [any]: any }, op: any)
 			arr = {}
 			container[key] = arr
 		end
-		-- deepClone like the Set branch: an Insert op's Value is the LIVE-stored
-		-- element reference (Node.applyInsert emits the same table it inserted), so
-		-- inserting it raw would alias live data into this diagnostics mirror. A
-		-- later op descending through that element would then re-apply to the live
-		-- object and corrupt the real (saved) data.
+		-- An Insert op's Value is the live-stored element reference, so inserting it raw
+		-- would alias live data into this mirror, and a later op descending through that
+		-- element would corrupt the real saved data.
 		table.insert(arr, math.clamp(op.Index or #arr + 1, 1, #arr + 1), Util.deepClone(op.Value))
 	elseif op.Kind == "Remove" then
 		local arr = container[key]
@@ -150,9 +127,8 @@ local function applyPlainOp(root: { [any]: any }, op: any)
 		if type(value) == "table" then
 			table.clear(value)
 		else
-			-- Matches the client mirror: a Clear only emits for a container that
-			-- existed server-side, so materialize the cleared {} if its creating op
-			-- was coalesced away.
+			-- A Clear only emits for a container that existed server-side, so materialize
+			-- the cleared {} if its creating op was coalesced away.
 			container[key] = {}
 		end
 	end
@@ -195,14 +171,18 @@ function DebugHook.Attach(Data: any, ctx: any)
 	local sizeCache: { [any]: { Bytes: number?, At: number } } = {}
 	local statusHistory: { { T: number, WallAt: number, From: string, To: string } } = {}
 	local armedLoadFailures: { [string]: number } = {}
+	-- Removers for registrations on library-level singletons: the Log sink list and
+	-- Health.OnStatusChanged. Everything else this hook installs is ctx-scoped and dies
+	-- with the bundle; these two outlive it and nothing else clears them.
+	local teardown: { () -> () } = {}
+	local detached = false
 	local wrapsInstalled = false
 	local storeWrapped = false
 	local everHandshaken = false
 
-	-- Everything since Attach (game boot), whether or not a plugin is
-	-- listening: each stream's ring replays on its subscribe edge so panels
-	-- show the whole session regardless of when their tab was opened.
-	-- Circular: a shifting array would pay an O(cap) move per record once full.
+	-- Everything since Attach, whether or not a plugin is listening; each ring replays on
+	-- its stream's subscribe edge, so a panel shows the whole session however late its tab
+	-- was opened. Circular, because a shifting array would pay an O(cap) move per record.
 	type Ring = { Items: { any }, Cap: number, Count: number, Next: number }
 
 	local function newRing(cap: number): Ring
@@ -217,10 +197,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 		end
 	end
 
-	-- Chronological snapshot. With `flagReplay`, each record is a shallow
-	-- copy marked Replay = true — the plugin feeds replayed ops to the
-	-- Changes feed and watches but must NOT apply them to its live tree
-	-- mirror (they are older than any ReadTree page it holds).
+	-- Chronological snapshot. With `flagReplay` each record is a shallow copy marked
+	-- Replay = true; the plugin must not apply those to its live tree mirror, since they
+	-- are older than any ReadTree page it holds.
 	local function ringSnapshot(ring: Ring, flagReplay: boolean?): { any }
 		local out = table.create(ring.Count)
 		local start = if ring.Count < ring.Cap then 1 else ring.Next
@@ -244,10 +223,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 	local sendSeq = 0
 	local metricSeq = 0
 
-	-- Writes initiated by the plugin are attributed Source=ScribeStudio.
-	-- Tracked per-coroutine (not a depth counter) so game writes that happen
-	-- while a hook call yields (e.g. HandleReceipt awaiting a save) are never
-	-- mislabeled.
+	-- Writes initiated by the plugin are attributed Source=ScribeStudio. Tracked
+	-- per-coroutine rather than by a depth counter, so game writes that happen while a
+	-- hook call yields are never mislabeled.
 	local hookWriteThreads: { [thread]: boolean } = {}
 
 	local function studioCall(fn: any, ...: any): (boolean, ...any)
@@ -258,9 +236,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 		return table.unpack(results, 1, results.n)
 	end
 
-	-- Command registry: game code registers through Data.Command after the
-	-- hook attaches (Attach runs inside Server.new, before the bundle is
-	-- returned), so wrapping Register here observes every registration.
+	-- Attach runs inside Server.new, before the bundle is returned, so wrapping Register
+	-- here observes every registration game code makes.
 	local commandRegistry: { [string]: { Name: string, Args: { string }?, Handler: any } } = {}
 	do
 		local origRegister = ctx.Commands.Register
@@ -285,6 +262,24 @@ function DebugHook.Attach(Data: any, ctx: any)
 	local streamEv = Instance.new("BindableEvent")
 	streamEv.Name = "Stream"
 	streamEv.Parent = container
+
+	--- Release the process-singleton registrations (the Log sink, the Health listener) and
+	--- stop the pump. Idempotent, and deliberately does not clear `attached`, so a second
+	--- Attach still refuses with DEBUG_HOOK_DUPLICATE. The ctx-scoped wraps stay installed
+	--- and die with the bundle.
+	local function detach()
+		if detached then
+			return
+		end
+		detached = true
+		-- Ends the pump on its next tick, which is what it already watches for.
+		container.Parent = nil
+		for _, release in teardown do
+			-- A throwing release must not strand the ones after it.
+			pcall(release)
+		end
+		table.clear(teardown)
+	end
 
 	local function queue(stream: string, item: any)
 		if not subscriptions[stream] then
@@ -312,9 +307,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 			else
 				bucket = {}
 			end
-			-- Commit the drain progress BEFORE encoding: if encode throws on a
-			-- pathological chunk (e.g. a >32-deep value), the poisoned chunk is
-			-- dropped instead of the whole bucket re-firing every pump tick.
+			-- Commit the drain progress before encoding, so a chunk that throws is dropped
+			-- instead of the whole bucket re-firing on every pump tick.
 			pending[stream] = bucket
 			local ok, err = pcall(function()
 				streamEv:Fire(stream, encode(chunk))
@@ -335,9 +329,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 		if not attributionEnabled then
 			return nil
 		end
-		-- Walk out of the Scribe package: wrapper -> Persistence OnOp -> Node
-		-- emit/apply -> accessor method -> (accessorCall) -> game code.
-		-- Batches/transactions add frames, so the walk goes deep.
+		-- Walk out of the Scribe package to the first game-code frame. Batches and
+		-- transactions add frames, so the walk goes deep.
 		for level = 3, 24 do
 			local source, line = debug.info(level, "sl")
 			if source == nil then
@@ -400,15 +393,14 @@ function DebugHook.Attach(Data: any, ctx: any)
 				Reason = reason,
 			})
 			if state == "Ready" then
-				-- Seed the old-value mirror BEFORE the entry's first op: the
-				-- node tree mutates LiveData before emitting, so a mirror
-				-- seeded lazily inside the op wrap would read Old == new.
+				-- Seed the old-value mirror before the entry's first op: the node tree
+				-- mutates LiveData before emitting, so lazy seeding reads Old == new.
 				mirrorFor(entry)
 			elseif state == "SessionEnded" then
 				mirrors[entry] = nil
 				sizeCache[entry] = nil
-				-- Drop the strong reference or the whole profile stays pinned
-				-- for the rest of the play session.
+				-- Drop the strong reference or the profile stays pinned for the rest of
+				-- the play session.
 				entryConnections[entry] = nil
 				connection:Disconnect()
 			end
@@ -446,6 +438,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 				SizeBytes = profileSize(entry),
 				Blocked = entry.Blocked,
 				HandshakeReady = entry.HandshakeReady,
+				QueueOpen = entry.QueueOpen,
 				QueueDepth = #entry.Queue,
 				Mock = ctx.Persistence.Mode == "Mock",
 			})
@@ -464,10 +457,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 		end
 		wrapsInstalled = true
 
-		-- Every replication-worthy op (including ServerOnly paths, which the
-		-- original PushOp filters out after us). Recorded ALWAYS — not just
-		-- while subscribed — so ops from before the plugin opened replay into
-		-- the Changes feed later.
+		-- Every replication-worthy op, including the ServerOnly paths the original PushOp
+		-- filters out after us. Recorded whether or not anything is subscribed, so ops
+		-- from before the plugin opened can replay into the Changes feed later.
 		local origPushOp = ctx.Replication.PushOp
 		ctx.Replication.PushOp = function(entry: any, op: any, schema: any?)
 			local ok, err = pcall(function()
@@ -475,9 +467,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 				local mirror = mirrorFor(entry)
 				local old: any = nil
 				if op.Kind == "Set" or op.Kind == "Clear" then
-					-- For Clear this is the full contents (not just a count) so
-					-- the plugin's time-travel replay can undo it; the record
-					-- clone below snapshots it before applyPlainOp mutates.
+					-- For Clear this is the full contents, not a count, so the plugin's
+					-- replay can undo it; the clone below snapshots it before
+					-- applyPlainOp mutates.
 					old = readPath(mirror, op.Path)
 				elseif op.Kind == "Remove" then
 					local arr = readPath(mirror, op.Path)
@@ -487,10 +479,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 				end
 				local visibility = if schema then schema.Visibility else Template.VisibilityOf(compiled, op.Path)
 				opSeq += 1
-				-- Value/Old are cloned: the ring outlives the flush window, and
-				-- both game code (Value) and the mirror (Old) keep mutating the
-				-- objects they reference. The clone runs before applyPlainOp so
-				-- Clear's old contents survive.
+				-- Value/Old are cloned because the ring outlives the flush window and both
+				-- game code and the mirror keep mutating what they reference. The clone
+				-- runs before applyPlainOp so Clear's old contents survive.
 				local record = {
 					HookSeq = opSeq,
 					T = os.clock(),
@@ -516,8 +507,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 			return origPushOp(entry, op, schema)
 		end
 
-		-- Real wire bytes per send, per player. Recorded always (ring) so the
-		-- Bandwidth panel shows the whole session, not just time spent on it.
+		-- Real wire bytes per send, per player.
 		local function recordSend(userId: number, bytes: buffer)
 			sendSeq += 1
 			local record = {
@@ -545,8 +535,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 			end
 		end
 
-		-- Log ring: seeded from the core log history (covers template compile
-		-- and everything else logged before Attach), then fed by the sink.
+		-- Log ring: seeded from the core log history, which covers everything logged
+		-- before Attach, then fed by the sink.
 		local function recordLog(logEntry: any)
 			logSeq += 1
 			local record = {
@@ -567,15 +557,18 @@ function DebugHook.Attach(Data: any, ctx: any)
 				recordLog(logEntry)
 			end
 		end)
-		Log.AddSink(recordLog)
+		table.insert(teardown, Log.AddSink(recordLog))
 
-		Health.OnStatusChanged:Connect(function(newStatus: string, oldStatus: string)
+		local statusConn = Health.OnStatusChanged:Connect(function(newStatus: string, oldStatus: string)
 			local record = { T = os.clock(), WallAt = os.time(), From = oldStatus, To = newStatus }
 			table.insert(statusHistory, record)
 			if #statusHistory > 100 then
 				table.remove(statusHistory, 1)
 			end
 			queue("Status", record)
+		end)
+		table.insert(teardown, function()
+			statusConn:Disconnect()
 		end)
 
 		ctx.Signals.OnSave:Connect(function(info: any)
@@ -599,21 +592,17 @@ function DebugHook.Attach(Data: any, ctx: any)
 				task.wait(1 / OPS_FLUSH_HZ)
 				local ok, err = pcall(function()
 					local now = os.clock()
-					-- Watch + seed every Ready entry each tick: the mirror must
-					-- exist before an entry's first op (the node tree mutates
-					-- LiveData before emitting, so lazy seeding reads Old==new),
-					-- and StateChanged connections may predate any roster tick.
+					-- Seed every Ready entry each tick: the mirror must exist before the
+					-- entry's first op, or Old reads back as the new value.
 					for _, entry in ctx.Persistence.Entries do
 						if entry.State == "Ready" and mirrors[entry] == nil then
 							watchEntry(entry)
 							mirrorFor(entry)
 						end
 					end
-					-- Writes with Replicate=false bypass the op stream and
-					-- drift the old-value mirrors; refresh them periodically.
-					-- Gated on a plugin having attached: before that, boot-ring
-					-- Old accuracy for silently-written paths isn't worth a
-					-- recurring deep clone of every profile.
+					-- Writes with Replicate=false bypass the op stream and drift the
+					-- old-value mirrors. Gated on a plugin having attached, so an
+					-- unwatched game never pays a recurring deep clone of every profile.
 					if everHandshaken and now - lastResync >= 10 then
 						lastResync = now
 						local mirrored = {}
@@ -646,8 +635,6 @@ function DebugHook.Attach(Data: any, ctx: any)
 							Status = Health.GetStatus(),
 							Metrics = Metrics.Get(),
 						}
-						-- Recorded always so Diagnostics graphs cover the whole
-						-- session, not just time spent on that tab.
 						ringPush(metricsRing, tick)
 						if subscriptions.Metrics then
 							streamEv:Fire("Metrics", encode({ tick }))
@@ -658,6 +645,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 					Log.Warn("Lifecycle", "DEBUG_HOOK_ERROR", tostring(err), {})
 				end
 			end
+			-- The container may be destroyed by somebody other than detach(). Release
+			-- either way, or the sink and the listener outlive the pump that fed them.
+			detach()
 		end)
 	end
 
@@ -745,9 +735,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 		return { Table = true, Count = count, Children = children }
 	end
 
-	-- A page of the tree at `path`: leaves inline, deep tables as stubs the
-	-- plugin re-requests on expand. Bounded by a node budget so no single
-	-- response can explode.
+	-- A page of the tree at `path`: leaves inline, deep tables as stubs the plugin
+	-- re-requests on expand. Bounded by a node budget so no response can explode.
 	local function readTreePage(entry: any, path: { string | number }, depth: number, budget: { n: number }): any
 		local value = readPath(liveRootsFor(entry), path)
 		local schema: any, dynStart = Template.Resolve(compiled, path)
@@ -757,15 +746,23 @@ function DebugHook.Attach(Data: any, ctx: any)
 		return describeValue(value, depth, budget, schema)
 	end
 
+	-- Dotted input paths of a derived node, for the schema export and the write
+	-- refusal. The spec's Compute is a function and never crosses the wire.
+	local function derivedInputPaths(spec: any): { string }
+		local out = table.create(#spec.InputPaths)
+		for i, inputPath in spec.InputPaths do
+			out[i] = table.concat(inputPath, ".")
+		end
+		return out
+	end
+
 	-- Command handlers -------------------------------------------------------------
 
 	local handlers: { [string]: (args: any) -> any } = {}
 
 	function handlers.Handshake(args: any): any
 		local major = tonumber(args.ProtocolVersion) or 0
-		-- The plugin declares the version range it can speak; accept when this
-		-- hook's version falls inside it. Plugins without MinProtocolVersion
-		-- (pre-v8) effectively declare [major, major].
+		-- A plugin without MinProtocolVersion effectively declares [major, major].
 		local minSupported = tonumber(args.MinProtocolVersion) or major
 		-- NaN compares false both ways and would slip through the range check.
 		if major ~= major or minSupported ~= minSupported then
@@ -783,10 +780,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 		end
 		installWraps()
 		everHandshaken = true
-		-- A handshake means a NEW plugin instance (reloaded/updated plugin
-		-- mid-session): forget the previous instance's subscriptions so the
-		-- next SetSubscriptions sees a false->true Ops edge and replays the
-		-- boot ring into the fresh, empty Store.
+		-- A handshake means a new plugin instance, so forget the previous one's
+		-- subscriptions: the next SetSubscriptions then sees a false->true Ops edge and
+		-- replays the boot ring into the fresh, empty Store.
 		for stream in subscriptions do
 			subscriptions[stream] = false
 		end
@@ -804,8 +800,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 			ScribeVersion = scribeVersion,
 			TemplateHash = compiled.Hash,
 			NodeCount = compiled.NodeCount,
-			-- Derived from the RESOLVED mode, so a Mode = "Mock" bundle reports as
-			-- mocked. Mode is sent alongside for a plugin that wants the exact value.
+			-- Derived from the resolved mode, so a Mode = "Mock" bundle reports as mocked.
 			Mode = ctx.Persistence.Mode,
 			UseMock = ctx.Persistence.Mode == "Mock",
 			DontSave = ctx.Persistence.Mode == "Mock",
@@ -827,8 +822,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 				table.clear(pending[stream])
 			end
 		end
-		-- Mirrors stay resident even while unsubscribed (the boot-op ring
-		-- needs Old values); seed any Ready entries that have no ops yet.
+		-- Mirrors stay resident while unsubscribed because the op ring needs Old values;
+		-- seed any Ready entries that have no ops yet.
 		if subscriptions.Ops then
 			for _, entry in ctx.Persistence.Entries do
 				if entry.State == "Ready" then
@@ -837,12 +832,10 @@ function DebugHook.Attach(Data: any, ctx: any)
 				end
 			end
 		end
-		-- On each stream's false->true edge, replay its ring and flush
-		-- immediately so the pending queue is empty again for live records.
-		-- Every record carries a per-stream sequence number (the plugin
-		-- dedupes, so a re-subscribe cannot double-deliver). Op records are
-		-- additionally flagged Replay = true — the plugin must not apply them
-		-- to its live tree mirror.
+		-- On each stream's false->true edge, replay its ring and flush immediately so the
+		-- pending queue is free again for live records. Every record carries a per-stream
+		-- sequence number, which the plugin dedupes on, so a re-subscribe cannot
+		-- double-deliver.
 		local function replay(stream: string, ring: Ring, flagReplay: boolean?)
 			if subscriptions[stream] and not had[stream] and ring.Count > 0 then
 				pending[stream] = ringSnapshot(ring, flagReplay)
@@ -852,8 +845,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 		replay("Ops", opsRing, true)
 		replay("Logs", logsRing)
 		replay("Bandwidth", sendsRing)
-		-- Metrics has no pending bucket (fired directly at 1 Hz); replay the
-		-- tick history the same chunked way.
+		-- Metrics has no pending bucket, being fired directly at 1 Hz; replay the tick
+		-- history the same chunked way.
 		if subscriptions.Metrics and not had.Metrics and metricsRing.Count > 0 then
 			local snapshot = ringSnapshot(metricsRing)
 			local offset = 1
@@ -932,6 +925,16 @@ function DebugHook.Attach(Data: any, ctx: any)
 		if #path == 0 then
 			return { Ok = false, Error = "cannot write the root" }
 		end
+		-- Refuse here rather than let the accessor's own error surface, so the plugin
+		-- can show what the field is computed from. Derived paths are always static.
+		local targetNode, dynStart = Template.Resolve(compiled, path)
+		if dynStart > #path and targetNode.Derived then
+			local inputs = table.concat(derivedInputPaths(targetNode.Derived), ", ")
+			return {
+				Ok = false,
+				Error = `{table.concat(path, ".")} is a derived field: it is computed from {inputs} and cannot be written`,
+			}
+		end
 		local mode: string = args.Mode or "Set"
 		local ok, err = studioCall(function()
 			if mode == "Set" then
@@ -960,10 +963,10 @@ function DebugHook.Attach(Data: any, ctx: any)
 				end
 				accessorAt(entry, path).ExtendTimed(seconds)
 			elseif mode == "ClearTimed" then
-				-- Cancel the timer, leave the value in place. Goes through Timed's own
-				-- raw-store write rather than touching _Scribe.Timed here: a NESTED
-				-- Timed field's pathKey embeds \31, which the accessor tree rejects, and
-				-- a save in flight has the profile pointed at a converted copy.
+				-- Cancel the timer, leave the value. Goes through Timed's own raw-store
+				-- write rather than touching _Scribe.Timed here: a nested Timed field's
+				-- pathKey embeds \31, which the accessor tree rejects, and a save in
+				-- flight has the profile pointed at a converted copy.
 				accessorAt(entry, path).Active() -- errors early on non-Timed fields
 				ctx.Timed.ClearField(entry, Util.pathKey(path))
 			else
@@ -985,7 +988,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 		for id = 0, compiled.NodeCount - 1 do
 			local node = compiled.ById[id]
 			if node then
-				table.insert(nodes, {
+				local record: any = {
 					Id = node.Id,
 					Path = table.clone(node.Path),
 					Kind = node.Kind,
@@ -998,12 +1001,23 @@ function DebugHook.Attach(Data: any, ctx: any)
 					MaxLength = node.MaxLength,
 					Members = if node.Members then table.clone(node.Members) else nil,
 					HasChildren = node.Children ~= nil,
-				})
+				}
+				-- Additive since v9; the field is absent on a non-derived node.
+				local derived = node.Derived
+				if derived then
+					record.Derived = {
+						Inputs = derivedInputPaths(derived),
+						Transmit = derived.Transmit,
+						OfflineComputable = derived.OfflineComputable,
+						Label = derived.Label,
+					}
+				end
+				table.insert(nodes, record)
 			end
 		end
-		-- Element subtrees are id-less (reached only through AnyChild), so the ById
-		-- walk above cannot see them. Export them additively, keyed by the container
-		-- node's id; older plugins ignore the extra field.
+		-- Element subtrees are id-less, reached only through AnyChild, so the ById walk
+		-- above cannot see them. Exported additively, keyed by the container node's id;
+		-- older plugins ignore the extra field.
 		local elements: { [any]: any } = {}
 		local function describeSchemaNode(node: any): any
 			local children: { [string]: any }? = nil
@@ -1108,10 +1122,9 @@ function DebugHook.Attach(Data: any, ctx: any)
 		local player = entry.Player
 		local profile: any = entry.Profile
 		if profileIsActive(profile) then
-			-- Locally-initiated end: without this flag Persistence would classify
-			-- the OnSessionEnd as an external steal and skip the final save's
-			-- bookkeeping. (SimulateSessionSteal deliberately OMITS the flag -- a
-			-- steal misclassification is exactly what that simulation exercises.)
+			-- Without this flag Persistence classifies the OnSessionEnd as an external
+			-- steal and skips the final save's bookkeeping. SimulateSessionSteal omits it
+			-- deliberately, since a steal is what that simulation exercises.
 			entry.LocalSessionEnd = true
 			profile:EndSession()
 		end
@@ -1264,8 +1277,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 		if gate then
 			return { Ok = false, Error = gate }
 		end
-		-- The resolved mode, not the legacy flag: Mode never reaches options, so
-		-- gating on UseMock refused injection on a Mode = "Mock" bundle.
+		-- The resolved mode, not the legacy UseMock flag: Mode never reaches options, so
+		-- gating on UseMock refuses injection on a Mode = "Mock" bundle.
 		if ctx.Persistence.Mode ~= "Mock" then
 			return {
 				Ok = false,
@@ -1453,17 +1466,17 @@ function DebugHook.Attach(Data: any, ctx: any)
 
 	container.Parent = ServerStorage
 
-	-- Record from game boot, not from first plugin handshake: the op ring,
-	-- old-value mirrors, and status history must exist before any plugin
-	-- attaches. (Parent the container first — the pump loop exits when it
-	-- sees container.Parent == nil.)
+	-- Record from game boot, not from the first plugin handshake: the op ring, old-value
+	-- mirrors and status history must exist before any plugin attaches. Parent the
+	-- container first, because the pump loop exits when container.Parent is nil.
 	installWraps()
 
-	-- Restore simulated state when the session tears down (belt and braces —
-	-- Studio destroys the whole DataModel on stop anyway).
+	-- Restore simulated state on teardown; Studio destroys the DataModel anyway.
 	game:BindToClose(function()
 		table.clear(armedLoadFailures)
 	end)
+
+	return detach
 end
 
 return DebugHook

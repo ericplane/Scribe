@@ -15,7 +15,10 @@ local task = require("@lune/task")
 local process = require("@lune/process")
 local serde = require("@lune/serde")
 
-local TEST_TIMEOUT = 10 -- seconds per `it` block
+-- Seconds per `it` block. The default is unchanged; the override exists so a
+-- simulation soak can run deep without loosening the cap for the ordinary suite,
+-- where a 10-second test is a hang worth failing on.
+local TEST_TIMEOUT = tonumber(process.env.SCRIBE_TEST_TIMEOUT) or 10
 
 --------------------------------------------------------------------------------
 -- Fake signals
@@ -139,6 +142,32 @@ local function isFakeInstance(value)
 	return type(value) == "table" and rawget(value, INSTANCE_MARKER) == true
 end
 
+--- Roblox's Instance:Clone(), as far as the module tree needs it: a deep copy with
+--- no parent, carrying `_source` so shimRequire loads the module AGAIN rather than
+--- handing back the original's cached value.
+---
+--- Defined here rather than beside the other InstanceMethods because it needs
+--- `newInstance`, which is a local declared above only by accident of ordering --
+--- a method written earlier in the file would resolve the name as a global and get
+--- nil. Left as a method so specs reach it exactly as they would in Studio.
+---
+--- What it is FOR: a Scribe module whose state is a once-per-process latch cannot
+--- be re-armed, so a spec that must not spend the shared one takes a private copy
+--- instead. test/Specs/DebugHookIntegration.spec is the case, and the reason it is
+--- worth supporting here is that it is not a headless problem at all -- headless
+--- the latch is never even reached -- it is what made the Studio run's ordering
+--- decide which of two specs got to measure the hook.
+function InstanceMethods.Clone(self)
+	local copy = newInstance(rawget(self, "Name"), rawget(self, "ClassName"))
+	rawset(copy, "_source", rawget(self, "_source"))
+	for name, child in rawget(self, "_children") do
+		local childCopy = InstanceMethods.Clone(child)
+		rawset(childCopy, "Parent", copy)
+		rawget(copy, "_children")[name] = childCopy
+	end
+	return copy
+end
+
 local function buildTree(name, path)
 	if fs.isDir(path) then
 		local node = newInstance(name, "Folder")
@@ -170,6 +199,19 @@ end
 -- Enum proxy (lazily creates unknown enums/items)
 --------------------------------------------------------------------------------
 
+-- Marks a table as a fake EnumItem. A private key rather than a field, so it
+-- cannot collide with a real member name and does not show up in iteration.
+--
+-- It exists because ProfileStore guards VersionQuery with
+--   typeof(sort_direction) ~= "EnumItem" or sort_direction.EnumType ~= Enum.SortDirection
+-- and Scribe reaches that guard (src/Server/Persistence.luau:1889). Passing the
+-- guard needs BOTH halves: a typeof that answers "EnumItem" and an EnumType that
+-- is identity-equal to the enum object -- a string EnumType fails, and so does the
+-- object with the shim's ordinary typeof. Only a simulation env supplies the
+-- typeof half (test/Sim/Env.luau); this marker is how it recognises what to lie
+-- about, and its scope is exactly the one chunk that needs the lie.
+local ENUM_ITEM_MARKER = {}
+
 local Enum = setmetatable({}, {
 	__index = function(self, enumName)
 		local created = {}
@@ -192,7 +234,13 @@ local Enum = setmetatable({}, {
 				local item = setmetatable({
 					Name = itemName,
 					Value = nextValue,
-					EnumType = enumName,
+					-- The enum OBJECT, not its name. Real EnumItem.EnumType is the
+					-- Enum, and ProfileStore compares it by identity. The only
+					-- reader in this tree is src/Internal/Datatypes.luau:483, which
+					-- does tostring(value.EnumType) -- and the object's __tostring
+					-- returns enumName, so that string is unchanged.
+					EnumType = enumType,
+					[ENUM_ITEM_MARKER] = true,
 				}, {
 					__tostring = function()
 						return `Enum.{enumName}.{itemName}`
@@ -263,7 +311,17 @@ end
 
 local FakeCFrame = {}
 
-function FakeCFrame.new(x, y, z, qx, qy, qz, qw)
+-- Mirrors the real CFrame.new overload set: 3 arguments (position, identity
+-- rotation), 7 (position + quaternion), and 12 (position + the nine rotation
+-- components VERBATIM -- Roblox does not re-orthonormalize them, which is why
+-- GetComponents is its exact inverse and why the codec's exact form round-trips).
+function FakeCFrame.new(...)
+	local argc = select("#", ...)
+	if argc >= 12 then
+		local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = ...
+		return cframeFromComponents(x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
+	end
+	local x, y, z, qx, qy, qz, qw = ...
 	if qx == nil then
 		return cframeFromComponents(x or 0, y or 0, z or 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
 	end
@@ -404,6 +462,11 @@ local FakePhysicalProperties = {
 
 local services = {}
 
+-- Fixed start for the GUID sequence, so a full run produces the same ids every
+-- time. Arbitrary but nonzero: xorshift32 has zero as a fixed point.
+local GUID_SEED = 0x5C21BE01
+local guidState = GUID_SEED
+
 services.HttpService = {
 	JSONEncode = function(_self, value)
 		return serde.encode("json", value)
@@ -411,6 +474,14 @@ services.HttpService = {
 	JSONDecode = function(_self, text)
 		return serde.decode("json", text)
 	end,
+	-- Deterministic, NOT math.random. Util.guid() feeds gift ids and (via
+	-- FakeProfileStore) version ids, and both end up inside persisted data -- so an
+	-- unseeded generator here means the stored state differs on every run and any
+	-- digest taken over it is worthless for replay. Uniqueness is what a GUID is
+	-- for; unpredictability is not, and the harness needs reproducibility more.
+	--
+	-- Same xorshift32 as test/Sim/Rng.luau, and for the same reason: an LCG with a
+	-- ~2^30 multiplier overflows the double mantissa and drops its low bits.
 	GenerateGUID = function(_self, _wrapped)
 		local hex = "0123456789abcdef"
 		local out = {}
@@ -418,11 +489,20 @@ services.HttpService = {
 			if i == 9 or i == 14 or i == 19 or i == 24 then
 				out[i] = "-"
 			else
-				local index = math.random(1, 16)
+				guidState = bit32.bxor(guidState, bit32.lshift(guidState, 13))
+				guidState = bit32.bxor(guidState, bit32.rshift(guidState, 17))
+				guidState = bit32.bxor(guidState, bit32.lshift(guidState, 5))
+				local index = (guidState % 16) + 1
 				out[i] = string.sub(hex, index, index)
 			end
 		end
 		return table.concat(out)
+	end,
+	--- Re-pin the GUID sequence. A simulation that replays a seed calls this first,
+	--- or the ids it stores depend on how many guids every earlier spec happened to
+	--- consume.
+	ResetGuidSequence = function(_self, seed: number?)
+		guidState = seed or GUID_SEED
 	end,
 }
 
@@ -486,12 +566,41 @@ services.AnalyticsService = {
 	end,
 }
 
+-- A simulation installs a modelled backend here; with nothing installed this
+-- behaves exactly as it always has, and the two error strings below are
+-- byte-identical to the originals on purpose. test/Specs/LeaderboardMode.spec
+-- names that GetOrderedDataStore error as its discriminator, so changing a word
+-- of it silently rewrites what that spec asserts.
+--
+-- The TABLE is mutated in place and never replaced: src/Server/Leaderboards.luau:6
+-- captures it into a module upvalue at load time, and modules load once, so a
+-- replacement object would be invisible to the one caller that matters.
+local installedDataStore = nil
+
 services.DataStoreService = {
-	GetOrderedDataStore = function()
+	Install = function(_self, impl)
+		installedDataStore = impl
+	end,
+	Reset = function(_self)
+		installedDataStore = nil
+	end,
+	GetOrderedDataStore = function(_self, name, scope)
+		if installedDataStore then
+			return installedDataStore:GetOrderedDataStore(name, scope)
+		end
 		error("shim: OrderedDataStores are not available headless (run with UseMock)")
 	end,
-	GetDataStore = function()
+	GetDataStore = function(_self, name, scope, options)
+		if installedDataStore then
+			return installedDataStore:GetDataStore(name, scope, options)
+		end
 		error("shim: DataStores are not available headless (run with UseMock)")
+	end,
+	GetRequestBudgetForRequestType = function(_self, kind)
+		if installedDataStore then
+			return installedDataStore:GetRequestBudgetForRequestType(kind)
+		end
+		return 0
 	end,
 }
 
@@ -643,6 +752,22 @@ local baseGlobals = {}
 
 local moduleCache = {}
 
+-- Which shim globals a module has to be handed as PARAMETERS rather than read as
+-- globals. Filled in below, once baseGlobals is complete.
+--
+-- Handing `luau.load` an `environment` table is what made this harness slow, and
+-- the flag everyone reaches for is not the cause: a chunk whose globals are a
+-- caller-supplied table is not a SAFE environment, so Luau declines the FASTCALL
+-- path and every `math.max` becomes a real global lookup plus a real call.
+-- Measured at 4.2x on a builtin-saturated body, and 1.0x on plain arithmetic --
+-- which is exactly why a single blanket correction factor was never right.
+--
+-- So modules load against the process's real globals, and the names the shim has
+-- to override are passed in as parameters instead. A parameter shadows a global
+-- lexically, while `math`/`table`/`string` stay true globals -- which is the
+-- condition Luau needs to emit FASTCALL.
+local passName = { script = true }
+
 local function shimRequire(target)
 	if not isFakeInstance(target) then
 		error(`shim: require expects a ModuleScript instance, got {type(target)}`)
@@ -656,17 +781,42 @@ local function shimRequire(target)
 		error(`shim: {target:GetFullName()} is not a ModuleScript`)
 	end
 
-	local env = { script = target }
-	for key, value in baseGlobals do
-		env[key] = value
+	local text = fs.readFile(source)
+
+	-- Only the names this module actually writes down. Every parameter costs a
+	-- register for the life of the chunk and Luau allows 200 locals per function,
+	-- so handing all of them to every module would spend that budget on files that
+	-- use none. Scanning for identifier tokens OVER-approximates -- a name inside a
+	-- comment counts, and so does the `unpack` in `table.unpack` -- and that is the
+	-- safe direction: a spare parameter costs one register, a missing one is a
+	-- silent wrong answer. Never tighten this into an exact-use analysis.
+	local mentioned = {}
+	for word in string.gmatch(text, "[%a_][%w_]*") do
+		if passName[word] then
+			mentioned[word] = true
+		end
+	end
+	local params = {}
+	for name in mentioned do
+		table.insert(params, name)
+	end
+	table.sort(params)
+
+	-- The whole prefix sits on line 1 and the closing `end` goes on its own line
+	-- AFTER the source, so every line of the module keeps its real number in error
+	-- messages and tracebacks.
+	local wrapped = `return function({table.concat(params, ", ")}) ` .. text .. "\n" .. "end"
+	local chunk = luau.load(wrapped, {
+		debugName = target:GetFullName(),
+		injectGlobals = true,
+	})
+
+	local args = table.create(#params)
+	for index, name in params do
+		args[index] = if name == "script" then target else baseGlobals[name]
 	end
 
-	local chunk = luau.load(fs.readFile(source), {
-		debugName = target:GetFullName(),
-		environment = env,
-		injectGlobals = false,
-	})
-	local value = chunk()
+	local value = chunk()(table.unpack(args, 1, #params))
 	moduleCache[target] = { value = value }
 	return value
 end
@@ -772,6 +922,81 @@ end
 local root = newInstance("ScribeDev", "Folder")
 addChild(root, buildTree("Scribe", "src"))
 addChild(root, buildTree("Test", "test"))
+
+-- The escape hatch a simulation needs, and the ONLY one.
+--
+-- test/Sim builds each simulated server its own environment: its own clock, its
+-- own scheduler, its own JobId, its own copy of every module. That needs raw
+-- chunk loading -- but `@lune/luau` and `@lune/fs` are unreachable from a module
+-- the shim loaded, because shimRequire only resolves fake Instances. So the
+-- capability is handed down explicitly here rather than left to be smuggled.
+--
+-- Inert with respect to the LIBRARY: nothing in src/ reads it, and reading it does
+-- nothing until something calls LoadChunk. It is NOT unread by tests, which this
+-- comment used to claim: test/Sim/ loads fork source through it (Loader, Bundle, Env,
+-- Server), and four places under test/ read `__SimHost.Env` as the only way to see a
+-- process environment variable at all -- SimSoak.spec:47 (SCRIBE_SOAK),
+-- SimStudy.spec:20 (SCRIBE_STUDY), TestCtx.luau:114 (SCRIBE_FRAGMENT_ALL) and
+-- RngSeam.spec:105. Every mode gate in the suite runs through this table.
+baseGlobals.__SimHost = {
+	ReadSource = function(path: string): string
+		return fs.readFile(path)
+	end,
+	LoadChunk = function(source: string, env, name: string)
+		return luau.load(source, { debugName = name, environment = env, injectGlobals = false })
+	end,
+	-- Copy this; never mutate it. Every simulated server derives its globals from
+	-- these, so a mutation would leak across servers and out into the suite.
+	BaseGlobals = baseGlobals,
+	Root = root,
+	-- THE Enum object. ProfileStore compares EnumType by identity, so a simulation
+	-- must hand out items from this one, not a rebuilt copy.
+	Enum = Enum,
+	IsEnumItem = function(value): boolean
+		return type(value) == "table" and rawget(value, ENUM_ITEM_MARKER) == true
+	end,
+	Typeof = shimTypeof,
+	-- Process environment, for specs that gate a deep run behind a variable.
+	-- Handed down rather than reachable: @lune/process cannot be required from a
+	-- shim-loaded module, and a spec that tried would silently get a false answer
+	-- instead of an error -- which is exactly how a soak stops running without
+	-- anyone noticing.
+	Env = process.env,
+}
+
+-- baseGlobals is complete, so the override set can be worked out.
+--
+-- COMPUTED, never written down, because both ways of getting the list wrong are
+-- silent. Most of these names do not resolve natively at all, so omitting one
+-- raises. But `typeof`, `require`, `debug` and `unpack` all DO resolve under Lune
+-- -- to something other than the shim's version -- so a module handed the native
+-- one would quietly do the wrong thing instead of failing. (`unpack` is the one
+-- that gets missed: Lune's global `unpack` is not `table.unpack`.) A name added
+-- to baseGlobals later would land in the same trap. Probing each key against its
+-- native value and passing it whenever the two differ makes both cases
+-- impossible rather than merely documented.
+do
+	local function nativeGlobal(name: string)
+		local ok, chunk = pcall(luau.load, "return " .. name, {
+			debugName = "probe:" .. name,
+			injectGlobals = true,
+		})
+		if not ok then
+			return nil
+		end
+		local ranOk, value = pcall(chunk)
+		if not ranOk then
+			return nil
+		end
+		return value
+	end
+
+	for key, value in baseGlobals do
+		if not rawequal(nativeGlobal(key), value) then
+			passName[key] = true
+		end
+	end
+end
 
 local specsFolder = root._children.Test._children.Specs
 if not specsFolder then
@@ -892,6 +1117,22 @@ print("")
 for _, message in collectErrors do
 	failed += 1
 	print(`  LOAD FAIL  {message}`)
+end
+
+-- Modules now share the process's real global table, so a `local` left off a
+-- top-level name would leak into every other module instead of dying inside that
+-- module's private env copy -- which is the one property the old loader had and
+-- this one does not. Lune keeps its own builtins behind a metatable, so anything
+-- ENUMERABLE here was written by this run.
+--
+-- After the last test, never before: `getfenv` permanently deoptimizes the
+-- environment it is asked about, and calling it early costs the whole suite the
+-- speedup this loader exists for. Nothing else in lune/, src/ or test/ calls it.
+for key in getfenv(0) do
+	if key ~= "_G" then
+		failed += 1
+		print(`  GLOBAL LEAK  a module assigned the global \`{tostring(key)}\`; add the missing \`local\``)
+	end
 end
 print(string.format("%d passed, %d failed, %d skipped in %.2fs", passed, failed, skipped, duration))
 

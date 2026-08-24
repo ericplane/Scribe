@@ -9,10 +9,9 @@ local Datatypes = require(script.Parent.Datatypes)
 
 local Util = {}
 
--- Deepest nesting a written value may have, counted from the root. Enforced at
--- write time by Node.validateWrite and at compile time against an ArrayOf/DictOf
--- element shape, so a template that declares a tree no write could ever satisfy
--- fails at startup instead of on every write.
+-- Deepest nesting a written value may have, counted from the root. Enforced by
+-- Node.validateWrite at write time and against ArrayOf/DictOf element shapes at compile
+-- time, so an unsatisfiable template fails at startup rather than on every write.
 Util.MAX_VALUE_DEPTH = 24
 
 function Util.cloneBuffer(value: buffer): buffer
@@ -21,10 +20,8 @@ function Util.cloneBuffer(value: buffer): buffer
 	return out
 end
 
--- True when `s` is valid UTF-8 -- the only strings (and JSON object keys) a
--- DataStore will persist. `utf8.len` returns nil at the first malformed byte;
--- an empty string is valid (len 0). Any string that fails this cannot be
--- JSON-encoded and would fail the whole profile save with DataStore error 104.
+-- True when `s` is valid UTF-8, the only strings (and JSON object keys) a DataStore
+-- will persist. Anything else fails the whole profile save with DataStore error 104.
 function Util.isUtf8(s: string): boolean
 	return utf8.len(s) ~= nil
 end
@@ -35,46 +32,48 @@ export type Unpersistable = {
 	Detail: string, -- human-readable message
 }
 
--- Depth-first scan for the first value or key in a persistable data structure
--- that a DataStore cannot store. The raw-table save boundaries that bypass
--- Node.validateWrite (OnPlayerInit, UpdateOffline, migrations, Dynamic seeds)
--- use this to catch data that would otherwise fail the ENTIRE profile save (or
--- replication) opaquely -- invalid UTF-8 (error 104), or an unserializable leaf
--- (userdata/Instance/function/thread/native vector, or a NaN/inf number).
+-- Depth-first scan for the first value or key a DataStore cannot store: invalid UTF-8
+-- (error 104), or an unserializable leaf. Used by the raw-table save boundaries that
+-- bypass Node.validateWrite (OnPlayerInit, UpdateOffline, migrations, Dynamic seeds),
+-- where the alternative is the entire profile save failing opaquely.
 --
--- Returns the first offender (its ancestor keys are all valid UTF-8, since a bad
--- key is reported before recursing under it, so `Path` never embeds bad bytes),
--- or nil when the whole structure is DataStore-safe. Buffers and finite
--- numbers/booleans/strings are DataStore-safe and pass.
--- `stats`, when supplied, collects the deepest table nesting reached. Stored data
--- can legally be nested deeper than a WRITE is allowed to reach (MAX_VALUE_DEPTH):
--- such a profile loads and reads cleanly and only refuses writes to its deepest
--- leaves, at the first Set, long after load. Riding along on this walk reports it
--- at load instead, and costs one comparison per table rather than a second pass
--- over the whole profile. It is only as complete as the walk: a scan that returns
--- early on an offender leaves MaxDepth partial, which is fine because that path
--- already fails loudly.
-function Util.findUnpersistable(
+-- Returns the first offender, whose ancestor keys are all valid UTF-8 because a bad key
+-- is reported before recursing under it, or nil when the structure is DataStore-safe.
+-- `stats`, when supplied, collects the deepest nesting reached; stored data may legally
+-- be nested deeper than a write can reach, and riding along here reports that at load
+-- instead of at the first Set. It is only as complete as the walk.
+--
+-- The path rides a scratch stack rather than a fresh array per child. `n` is the number
+-- of LIVE entries and is passed by value, so a frame only reads `stack[1..n]` and stale
+-- entries past it are unreachable; that is why there is no pop.
+local function snapshotPath(stack: { string | number }, n: number, extra: (string | number)?): { string | number }
+	local out: { string | number } = {}
+	table.move(stack, 1, n, 1, out)
+	if extra ~= nil then
+		out[n + 1] = extra
+	end
+	return out
+end
+
+local function scanUnpersistable(
 	value: any,
-	path: { string | number }?,
-	depth: number?,
+	stack: { string | number },
+	n: number,
+	d: number,
 	stats: { MaxDepth: number }?
 ): Unpersistable?
-	local at = path or {}
-	local d = depth or 0
 	if stats and d > stats.MaxDepth then
 		stats.MaxDepth = d
 	end
-	-- Checked FIRST, on typeof rather than type: a Roblox datatype IS storable,
-	-- just not raw, and reaching this scan means it was written around the accessor
-	-- (OnPlayerInit, a migration, an offline draft) so nothing packed it. Ahead of
-	-- the type dispatch because these are userdata in Roblox but plain tables under
-	-- the headless shim, and recursing into one reports a confusing key-type error
-	-- instead of the real problem.
+	-- Checked first, and on typeof rather than type: a Roblox datatype is storable but not
+	-- raw, and it is userdata on Roblox yet a plain table under the headless shim, so
+	-- recursing into one reports a confusing key-type error instead of the real problem.
+	-- Do not gate this on `type(value)` to skip the typeof call: a mistake here is a false
+	-- negative, and every future save then fails with no path in the log.
 	local typeName = typeof(value)
 	if Datatypes.IsSupported(typeName) then
 		return {
-			Path = at,
+			Path = snapshotPath(stack, n),
 			Kind = "Unserializable",
 			Detail = `a raw {typeName}, which only the accessor packs; write `
 				.. `Scribe.Datatypes.Pack("{typeName}", value) here, or store a plain number instead`,
@@ -85,45 +84,62 @@ function Util.findUnpersistable(
 		if Util.isUtf8(value :: string) then
 			return nil
 		end
-		return { Path = at, Kind = "InvalidUtf8", Detail = "string contains invalid UTF-8 bytes" }
+		return {
+			Path = snapshotPath(stack, n),
+			Kind = "InvalidUtf8",
+			Detail = "string contains invalid UTF-8 bytes",
+		}
 	elseif t == "boolean" or t == "buffer" then
 		return nil
 	elseif t == "number" then
 		if value ~= value or value == math.huge or value == -math.huge then
-			return { Path = at, Kind = "Unserializable", Detail = "NaN/inf number" }
+			return { Path = snapshotPath(stack, n), Kind = "Unserializable", Detail = "NaN/inf number" }
 		end
 		return nil
 	elseif t == "table" then
-		-- A cyclic table (OnPlayerInit/migration data can carry one) would recurse
-		-- forever; this scan runs UNPROTECTED inside the load path, so an overflow
-		-- kills the player's load. Depth-cap well past MAX_VALUE_DEPTH: anything
-		-- this deep cannot be written or wire-encoded either.
+		-- A cyclic table would recurse forever, and this scan runs unprotected inside the
+		-- load path, so an overflow kills the player's load. Capped well past
+		-- MAX_VALUE_DEPTH; nothing this deep is writable or wire-encodable anyway.
 		if d > 64 then
-			return { Path = at, Kind = "Unserializable", Detail = "nested deeper than 64 levels (or cyclic)" }
+			return {
+				Path = snapshotPath(stack, n),
+				Kind = "Unserializable",
+				Detail = "nested deeper than 64 levels (or cyclic)",
+			}
 		end
 		local hasNum, hasStr = false, false
+		-- One pass, and the order is load-bearing: splitting this into a key pass and a
+		-- value pass would report a different offender for the same data, and would leave
+		-- stats.MaxDepth short, since the recursion is what deepens it.
 		for k, v in value :: any do
 			local kt = type(k)
 			if kt ~= "string" and kt ~= "number" then
-				local kp = table.clone(at)
-				table.insert(kp, "<key>")
-				return { Path = kp, Kind = "Unserializable", Detail = `unsupported key type "{kt}"` }
+				return {
+					Path = snapshotPath(stack, n, "<key>"),
+					Kind = "Unserializable",
+					Detail = `unsupported key type "{kt}"`,
+				}
 			end
 			hasNum = hasNum or kt == "number"
 			hasStr = hasStr or kt == "string"
 			if hasNum and hasStr then
 				-- JSON cannot encode a table mixing array indices and object keys;
 				-- the whole profile save fails.
-				return { Path = at, Kind = "Unserializable", Detail = "table mixes array indices and string keys" }
+				return {
+					Path = snapshotPath(stack, n),
+					Kind = "Unserializable",
+					Detail = "table mixes array indices and string keys",
+				}
 			end
 			if kt == "string" and not Util.isUtf8(k :: string) then
-				local kp = table.clone(at)
-				table.insert(kp, "<invalid-key>")
-				return { Path = kp, Kind = "InvalidUtf8", Detail = "object key contains invalid UTF-8 bytes" }
+				return {
+					Path = snapshotPath(stack, n, "<invalid-key>"),
+					Kind = "InvalidUtf8",
+					Detail = "object key contains invalid UTF-8 bytes",
+				}
 			end
-			local childPath = table.clone(at)
-			table.insert(childPath, k)
-			local found = Util.findUnpersistable(v, childPath, d + 1, stats)
+			stack[n + 1] = k
+			local found = scanUnpersistable(v, stack, n + 1, d + 1, stats)
 			if found ~= nil then
 				return found
 			end
@@ -132,7 +148,23 @@ function Util.findUnpersistable(
 	end
 	-- userdata (Instance), function, thread, native vector, etc. A packable
 	-- datatype never reaches here: it is caught by the typeof check at the top.
-	return { Path = at, Kind = "Unserializable", Detail = `unsupported type "{typeName}"` }
+	return {
+		Path = snapshotPath(stack, n),
+		Kind = "Unserializable",
+		Detail = `unsupported type "{typeName}"`,
+	}
+end
+
+function Util.findUnpersistable(
+	value: any,
+	path: { string | number }?,
+	depth: number?,
+	stats: { MaxDepth: number }?
+): Unpersistable?
+	-- Cloned, not adopted: the caller still owns `path`, and the scratch stack would
+	-- otherwise leave its bookkeeping behind in someone else's table.
+	local stack: { string | number } = if path then table.clone(path) else {}
+	return scanUnpersistable(value, stack, #stack, depth or 0, stats)
 end
 
 -- Deep copy of a plain data value. Buffers are mutable, so they are copied
@@ -204,24 +236,126 @@ function Util.count(t: { [any]: any }): number
 	return n
 end
 
--- Approximate serialized size in bytes. Buffer-aware (DataStores store
--- buffers as base64, ~4/3 of their raw length), so it works where JSONEncode
--- would throw. Used for the wipe guard and profile-size monitoring, where
--- only magnitudes and ratios matter.
-function Util.approxSize(value: any): number
+-- What each byte costs beyond the raw one it already occupies, indexed by `byte + 1` so
+-- every lookup lands in the array part.
+--
+-- Non-ASCII is free: the encoder emits raw UTF-8, not \uXXXX escapes. \b \t \n \f \r have
+-- two-byte escapes and cost one extra; every other control character below 0x20 is
+-- written as \u00XX, so five extra. A quote and a backslash cost one each.
+local ESCAPE_COST: { number } = table.create(256, 0)
+for b = 0, 31 do
+	ESCAPE_COST[b + 1] = 5
+end
+for _, b in { 8, 9, 10, 12, 13 } do
+	ESCAPE_COST[b + 1] = 1
+end
+ESCAPE_COST[35] = 1 -- byte 34, a double quote
+ESCAPE_COST[93] = 1 -- byte 92, a backslash
+
+-- Bytes JSON spends on a string literal, quotes included. No `string.find` fast path in
+-- front of the byte walk: Luau's pattern matcher tests a character class per byte with no
+-- vectorised path, and measured 2.6x slower than `string.byte` plus an array-part index.
+local function jsonStringBytes(s: string): number
+	local n = #s
+	local total = n + 2
+	for i = 1, n do
+		total += ESCAPE_COST[string.byte(s, i) + 1]
+	end
+	return total
+end
+
+-- Digits in a non-negative integral double below 1e21.
+local function decimalDigits(n: number): number
+	if n < 10 then
+		return 1
+	elseif n < 100 then
+		return 2
+	elseif n < 1000 then
+		return 3
+	elseif n < 10000 then
+		return 4
+	elseif n < 100000 then
+		return 5
+	elseif n < 1000000 then
+		return 6
+	end
+	-- Past a million the comparison ladder stops paying for itself. %.0f prints
+	-- the double's exact integer value, so this stays exact rather than fitted.
+	return #string.format("%.0f", n)
+end
+
+-- Bytes JSON spends on a number.
+local function jsonNumberBytes(v: number): number
+	if v ~= v or v == math.huge or v == -math.huge then
+		-- Not encodable at all; findUnpersistable rejects these separately, so
+		-- charge `null` and move on rather than inventing a size.
+		return 4
+	end
+	-- The encoder writes integral values in full decimal all the way to 1e20 and only
+	-- switches to exponent form at 1e21, so %.17g alone renders 1e20 as "1e+20" and
+	-- under-counts it by sixteen bytes.
+	if v % 1 == 0 and v > -1e21 and v < 1e21 then
+		local digits = decimalDigits(if v < 0 then -v else v)
+		return if v < 0 then digits + 1 else digits
+	end
+	return #string.format("%.17g", v)
+end
+
+-- Approximate serialized size in bytes, as an UPPER bound on what the DataStore would
+-- store, which is the number the ~4 MB per-key ceiling is measured against. Buffer-aware
+-- (DataStores store buffers as base64, 4/3 of their raw length rounded up to a 4-byte
+-- group), so it works where JSONEncode would throw.
+--
+-- Upper bound rather than best guess: PROFILE_SIZE warns before saves start failing at the
+-- ceiling, so an under-count is silent while an over-count only costs an early warning.
+--
+-- Only array positions inside 1..#t are free. The encoder writes {[123]="a"} as
+-- {"123":"a"}, which is why Template.CoerceMapKeys exists, so a numeric key outside the
+-- array part is charged like a string one.
+--
+-- Still approximate, deliberately: it never builds the string. The slack that remains is
+-- non-integral numbers whose shortest round-trip form is short, which errs upward.
+function Util.approxSize(value: any, depth: number?): number
+	local d = depth or 0
 	local t = type(value)
 	if t == "string" then
-		return #value + 2
+		return jsonStringBytes(value :: string)
 	elseif t == "number" then
-		return 10
+		return jsonNumberBytes(value :: number)
 	elseif t == "boolean" then
-		return 5
+		return if value then 4 else 5
 	elseif t == "buffer" then
-		return math.ceil(buffer.len(value) * 4 / 3) + 2
+		return 4 * math.ceil(buffer.len(value :: buffer) / 3) + 2
 	elseif t == "table" then
-		local total = 2
-		for k, v in value do
-			total += Util.approxSize(k) + Util.approxSize(v) + 2
+		-- This also measures live data from the raw-write boundaries, which can be cyclic,
+		-- and it runs unprotected on the save path, so a cycle here would kill the save
+		-- rather than fail it. Cap exactly where findUnpersistable does.
+		if d > 64 then
+			return 2
+		end
+		local arrayLength = #(value :: any)
+		local total, entries = 2, 0 -- {} / []
+		for k, v in value :: any do
+			entries += 1
+			if type(k) == "number" and k >= 1 and k <= arrayLength and k % 1 == 0 then
+				total += Util.approxSize(v, d + 1)
+			else
+				-- The key dispatch TESTS the key type rather than asserting it. Casting a
+				-- key to number here raises on a boolean or table key, and approxSize runs
+				-- inside a save-path Signal handler that swallows the raise, so the
+				-- PROFILE_SIZE warning silently stops firing. The 6 for an unencodable key
+				-- measures nothing (findUnpersistable is what reports it); what matters is
+				-- that the walk continues past the key.
+				local kt = type(k)
+				local keyBytes = if kt == "string"
+					then jsonStringBytes(k :: string)
+					elseif kt == "number" then jsonNumberBytes(k :: number) + 2 -- quoted, as the encoder writes it
+					else 6
+				total += keyBytes + 1 + Util.approxSize(v, d + 1) -- + ':'
+			end
+		end
+		if entries > 1 then
+			total += entries - 1 -- separating commas, not one per entry
 		end
 		return total
 	end
@@ -258,12 +392,9 @@ function Util.guid(): string
 	return HttpService:GenerateGUID(false)
 end
 
--- Shallow equality suitable for "did this leaf change" checks. Tables and
--- buffers always count as changes: both are mutable, so a re-Set of the same
--- reference may carry in-place edits that must replicate.
--- Byte equality for two buffers. Buffers compare by IDENTITY under `==`, so a
--- packed datatype sitting in the store never equals a freshly packed needle even
--- when they hold the same value. Used by the array search accessors.
+-- Byte equality for two buffers, for the array search accessors. Buffers compare by
+-- identity under `==`, so a packed datatype in the store never equals a freshly packed
+-- needle even when they hold the same value.
 function Util.bufferEquals(a: buffer, b: buffer): boolean
 	local len = buffer.len(a)
 	if len ~= buffer.len(b) then
@@ -285,6 +416,9 @@ function Util.bufferEquals(a: buffer, b: buffer): boolean
 	return true
 end
 
+-- Shallow equality for "did this leaf change" checks. Tables and buffers always count as
+-- changes: both are mutable, so a re-Set of the same reference may carry in-place edits
+-- that must replicate.
 function Util.leafEquals(a: any, b: any): boolean
 	local t = type(a)
 	return a == b and t ~= "table" and t ~= "buffer"

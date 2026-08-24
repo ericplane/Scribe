@@ -24,6 +24,7 @@ BLOCK = re.compile(r"--\[=\[(.*?)\]=\]", re.S)
 
 DATATYPES = []                # datatype-declarator family; filled by main()
 VERSION = "0.0.0"             # wally.toml package version; filled by main()
+TYPES = {}                    # exported type name -> its anchor on api/types.md
 
 
 def read_version():
@@ -36,8 +37,9 @@ def read_version():
 
 
 def parse_block(body, next_code):
-    e = dict(cls=None, within=None, kind=None, name=None, ptype=None, interface=False,
-             params=[], returns=[], tags=[], flags=[], desc=[])
+    e = dict(cls=None, within=None, kind=None, name=None, key=None, ptype=None,
+             interface=False, params=[], returns=[], tags=[], flags=[], fields=[],
+             desc=[])
     for line in body.split("\n"):
         s = line.strip()
         if s.startswith("@class "): e["cls"] = s[7:].strip()
@@ -48,14 +50,33 @@ def parse_block(body, next_code):
             p = s[6:].strip().split(None, 1)
             e["kind"], e["name"] = "prop", p[0]
             e["ptype"] = p[1] if len(p) > 1 else "any"
-        # @interface/@type declare a shape, not a member. This generator does not
-        # render them, so they legitimately resolve to no member name.
-        elif s.startswith("@interface ") or s.startswith("@type "): e["interface"] = True
+        # @interface/@type declare an exported shape rather than a member of a class,
+        # so they get an entry on the Types page and legitimately resolve to no member
+        # name. @within is IGNORED on these blocks: a type is reached from every
+        # signature that names it, not from the one class that happens to declare it.
+        # `key` is the name with its generic parameters stripped, because that is the
+        # bare token a rendered signature actually contains.
+        elif s.startswith("@interface ") or s.startswith("@type "):
+            head, _, rest = s[1:].partition(" ")
+            p = rest.strip().split(None, 1)
+            e["interface"] = True
+            e["kind"] = "interface" if head == "interface" else "type"
+            e["name"] = p[0] if p else None
+            e["key"] = re.sub(r"<.*", "", e["name"]) if e["name"] else None
+            if head == "type" and len(p) > 1:
+                e["ptype"] = p[1]
         elif s.startswith("@param "): e["params"].append(s[7:].strip())
         elif s.startswith("@return "): e["returns"].append(s[8:].strip())
         elif s.startswith("@tag "): e["tags"].append(s[5:].strip())
         elif s in ("@server", "@client", "@yields"): e["flags"].append(s[1:])
         elif s.startswith("@"): pass
+        # `.Field Type -- what it is`, the Moonwave field line. Recognised only
+        # inside an @interface block, so prose that happens to open with a dot is
+        # still prose everywhere else.
+        elif e["kind"] == "interface" and re.match(r"\.\w+\s", s):
+            fname, _, rest = s[1:].partition(" ")
+            ftype, _, fdesc = rest.strip().partition(" -- ")
+            e["fields"].append((fname, ftype.strip(), fdesc.strip()))
         else: e["desc"].append(line)
     # infer name from the code line for members with no explicit @function/@method/@prop
     if e["within"] and not e["name"] and next_code:
@@ -67,6 +88,7 @@ def parse_block(body, next_code):
 
 def collect():
     classes = {}  # name -> {desc, members:[]}
+    types = {}    # key (the name without generics) -> parsed @interface/@type block
     seen = {}     # (within, name) -> "path:line" of the doc block that defined it first
     dups = []     # (within, name, first_src, dup_src) for every redefinition
     orphans = []  # (within, src, next_code) for a @within block whose member is unresolvable
@@ -80,6 +102,21 @@ def collect():
                 if t and not t.startswith("--"):
                     nxt = t; break
             e = parse_block(m.group(1), nxt)
+            src = f"{path.relative_to(ROOT)}:{text.count(chr(10), 0, m.start()) + 1}"
+            if e["interface"]:
+                # Until this branch existed, parse_block set a flag here and collect()
+                # dropped the block with no diagnostic, so every authored @interface
+                # produced nothing at all and no build ever said so.
+                if not e["key"]:
+                    raise SystemExit(f"[docgen] {src}: @interface/@type with no name.")
+                if e["key"] in types:
+                    raise SystemExit(
+                        f'[docgen] {src}: the type {e["key"]} is documented twice (first '
+                        f'at {types[e["key"]]["src"]}). Give each exported type one block.'
+                    )
+                e["src"] = src
+                types[e["key"]] = e
+                continue
             if e["cls"]:
                 classes.setdefault(e["cls"], {"desc": "", "members": []})["desc"] = e["desc"]
             elif e["within"] and e["name"]:
@@ -87,14 +124,13 @@ def collect():
                 # duplicate API entry (and a duplicate TOC line). Almost always a
                 # public doc-comment accidentally left on BOTH the internal self.<name>
                 # and the Data.<name> wrapper. Flag every collision and fail the build.
-                src = f"{path.relative_to(ROOT)}:{text.count(chr(10), 0, m.start()) + 1}"
                 key = (e["within"], e["name"])
                 if key in seen:
                     dups.append((key[0], key[1], seen[key], src))
                 else:
                     seen[key] = src
                 classes.setdefault(e["within"], {"desc": "", "members": []})["members"].append(e)
-            elif e["within"] and not e["interface"]:
+            elif e["within"]:
                 # A @within block whose member name cannot be resolved (no explicit
                 # @function/@method/@prop, and the next code line is not a definition)
                 # is silently DROPPED from the API page, which dangles every
@@ -147,7 +183,7 @@ def collect():
         # even when mkdocs surfaces the hook failure, then fail the build non-zero.
         print("\n".join(lines), file=sys.stderr)
         raise SystemExit(1)
-    return classes
+    return classes, types
 
 
 def find_datatypes():
@@ -179,6 +215,14 @@ def convert_xref(text):
             f"doc-comments and would ship as a dead absolute path.\n"
             f"          Use the Moonwave autolink form instead, e.g. [Server.WaitForData]."
         )
+
+    # [ExportedType] resolves to that type's entry on the Types page. Only names
+    # the generator actually rendered are rewritten, so an ordinary bracketed word
+    # in prose is left exactly as written.
+    def repl_type(m):
+        n = m.group(1)
+        return f"[`{n}`](types.md#{TYPES[n]})" if n in TYPES else m.group(0)
+    text = re.sub(r"\[([A-Z]\w*)\](?!\()", repl_type, text)
 
     # [Class.member] / [Class] Moonwave autolinks -> Material links
     def repl(m):
@@ -230,6 +274,11 @@ def md(text):
     return unescape_code_pipes(convert_xref(convert_admonitions(text)))
 
 
+def member_sep(e):
+    # `@method` members are called with a colon. Props are fields, so they stay dotted.
+    return ":" if e["kind"] == "method" else "."
+
+
 def signature(e, cls):
     if e["kind"] == "prop":
         return f'{cls}.{e["name"]}: {e["ptype"]}'
@@ -255,7 +304,7 @@ def signature(e, cls):
             f"Lua syntax highlighting for the whole signature. Reference the exported type by "
             f"name instead.\n          {ps}"
         )
-    sig = f'{cls}.{e["name"]}({ps})'
+    sig = f'{cls}{member_sep(e)}{e["name"]}({ps})'
     if e["returns"]:
         sig += " → " + " ".join(" ".join(strip_note(r).split()) for r in e["returns"])
     if "--" in sig:
@@ -266,8 +315,29 @@ def signature(e, cls):
     return sig
 
 
+def type_links(sig, cls, name, sep="."):
+    # A signature renders inside a ```lua fence, and Markdown will not make a link
+    # inside one, so an exported type named in a signature is a dead word on the
+    # page. Emit the links directly beneath the fence instead, in the order the
+    # signature mentions them. The `Class.member` prefix is stripped first so a
+    # declarator does not list the type it is named after (Scribe.Flags -> Flags).
+    head = f'{cls}{sep}{name}'
+    body = sig[len(head):] if sig.startswith(head) else sig
+    found = []
+    for tok in re.findall(r"\b[A-Za-z_]\w*\b", body):
+        # Skip the class being rendered. BigValue is both a class page and an
+        # exported type, so BigValue.Pow would otherwise send the reader to a stub
+        # whose entire content points back at the page they are already on.
+        if tok in TYPES and tok != cls and tok not in found:
+            found.append(tok)
+    if not found:
+        return None
+    links = ", ".join(f"[`{n}`](types.md#{TYPES[n]})" for n in found)
+    return f"Types: {links}\n{{ .api-typerefs }}"
+
+
 def render_member(e, cls):
-    out = [f'### .{e["name"]} {{ #{slug(e["name"])} }}', ""]
+    out = [f'### {member_sep(e)}{e["name"]} {{ #{slug(e["name"])} }}', ""]
     raw = list(e["flags"])
     if e["kind"] == "prop":
         raw.insert(0, "signal" if e["ptype"] == "Signal" else "property")
@@ -277,10 +347,15 @@ def render_member(e, cls):
         out.append("")
     # Tagged so extra.css can let ONLY signatures wrap. Guide code examples keep
     # horizontal scrolling, where wrapping would mangle real Lua.
+    sig = signature(e, cls)
     out.append("``` { .lua .api-signature }")
-    out.append(signature(e, cls))
+    out.append(sig)
     out.append("```")
     out.append("")
+    refs = type_links(sig, cls, e["name"], member_sep(e))
+    if refs:
+        out.append(refs)
+        out.append("")
     if e["desc"]:
         out.append(md(e["desc"]))
         out.append("")
@@ -337,6 +412,65 @@ def render_class(name, data):
     return "\n".join(out)
 
 
+TYPES_INTRO = """The exported shapes that the signatures on the other API pages name.
+Every one of them is reachable through the module you required, so you can annotate
+your own locals with `Scribe.LeaderboardEntry` and get the same checking Scribe uses
+internally. Nothing here is something you construct by hand unless the entry says so.
+"""
+
+
+CLASS_PAGES = ("Server", "Client", "Value", "Scribe")
+
+
+def type_cell(ftype):
+    # A Type column that names a page the site already has should be a link, so a
+    # reader chasing `.Server Server` or `.Level LogLevel` lands on the definition
+    # rather than reading the word again. Exact matches only: a compound like
+    # `("Default" | ScribeTransport)?` has no single destination, so it stays code.
+    base = ftype[:-1] if ftype.endswith("?") else ftype
+    if base in TYPES:
+        return f"[`{ftype}`](types.md#{TYPES[base]})"
+    if base in CLASS_PAGES:
+        return f"[`{ftype}`]({slug(base)}.md)"
+    return f"`{ftype}`"
+
+
+def render_type(e):
+    # `<` opens a raw HTML tag in a Markdown heading, so an unescaped `Timed<T>`
+    # renders as a bare `Timed` and the generic silently disappears.
+    title = e["name"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    out = [f'### {title} {{ #{TYPES[e["key"]]} }}', ""]
+    if e["kind"] == "type" and e["ptype"]:
+        out += ["``` { .lua .api-signature }", f'type {e["name"]} = {e["ptype"]}', "```", ""]
+    if e["fields"]:
+        out += ["| Field | Type | What it is |", "| --- | --- | --- |"]
+        for fname, ftype, fdesc in e["fields"]:
+            # A pipe inside the type (a union) is safe: Python-Markdown does not split
+            # a row on a pipe inside an inline-code span. A pipe in the prose cell is
+            # not, so escape that one.
+            out.append(f'| `{fname}` | {type_cell(ftype)} | {md(fdesc).replace("|", chr(92) + "|")} |')
+        out.append("")
+    if e["desc"]:
+        out += [md(e["desc"]), ""]
+    return "\n".join(out)
+
+
+def render_types(types):
+    out = ["# Types", "", TYPES_INTRO, ""]
+    order, groups = [], {}
+    for e in types.values():
+        tag = (e["tags"] or ["General"])[0]
+        if tag not in groups:
+            order.append(tag)
+            groups[tag] = []
+        groups[tag].append(e)
+    for tag in order:
+        out += [f"## {tag}", ""]
+        for e in groups[tag]:
+            out.append(render_type(e))
+    return "\n".join(out)
+
+
 def check_grid_cards(text, source):
     # A Material "grid cards" card is a list item, so every line of its body must
     # stay indented under it. Lose the indent on one line and that card ends
@@ -384,7 +518,7 @@ def copy_theme():
 
 
 def main():
-    global DATATYPES, VERSION
+    global DATATYPES, VERSION, TYPES
     DATATYPES = find_datatypes()
     VERSION = read_version()
 
@@ -393,10 +527,16 @@ def main():
     (OUT / "api").mkdir(parents=True, exist_ok=True)
     (OUT / ".gitkeep").write_text("", encoding="utf-8")
 
-    classes = collect()
+    classes, types = collect()
+    # The registry has to exist before ANY page renders: render_member consults it
+    # for the type links under each signature, and convert_xref for [ExportedType].
+    TYPES = {key: slug(key) for key in types}
     for cls, data in classes.items():
         (OUT / "api" / f"{slug(cls)}.md").write_text(render_class(cls, data), encoding="utf-8")
     print("[docgen] API:", ", ".join(f"{k}({len(v['members'])})" for k, v in classes.items()))
+    if types:
+        (OUT / "api" / "types.md").write_text(render_types(types), encoding="utf-8")
+    print(f"[docgen] types: {len(types)} exported shapes")
 
     guides = sorted(DOCS.glob("*.md"))
     for path in guides:

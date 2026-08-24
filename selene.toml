@@ -1,4 +1,14 @@
 std = "roblox+testez"
 
 # The Lune runner uses Lune globals/requires, not Roblox's.
-exclude = ["lune/**", "Packages/**", "ServerPackages/**", "DevPackages/**"]
+# `src/Internal/Store/ProfileStore.luau` is a vendored fork kept line-identical
+# with upstream so it stays diffable; letting selene rewrite 2,242 lines of
+# someone else's code would destroy that for no benefit. Scribe's own code around
+# it -- src/Internal/Store/init.luau -- is NOT excluded and is linted normally.
+exclude = [
+	"lune/**",
+	"Packages/**",
+	"ServerPackages/**",
+	"DevPackages/**",
+	"src/Internal/Store/ProfileStore.luau",
+]

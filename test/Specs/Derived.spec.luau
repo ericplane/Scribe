@@ -726,4 +726,46 @@ return function()
 			end)).to.equal(false)
 		end)
 	end)
+	itRunning("settles a mark laid down BEHIND the sweep cursor, which takes a second pass", function()
+		-- Why MAX_SETTLE_PASSES is 4 and not 1, pinned.
+		--
+		-- runSettle sweeps `Compiled.DerivedNodes` in topological order rather than
+		-- sweeping the dirty set, and its comment says that is what makes a CHAIN of
+		-- any depth settle in one pass -- a dependent always sits after its inputs, so
+		-- a mark laid down by a recompute is still ahead of the cursor. True, and it
+		-- is exactly why a chain cannot pin the loop: one pass is enough for one.
+		--
+		-- The case that needs a second pass is a mark laid down BEHIND the cursor, and
+		-- a LISTENER is what lays one. `Late` reads `Early`, so the compiler orders
+		-- Early first; a listener on Late writes `B`, which is an input of Early. By
+		-- then the cursor is past Early, so the mark survives to the next pass.
+		--
+		-- It converges rather than feeding back forever: the listener writes the same
+		-- constant every time, so the second recompute of Late short-circuits at
+		-- leafEquals and lays no third mark. With MAX_SETTLE_PASSES = 1, Early keeps
+		-- the value it computed while B was still 0 and DERIVED_FEEDBACK fires on a
+		-- program that was going to settle.
+		local harness = TestCtx.make({
+			AutoPump = false,
+			Template = {
+				A = Scribe.Int(0, { Min = 0 }),
+				B = Scribe.Int(0, { Min = 0 }),
+				Early = Scribe.Derived(Scribe.Int(0), { "A", "B" }, function(a: number, b: number): number
+					return a * 10 + b
+				end),
+				Late = Scribe.Derived(Scribe.Int(0), { "Early" }, function(early: number): number
+					return early + 1000
+				end),
+			},
+		})
+		local _player, _entry, data = harness.Join()
+		data.Late.Changed(function()
+			data.B.Set(1)
+		end)
+
+		data.A.Set(5)
+		-- Early = 5*10 + 1 requires the SECOND pass to have run; at one pass it is 50.
+		expect(`Early={data.Early.Get()} Late={data.Late.Get()}`).to.equal("Early=51 Late=1051")
+		harness.Cleanup()
+	end)
 end

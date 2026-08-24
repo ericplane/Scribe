@@ -1,203 +1,330 @@
 # Log Code Reference
 
-Every diagnostic Scribe emits carries a stable, machine-readable `Code` that stays the same across versions, so you can route, filter, and alert on exactly the events you care about. This page lists all of them.
+Every diagnostic Scribe emits carries a stable, machine-readable `Code`. The string never changes between versions, so you can route, filter and alert on exactly the events you care about without parsing messages. This page lists all of them, grouped by category.
 
-Each log entry is `{ At, Level, Category, Code, Message, Context }`, where `Level` is one of `Debug`, `Info`, `Warn`, `Error`, or `Fatal`. **`Error` and `Fatal` entries also fire [`Scribe.OnIssue`](/api/Scribe#OnIssue).** Each section heading below **is** the entry's `Category` value, so a row's section is what a `Category` filter matches.
+## Routing the codes you care about
 
-Codes marked _(Studio only)_ never fire on a live server; they come from the [Scribe Studio plugin](./studio-plugin)'s simulation tools, so you can safely ignore them in production alerting. Rows that say _in DevMode_ are gated the same way in practice: dev mode defaults to `RunService:IsStudio()`, so those codes will not reach production alerting either.
-
-## Consuming codes
+Add a sink and pick what leaves your server. Scribe sends nothing anywhere on its own.
 
 ```lua
--- Forward exactly what you want to your own backend
+-- ServerScriptService/EmberfallDiagnostics.server.luau
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Scribe = require(ReplicatedStorage.Packages.Scribe)
+
 Scribe.AddLogSink(function(entry)
     -- entry = { At, Level, Category, Code, Message, Context }
     if entry.Level == "Error" or entry.Level == "Fatal" then
-        MyBackend:Report(entry)                          -- everything serious
+        MyBackend:Report(entry)                     -- everything serious
     elseif entry.Code == "PROFILE_SIZE" or entry.Code == "WIPE_GUARD_TRIPPED" then
-        MyBackend:Report(entry)                          -- specific codes to watch
+        MyBackend:Report(entry)                     -- specific codes to watch
     end
 end)
 
--- Or pull recent entries on demand, filtered by code / level / category
+-- Or pull recent entries on demand.
 Scribe.GetRecentLogs({ Code = "PROFILE_LOAD_FAIL", Limit = 50 })
 Scribe.GetRecentLogs({ Level = "Error", Limit = 100 }) -- Level filters by minimum severity
-
--- Every Error / Fatal also arrives here
-Scribe.OnIssue:Connect(function(entry) alert(entry) end)
 ```
 
-`Code`, `Level`, and `Category` are typed string unions, so your editor autocompletes their values both in a `GetRecentLogs` filter and on `entry` inside a sink: typing `Code = "PRO` suggests every code beginning with `PRO`.
+`Code`, `Level` and `Category` are typed string unions, so your editor autocompletes them both in a `GetRecentLogs` filter and on `entry` inside a sink. Typing `Code = "PRO` suggests every code beginning with `PRO`.
 
-The `Context` table carries structured fields that vary by code (the player, a data path, byte counts, store names, and so on). The built-in sink forwards entries to Roblox's structured `LogService` output keyed by `Code`, so Creator Analytics aggregates by code, but **only entries at or above the `LogLevel` option**, which defaults to `Warn` on a live server and `Debug` in Studio. The `Info` and `Debug` codes below therefore reach neither the console nor Creator Analytics in production unless you set `LogLevel = "Info"`. Sinks you add with `AddLogSink`, the `GetRecentLogs` ring, and `OnIssue` are never level-filtered: they always see every entry.
+## Reading a row
+
+Each entry is `{ At, Level, Category, Code, Message, Context }`.
+
+| Level | What it means for you |
+| --- | --- |
+| `Debug` | Detail for when you are already investigating something. |
+| `Info` | A normal event worth a record, such as a profile loading. |
+| `Warn` | Something is off, and the game keeps working. |
+| `Error` | Something failed. Also fires [`Scribe.OnIssue`](/api/Scribe#OnIssue). |
+| `Fatal` | Something failed and cannot recover. Also fires `OnIssue`. |
+
+Each section heading below **is** the entry's `Category` value, so a row's section is exactly what a `Category` filter matches. `Context` carries structured fields that vary by code: the player, a data path, byte counts, store names and so on.
+
+<a id="repeated-failures-are-folded"></a>
+
+??? note "Repeated failures are folded into one line"
+    These codes are emitted once per problem rather than once per retry: `PROFILE_STORE_ERROR`, `PROFILE_LOAD_FAIL`, `OFFLINE_READ_FAIL`, `VERSION_READ_FAIL`, `LB_ERASE_FAIL`, `PROFILE_ERASE_FAIL`, `PROFILE_RESTORE_FAIL`, `OFFLINE_WRITE_FAIL`, `MESSAGE_SEND_FAIL`, `GIFT_DELIVERY_RETRY` and `PROFILE_OVERWRITTEN`. Repeated failures of the same subject inside the retry window collapse into the first line.
+
+    Nothing is lost. The first failure of a subject always logs. The line that ends a fold carries `Context.Repeats`, the number of attempts folded into the previous line. The `HealthFailures` and `DataStoreErrors` counters still count every attempt, and `FailuresCollapsed` counts the suppressed lines. See [Diagnostics](./diagnostics).
+
+    A failure with no subject to fold on logs every time.
+
+??? note "Codes that never reach you"
+    Rows marked _(Studio only)_ come from the [Scribe Studio](./studio-plugin)'s simulation tools. They cannot fire on a live server, so you can leave them out of production alerting entirely. Rows that say _in DevMode_ are gated the same way in practice, because dev mode defaults to `RunService:IsStudio()` unless you turn `DevMode` on yourself.
+
+    The console filters separately. The built-in sink forwards entries to Roblox's structured `LogService` output keyed by `Code`, so Creator Analytics aggregates by code rather than by message text, and it forwards only entries at or above the `LogLevel` option. That defaults to `Warn` on a live server and `Debug` in Studio.
+
+    Entries below the threshold are still written to the ring buffer and still reach your own sinks, so `GetRecentLogs` sees them even when the console does not.
 
 ## Persistence
 
-| Code                           | Level        | Meaning                                                                                                                                                                                                                         |
-| ------------------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DATASTORE_CRITICAL`           | Error        | ProfileStore's OnCriticalToggle reported the DataStore backend entered a critical (sustained failure) state, so loads and saves are likely failing platform-wide.                                                               |
-| `MESSAGE_SEND_FAIL`            | Warn         | `SendMessage` could not deliver a cross-server message: ProfileStore's `MessageAsync` threw or reported no commit, so the recipient will never receive it. Usually a DataStore outage. `SendMessage` returns `false` for the same condition. |
-| `MIGRATION_FAIL`               | Error / Warn | `Error` when a migration step throws, or when the migrated result contains unpersistable data (invalid UTF-8, an unserializable value, a mixed-key table) caught by a scan before the commit. Migrations run on a clone, so the session is aborted fail-closed and the unmodified original persists rather than half-migrated data. One carve-out adds a follow-up `Warn` after that `Error`: a returning profile holding nothing but current template defaults is loaded un-migrated and left **unstamped** instead of kicked, so the chain retries on every join until the migration is fixed. |
-| `MIGRATION_RECONCILE_DEPENDENT` | Warn         | **Opt-in only:** set `MigrationShadow = true` in your options. It is off by default everywhere, including Studio, because the shadow re-executes your migration bodies against a clone, so any side effect in them fires twice. Turn it on while auditing a migration, then turn it off. It reports a migration step that behaves differently against the raw stored data than against the reconciled data it actually receives: Scribe fills missing template keys with their defaults **before** migrations run, so a step guarded on `if data.Field == nil` never fires and silently does nothing for returning players. The shadow re-runs the chain against the raw stored data and reports the first diverging paths, or the step that throws against them. Write migration bodies that are safe against raw stored data: nil-guard every reach-through, and keep them pure functions of `data` (a step using `math.random`, `os.time`, or an external DataStore will warn spuriously). |
-| `PROFILE_LOAD_FAIL`            | Error        | A profile could not be loaded: `StartSessionAsync` returned no profile or threw while the player was still present, or a `Mode = "NoSave"` view found no stored profile to read. Under the default `LoadFailurePolicy = "Kick"` the player is kicked (or the `NoSave` view is torn down) and the code fires once. Under `"Wait"` nobody is kicked: the load retries with backoff (5s per attempt, capped at 60s) and this code fires **again on every attempt**, with `Context.Attempt` counting them, so deduplicate on `Attempt > 1` if you alert on it. A load abandoned because the server is shutting down is torn down silently and never reaches this code. Note it also does **not** cover a DataStore outage: ProfileStore retries a failing `StartSessionAsync` internally and does not time out while the player is present, so an outage leaves the player in a loading state rather than reaching this code. |
-| `PROFILE_VERSION_AHEAD`        | Error / Warn | The stored profile's version is newer than this server's code knows about; it fires as Error and fails closed (kicks) under VersionAheadPolicy=Kick, or Warn and proceeds under Allow, indicating a mixed/staged deploy hazard. |
-| `EXPORT_ENCODE_FAIL`           | Warn         | A GDPR/data Export could not JSON-encode a player's profile data, so Export returns nil instead of a serialized payload.                                                                                                        |
-| `OFFLINE_READ_FAIL`            | Warn         | An offline GetAsync read of a non-active user's profile errored (a retryable read failure, distinct from a genuinely missing profile), so GetOffline returns nil.                                                               |
-| `PROFILE_ERASED`               | Warn         | A player's profile was permanently removed via the GDPR Erase path; the log records the audit context and whether the associated leaderboard keys were also cleared.                                                            |
-| `PROFILE_RESET`                | Warn         | A profile's data was wiped back to template defaults because the ResetData option was enabled, expected in testing but alarming if seen in production.                                                                          |
-| `PROFILE_RESTORED`             | Warn         | A profile was rolled back to an earlier entry from version history via RestoreVersion; the log records the restored version and audit context.                                                                                  |
-| `PROFILE_SIZE`                 | Warn         | The profile exceeded the size-warning threshold and is approaching the ~4 MB DataStore per-key ceiling, risking save failures if it keeps growing. Measured before each save attempt, so it still fires when that save then FAILS, which is the case it exists for, and it stays latched until the size drops back below. Also fires `OnAnomaly` with reason `ProfileSize`.                            |
-| `PROFILE_STORE_ERROR`          | Warn         | ProfileStore.OnError reported a DataStore error against this bundle's store; if it corresponds to an in-flight save, that save is marked failed for the affected player. Also fires `OnSave`. A recurring `104: ... valid UTF-8 characters` here means a string value or object key contains invalid UTF-8; Scribe now rejects those at the write boundary, so a lingering one points at a raw-table path (see `PROFILE_UNPERSISTABLE`). |
-| `PROFILE_STORE_SIGNAL_MISSING` | Warn         | ProfileStore's OnError or OnCriticalToggle signal could not be connected, so save-failure/critical-state observability for this bundle is disabled.                                                                             |
-| `PROFILE_TOO_LARGE`            | Error        | A save failed while the profile is already over the ~3.5 MB size-warning threshold, so the cause is almost certainly the ~4 MB DataStore per-key ceiling rather than a transient throttle. It will NOT recover on retry: every subsequent save, including the leave/shutdown save, keeps failing until the profile is trimmed. |
-| `MODE_OVERRIDES_LEGACY`        | Warn         | `Mode` was set alongside one of the legacy persistence flags (`UseMock`, `DontSave`, `ViewedUserId`, `OverriddenUserId`). `Mode` wins and the legacy flag is ignored; remove it to silence this. |
-| `SAVE_INTERVAL_CLAMPED`        | Warn         | The requested SaveInterval was below the minimum floor (DataStore write throttling) and was clamped up to that floor instead of the requested value.                                                                            |
-| `SAVE_INTERVAL_CONFLICT`       | Warn         | Two bundles asked for different autosave cadences. ProfileStore's `AUTO_SAVE_PERIOD` is a process-wide constant, so only one can win and the later value does. Set it once with `Scribe.Configure` instead. |
-| `SAVE_INTERVAL_FAIL`           | Warn         | Applying the configured SaveInterval to ProfileStore's AUTO_SAVE_PERIOD failed (SetConstant threw), so the autosave cadence was not changed.                                                                                    |
-| `SIM_LOAD_FAILURE`             | Warn         | _(Studio only.)_ The Scribe Studio debug plugin armed or triggered a simulated profile-load failure to exercise the load-failure/retry path; it can only occur in Studio, never on a live server.                               |
-| `SIM_SESSION_STEAL`            | Warn         | _(Studio only.)_ The Scribe Studio debug plugin simulated a session steal by force-ending an active profile session to exercise the session-lock/steal path; Studio-only, never on a live server.                               |
-| `STATUS_CHANGED`               | Warn / Info  | The Health status machine transitioned between Healthy/Degraded/Outage (Info when returning to Healthy, Warn when degrading), reflecting the recent DataStore failure/success trend. Also fires `OnStatusChanged`.              |
-| `UNKNOWN_ROOT_KEYS`            | Warn         | In DevMode, a loaded profile contained top-level keys not present in the template, signaling schema drift that a migration should remove.                                                                                       |
-| `VERSION_QUERY_FAIL`           | Warn         | Enumerating a profile's DataStore version history via VersionQuery failed, so ListVersions returns whatever partial results it gathered before the error.                                                                       |
-| `VERSION_READ_FAIL`            | Warn         | Reading a specific historical profile version via GetAsync errored (a retryable read failure, not a missing version), so GetVersion returns nil.                                                                                |
-| `DATASTORE_RECOVERED`          | Info         | ProfileStore's OnCriticalToggle reported the DataStore backend left its critical state, meaning the earlier outage has cleared and normal saves/loads resumed.                                                                  |
-| `MIGRATED`                     | Info         | A stored profile was successfully upgraded through one or more migration steps to the current version and the migrated data was committed.                                                                                      |
-| `PROFILE_LOADED`               | Info         | A player's profile session finished loading and reached the Ready state, so their data tree is live and usable, a routine per-session confirmation.                                                                             |
-| `SAVE_INTERVAL_SET`            | Info         | The configured SaveInterval was successfully applied to ProfileStore's global AUTO_SAVE_PERIOD, confirming the requested autosave cadence is in effect.                                                                         |
-| `SHUTDOWN_DONE`                | Info         | The BindToClose shutdown drain finished; it reports how many sessions remained un-drained when the budget expired (ideally zero).                                                                                               |
-| `SHUTDOWN_FLUSH`               | Info         | Server shutdown began: new sessions are refused and the profile-save and leaderboard queues are being drained within the BindToClose budget.                                                                                    |
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `DATASTORE_CRITICAL` | Error | ProfileStore reported the DataStore backend has entered a sustained failure state, so loads and saves are likely failing platform wide. |
+| `MESSAGE_SEND_FAIL` | Warn | A cross-server message could not be delivered. Usually a DataStore outage. `SendMessage` returns `false` for the same condition. `Context.ProvablyClean` is `true` only when nothing reached storage; otherwise the write may have committed and lost its answer, so treat the message as retryable rather than lost. |
+| `MESSAGE_QUEUE_FULL` | Error | The recipient already holds the maximum 1,000 undelivered messages, so the send was refused and `SendMessage` returned `false`. Nothing already queued is destroyed. `Context.ProvablyClean` is `true` when no attempt in that call reached storage; `false` means an earlier attempt may already have queued the message, so it can still arrive. |
+| `MESSAGE_NO_LISTENER` | Warn | A cross-server message arrived for an active session with nothing connected to `Data.OnMessage`. It was not acknowledged, so it is handed to the game again on the next load. Usually a startup race. |
+| `MESSAGE_HANDLER_ERROR` | Error | An `OnMessage` handler threw. The message was not acknowledged and is redelivered next session, so a handler that throws deterministically stays stuck until it is fixed. |
+| `MESSAGE_HANDLER_STALLED` | Warn | An `OnMessage` handler had not returned when the session ended, so the message was not acknowledged and is redelivered next load. `Context.Outstanding` counts the open deliveries. |
+| `MIGRATION_FAIL` | Error / Warn | A migration step threw, or the migrated result contained unpersistable data caught by a scan before the commit. Migrations run on a clone, so the session is aborted and the unmodified original persists rather than half-migrated data. |
+| `MIGRATION_RESERVED_DISCARDED` | Error | A migration step changed the reserved `_Scribe` root and that change was discarded. Only `Version` was re-stamped. That root is library owned, and it holds the receipt dedupe ring, gift escrow, gift credits, perks, purchase logs and `Scribe.Timed` deadlines. |
+| `MIGRATION_RECONCILE_DEPENDENT` | Warn | Opt-in only, with `MigrationShadow = true`. A migration step behaves differently against the raw stored data than against the reconciled data. Turn the option on while auditing a migration and off again afterwards, because the shadow re-runs your migration bodies and fires their side effects twice. |
+| `LEGACY_IMPORTED` | Info | `ImportLegacyData` returned a table and Scribe adopted its top-level keys. The profile then enters the migration chain at version 1 and runs every step. Keys under `_Scribe` and `_ScribeSession` are never adopted, and the profile is not reported as new to `OnPlayerInit`. |
+| `LEGACY_IMPORT_FAIL` | Error | `ImportLegacyData` threw, so Scribe refused the load rather than starting the player empty. Loading them empty would commit an empty profile as canonical and strand the legacy data forever. |
+| `PROFILE_LOAD_FAIL` | Error | A profile could not be loaded. Under the default `LoadFailurePolicy = "Kick"` the player is kicked and the code fires once. Under `"Wait"` nobody is kicked and the load retries. |
+| `PROFILE_VERSION_AHEAD` | Error / Warn | The stored profile's version is newer than this server's code knows about. It fires as `Error` and kicks under `VersionAheadPolicy = "Kick"`, or as `Warn` and proceeds under `"Allow"`. Either way it signals a mixed or staged deploy. |
+| `PROFILE_SCHEMA_VIOLATION` | Error / Warn | The opt-in `SchemaPolicy` check found the stored profile does not match the compiled template: a wrong type, a value outside a declared bound, an over-length string, a value outside an enum, invalid UTF-8, an undeclared key, or a container whose shape or caps changed. |
+| `EXPORT_ENCODE_FAIL` | Warn | A data export could not JSON-encode a player's profile, so `Export` returns nil instead of a payload. |
+| `OFFLINE_READ_FAIL` | Warn | An offline read of a non-active user's profile errored, so `GetOffline` returns nil. This is a retryable read failure and not a genuinely missing profile. |
+| `OFFLINE_WRITE_FAIL` | Warn | `UpdateOffline` could not complete because the DataStore call itself failed, so nothing was stored. A refused write, such as a live session elsewhere or a key that changed under the update, is the compare-and-set working and does not fire this. |
+| `PROFILE_ERASED` | Warn | A profile was permanently removed through the erase path. The log records the audit context and whether the leaderboard keys were cleared too. |
+| `PROFILE_ERASE_FAIL` | Warn | An erase did not complete, so the profile is still stored and the erase must be retried. A leaderboard key that survived a profile removal reports separately as `LB_ERASE_FAIL`. |
+| `PROFILE_RESET` | Warn | A profile was wiped back to template defaults because `ResetData` was enabled. Expected in testing, alarming in production. |
+| `PROFILE_RESTORED` | Warn | A profile was rolled back to an earlier version. The log records the restored version and the audit context. |
+| `PROFILE_RESTORE_FAIL` | Warn | A restore did not complete, so the stored profile is unchanged. The version was not found, a live session held the key, the live key no longer exists, or the commit failed. |
+| `RESTORE_RESERVED_PRESERVED` | Warn | A restore rolled the profile back, and the library-owned `_Scribe` root was kept as it was live rather than rolled back with it. That root records events that already happened in the real world, such as settled receipts and spent cooldowns. |
+| `PROFILE_SIZE` | Warn | The profile passed the size-warning threshold and is approaching the 4 MB per-key ceiling. Measured before each save attempt, so it still fires when that save then fails. It stays latched until the size drops back. Also fires `OnAnomaly`. |
+| `PROFILE_STORE_ERROR` | Warn | ProfileStore reported a DataStore error against this bundle's store. `Context.Class` is `Throttled`, `Failed`, `Unresolved` or `Rejected`, and `Context.Code` is the numeric prefix Roblox sent. A nil code means the message did not carry one. |
+| `PROFILE_STORE_SIGNAL_MISSING` | Warn | ProfileStore's error or critical-state signal could not be connected, so save-failure observability for this bundle is off. |
+| `PROFILE_TOO_LARGE` | Error | A save failed while the profile is already over the 3.5 MB warning threshold, so the cause is the 4 MB ceiling rather than a throttle. It will not recover on retry. Every later save, including the leave save, keeps failing until the profile is trimmed. |
+| `MODE_OVERRIDES_LEGACY` | Warn | `Mode` was set alongside a legacy persistence flag. `Mode` wins and the legacy flag is ignored. Remove the flag to silence this. |
+| `SAVE_INTERVAL_CLAMPED` | Warn | The requested `SaveInterval` was below the throttling floor and was raised to it. |
+| `SAVE_INTERVAL_CONFLICT` | Warn | Two bundles asked for different autosave cadences. ProfileStore's autosave period is process wide, so the later value wins. Set it once with `Scribe.Configure`. |
+| `HEALTH_THRESHOLDS_CONFLICT` | Warn | Two bundles asked for different `StatusThresholds`. The health machine is a library-level singleton, so the thresholds are process wide and the later value wins -- which means one bundle can loosen the Outage gate that refuses Robux for every other bundle. Emitted once per field. Set them once, identically, in every bundle. |
+| `SAVE_INTERVAL_FAIL` | Warn | Applying the configured `SaveInterval` threw, so the autosave cadence was not changed. |
+| `SAVE_INTERVAL_SET` | Info | The configured `SaveInterval` was applied successfully. |
+| `WIPE_GUARD_RATIO_CLAMPED` | Warn | The configured `WipeGuardShrinkRatio` was outside the usable range and was clamped. At or below zero every shrink trips the guard. At or above one it can never trip. |
+| `SAVE_WAIT_TIMEOUT` | Warn | A caller waiting on a save gave up. This is unresolved, not failed: the save often lands moments later, so `SavesOk` may increment for the very save the caller was told `false` about. Counted as `SaveWaitTimeouts`. |
+| `SIM_LOAD_FAILURE` | Warn | _(Studio only.)_ The Studio plugin armed or triggered a simulated load failure. |
+| `SIM_SESSION_STEAL` | Warn | _(Studio only.)_ The Studio plugin force-ended an active session to exercise the session-lock path. |
+| `STATUS_CHANGED` | Warn / Info | The health machine moved between Healthy, Degraded and Outage. `Info` when returning to Healthy, `Warn` when degrading. Also fires `OnStatusChanged`. |
+| `UNKNOWN_ROOT_KEYS` | Warn | In DevMode, a loaded profile carried top-level keys the template does not declare. That is schema drift a migration should remove. |
+| `VERSION_QUERY_FAIL` | Warn | Enumerating a profile's version history failed, so `ListVersions` returns whatever partial results it gathered. |
+| `VERSION_READ_FAIL` | Warn | Reading a specific historical version errored, so `GetVersion` returns nil. This is a retryable read failure and not a missing version. |
+| `DATASTORE_RECOVERED` | Info | The DataStore backend left its critical state, so the earlier outage has cleared. |
+| `MIGRATED` | Info | A stored profile was upgraded through one or more migration steps and committed. |
+| `PROFILE_LOADED` | Info | A profile finished loading and reached `Ready`, so the data tree is live. |
+| `SHUTDOWN_FLUSH` | Info | Shutdown began. New sessions are refused and the save and leaderboard queues are draining. |
+| `SHUTDOWN_DONE` | Info | The shutdown drain finished. It reports sessions left un-drained when the budget expired, exit hooks skipped for want of budget, and hooks cut off while still running. Ideally all three are zero. |
 
 ## Integrity
 
-| Code                 | Level | Meaning                                                                                                                                                                                                                                                             |
-| -------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PROFILE_OVERWRITTEN` | Error | Fires when ProfileStore could not recognise the stored value for a key as a profile and **replaced it with a fresh template**. The session starts from defaults and the previous data is gone: because the overwritten profile comes back at load count 1, it is otherwise indistinguishable from a first-time player (`isNewProfile` is `true` and migrations are skipped). Treat this as data loss and restore from version history before the player saves over it. Also fires `OnAnomaly` with reason `ProfileOverwritten`. |
-| `WIPE_GUARD_TRIPPED` | Error | Fires just before a save when the wipe-guard detects an implausible data collapse (e.g., the serialized profile shrank dramatically), indicating likely data loss or corruption that would otherwise be persisted. Also fires `OnAnomaly`.                          |
-| `ANOMALY`            | Warn  | Fires when an implausible or suspicious write to player data is detected at a specific path (validation flagged the value), often indicating an exploit attempt or a logic bug in game code. Also fires `OnAnomaly`. `OutOfBounds` and `OverMaxLength` follow `BoundsPolicy`: the default `"Clamp"` logs the anomaly and stores the clamped or truncated value, `"Reject"` throws at the write site. `NotAMember`, `NonFiniteComponent`, and `InvalidUtf8` (a string value that is not valid UTF-8) **always** throw at the write whatever the policy; the anomaly fires first so the path is still recorded. Unserializable values and invalid table keys throw without an anomaly, or on raw paths are reported by the load scan as `PROFILE_UNPERSISTABLE`. |
-| `PROFILE_TOO_DEEP`   | Warn  | Fires once at load when the stored data is nested deeper than the write-depth limit (24 levels). Those leaves load and **read** correctly, but every write to them is refused at runtime — so without this the failure surfaced only at the first `Set`, far from its cause. Flatten the shape or migrate it. |
-| `TIMED_SWEEP_FAIL`   | Warn  | Fires when the periodic timed sweep errors while resetting a lapsed timed field back to its default value, so that field may be left in a stale or inconsistent state.                                                                                              |
-| `WIPE_GUARD_BLOCKED` | Warn  | Fires when the wipe-guard tripped and WipeGuardPolicy is 'Block', so the pending save is held and the last known-good snapshot is persisted instead of the suspicious live data.                                                                                    |
-| `WIPE_GUARD_FORCED`  | Warn  | Fires when a save the wipe-guard had blocked is forcibly flushed through (e.g., Data.Flush with Force=true), pushing live data to storage and overriding the guard's protection.                                                                                    |
-| `WIPE_GUARD_CLEARED` | Info  | Fires when a profile that the wipe-guard had previously blocked passes the check again, so its live data resumes saving normally; this is a routine recovery confirmation.                                                                                          |
-| `ANALYTICS_FAIL`     | Debug | Fires when AnalyticsService:LogEconomyEvent (or a custom-field Resolve) throws while recording an economy transaction, meaning economy events are silently failing to reach the analytics dashboards; an isolated failure is noise, but a sustained stream signals a broken analytics pipeline. |
-| `ECONOMY_FIELD_UNDECLARED` | Warn | In DevMode, a tagged Increment/Decrement passed a per-call custom `Fields` name that the currency did not declare in its `Economy` config, so it is not recorded; usually a typo in the field name. |
-| `ECONOMY_FIELDS_OVERFLOW`  | Warn | In DevMode, a currency's `Economy` config declares more than the three custom-field slots Roblox allows, so the fields past the third are dropped; trim the declared list to three. |
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `PROFILE_OVERWRITTEN` | Error | ProfileStore could not recognise the stored value for a key as a profile and replaced it with a fresh template. The session starts from defaults and the previous data is gone. The overwritten profile comes back at load count 1, so it is otherwise indistinguishable from a first-time player. |
+| `WIPE_GUARD_TRIPPED` | Error | Just before a save, the wipe guard detected an implausible collapse in the data. Also fires `OnAnomaly`. |
+| `ANOMALY` | Warn | An implausible or suspicious write was detected at a specific path. Often an exploit attempt, sometimes a logic bug. `OutOfBounds` and `OverMaxLength` follow `BoundsPolicy`. Also fires `OnAnomaly`. |
+| `PROFILE_TOO_DEEP` | Warn | The stored data is nested deeper than the 24-level write limit. Those leaves load and read correctly, and every write to them is refused at runtime. Flatten the shape or migrate it. |
+| `TIMED_SWEEP_FAIL` | Warn | The periodic sweep errored while resetting a lapsed `Scribe.Timed` field, so that field may be left stale. |
+| `WIPE_GUARD_BLOCKED` | Warn | The wipe guard tripped under `WipeGuardPolicy = "Block"`, so the pending save is held and the last known-good snapshot is persisted instead. |
+| `WIPE_GUARD_FORCED` | Warn | A save the wipe guard had blocked was forced through with `Data.Flush(player, { Force = true })`, overriding the guard. |
+| `WIPE_GUARD_CLEARED` | Info | A previously blocked profile passed the check again and resumed saving normally. |
+| `ANALYTICS_FAIL` | Debug | Logging an economy event threw, so that event never reached the analytics dashboards. One failure is noise. A sustained stream is a broken pipeline. |
+| `ECONOMY_FIELD_UNDECLARED` | Warn | In DevMode, a tagged `Increment` or `Decrement` passed a custom field name the currency did not declare in its `Economy` config, so it was not recorded. Usually a typo. |
+| `ECONOMY_FIELDS_OVERFLOW` | Warn | In DevMode, a currency declares more than the three custom-field slots Roblox allows, so the fields past the third are dropped. |
 
 ## Replication
 
-| Code                       | Level | Meaning                                                                                                                                                                                                                                                                                               |
-| -------------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SERIALIZE_FAIL`           | Error | Fires when encoding a replication frame throws (while flushing a player's diff queue, flushing the shared diff queue, or building a client's initial snapshot). Some queued value could not be serialized to the wire; the message carries the encode error, and the affected ops are not sent as-is. |
-| `SNAPSHOT_ROOT_DROPPED`    | Error | Fires during initial-snapshot encoding when a specific top-level data root cannot be serialized, so it is omitted from the Init frame and the client receives everything except that root; indicates an unserializable value at that root path. Also fires `OnAnomaly`.                               |
-| `CLIENT_HANDSHAKE_TIMEOUT` | Warn  | Fires on the server when a client never sends its Hello frame within the handshake timeout after joining, so replication never starts for that player. Most often the Scribe bundle was never required on the client (a `LocalScript` must require it to begin the handshake); it can also mean a broken or missing custom client transport adapter.                                                                           |
-| `OP_BEFORE_INIT`           | Warn  | Fires on the client when a Diff frame arrives before the initial snapshot has been applied (a protocol ordering error), after which the client re-sends Hello to request a fresh Init.                                                                                                                |
-| `PROTOCOL_MISMATCH`        | Warn  | Fires on the server during the handshake when the client's wire protocol version byte differs from the server's, meaning the binary layout itself is incompatible; the handshake fails closed (no Init is sent and the client never syncs), unlike a schema-hash mismatch which is decode-safe.        |
-| `SCHEMA_MISMATCH`          | Warn  | Fires on the server during the handshake when the client's reported schema hash differs from the server's, meaning client and server were built from divergent data templates. Replication is refused for that client (fail closed), because a field id shared by the two drifted templates could map ops to the wrong client key. Only reachable with a custom cross-place transport, since vanilla Roblox ships client and server from the same place version. |
-| `INIT_APPLIED`             | Debug | Fires on the client right after it decodes the server's initial full snapshot and applies it over a freshly reset default mirror; a routine confirmation that the client's state is now populated (and, on the first apply, that the client is marked loaded).                                        |
-| `INIT_SENT`                | Debug | Fires on the server after it has encoded and transmitted the initial full-state snapshot to a joining client during the handshake; a routine confirmation that replication for that player has begun.                                                                                                 |
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `SERIALIZE_FAIL` | Error | Encoding a replication frame threw, so some queued value could not be put on the wire and the affected ops were not sent as-is. The message carries the encode error. |
+| `SNAPSHOT_ROOT_DROPPED` | Error | A top-level root could not be serialized into a client's initial snapshot, so that client receives everything except that root. Also fires `OnAnomaly`. |
+| `INIT_APPLIED` | Debug | The client finished applying the initial snapshot, so its mirror now matches the server. This is the normal end of the join handshake and needs no action. |
+| `INIT_SENT` | Debug | The server sent a player their initial snapshot. Pair it with `INIT_APPLIED` on the client to see a join complete end to end. |
+| `INIT_SEND_FAIL` | Error | The initial snapshot for one player was refused by the transport. The player is deliberately not marked ready, so the client's own retry can still succeed. Counted as `InitSendFailed`. |
+| `CLIENT_HANDSHAKE_TIMEOUT` | Warn | A client never sent its Hello frame within the handshake timeout, so replication never started for them. Most often the bundle was never required on the client. A `LocalScript` has to require it to begin the handshake. |
+| `INIT_UNDELIVERED` | Warn | The client did send Hello, and the snapshot Scribe built in reply never reached the transport. The one innocent cause is a transport refusing a payload this size, so the message names `MaxOutboundBytes`. |
+| `MIRROR_RESYNC` | Warn | A frame addressed to one client could not be delivered, so their mirror no longer matches the server and Scribe is re-sending the whole snapshot. This is a repair rather than a loss, and it names a transport that is refusing frames. |
+| `OUTBOUND_OVERSIZE` | Warn | A single outbound frame needed more fragments than Scribe considers reasonable, which is 16, or roughly a megabyte at the default `MaxOutboundBytes`. The frame is still delivered, so this is a cost report. For an `Init` the message names the largest roots by encoded wire bytes. |
+| `OP_BEFORE_INIT` | Warn | Client side. A diff frame arrived before the initial snapshot was applied, which is a protocol ordering error. The client re-sends Hello to request a fresh snapshot. |
+| `PROTOCOL_MISMATCH` | Warn | A client's wire version differs from the server's, so two different Scribe versions are running. Replication is refused for that client. |
+| `SCHEMA_MISMATCH` | Warn | Same wire version, divergent templates, so the client derived a different schema hash. Replication is refused for that client. |
+
+??? note "Two codes for the same symptom, and why"
+    `CLIENT_HANDSHAKE_TIMEOUT` and `INIT_UNDELIVERED` both mean a client never got its data, and they are separate codes because the fix is different.
+
+    `CLIENT_HANDSHAKE_TIMEOUT` means the client never asked. Check that a `LocalScript` requires the Emberfall shared module, or that a custom client transport adapter is present and working.
+
+    `INIT_UNDELIVERED` means the client asked and the answer never left. Check `MaxOutboundBytes` against what your channel actually accepts, and look at the `JoinBytes` distribution in [`Scribe.GetMetrics`](/api/Scribe#GetMetrics) to see how large the snapshot has grown.
+
+    `MIRROR_RESYNC` matters more than it looks. A loaded client cannot ask for a resync itself, because every Hello is gated on the client not yet being loaded, so this is the only signal that a mirror ever went stale.
 
 ## Transport
 
-| Code               | Level | Meaning                                                                                                                                                                                                                                                                                                   |
-| ------------------ | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `INBOUND_OVERSIZE` | Warn  | An inbound frame received from a client exceeded the configured maxInbound byte limit and was dropped without being processed, typically signaling a misbehaving client, a misconfigured size limit, or an attempted exploit. Logged at most once per second per player, on its own clock, so a flood cannot evict the diagnostic ring; the `InboundOversize` counter in [`Scribe.GetMetrics`](/api/Scribe#GetMetrics) still counts every occurrence. Dropped before decode, so it does **not** count toward the malformed-frame budget. |
-| `INBOUND_RATE_LIMITED` | Warn | A player sent raw inbound frames faster than `MaxInboundFrameRate`, so the frame was dropped before it was read at all. This is the only ceiling that sees **every** frame whatever its type, size, or validity, and unlike the command limiter it drops **silently**: no reply is sent, because replying is the amplification the limit exists to avoid. It sits well above `CommandRateLimit` by default, so a chatty-but-legitimate client hits `COMMAND_RATE_LIMITED` (which does reply) long before this; reaching this code means traffic no real client produces. Logged at most once per second per player, on its own clock; the `InboundRateLimited` counter in [`Scribe.GetMetrics`](/api/Scribe#GetMetrics) counts every occurrence. Dropped before parsing, so it does **not** count toward the malformed-frame budget. |
-| `INBOUND_OVERSIZE_LIMIT` | Warn | A player reached the oversize-frame limit (32) in a session, so the server stops dispatching that player's inbound frames entirely for the rest of the session. Oversize keeps its **own** budget rather than counting toward the malformed one, because the two say different things (a malformed frame was decoded and failed, an oversize frame was never read), and a shared counter would let either mask the other. Scribe builds every frame a real client sends, so it cannot emit one over the limit; the single innocent cause is a `MaxInboundBytes` set below what this game's own commands produce, which breaks every client equally and is named in the message. |
-| `MALFORMED_FRAME`  | Warn  | A network frame could not be decoded or dispatched: on the server, an inbound client frame failed to parse (per-player MalformedCount is incremented and OnAnomaly fires); on the client, a server frame failed to handle. This indicates a protocol/version mismatch, corruption, or a malicious client. The server throttles this log and its anomaly to at most once per second per player so a crafted-frame flood cannot spam them. |
-| `MALFORMED_FRAME_LIMIT` | Warn | A player reached the malformed-frame limit (32) in a session, so the server stops dispatching that player's inbound frames entirely for the rest of the session (dropped before parsing). A real client never sends malformed frames, so this indicates a broken or malicious client. |
-| `SEND_FAIL`        | Warn  | The transport adapter threw while sending an outbound buffer: a diff to a single client (SendToClient) or all clients (SendToAllClients), or the client's own Hello handshake (SendToServer). That frame was not delivered, usually pointing to a transport/adapter fault, a player who just disconnected, or a Sandboxed Scribe (a sandboxed thread cannot fire a non-sandboxed RemoteEvent). |
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `INBOUND_OVERSIZE` | Warn | An inbound frame exceeded `MaxInboundBytes` and was dropped before decoding, so it does not count toward the malformed-frame budget. Logged at most once per second per player, while `InboundOversize` counts every occurrence. |
+| `INBOUND_OVERSIZE_LIMIT` | Warn | A player reached the oversize-frame limit of 32 in one session, so the server stops dispatching their inbound frames for the rest of the session. Scribe cannot build a frame over the limit itself, so the one innocent cause is a `MaxInboundBytes` set below what this game's own commands produce. |
+| `INBOUND_WORK_LIMIT` | Warn | A frame would have retained more bytes than `MaxInboundRetainedBytes` allows, so it was dropped part way through decoding. No reply is sent. Raise the option if your own client legitimately sends payloads this large. |
+| `INBOUND_RATE_LIMITED` | Warn | A player sent raw frames faster than `MaxInboundFrameRate`, so the frame was dropped before it was read. It drops silently, because replying is the amplification the limit exists to avoid. |
+| `MALFORMED_FRAME` | Warn | A frame could not be decoded or dispatched. On the server the per-player malformed count rises and `OnAnomaly` fires. Throttled to once per second per player. |
+| `MALFORMED_FRAME_LIMIT` | Warn | A player reached the malformed-frame limit of 32 in one session, so the server stops dispatching their inbound frames for the rest of the session. A real client never sends malformed frames. |
+| `SEND_FAIL` | Warn | The transport adapter threw while sending an outbound buffer. Usually an adapter fault, a player who just disconnected, or a sandboxed Scribe package. |
+| `FRAGMENT_REFUSED` | Debug | Client side. A fragment was discarded for a gap, a replay, or a declared length past the reassembly cap. The logical frame is abandoned and the next one starts clean. Counted as `FragmentsRefused`. |
+
+??? note "Why the size limits are three separate ceilings"
+    They catch three different things, and a single number could not.
+
+    `INBOUND_OVERSIZE` is about raw bytes. `INBOUND_WORK_LIMIT` is about how much memory a frame **retains** once decoded: 8 KB of one-byte booleans retains a quarter of a megabyte of array storage while 8 KB of one string retains 8 KB, and the depth cap does not see it either, because a flat table of four thousand siblings is only one level deep. `INBOUND_RATE_LIMITED` is about how often frames arrive, and it is the only ceiling that sees every frame whatever its type, size or validity.
+
+    Oversize keeps its own session budget rather than counting toward the malformed one, because the two say different things. A malformed frame was decoded and failed. An oversize frame was never read. A shared counter would let either mask the other.
+
+    The work limit is deliberately kept out of the malformed budget as well, because an over-budget frame may be a legitimate payload from your own client and it must not be able to block that player's session.
+
+    The inbound frame rate sits well above `CommandRateLimit` by default, so a chatty but legitimate client hits `COMMAND_RATE_LIMITED`, which does reply, long before this. Reaching `INBOUND_RATE_LIMITED` means traffic no real client produces.
+
+    A non-zero `FRAGMENT_REFUSED` count on a reliable ordered transport is a bug in an adapter, not a network condition. The [transport contract](./transports) forbids the loss and reordering that would explain it.
 
 ## Commands
 
-| Code                        | Level | Meaning                                                                                                                                                                                                                        |
-| --------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `COMMAND_ERROR`             | Error | A registered command handler threw an error during execution (caught by xpcall); the caller gets a generic "error" reply and this points to a bug in your command handler code.                                                |
-| `COMMAND_BAD_ARGS`          | Warn  | An incoming command's argument at a given position failed the command's registered argument-type schema, so the request was rejected with "bad-args", indicating a malformed client call, version skew, or an exploit. Logged at most once per second per player, so a flood cannot evict the diagnostic ring; the `CommandsRejected` counter in [`Scribe.GetMetrics`](/api/Scribe#GetMetrics) still counts every occurrence. A client sending **more** arguments than the schema declares is rejected with the same "bad-args" reason but is not logged at all; only that counter moves. |
-| `COMMAND_RATE_LIMITED`      | Warn  | A player sent commands faster than the configured per-second token-bucket limit, so the request was rejected with "rate-limited", indicating command spam or a possible exploit. Logged at most once per second per player, and past a sustained flood (256 rate-limited frames without a 10s quiet gap) the rejection reply is dropped too. |
-| `COMMAND_REPLY_ENCODE_FAIL` | Warn  | A command handler returned a value that can't be serialized for the network reply (e.g. an Instance or function), so Scribe substitutes a "reply-encode-failed" response, indicating the handler returned an unsupported type. |
-| `COMMAND_REPLY_TRUNCATED`   | Warn  | A command handler returned more values than a reply frame carries (8), so only the first 8 were sent and the caller silently saw trailing nils. Return fewer values, or pack the extras into a table. |
-| `COMMAND_UNKNOWN`           | Warn  | A client invoked a command name that isn't present in the server's command registry, so it was rejected with "unknown-command", indicating a client/server mismatch or an exploit probing for commands. Logged at most once per second per player, so a flood cannot evict the diagnostic ring; the `CommandsRejected` counter in [`Scribe.GetMetrics`](/api/Scribe#GetMetrics) still counts every occurrence. The clock is per code, so `COMMAND_UNKNOWN` and `COMMAND_BAD_ARGS` do not throttle each other. |
-| `SIM_COMMAND`               | Info  | _(Studio only.)_ A developer invoked a command through the Scribe Studio debug plugin's simulation button rather than a real client; a routine Studio-only diagnostic, not a live-server event.                                |
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `COMMAND_ERROR` | Error | A handler threw. The caller gets a generic `error` reply and the traceback stays on the server. |
+| `COMMAND_BAD_ARGS` | Warn | An argument failed the registered `Args` spec, so the request was rejected with `bad-args`. Throttled to once per second per player, while `CommandsRejected` counts every occurrence. Sending more arguments than declared is rejected the same way but is not logged at all. |
+| `COMMAND_RATE_LIMITED` | Warn | A player sent commands faster than `CommandRateLimit`, so the request was rejected with `rate-limited`. Throttled to once per second per player. Past a sustained flood the rejection reply is dropped too. |
+| `COMMAND_UNKNOWN` | Warn | A client invoked a name the registry does not hold, so it was rejected with `unknown-command`. Usually version skew, sometimes probing. The throttle clock is per code, so this and `COMMAND_BAD_ARGS` do not throttle each other. |
+| `COMMAND_REPLY_ENCODE_FAIL` | Warn | A handler returned a value the wire cannot carry, such as an `Instance` or a function, so the caller sees `reply-encode-failed`. The handler's writes still stand. |
+| `COMMAND_REPLY_TRUNCATED` | Warn | A handler returned more than the eight values a reply frame carries, so the caller saw trailing nils. Pack the extras into a table. |
+| `COMMAND_BAD_IDEMPOTENCY_KEY` | Warn | The command's idempotency requirement and the request disagreed, or the key was empty, over 64 bytes, or not valid UTF-8. The handler never ran. |
+| `COMMAND_IDEM_EVICTED` | Warn | A player's 64-record idempotency cache was full, so the oldest settled record was dropped. A retry under that key will run the handler a second time. Also counted as `CommandIdemEvicted`. |
+| `COMMAND_IDEM_SATURATED` | Warn | All 64 records were still in flight, so there was nothing safe to evict and the new request was refused with `rate-limited`. That means 64 handlers are yielding at once for one player. |
+| `SIM_COMMAND` | Info | _(Studio only.)_ A developer invoked a command through the Studio plugin rather than a real client. |
+
+??? note "Why an idempotency mismatch is refused rather than downgraded"
+    A caller who believes a command is deduplicated and is wrong is worse off than one who knows it is not, so `COMMAND_BAD_IDEMPOTENCY_KEY` refuses in both directions and never quietly falls back to a plain request. See [Commands & Requests](./commands).
+
+    `COMMAND_IDEM_EVICTED` exists for the same reason. Reaching it needs far more distinct keys in flight than a real client produces, and when it happens the protection is genuinely gone for those keys, so it is reported rather than dropped silently.
+
+    `COMMAND_IDEM_SATURATED` is the other end of the same cache. Dropping an in-flight record would strand every duplicate parked on it, so nothing is dropped and the new request is refused instead. Look for a handler that never returns, or a client deliberately holding them open.
 
 ## Monetization
 
-| Code                      | Level | Meaning                                                                                                                                                                                                                         |
-| ------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GRANT_FAIL`              | Error | A product's Grant callback threw during purchase processing, so the grant was aborted fail-closed and the receipt returns NotProcessedYet for Roblox to retry; the Grant function has a bug to fix.                             |
-| `RECEIPT_UNKNOWN_PRODUCT` | Error | A purchase receipt arrived for a product ID that is not registered in Products, so it cannot be granted and is deferred; the product must be added to the Products registry.                                                    |
-| `OWNERSHIP_CHECK_FAIL`    | Warn  | A MarketplaceService UserOwnsGamePassAsync call errored, so the game-pass ownership check could not be resolved and is treated as not-owned; frequent occurrences indicate a Roblox API/network problem.                        |
-| `RECEIPT_OFFLINE_RETRY`   | Warn  | An offline receipt could not read the buyer's saved profile, so the purchase is deferred (NotProcessedYet) for Roblox to retry later; repeated hits suggest DataStore read problems.                                            |
-| `RECEIPT_RETRY`           | Warn  | A grant was applied in memory but the auto-flush save did not confirm within the timeout, so the receipt returns NotProcessedYet and lets Roblox retry (safe via idempotency); persistent hits point to save/DataStore latency. |
-| `SIM_RECEIPT`             | Warn  | _(Studio only.)_ The Scribe Studio plugin injected a mock receipt for testing, which routes through HandleReceipt; it can never fire on a live server. Injection requires the resolved `Mode = "Mock"` (or the legacy `UseMock`), so no real store is ever touched.                                                                      |
-| `UNDECLARED_CATEGORY`     | Warn  | In DevMode, a purchase-log entry used a category string that is not in the declared categories set, signaling a likely typo or a missing category declaration.                                                                  |
-| `UNDECLARED_PERK`         | Warn  | In DevMode, a perk key was granted or referenced that is not present in the Perks registry, indicating a likely typo or an unregistered perk.                                                                                   |
-| `UNKNOWN_OWNS_KEY`        | Warn  | In DevMode, `Owns` or `OwnsAsync` was called with a key that is not a registered pass, a declared perk, a product grant, or `RobloxPlus`, so it will always return false. Almost always a typo'd pass or perk name. Warned once per key. |
-| `PERK_GRANTED`            | Info  | A perk flag was successfully set on a Ready player via GrantPerk, a routine confirmation that the perk is now owned.                                                                                                            |
-| `PERK_REVOKED`            | Info  | A perk flag was cleared on a Ready player via RevokePerk, a routine confirmation that the perk was removed.                                                                                                                     |
-| `PURCHASE_ID_EVICTED`     | Warn  | The receipt de-duplication ring was full of ids that have **not** yet passed `PurchaseIdTTL`, so the oldest were dropped to make room. This is the only eviction that can matter: if Roblox still retries a receipt whose id was dropped, `RECEIPT_DUPLICATE` will not fire and the purchase is granted a second time. Normally unreachable, because the TTL drains the ring long before the cap is reached, so seeing it means this player buys faster than the TTL expires. Raise `MaxProcessedPurchaseIds`. `Context.Dropped` counts the entries lost; the `PurchaseIdsEvicted` counter in [`Scribe.GetMetrics`](/api/Scribe#GetMetrics) totals them. |
-| `RECEIPT_DUPLICATE`       | Info  | A receipt whose PurchaseId was already processed was re-acknowledged idempotently, returning PurchaseGranted without granting a second time, normal Roblox retry behavior.                                                      |
-| `RECEIPT_GRANTED`         | Info  | A purchase was successfully applied and durably saved (either an online grant or an offline perk grant committed to the buyer's profile), the expected success path.                                                            |
-| `RECEIPT_HANDLER_BOUND` | Info | Scribe bound `MarketplaceService.ProcessReceipt` and now handles developer-product receipts for this game. It only binds when `Products` are configured; set `OwnReceipts = false` if your game runs its own receipt handler. |
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `GRANT_FAIL` | Error | A product's `Grant` threw, so the grant was aborted fail-closed and the receipt returns `NotProcessedYet` for Roblox to retry. There is a bug in the `Grant` function. |
+| `GRANT_PARTIAL` | Error | A product's `Grant` yielded and then threw. The writes it made before throwing are already in the profile and cannot be taken back, so the receipt is settled as delivered once instead of retried. The purchase log entry is marked `Partial`. Counted as `ReceiptsPartial`. |
+| `GRANT_SEEDED_ELEMENT` | Warn | _(DevMode only.)_ A `Grant` brought a container element into existence by writing through a key that named none, so the element was seeded from its defaults. When the key came from stored data, that is a dangling dereference and the player gets goods on something they can never see. |
+| `RECEIPT_IN_FLIGHT` | Warn | The same buyer and purchase id were already being processed on this server, so this delivery was refused and left for Roblox to retry. Seeing it occasionally is the guard working. Seeing it constantly means something is re-invoking `ProcessReceipt` concurrently. |
+| `RECEIPT_UNKNOWN_PRODUCT` | Error | A receipt arrived for a product id that is not in `Products`, so it cannot be granted and is deferred. Add the product to the registry. |
+| `OWNERSHIP_CHECK_FAIL` | Warn | A game-pass ownership call errored, so the check could not be resolved and is treated as not owned. Frequent hits point at a Roblox API problem. |
+| `RECEIPT_OFFLINE_RETRY` | Warn | An offline receipt could not read the buyer's saved profile, so the purchase is deferred for Roblox to retry. Repeated hits suggest DataStore read problems. |
+| `RECEIPT_RETRY` | Warn | A grant was applied in memory but the save did not confirm within the timeout, so the receipt returns `NotProcessedYet`. This is safe because the grant is idempotent. Persistent hits point at save latency. |
+| `PURCHASE_CLAIM_EVICTED` | Warn | A profile held `MaxPurchaseClaims` live `Data.Purchase` claims, so the one nearest to expiring was dropped. A retry under that key would apply the purchase a second time. |
+| `PURCHASE_ID_EVICTED` | Warn | The receipt dedupe ring was full of ids that have not yet passed `PurchaseIdTTL`, so the oldest were dropped. If Roblox retries a receipt whose id was dropped, it is granted a second time. Raise `MaxProcessedPurchaseIds`. |
+| `UNDECLARED_CATEGORY` | Warn | In DevMode, a purchase-log entry used a category string that is not in the declared set. Usually a typo. |
+| `UNDECLARED_PERK` | Warn | In DevMode, a perk key was granted or referenced that is not in the `Perks` registry. Usually a typo. |
+| `UNKNOWN_OWNS_KEY` | Warn | In DevMode, `Owns` or `OwnsAsync` was called with a key that is not a registered pass, a declared perk, a product grant, or `RobloxPlus`, so it will always return false. Warned once per key. |
+| `SIM_RECEIPT` | Warn | _(Studio only.)_ The Studio plugin injected a mock receipt. Injection requires the resolved `Mode = "Mock"`, so no real store is ever touched. |
+| `PERK_GRANTED` | Info | A perk flag was set on a ready player. |
+| `PERK_REVOKED` | Info | A perk flag was cleared on a ready player. |
+| `PURCHASE_DUPLICATE` | Info | A `Data.Purchase` carried an idempotency key that had already been applied, so the grant was skipped and the call returned success. Keys expire at `PurchaseClaimTTL`. |
+| `RECEIPT_DUPLICATE` | Info | A receipt whose purchase id was already processed was re-acknowledged, returning `PurchaseGranted` without granting again. Normal Roblox retry behaviour. |
+| `RECEIPT_GRANTED` | Info | A purchase was applied and durably saved. This is the expected success path for `CoinPack500` and `GemPack100`. |
+| `RECEIPT_HANDLER_BOUND` | Info | Scribe bound `MarketplaceService.ProcessReceipt` and now handles developer-product receipts. Set `OwnReceipts = false` if your game runs its own handler. |
+
+??? note "Two receipt codes worth understanding"
+    **`GRANT_PARTIAL`.** A yielding `Grant` cannot run inside a transaction, so it runs without rollback. When it throws half way, its writes are already in the profile. Answering `NotProcessedYet` would make Roblox retry and re-apply those writes on every attempt, which in testing produced 1000, then 2000, then 3000 coins, all persisted. Settling the receipt as delivered once is the smaller loss, and the code is raised so an operator can compensate the player by hand.
+
+    The fix is always the same. Move the async work out of `Grant`, either before the prompt or afterwards through `OnSave`, and the grant becomes atomic again. See [Monetization](./monetization).
+
+    **`RECEIPT_IN_FLIGHT`.** The persisted dedupe ring is a completion record, written only after the grant commits. Between the duplicate check and that write, a second delivery of the same receipt would otherwise see "not yet granted" and grant again. Every yield in that window widens it, including a yielding `Grant`, an offline round trip, or a gift's cross-server message.
+
+    The guard never waits. It refuses immediately and leaves the retry to Roblox. By the time Roblox retries, the first call has either marked the receipt processed, so the retry answers `PurchaseGranted`, or failed, so the retry is clean.
 
 ## Gifting
 
-| Code                              | Level | Meaning                                                                                                                                                                                                                                                                         |
-| --------------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GIFT_INTENT_WRITE_FAIL`          | Error | The durable save of a pending gift intent failed right before prompting the purchase, so the gift prompt is refused and no Robux is charged; indicates a DataStore/save-flush problem worth investigating.                                                                      |
-| `GIFT_UNKNOWN_PRODUCT`            | Error | A cross-server ProfileStore gift message referenced a product name that is not registered on this server (a config/deploy mismatch); the message is kept so a later deploy can process it, but delivery is stalled until then.                                                  |
-| `GIFT_CREDIT_ISSUED`              | Warn  | A giftable perk was purchased with no gift intent while the buyer already owns it (NoGiftIntentPolicy=GrantOrCredit), so instead of a no-op grant an unassigned re-aimable gift credit was written to the buyer. Also fires `OnGiftCredit`.                                     |
-| `GIFT_DELIVERY_RETRY`             | Warn  | Cross-server/offline gift delivery via ProfileStore MessageAsync failed, so the receipt returns NotProcessedYet and Roblox will retry; repeated occurrences point to a DataStore/messaging problem.                                                                             |
-| `GIFT_INTENT_EXPIRED`             | Warn  | A stored gift intent was older than the intent TTL (an abandoned gift prompt), so it is cleared and any incoming receipt falls through to the no-intent policy; normal cleanup, not a failure.                                                                                  |
-| `GIFT_NO_INTENT`                  | Warn  | A giftable perk product was purchased with no matching gift intent and the buyer does not already own it, so the perk is granted directly to the buyer instead of a recipient; an expected fallback path.                                                                       |
-| `GIFT_RECIPIENT_ALREADY_OWNS`     | Warn  | Between the gift prompt and the receipt the intended recipient already acquired the perk (and it was not already delivered by us), so the purchase is converted into a re-aimable gift credit for the buyer to avoid burning Robux on a no-op grant. Also fires `OnGiftCredit`. |
-| `RECEIPT_DECLINED_PENDING_CREDIT` | Warn  | A no-intent perk purchase arrived while the buyer already owns the perk AND still holds an unused gift credit, so the purchase is declined (NotProcessedYet, Roblox refunds) to prevent stacking a wasteful duplicate credit.                                                   |
-| `RECEIPT_HELD`                    | Warn  | A no-intent perk purchase arrived while the buyer already owns the perk and NoGiftIntentPolicy is Hold, so the receipt is held as NotProcessedYet for retry instead of auto-crediting; a policy-driven hold, not an error.                                                      |
-| `GIFT_CREDIT_UNKNOWN_PRODUCT`     | Warn  | On load, a player holds gift credits keyed by a product name that is no longer in the Products config (the product was renamed or removed); the paid credits are unspendable until the product entry returns or a migration renames the credit key. Never deleted automatically.  |
-| `GIFT_CREDIT_USED`                | Info  | A buyer redeemed one of their existing unassigned gift credits to deliver a gift, so no new purchase was charged; a normal informational confirmation of a credit-funded gift.                                                                                                  |
-| `GIFT_RECEIPT_GRANTED`                 | Info  | A gift purchase receipt was successfully and durably delivered to the intended recipient and logged as GiftSent; a routine success confirmation of gift delivery.                                                                                                               |
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `GIFT_CREDIT_REFUND_FAIL` | Error | A gift delivery failed AFTER the buyer's paid credit had been spent, and the buyer had already left, so the refund had to go to their stored profile -- and that write failed too. The credit is lost and needs restoring by hand; the code names the user and the product. |
+| `GIFT_INTENT_WRITE_FAIL` | Error | The durable save of a pending gift intent failed right before prompting, so the prompt is refused and no Robux is charged. |
+| `GIFT_UNKNOWN_PRODUCT` | Error | A cross-server gift message referenced a product name this server does not have, which is a deploy mismatch. The message is kept so a later deploy can process it, and delivery is stalled until then. |
+| `GIFT_AIM_CAP_REACHED` | Warn | The buyer's durable gift-aim store is at its cap. Either a prompt was refused before any Robux moved, or a stale intent could not be archived at load and its recipient was forgotten. |
+| `GIFT_AIM_EXPIRED` | Warn | A durable gift aim passed the receipt-retry horizon with its purchase unsettled and was dropped. It names the recipient and product so the gift can be compensated by hand. A receipt arriving after this is granted to the buyer. |
+| `GIFT_AIM_SETTLED` | Warn | A receipt arrived after its gift intent had been swept as stale and was settled from the durable aim, so it reached the recipient it was paid for rather than the buyer. |
+| `GIFT_CREDIT_ISSUED` | Warn | A giftable perk was bought with no gift intent while the buyer already owns it, under `NoGiftIntentPolicy = "GrantOrCredit"`, so a re-aimable credit was written instead of a no-op grant. Also fires `OnGiftCredit`. |
+| `GIFT_CREDIT_UNCONFIRMED` | Warn | A gift bought with a paid credit could neither be confirmed delivered nor proved undelivered, so the credit was deliberately NOT refunded: the gift may already be queued, and handing the credit back would let one payment grant twice under a fresh id. It names the buyer, the product and the recipient so the rare genuine loss can be compensated by hand. |
+| `GIFT_DELIVERY_RETRY` | Warn | Cross-server gift delivery failed, so the receipt returns `NotProcessedYet` and Roblox will retry. Repeated hits point at a DataStore messaging problem. |
+| `GIFT_INTENT_EXPIRED` | Warn | A stored gift intent outlived the intent TTL, which is an abandoned prompt. It is cleared and any incoming receipt falls through to the no-intent policy. Normal cleanup. |
+| `GIFT_NO_INTENT` | Warn | A giftable perk was bought with no matching intent and the buyer does not already own it, so the perk was granted to the buyer. An expected fallback. |
+| `GIFT_RECIPIENT_ALREADY_OWNS` | Warn | Between prompt and receipt the recipient acquired the perk anyway, so the purchase became a re-aimable credit for the buyer rather than a wasted grant. Also fires `OnGiftCredit`. |
+| `RECEIPT_DECLINED_PENDING_CREDIT` | Warn | A no-intent perk purchase arrived while the buyer already owns the perk and still holds an unused credit, so the purchase was declined and Roblox refunds it. |
+| `RECEIPT_HELD` | Warn | A no-intent perk purchase arrived while the buyer already owns the perk under `NoGiftIntentPolicy = "Hold"`, so the receipt is held for retry instead of auto-crediting. |
+| `GIFT_CREDIT_UNKNOWN_PRODUCT` | Warn | A player holds gift credits keyed by a product name that is no longer in `Products`. The paid credits are unspendable until the product returns or a migration renames the key. They are never deleted automatically. |
+| `GIFT_CREDIT_USED` | Info | A buyer redeemed an existing credit to deliver a gift, so no new purchase was charged. |
+| `GIFT_RECEIPT_GRANTED` | Info | A gift purchase was durably delivered to the intended recipient and logged as sent. |
 
 ## Leaderboards
 
-| Code                | Level | Meaning                                                                                                                                                                                        |
-| ------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LB_ERASE_FAIL`     | Error | A leaderboard OrderedDataStore RemoveAsync failed during GDPR user erasure, so the player's score may still remain on at least one board and the erase must be retried.                        |
-| `LB_INTERVAL_CLAMPED` | Warn | A board's `RefreshInterval` was below the 60 second floor and was raised to it. `GetSortedAsync`'s request budget scales with player count, so a near-empty server has the least room while still refreshing every board. A sub-minute board is almost always an in-server live scoreboard, which belongs in [`Scribe.Shared`](./visibility) at no DataStore cost; these boards are global and all-time. |
-| `LB_QUEUE_OVERFLOW` | Warn  | The leaderboard write queue hit its capacity cap so the oldest pending score write was dropped, indicating score updates are being enqueued faster than the pacer can persist them.            |
-| `LB_READ_FAIL`      | Warn  | An OrderedDataStore GetSortedAsync call failed while refreshing a leaderboard, so that board's rankings could not be updated this refresh cycle.                                               |
-| `LB_WRITE_DROPPED`  | Warn  | A single leaderboard score write was permanently abandoned after failing three retry attempts with no newer value superseding it, so that player's score update was lost.                      |
-| `LB_SCORE_OUT_OF_RANGE` | Warn | On a plain numeric stat, the score multiplied by the board's `Scale` fell outside the exact-integer range (2^53) an OrderedDataStore key can hold without losing its low digits, so the write was dropped instead of queued, since it would be rejected on every attempt. Lower `Scale`, or bound the stat. On a [`Scribe.Big`](./leaderboards#ranking-a-scribebig) stat the same code fires for a different reason: the score was negative (the packing has no sign bit) or its exponent passed the board's cap for its [`SigFigs`](./leaderboards#resolution-vs-range-sigfigs), and the message names both. `Scale` does not apply to a big board. |
-| `LB_WRITE_FAIL`     | Warn  | A single OrderedDataStore SetAsync attempt failed while persisting a player's leaderboard score; the write may still be retried up to the retry limit. Leaderboard write and read failures deliberately do NOT feed the global health status, since routine OrderedDataStore throttling would otherwise flip it to Outage and block Robux receipts. |
-| `LB_SHUTDOWN_FLUSH` | Info  | Emitted once during server shutdown after FlushAllBlocking drains the leaderboard write queue within its budget, reporting how many writes were flushed and how many remained unwritten.       |
-| `LB_STAT_RESOLVE_FAIL` | Warn | A board's `Stat` path failed to resolve for one player at load, so that board is not tracking them this session. Boards are wired independently, so the others are unaffected. A genuinely undeclared path is caught at startup instead, so this points at a path that only some data shapes satisfy. |
-| `LB_UNKNOWN_BOARD` | Warn | In DevMode, `GetLeaderboard` or `GetMyRank` was called with a name that is not declared in the `Leaderboards` option, so it returns nothing. Board names are **case-sensitive**, so `"playtime"` does not match a board declared as `Playtime`. Warned once per name; without it a typo is indistinguishable from a board that has not finished its first refresh. |
-| `SIM_LB_FLUSH`      | Info  | _(Studio only.)_ Fired when a developer uses the Scribe Studio debug plugin to manually drain the leaderboard write queue; a Studio-only simulation action that never occurs on a live server. |
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `LB_ERASE_FAIL` | Error | A board removal failed during user erasure, so the player's score may still sit on at least one board and the erase must be retried. One entry per erase, with `Context.Boards` listing every board that failed. |
+| `LB_INTERVAL_CLAMPED` | Warn | A board's `RefreshInterval` was below the 60 second floor and was raised to it. A sub-minute board is almost always an in-server scoreboard, which belongs in [`Scribe.Shared`](./visibility) at no DataStore cost. |
+| `LB_QUEUE_OVERFLOW` | Warn | The write queue hit its cap, so the oldest pending score write was dropped. Score updates are arriving faster than the pacer can persist them. |
+| `LB_READ_FAIL` | Warn | A board refresh failed, so its rankings could not be updated this cycle. Store failures are throttled to one line per code every 30 seconds, and the line carries how many it suppressed; the counters keep counting every attempt. Studio with API access off is reported once for the whole session instead, because it is a setting rather than an outage. |
+| `LB_BUDGET_DEFERRED` | Warn | Under `BudgetPolicy = "Defer"`, a background request was postponed because the DataStore budget was down to the reserve. Nothing is dropped, and boards update more slowly until the allowance recovers. Logged at most once per 30 seconds. |
+| `LB_WRITE_DROPPED` | Warn | A score write was abandoned after three failed retries with no newer value superseding it, so that update was lost. Throttled the same way as `LB_READ_FAIL`. |
+| `LB_SCORE_OUT_OF_RANGE` | Warn | The score fell outside what an ordered key can hold, so the write was dropped rather than queued, since it would be rejected on every attempt. Lower `Scale`, or bound the stat. |
+| `LB_WRITE_FAIL` | Warn | One score write attempt failed. It may still be retried up to the retry limit. Throttled the same way as `LB_READ_FAIL`. |
+| `LB_STAT_RESOLVE_FAIL` | Warn | A board's `Stat` path failed to resolve for one player at load, so that board is not tracking them this session. The other boards are unaffected. |
+| `LB_UNKNOWN_BOARD` | Warn | In DevMode, a board name was requested that is not declared in the `Leaderboards` option. Board names are case sensitive, so `"toplevel"` does not match `TopLevel`. Warned once per name. |
+| `LB_SHUTDOWN_FLUSH` | Info | The write queue was drained during shutdown, reporting how many writes landed and how many remained. |
+| `SIM_LB_FLUSH` | Info | _(Studio only.)_ A developer drained the write queue from the Studio plugin. |
+
+??? note "Why board failures never move the health status"
+    Leaderboard read and write failures deliberately do not feed the global health machine. Routine ordered-store throttling would otherwise flip the status to `Outage`, and `Outage` blocks Robux receipts. A slow `TopLevel` board must never stop players buying `GemPack100`.
+
+    `LB_SCORE_OUT_OF_RANGE` fires for two different reasons and the message says which. On a plain numeric stat, the score multiplied by the board's `Scale` passed the exact-integer range an ordered key can hold without losing its low digits. On a [`Scribe.Big`](./leaderboards) stat, the score was negative, because the packing has no sign bit, or its exponent passed the board's cap for its configured significant figures. `Scale` does not apply to a big board.
+
+    A sustained `LB_BUDGET_DEFERRED` means the server produces score changes faster than its ordered-write allowance can carry them. Raise `RefreshInterval`, or write fewer distinct stats.
 
 ## Derived
 
-| Code                | Level | Meaning                                                                                                                                                                                                                                    |
-| ------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DERIVED_ERROR`     | Error | A [derived field](./derived)'s compute function threw. The field keeps its previous value and the write that triggered the recompute still succeeds, so the symptom is a field that stops tracking its inputs rather than a failed write. Logged once per field per session: a throwing function throws on every write, and an unthrottled log would evict the ring holding the evidence. |
-| `DERIVED_FEEDBACK`  | Error | A `Changed` listener kept writing an input from inside the recompute that listener's own field triggered, so the settle pass gave up after four rounds. The named fields hold whatever the last round computed. Move the write out of the listener, or derive the value instead of writing it. |
-| `DERIVED_MISMATCH`  | Warn  | _(DevMode only.)_ The server computed a different value than this realm did for a field both compute locally, which means the compute function is not pure — `os.time`, `math.random`, or an upvalue that differs between server and client. The server's value is applied. Nothing is sent (and so nothing is compared) outside DevMode, which is why this must be fixed in Studio. |
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `DERIVED_ERROR` | Error | A [derived field](./derived)'s compute function threw. The field keeps its previous value and the write that triggered the recompute still succeeds, so the symptom is a field that stops tracking its inputs. Logged once per field per session. |
+| `DERIVED_FEEDBACK` | Error | A `Changed` listener kept writing an input from inside the recompute its own field triggered, so the settle pass gave up after four rounds. Move the write out of the listener, or derive the value instead of writing it. |
+| `DERIVED_MISMATCH` | Warn | _(DevMode only.)_ The server computed a different value than this realm did for a field both compute locally, so the compute function is not pure. Look for `os.time`, `math.random`, or an upvalue that differs between the two realms. The server's value is applied. |
+
+A derived compute runs on both realms, which is what makes Emberfall's `Level` free to replicate: only `Xp` crosses the wire. Outside DevMode nothing is sent, so nothing is compared, which is why an impure compute has to be caught in Studio before it ships. See [Derived Fields](./derived).
 
 ## Lifecycle
 
-| Code                     | Level | Meaning                                                                                                                                                                                                                                   |
-| ------------------------ | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LISTENER_ERROR`         | Error | A developer-supplied listener/callback (e.g. an OnChanged/economy listener wired into the change runner) threw while processing a data change, and Scribe caught and reported it, meaning there is a bug in the game's own listener code. |
-| `ON_PLAYER_INIT_ERROR`   | Error | The developer-provided options.OnPlayerInit callback threw while initializing a newly loaded player's profile data, indicating a bug in that init hook.                                                                                   |
-| `DYNAMIC_DEFAULT_FAILED`  | Error | A `Scribe.Dynamic` factory threw while seeding a field on a brand-new profile, so that field keeps its declaration-time baseline instead. Indicates a bug in the factory function.                                                        |
-| `PROFILE_UNPERSISTABLE`  | Error | Data written during load, by a `Scribe.Dynamic` factory or the `OnPlayerInit` hook, cannot be stored and would fail the entire DataStore save and replication: invalid UTF-8 bytes, an unserializable value (userdata, an `Instance`, a function, or a NaN/inf number), a table that mixes array indices with string keys, or a table nested past 64 levels. These paths bypass the accessor write-guard, so Scribe scans the profile after load and logs the exact path; the value is left in place (non-fatal) for you to fix. Also fires `OnAnomaly` with reason `InvalidUtf8` or `Unserializable`. |
-| `SUBSYSTEM_HOOK_ERROR`   | Error | An internal subsystem load hook (Timed, Monetization, Leaderboards, or Replication) errored when a player's entry became ready, pointing to a Scribe-internal fault or corrupt saved data for that subsystem.                             |
-| `API_NAME_COLLISION`     | Warn / Error | A template field name collides with a reserved accessor/method name, so that field is unreachable through the typed API and should be renamed. The **client** reports a shadowed ROOT field at `Error`, on live servers as well as in Studio, because that is the case where `Data.<name>` silently turns from an accessor into a method. The server's Studio-only checks (a root name matching a `Data` API name, or any field named like an accessor method such as `Get`) stay at `Warn`. |
-| `DEBUG_HOOK_DUPLICATE`   | Warn  | _(Studio only.)_ A second Scribe debug hook (server or client) tried to attach while one already exists, so only the first bundle is inspectable in the Studio plugin.                                                                    |
-| `DEBUG_HOOK_ERROR`       | Warn  | _(Studio only.)_ The Studio debug bridge failed to encode/stream a diagnostic chunk or record an intercepted op and dropped it, affecting only the inspector view and not live gameplay data.                                             |
-| `DEBUG_HOOK_FAIL`        | Warn  | _(Studio only.)_ Attaching the Scribe Studio debug hook itself errored inside its pcall, so the game runs normally but is not inspectable by the Studio plugin this session.                                                              |
-| `DEBUG_HOOK_WRITES`      | Warn  | _(Studio only.)_ The Studio plugin toggled its ability to write to live data on or off via SetWritesEnabled; warned because enabling lets the inspector mutate real player data.                                                          |
-| `DEV_WARNING`            | Warn  | In DevMode, a call pattern that is almost certainly a bug was detected while processing a write. The current case is `Decrement` called with a negative delta, which adds instead of subtracting; the message names the path. Pass a positive amount, or use `Increment`.                                                                                                                                     |
-| `SANDBOXED`              | Warn  | The Scribe package has Roblox's `Sandboxed` property set to `true`, so it cannot fire its replication RemoteEvents (a sandboxed thread may only fire sandboxed events) and nothing will sync. Set `Sandboxed = false` on the Scribe package (and ProfileStore); usually caused by inserting Scribe from a model/toolbox instead of syncing from source. |
-| `SIM_STATUS`             | Warn  | _(Studio only.)_ The Studio plugin forced the service health status (Healthy/Degraded/Outage) for testing, which broadcasts the new status; a deliberate Studio-only simulation, not a real outage. Also fires `OnStatusChanged`.         |
-| `UNKNOWN_OPTION`         | Warn  | In Studio, an option key passed to Scribe was not recognized (likely a typo) and would be silently ignored. The check runs only in Studio, so boot the game there at least once after changing options or the typo goes unreported.        |
-| `DEBUG_HOOK_ATTACHED`    | Info  | _(Studio only.)_ The Scribe Studio companion plugin completed its server-side handshake and the debug bridge attached successfully; a routine Studio-only confirmation.                                                                   |
-| `DEBUG_HOOK_ATTRIBUTION` | Info  | _(Studio only.)_ The Studio plugin turned write-source attribution capture on or off via SetAttribution; informational Studio-only state change.                                                                                          |
-| `SERVER_STARTED`         | Info  | The Scribe server finished initializing (schema compiled and transport resolved); a normal one-time startup confirmation with field count and transport name.                                                                             |
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `LISTENER_ERROR` | Error | A listener or callback you supplied threw while processing a data change. Scribe caught it and reported it. |
+| `ON_PLAYER_INIT_ERROR` | Error | The `OnPlayerInit` callback threw while initializing a newly loaded profile. |
+| `DYNAMIC_DEFAULT_FAILED` | Error | A `Scribe.Dynamic` factory threw while seeding a field on a brand-new profile, so that field keeps its declaration-time baseline. |
+| `PROFILE_UNPERSISTABLE` | Error | A value in the loaded profile cannot be stored and would fail the whole save: invalid UTF-8, an unserializable value, a table mixing array indices with string keys, or a table nested past 64 levels. Scribe logs the exact path and leaves the value in place for you to fix. Also fires `OnAnomaly`. |
+| `SUBSYSTEM_HOOK_ERROR` | Error | An internal load hook for Timed, Monetization, Leaderboards or Replication errored when a player's entry became ready. |
+| `API_NAME_COLLISION` | Warn / Error | A template field name collides with a reserved accessor or method name, so that field is unreachable through the typed API. Rename it. |
+| `DEV_WARNING` | Warn | In DevMode, a call pattern that is almost certainly a bug was detected. The current case is `Decrement` with a negative delta, which adds instead of subtracting. The message names the path. |
+| `SANDBOXED` | Warn | The Scribe package has Roblox's `Sandboxed` property set, so it cannot fire its replication events and nothing will sync. Set `Sandboxed = false` on the Scribe package and on ProfileStore. Usually caused by inserting Scribe from the toolbox instead of syncing from source. |
+| `UNKNOWN_OPTION` | Warn | In Studio, an option key passed to Scribe was not recognised and would be silently ignored. Boot the game in Studio at least once after changing options, or the typo goes unreported. |
+| `DEBUG_HOOK_DUPLICATE` | Warn | _(Studio only.)_ A second debug hook tried to attach, so only the first bundle is inspectable in the plugin. |
+| `DEBUG_HOOK_ERROR` | Warn | _(Studio only.)_ The debug bridge dropped a diagnostic chunk. Only the inspector view is affected. |
+| `DEBUG_HOOK_FAIL` | Warn | _(Studio only.)_ Attaching the debug hook errored, so the game runs normally and is not inspectable this session. |
+| `DEBUG_HOOK_WRITES` | Warn | _(Studio only.)_ The plugin toggled its ability to write to live data. |
+| `SIM_STATUS` | Warn | _(Studio only.)_ The plugin forced the health status for testing, which broadcasts the new status. Also fires `OnStatusChanged`. |
+| `DEBUG_HOOK_ATTACHED` | Info | _(Studio only.)_ The Studio plugin finished its handshake and attached. |
+| `DEBUG_HOOK_ATTRIBUTION` | Info | _(Studio only.)_ The plugin turned write-source attribution on or off. |
+| `SERVER_STARTED` | Info | The Scribe server finished initializing, reporting the field count and the transport name. |
+
+??? note "Two lifecycle checks worth knowing"
+    The client reports a shadowed **root** field at `Error`, on live servers as well as in Studio, because that is the case where `Data.Coins` silently turns from an accessor into a method.
+
+    The server's checks stay at `Warn` and are gated on `DevMode`. Those are a root name matching a `Data` API name, and any field named like an accessor method such as `Get`. `DevMode` defaults to Studio but is an ordinary option, so a headless or CI run can turn it on.
+
+    Both realms scan after the whole `Data` surface is built, so a name assigned late in construction is judged like any other. See [Configuration](./configuration).
+
+    **`PROFILE_UNPERSISTABLE` runs on every load.** The scan covers the whole profile, not only what load-time code wrote, and there is no option to turn it off.
+
+    The usual source is a `Scribe.Dynamic` factory or the `OnPlayerInit` hook, both of which bypass the accessor write guard. Corruption that came straight out of the DataStore is reported the same way. The entry is non-fatal and names the exact path, because the alternative is a save that fails silently forever.
+
+## Where to next
+
+- [Diagnostics](./diagnostics) shows the counters and health machine these codes accompany.
+- [Scribe Studio](./studio-plugin) renders the log ring as a filterable live panel.
+- [Configuration](./configuration) covers `LogLevel`, `LogRingSize` and `DevMode`, which decide which of these you actually see.
+- [Commands & Requests](./commands) explains the `COMMAND_*` codes from the caller's side.
+- [Monetization](./monetization) explains the receipt and gift codes in the order they actually happen.

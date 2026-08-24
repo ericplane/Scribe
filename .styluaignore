@@ -1,0 +1,7 @@
+# Vendored fork, kept line-identical with upstream ProfileStore v1.0.3 so it can
+# still be diffed against it. Scribe's own additions are marked `SCRIBE PATCH`
+# inside it; everything Scribe writes around it (init.luau) is formatted normally.
+#
+# Depth-agnostic on purpose: the format gate is run against LF copies of the tree
+# at a different root, and a root-relative pattern silently stops matching there.
+**/Internal/Store/ProfileStore.luau
