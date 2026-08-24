@@ -158,6 +158,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The three seam checks below are pure grep, but the log-code check at the end
+      # of this job runs through lune, so the toolchain has to be here too.
+      - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
+      - name: Cache rokit tool store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.rokit
+          key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
       # Every reading of time and every timed wait in src/ must route through
       # Internal/Clock, or a simulation cannot fast-forward past it. One stray
       # os.time() is enough to pin a cooldown, a TTL or a retry backoff to real
