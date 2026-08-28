@@ -243,7 +243,7 @@ return function()
 		-- No AutoPump: Hello is never delivered, so Init never arrives and the
 		-- client stays unloaded. Accessing a root field goes through the Data
 		-- __index metamethod, which must NOT yield (Luau forbids yielding across
-		-- a metamethod boundary) — it returns the accessor with template defaults.
+		-- a metamethod boundary): it returns the accessor with template defaults.
 		local harness = TestCtx.make({ AutoPump = false })
 		local player = harness.Join()
 		harness.Transport.LocalPlayer = player
@@ -752,7 +752,11 @@ return function()
 		local harness, player, _entry, serverData, clientData = makeLoopback()
 
 		serverData.Coins.Set(100)
-		harness.Step()
+		-- Poll rather than assume one Step put the Diff in the mirror. This is the
+		-- precondition for the rollback below, not the subject.
+		harness.StepUntil(function()
+			return clientData.Coins.Get() == 100
+		end)
 		expect(clientData.Coins.Get()).to.equal(100)
 
 		-- The client predicts a purchase locally. Nothing is sent; the server has
@@ -768,7 +772,12 @@ return function()
 			serverData.Coins.Set(999)
 			error("aborted")
 		end)
-		harness.Step()
+		-- The restore is the subject, so wait for it to reach the mirror rather than
+		-- assuming one Step carried it. A suppressed restore never arrives and the
+		-- poll runs out, which is the failure this case is for.
+		harness.StepUntil(function()
+			return clientData.Coins.Get() == 100
+		end)
 
 		-- Read, then tear down, then assert. A failing assertion here would otherwise
 		-- skip Cleanup and leave a live entry for the rest of the run to trip over --

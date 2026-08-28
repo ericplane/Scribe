@@ -13,6 +13,7 @@ local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
 local Clock = require(Internal.Clock)
+local Profile = require(Internal.Profile)
 
 local Replication = {}
 
@@ -30,7 +31,7 @@ local STATUS_TO_ID: { [string]: number } = { Healthy = 0, Degraded = 1, Outage =
 
 -- Inverted once at load, so the oversize warning can name the kind of frame.
 local FRAME_NAMES: { [number]: string } = {}
-for name, id in Wire.Frames do
+for name, id in Wire.Frames :: { [string]: number } do
 	FRAME_NAMES[id] = name
 end
 
@@ -42,47 +43,40 @@ function Replication.new(ctx: any)
 
 	local maxInbound: number = options.MaxInboundBytes or 8192
 	-- Derived from the byte cap so the two stay in proportion: one inbound frame may
-	-- retain at most 16x its own bytes. 16 admits a full frame of the densest
-	-- legitimate shape (an array of two-byte strings, 14.5x) while refusing the
-	-- hostile ones (arrays of booleans or of empty tables both cost 32x). Counting
-	-- objects instead cannot tell those shapes apart at all; see Wire.NewReader.
+	-- retain at most 16x its own bytes. 16 admits the densest legitimate shape (an
+	-- array of two-byte strings, 14.5x) while refusing the hostile ones (arrays of
+	-- booleans or of empty tables both cost 32x). See Wire.NewReader.
 	local maxInboundRetained: number = options.MaxInboundRetainedBytes or math.max(4096, maxInbound * 16)
 	local inboundFrameRate: number = ctx.InboundFrameRate
 
 	-- The largest buffer Scribe hands a transport in one call; anything above it is
-	-- fragmented (Wire.Fragment) and reassembled by the client. There has to be a
-	-- ceiling because an Init snapshot is one op per root and MAX_OPS_PER_FRAME
-	-- cannot divide a single op, so without one a whole profile is handed over as one
-	-- call and occupies the channel until it is through. 65536 sits far below any
-	-- payload limit the platform might impose and leaves ordinary diffs unsplit. A
-	-- transport may declare a smaller MaxFrameBytes and it wins: only the adapter
-	-- knows its own framing overhead.
+	-- fragmented (Wire.Fragment) and reassembled by the client. A ceiling is needed
+	-- because an Init snapshot is one op per root and MAX_OPS_PER_FRAME cannot divide
+	-- a single op. 65536 sits far below any platform payload limit and leaves ordinary
+	-- diffs unsplit. A smaller transport MaxFrameBytes wins: only the adapter knows
+	-- its own framing overhead.
 	local declaredMax: number? = (transport :: any).MaxFrameBytes
 	local maxOutbound: number = options.MaxOutboundBytes or 65536
 	if type(declaredMax) == "number" then
 		maxOutbound = math.min(maxOutbound, declaredMax)
 	end
 	-- At maxOutbound = 64 the u16 fragment count caps a logical frame at 3.7 MB,
-	-- which a real profile can reach, so a too-small budget just trades one failure
-	-- for another. Refuse it at construction, where it is still a typo.
+	-- which a real profile can reach. Refuse it at construction, where it is a typo.
 	if maxOutbound < 256 then
 		error(`Scribe: MaxOutboundBytes must be at least 256 (got {maxOutbound})`, 0)
 	end
 	-- Identifies one logical fragmented frame so the client can tell two apart. Wraps
-	-- at 65536; a collision needs 65535 intervening fragmented frames while one is
-	-- still being reassembled.
+	-- at 65536; a collision needs 65535 intervening frames mid-reassembly.
 	local fragmentSeq = 0
 
 	-- One log per server, the first time a frame needs more fragments than this.
-	-- Measures what actually goes on the wire, which the profile-size warning does
-	-- not: a Session root is absent from LiveData but still rides in Init. Latched
-	-- rather than throttled, since it is a property of the template, not an event.
+	-- Measures the wire, unlike the profile-size warning: a Session root is absent
+	-- from LiveData but still rides in Init. Latched, being a template property.
 	local OVERSIZE_FRAGMENTS = 16
 	local warnedOversize = false
 
 	-- Same token-bucket shape as the command limiter, on its own per-entry clock:
-	-- refills at `inboundFrameRate` per second and caps there, so a burst spends a
-	-- budget an idle player has already rebuilt.
+	-- refills at `inboundFrameRate` per second and caps there.
 	local function takeFrameToken(entry: any): boolean
 		local now = Clock.Monotonic()
 		local elapsed = now - entry.FrameLast
@@ -129,9 +123,8 @@ function Replication.new(ctx: any)
 		if entry.QueueOpen then
 			local queue: { Wire.Op } = entry.Queue
 			if op.Kind == "Set" and op.Value ~= nil and type(op.Value) ~= "table" then
-				-- Scalar leaf Set: coalesce consecutive writes to the same path in
-				-- place. Supersession by whole-container writes is resolved once at
-				-- flush (compactOps), preserving emission order.
+				-- Scalar leaf Set: coalesce consecutive writes to the same path in place.
+				-- Supersession by whole-container writes is resolved at flush (compactOps).
 				local existing = entry.QueueIndex[pathKey]
 				if
 					existing
@@ -146,10 +139,9 @@ function Replication.new(ctx: any)
 					entry.QueueIndex[pathKey] = #queue
 				end
 			else
-				-- Whole-container writes (table Set, nil Set, Clear) and array ops
-				-- append, and break scalar coalescing at this path and every descendant.
-				-- A later scalar Set to a child would otherwise collapse into a slot now
-				-- preceding this write, and compactOps would drop it as superseded.
+				-- Whole-container writes (table Set, nil Set, Clear) and array ops append,
+				-- and break scalar coalescing here and below: a later child Set would
+				-- otherwise collapse into a preceding slot and be dropped as superseded.
 				table.insert(queue, op)
 				entry.QueueIndex[pathKey] = nil
 				local descendantPrefix = pathKey .. "\31"
@@ -169,10 +161,10 @@ function Replication.new(ctx: any)
 		end
 	end
 
-	-- Ranks a snapshot's roots by the bytes they contributed to the frame, for the
-	-- oversize warning. Scribe's own two roots are skipped: they are tens of bytes,
-	-- so never the answer. The "not persisted" annotation does NOT mean "unbounded";
-	-- it means ProfileSize and the DataStore ceiling say nothing about that root.
+	-- Ranks a snapshot's roots by the bytes they contributed, for the oversize
+	-- warning. Scribe's own two roots are skipped: tens of bytes, never the answer.
+	-- "not persisted" means ProfileSize and the DataStore ceiling say nothing about
+	-- that root, not that it is unbounded.
 	local function describeRoots(ops: { Wire.Op }?, spans: { number }?): string
 		if ops == nil or spans == nil then
 			return ""
@@ -193,7 +185,7 @@ function Replication.new(ctx: any)
 		if #ranked == 0 then
 			return ""
 		end
-		table.sort(ranked, function(a, b)
+		table.sort(ranked, function(a: { Key: string, Bytes: number }, b: { Key: string, Bytes: number })
 			return a.Bytes > b.Bytes
 		end)
 		local rootChildren = compiled.Root.Children :: { [string]: Template.SchemaNode }
@@ -208,9 +200,8 @@ function Replication.new(ctx: any)
 	end
 
 	-- One delivery to one client, with no accounting of its own: the callers count
-	-- once per frame instead. pcall takes the function and its arguments rather than
-	-- a closure because this runs once per recipient per frame, and on the Shared
-	-- fanout a fresh closure per call is N^2 allocations a frame.
+	-- once per frame. pcall takes the function and its arguments rather than a
+	-- closure because on the Shared fanout that is N^2 allocations a frame.
 	local function deliver(entry: any, bytes: buffer): boolean
 		local ok, err = pcall(transport.SendToClient, transport, entry.Player, bytes)
 		if not ok then
@@ -224,20 +215,18 @@ function Replication.new(ctx: any)
 	local sendInit: (entry: any) -> ()
 
 	-- A frame did not reach the transport, so this client's mirror is now a value the
-	-- server never had: Insert, Remove and Clear are not idempotent, so every later op
-	-- lands on the wrong base. A loaded client never Hellos again, so the server has
-	-- to notice. Repair is a fresh Init rather than a replay of the missed ops:
-	-- re-broadcasting a SharedDiff double-applies an Insert on the other recipients,
-	-- and a snapshot is total where a replay is partial.
+	-- server never had: Insert, Remove and Clear are not idempotent, so every later
+	-- op lands on the wrong base, and a loaded client never Hellos again. Repair is a
+	-- fresh Init, not a replay: re-broadcasting a SharedDiff would double-apply an
+	-- Insert on the other recipients.
 	local function markResync(entry: any, what: string)
 		if entry.ResyncPending then
 			return
 		end
 		entry.ResyncPending = true
-		-- Both flags, and the queue with them: HandshakeReady false stops broadcasts
-		-- to a client whose mirror is wrong, and clearing QueueOpen keeps out the
-		-- (HandshakeReady = true, QueueOpen = false) state, in which PushOp silently
-		-- discards every owner op.
+		-- Both flags, and the queue with them: HandshakeReady false stops broadcasts to
+		-- a client whose mirror is wrong, and clearing QueueOpen keeps out the
+		-- (ready, not open) state in which PushOp silently discards every owner op.
 		entry.HandshakeReady = false
 		entry.QueueOpen = false
 		entry.Queue = {}
@@ -251,11 +240,10 @@ function Replication.new(ctx: any)
 		)
 	end
 
-	-- One frame, to one client. Returns whether the WHOLE frame reached the transport,
+	-- One frame, to one client. Returns whether the whole frame reached the transport,
 	-- which sendInit needs: a snapshot that did not land must not mark the client
-	-- ready. Fragmentation happens here rather than in `deliver` because a broadcast
-	-- must split once and hand the same fragments to every recipient. `snapshotOps`
-	-- and `snapshotSpans` are passed only by sendInit.
+	-- ready. Fragmentation happens here rather than in `deliver` so a broadcast splits
+	-- once. `snapshotOps` and `snapshotSpans` are passed only by sendInit.
 	local function sendBuffer(entry: any, bytes: buffer, snapshotOps: { Wire.Op }?, snapshotSpans: { number }?): boolean
 		fragmentSeq = (fragmentSeq + 1) % 65536
 		local parts = 0
@@ -272,10 +260,9 @@ function Replication.new(ctx: any)
 			return true
 		end
 		if not whole then
-			-- Stop at the first refusal rather than pushing the rest: a hole in a
-			-- stream the receiver believes is contiguous could splice two frames
-			-- together. Aborting keeps a partial always a prefix, which the next
-			-- frame's index 0 discards cleanly.
+			-- Stop at the first refusal rather than pushing the rest: a hole in a stream
+			-- the receiver believes is contiguous could splice two frames together. A
+			-- partial stays a prefix, which the next frame's index 0 discards cleanly.
 			Metrics.Add("FragmentedSendFailed")
 			return false
 		end
@@ -308,13 +295,12 @@ function Replication.new(ctx: any)
 	end
 
 	-- One frame, to every ready client except `exceptEntry`. Returns the entries the
-	-- frame did NOT reach, or nil when every recipient got it; this is the only place
-	-- that knows which clients were missed.
+	-- frame did not reach, or nil when every recipient got it; the only place that
+	-- knows which clients were missed.
 	--
-	-- BytesOutPerSend is observed once here, not once per recipient: the metric means
-	-- bytes per outbound frame, and per-recipient sampling both cost O(N^2) reservoir
-	-- writes a frame and skewed the distribution toward the fanout. FramesSent still
-	-- counts every hand-off to the transport.
+	-- BytesOutPerSend is observed once here, not once per recipient: per-recipient
+	-- sampling cost O(N^2) reservoir writes a frame and skewed the distribution toward
+	-- the fanout. FramesSent still counts every hand-off to the transport.
 	local function broadcastBuffer(bytes: buffer, exceptEntry: any?): { any }?
 		-- Split once, before the recipient loop and before the fast-path branch: the
 		-- split depends only on the buffer, and the fast path never reaches `deliver`,
@@ -428,9 +414,8 @@ function Replication.new(ctx: any)
 				elseif op.Kind == "Insert" or op.Kind == "Remove" then
 					-- Index-shift barrier: an Insert/Remove rebinds which element every
 					-- numeric path under this container denotes, so a later table-Set at
-					-- arr[i] does NOT supersede an earlier op targeting the element that
-					-- occupied i before the shift. Walking backward, this op precedes
-					-- everything already marked, so drop the descendant marks under it.
+					-- arr[i] does not supersede an earlier op targeting the element that
+					-- occupied i before the shift. Drop the descendant marks under it.
 					local prefix = k .. "\31"
 					local prefixLen = #prefix
 					for marked in supersede do
@@ -446,17 +431,16 @@ function Replication.new(ctx: any)
 				end
 			end
 		end
-		local out: { Wire.Op } = table.create(#reversed)
+		local out = table.create(#reversed) :: { Wire.Op }
 		for i = #reversed, 1, -1 do
 			out[#out + 1] = reversed[i]
 		end
 		return out
 	end
 
-	-- Flush an entry's queued Shared ops as SharedDiff frames to every OTHER ready
-	-- client. Extracted so sendInit can drain a player's Shared queue before a new
-	-- client snapshots that player; otherwise a still-queued op is both reflected in
-	-- the snapshot and re-broadcast, double-applying Insert/Remove/Clear.
+	-- Flush an entry's queued Shared ops as SharedDiff frames to every other ready
+	-- client. Extracted so sendInit can drain the queue before a new client snapshots
+	-- that player; otherwise the op lands twice, double-applying Insert/Remove/Clear.
 	local function flushSharedQueue(entry: any)
 		local shared: { Wire.Op } = entry.SharedQueue
 		if #shared == 0 then
@@ -471,9 +455,8 @@ function Replication.new(ctx: any)
 				Wire.F64(w, entry.UserId)
 			end)
 			if ok then
-				-- A SharedDiff cannot be replayed to the client that missed it: the
-				-- other recipients already applied it. The missed client gets a whole
-				-- new snapshot, which is idempotent where an Insert is not.
+				-- A SharedDiff cannot be replayed to the client that missed it: the other
+				-- recipients already applied it. It gets a whole new snapshot instead.
 				local missed = broadcastBuffer(bytesOrErr, entry)
 				if missed ~= nil then
 					for _, other in missed do
@@ -499,10 +482,9 @@ function Replication.new(ctx: any)
 				local ok, bytesOrErr = pcall(Wire.EncodeOpsFrame, Wire.Frames.Diff, compiled, chunk)
 				if ok then
 					if not sendBuffer(entry, bytesOrErr) then
-						-- The queue was replaced at the top of this function, so these
-						-- ops exist nowhere else and a discarded refusal is permanent
-						-- divergence. Stop the chunk loop: later chunks depend on this
-						-- one having been applied.
+						-- The queue was replaced at the top of this function, so these ops
+						-- exist nowhere else and a discarded refusal is permanent divergence.
+						-- Later chunks depend on this one, so stop the loop.
 						markResync(entry, "Diff")
 						break
 					end
@@ -528,28 +510,26 @@ function Replication.new(ctx: any)
 
 	local connections: { any } = {}
 	-- Every entry with queued work flushes every frame, with deliberately no per-frame
-	-- budget. A budget needs a round-robin cursor over an ordered entry list, and
-	-- Entries is keyed by Player Instance: next(Entries, lastPlayer) raises once that
-	-- player has left, and a rehash on join makes resuming from a surviving key skip
-	-- entries silently. The path that is actually superlinear is the Shared fanout,
-	-- which a budget does not touch. The frame cost is measured below instead.
-	connections[#connections + 1] = RunService.PostSimulation:Connect(function()
+	-- budget: a budget needs a round-robin cursor over an ordered entry list, and
+	-- Entries is keyed by Player Instance, where next(Entries, lastPlayer) raises once
+	-- that player has left and a rehash on join silently skips entries. The
+	-- superlinear path is the Shared fanout, which a budget does not touch.
+	--- One frame's flush. Extracted so the profiler has something to name and so the
+	--- frame cost can be timed around it.
+	local function flushFrame(): (number, number)
 		local flushed = 0
 		local queued = 0
 		for _, entry in ctx.Persistence.Entries do
 			-- Repair before flushing: a resync re-snapshots live state, so any op that
-			-- would have flushed this frame is already in it.
-			--
-			-- Throttled on the previous ATTEMPT, not on LastInitAt, whose clock starts
-			-- at the join: gating on that would leave a client that lost a frame just
-			-- after its handshake stale for the rest of the cooldown.
+			-- would have flushed this frame is already in it. Throttled on the previous
+			-- attempt, not on LastInitAt, whose clock starts at the join: gating on that
+			-- would leave a client that lost a frame just after its handshake stale.
 			if entry.ResyncPending and entry.State == "Ready" and not entry.TornDown then
 				local now = Clock.Monotonic()
 				if now - (entry.LastResyncAt or -math.huge) >= REINIT_COOLDOWN then
 					entry.LastResyncAt = now
 					entry.ResyncPending = false
-					-- pcall for the reason onHello gives: every throw sendInit can
-					-- produce is a server-side fault, and one escaping here would take
+					-- pcall for the reason onHello gives: a throw escaping here would take
 					-- down the flush loop for every other player.
 					local okInit, initErr = pcall(sendInit, entry)
 					if not okInit then
@@ -559,9 +539,8 @@ function Replication.new(ctx: any)
 					end
 				end
 			end
-			-- Counted BEFORE the flush, because FlushEntry replaces both queues. This
-			-- is ops pending, not ops sent: compaction and coalescing shrink it on the
-			-- way to the wire. OpsSent covers what actually went out.
+			-- Counted before the flush, because FlushEntry replaces both queues. Ops
+			-- pending, not ops sent: compaction shrinks it on the way to the wire.
 			local pending = #entry.Queue + #entry.SharedQueue
 			if pending > 0 then
 				flushed += 1
@@ -569,11 +548,23 @@ function Replication.new(ctx: any)
 				self.FlushEntry(entry)
 			end
 		end
+		return flushed, queued
+	end
+
+	connections[#connections + 1] = RunService.PostSimulation:Connect(function()
+		-- No memory category here: this body runs on a thread the engine may recycle,
+		-- so the tag would outlive the call and stain whatever ran next on it.
+		local startedAt = Clock.Monotonic()
+		-- SyncSpan, and flushFrame is synchronous: it encodes and fires, and waits on
+		-- nothing. That is the precondition, not an incidental property.
+		local flushed, queued = Profile.SyncSpan("Scribe.Flush", flushFrame)
 		-- Nothing is recorded for an idle frame: a distribution padded with zeroes
 		-- would drag every percentile down and hide the busy frames.
 		if flushed > 0 then
 			Metrics.Observe("FlushEntriesPerFrame", flushed)
 			Metrics.Observe("FlushQueuedPerFrame", queued)
+			-- The frame cost itself, in seconds; the counts above say only how much work.
+			Metrics.Observe("FlushDuration", Clock.Monotonic() - startedAt)
 		end
 	end)
 
@@ -587,9 +578,8 @@ function Replication.new(ctx: any)
 			local store = if not rootSchema.Persist then entry.SessionStore else entry.LiveData
 			local value = if store then store[rootKey] else nil
 			if value ~= nil then
-				-- CloneVisible strips ServerOnly subtrees and returns nil for
-				-- roots with nothing visible (mixed-visibility roots like
-				-- _Scribe keep their Replicated subkeys).
+				-- CloneVisible strips ServerOnly subtrees and returns nil for roots with
+				-- nothing visible (mixed roots like _Scribe keep their Replicated subkeys).
 				local visible = Template.CloneVisible(rootSchema, value)
 				if visible ~= nil then
 					table.insert(ops, { Kind = "Set", Path = { rootKey }, Value = visible })
@@ -610,8 +600,8 @@ function Replication.new(ctx: any)
 			if rootSchema.Visibility == "Shared" and store then
 				local value = store[rootKey]
 				if value ~= nil then
-					-- CloneVisible strips ServerOnly subtrees nested under the
-					-- Shared root; a plain deepClone would broadcast them.
+					-- CloneVisible strips ServerOnly subtrees nested under the Shared root;
+					-- a plain deepClone would broadcast them.
 					local visible = Template.CloneVisible(rootSchema, value)
 					if visible ~= nil then
 						table.insert(ops, { Kind = "Set", Path = { rootKey }, Value = visible })
@@ -643,27 +633,24 @@ function Replication.new(ctx: any)
 
 	function sendInit(entry: any)
 		-- Open the queue in the same breath as taking the snapshot, with no yield
-		-- possible between them, so every write from here on is either in this clone
-		-- or in the queue behind it. Anything queued before the snapshot is superseded
-		-- by it, which is what the clear is for.
+		-- between them, so every write from here on is either in this clone or in the
+		-- queue behind it. The clear drops what the snapshot supersedes.
 		entry.Queue = {}
 		entry.QueueIndex = {}
 		entry.QueueOpen = true
-		-- Stamped at the START of the snapshot: measuring from completion would let a
+		-- Stamped at the start of the snapshot: measuring from completion would let a
 		-- slow encode widen its own cooldown.
 		entry.LastInitAt = Clock.Monotonic()
 		local ops = ownerSnapshotOps(entry)
 		-- Per-root byte spans, filled by the encode, so the oversize warning can name
-		-- what is large. `shippedOps` tracks what the DELIVERED frame contains, which
-		-- is not `ops` on the fallback path below.
+		-- what is large. `shippedOps` is what the delivered frame holds, not `ops`.
 		local spans: { number } = {}
 		local shippedOps: { Wire.Op } = ops
 		local ok, bytesOrErr =
 			pcall(Wire.EncodeOpsFrame, Wire.Frames.Init, compiled, ops, nil, spans, entry.InitSizeHint or lastInitBytes)
 		if not ok then
-			-- One un-encodable root must never permanently brick the client, which
-			-- would block every client API on waitForLoaded. Drop the offending roots,
-			-- surface them, and send the remainder so the handshake completes.
+			-- One un-encodable root must never brick the client, which would block every
+			-- client API on waitForLoaded. Drop it, surface it, and send the remainder.
 			Log.Error("Replication", "SERIALIZE_FAIL", tostring(bytesOrErr), { Player = entry.Player })
 			local safeOps = {}
 			for _, op in ops do
@@ -686,9 +673,8 @@ function Replication.new(ctx: any)
 					end
 				end
 			end
-			-- A fresh spans table, and shippedOps with it: attributing the frame that
-			-- was sent against the ops of the one that failed would name roots this
-			-- client never received.
+			-- A fresh spans table, and shippedOps with it: attributing the sent frame
+			-- against the failed one's ops would name roots this client never received.
 			spans = {}
 			shippedOps = safeOps
 			local okSafe, safeBytes = pcall(Wire.EncodeOpsFrame, Wire.Frames.Init, compiled, safeOps, nil, spans)
@@ -701,12 +687,11 @@ function Replication.new(ctx: any)
 			end
 			bytesOrErr = safeBytes
 		end
-		-- Drain every OTHER ready player's pending Shared ops BEFORE this client
-		-- becomes ready and snapshots them below. A queued op is already reflected in
-		-- other.LiveData, so it lands in the snapshot, and it would ALSO be
-		-- re-broadcast on the next flush, double-applying Insert/Remove/Clear.
-		-- Gated on HasShared: with no Shared root this loop walks every entry to find
-		-- nothing.
+		-- Drain every other ready player's pending Shared ops before this client becomes
+		-- ready and snapshots them below: a queued op is already in other.LiveData, so it
+		-- lands in the snapshot and would also be re-broadcast on the next flush,
+		-- double-applying Insert/Remove/Clear. Gated on HasShared, which without a Shared
+		-- root would walk every entry to find nothing.
 		if compiled.HasShared then
 			for _, other in ctx.Persistence.Entries do
 				if other ~= entry and other.State == "Ready" and #other.SharedQueue > 0 then
@@ -718,19 +703,17 @@ function Replication.new(ctx: any)
 		-- What this handshake costs the client in bytes, summed across every frame it
 		-- takes, not just the Init: the SharedInit fan-out that follows can dwarf it.
 		local joinBytes = buffer.len(bytesOrErr :: buffer)
-		-- Seed the NEXT Init's writer, this player's and the next joiner's. The LAST
+		-- Seed the next Init's writer, this player's and the next joiner's. The last
 		-- size, not a running maximum: one whale profile would permanently seed every
-		-- later joiner's writer at the whale's size with nothing to bring it back down.
-		-- Kept per entry and per context both, because the entry's own last Init is the
-		-- better estimate for a re-init and the context's is the only estimate a first
-		-- join has.
+		-- later joiner's writer at the whale's size. Kept per entry and per context: the
+		-- entry's own last Init is the better estimate for a re-init, the context's the
+		-- only one a first join has.
 		entry.InitSizeHint = joinBytes
 		lastInitBytes = joinBytes
 		if not sendBuffer(entry, bytesOrErr, shippedOps, spans) then
-			-- The snapshot never reached the transport, so this client has no mirror
-			-- for anything that follows. Leaving HandshakeReady false keeps that
-			-- recoverable and visible: the client's own Hello retry asks again, and the
-			-- handshake alarm in OnEntryReady can still fire.
+			-- The snapshot never reached the transport, so this client has no mirror for
+			-- anything that follows. Leaving HandshakeReady false keeps that recoverable:
+			-- the client's Hello retry asks again, and the handshake alarm still fires.
 			Metrics.Add("InitSendFailed")
 			Log.Error("Replication", "INIT_SEND_FAIL", "the initial snapshot could not be delivered", {
 				Player = entry.Player,
@@ -738,29 +721,25 @@ function Replication.new(ctx: any)
 			})
 			-- Un-take the snapshot. FlushEntry flushes when HandshakeReady and clears
 			-- when not QueueOpen, so QueueOpen true with HandshakeReady false matches
-			-- neither branch and the queue would grow unbounded for a client that never
-			-- receives any of it.
+			-- neither branch and the queue would grow unbounded.
 			entry.Queue = {}
 			entry.QueueIndex = {}
 			entry.QueueOpen = false
-			-- On a RE-Init these matter as much as the clear above: HandshakeReady is
-			-- still true from the first snapshot, and (HandshakeReady = true,
-			-- QueueOpen = false) is the state in which PushOp silently discards every
-			-- owner op forever. ResyncPending asks for another attempt, since a loaded
-			-- client has no Hello left to send.
+			-- On a re-Init these matter as much as the clear above: HandshakeReady is still
+			-- true from the first snapshot, and (ready, not open) is the state in which
+			-- PushOp silently discards every owner op forever. ResyncPending asks again,
+			-- since a loaded client has no Hello left to send.
 			entry.HandshakeReady = false
 			entry.ResyncPending = true
 			return
 		end
 		-- Only now: a client marked ready before its snapshot is on the wire can be
-		-- handed a diff it has no mirror to apply to. Because broadcastBuffer skips
-		-- unready entries, this is also what kept the Shared drain above from
-		-- re-broadcasting ops the snapshot already carries.
+		-- handed a diff it has no mirror to apply to. broadcastBuffer skips unready
+		-- entries, which is also what kept the Shared drain above safe.
 		entry.HandshakeReady = true
 		-- The snapshot landed but the handshake is not finished: a Status or SharedInit
 		-- that does not arrive leaves this client correct about itself and blind to
-		-- everyone else. Ask for the whole handshake again rather than inventing a
-		-- partial repair path.
+		-- everyone else. Ask for the whole handshake again.
 		if not sendStatus(entry) then
 			entry.ResyncPending = true
 		end
@@ -799,7 +778,7 @@ function Replication.new(ctx: any)
 		end
 		Metrics.Add("Handshakes")
 		-- Past the early return above, so a snapshot that never reached the transport
-		-- is not sampled: JoinBytes means what a COMPLETED handshake cost.
+		-- is not sampled: JoinBytes means what a completed handshake cost.
 		Metrics.Observe("JoinBytes", joinBytes)
 		Log.Debug("Replication", "INIT_SENT", "initial snapshot sent", { Player = entry.Player })
 	end
@@ -809,13 +788,11 @@ function Replication.new(ctx: any)
 	local function onHello(entry: any, reader: Wire.Reader)
 		local schemaHash = Wire.RU32(reader)
 		-- The client sends its wire PROTOCOL_VERSION after the hash. A mismatch means
-		-- the binary layout itself differs, not just the template, so decoding would be
-		-- unsafe: fail closed, unlike the hash check below which the value-mode prefix
-		-- keeps decode-safe.
+		-- the binary layout differs, not just the template, so decoding is unsafe: fail
+		-- closed, unlike the hash check below which the value-mode prefix keeps safe.
 		local protocolVersion = Wire.RU8(reader)
 		if protocolVersion ~= Wire.PROTOCOL_VERSION then
-			-- Metered like the re-init throttle below, so every refusal is countable
-			-- rather than only loggable.
+			-- Metered as well as logged, so every refusal is countable.
 			Metrics.Add("ProtocolMismatch")
 			Log.Warn("Replication", "PROTOCOL_MISMATCH", "client wire protocol version differs from the server", {
 				Player = entry.Player,
@@ -823,10 +800,10 @@ function Replication.new(ctx: any)
 			return
 		end
 		if schemaHash ~= compiled.Hash % 4294967296 then
-			-- Fail closed. Paths decode from the RECEIVER's own compiled.ById, so a
-			-- field id shared by two drifted templates maps to a different path on each
-			-- side and a server op lands on the wrong client key. The value-mode prefix
-			-- keeps value decoding safe, not path remapping.
+			-- Fail closed. Paths decode from the receiver's own compiled.ById, so a field
+			-- id shared by two drifted templates maps to a different path on each side and
+			-- a server op lands on the wrong client key. The value-mode prefix keeps value
+			-- decoding safe, not path remapping.
 			Metrics.Add("SchemaMismatch")
 			Log.Warn(
 				"Replication",
@@ -845,10 +822,9 @@ function Replication.new(ctx: any)
 				return
 			end
 			-- onHello runs inside the inbound pcall, whose failure branch charges the
-			-- CLIENT's malformed budget and blocks its session after 32 strikes. Every
-			-- throw sendInit can produce is a server-side fault, so letting one escape
-			-- here bans a player for a bug they did not cause and reports it as an
-			-- attack.
+			-- client's malformed budget and blocks its session after 32 strikes. Every
+			-- throw sendInit can produce is a server fault, so an escaping one bans a
+			-- player for a bug they did not cause.
 			local okInit, initErr = pcall(sendInit, entry)
 			if not okInit then
 				Log.Error("Replication", "INIT_SEND_FAIL", tostring(initErr), { Player = entry.Player })
@@ -859,9 +835,8 @@ function Replication.new(ctx: any)
 
 	function self.OnEntryReady(entry: any)
 		-- QueueOpen, not HandshakeReady: the question is whether a snapshot has already
-		-- been started for this entry, which is what stops a second one. It is the same
-		-- question the re-Init throttle asks, and the two reading different flags is
-		-- how the gap opened.
+		-- been started, which is the same question the re-Init throttle asks. The two
+		-- reading different flags is how the gap opened.
 		if entry.HelloReceived and not entry.QueueOpen then
 			local okInit, initErr = pcall(sendInit, entry)
 			if not okInit then
@@ -884,18 +859,16 @@ function Replication.new(ctx: any)
 				end
 			end
 		end
-		-- Anything queued before this snapshot is already IN it, and the next flush
-		-- would broadcast it again as a SharedDiff to the same recipients, permanently
-		-- doubling a non-idempotent Insert in every other mirror. Clear
-		-- unconditionally: the snapshot is authoritative either way.
+		-- Anything queued before this snapshot is already in it, and the next flush
+		-- would broadcast it again as a SharedDiff, permanently doubling a
+		-- non-idempotent Insert. Clear unconditionally: the snapshot is authoritative.
 		entry.SharedQueue = {}
 		Clock.Delay(HANDSHAKE_TIMEOUT, function()
 			if not entry.TornDown and not entry.HandshakeReady then
 				if entry.HelloReceived then
-					-- A different failure with the same symptom: the client DID ask,
-					-- and the answer could not be delivered. MaxOutboundBytes is named
-					-- because a transport refusing a payload this size is the one
-					-- innocent cause.
+					-- A different failure with the same symptom: the client did ask and the
+					-- answer could not be delivered. MaxOutboundBytes is named because a
+					-- transport refusing a payload this size is the one innocent cause.
 					Log.Warn(
 						"Replication",
 						"INIT_UNDELIVERED",
@@ -923,8 +896,7 @@ function Replication.new(ctx: any)
 		-- Symmetry rather than a fix: a removed entry's tree is already dead, so
 		-- nothing can push to it.
 		entry.QueueOpen = false
-		-- Only meaningful when the template declares a Shared root: SharedGone tells a
-		-- client to drop its mirror of this player, and without a Shared field there is
+		-- Only meaningful when the template declares a Shared root: without one there is
 		-- no mirror to drop. Sending it anyway costs one frame per remaining client on
 		-- every leave, making a full server drain quadratic.
 		if not compiled.HasShared then
@@ -933,8 +905,8 @@ function Replication.new(ctx: any)
 		local w = Wire.NewWriter(16)
 		Wire.U8(w, Wire.Frames.SharedGone)
 		Wire.F64(w, entry.UserId)
-		-- A missed SharedGone leaves a mirror of a player who has left, which no
-		-- later frame ever clears.
+		-- A missed SharedGone leaves a mirror of a player who has left, which no later
+		-- frame ever clears.
 		local missed = broadcastBuffer(Wire.Finish(w), entry)
 		if missed ~= nil then
 			for _, other in missed do
@@ -976,15 +948,13 @@ function Replication.new(ctx: any)
 		end
 		if entry.MalformedBlocked or entry.OversizeBlocked then
 			-- Past the malformed or oversize limit; drop without parsing so a flood of
-			-- crafted frames cannot keep burning CPU. Two counters and two flags because
-			-- which budget tripped is what the logs need, but the response is identical.
+			-- crafted frames cannot keep burning CPU. Two counters because the logs need
+			-- to say which budget tripped.
 			return
 		end
-		-- Ahead of the size check on purpose. Every other budget is per-kind, and an
-		-- oversize frame is excluded from the malformed budget by design (below), so
-		-- this is the one ceiling that sees every frame whatever its type, size or
-		-- validity, and it is spent before the frame is looked at. Silent, because
-		-- replying is exactly the amplification this tier exists to avoid.
+		-- Ahead of the size check on purpose: this is the one ceiling that sees every
+		-- frame whatever its type, size or validity, and it is spent before the frame
+		-- is looked at. Silent, because replying is the amplification this tier avoids.
 		if not takeFrameToken(entry) then
 			Metrics.Add("InboundRateLimited")
 			local now = Clock.Monotonic()
@@ -999,9 +969,8 @@ function Replication.new(ctx: any)
 		if buffer.len(bytes) > maxInbound then
 			entry.OversizeCount += 1
 			Metrics.Add("InboundOversize")
-			-- Throttle the LOG, on its own clock: this frame is attacker-controlled, so
-			-- logging every one is the cheapest way to evict the diagnostic ring. The
-			-- metric above still counts them all.
+			-- Throttle the log, on its own clock: this frame is attacker-controlled, so
+			-- logging every one would evict the diagnostic ring. The metric counts all.
 			local now = Clock.Monotonic()
 			if now - (entry.LastOversizeLog or -math.huge) >= MALFORMED_LOG_INTERVAL then
 				entry.LastOversizeLog = now
@@ -1024,7 +993,7 @@ function Replication.new(ctx: any)
 			end
 			return
 		end
-		-- Built OUTSIDE the pcall so its overBudget flag survives the failure. The
+		-- Built outside the pcall so its overBudget flag survives the failure. The
 		-- retained-bytes budget is what the byte cap above cannot express: `06 00` is
 		-- two bytes and allocates, eight kilobytes of one string allocates once.
 		local reader = Wire.NewReader(bytes, maxInboundRetained)
@@ -1039,11 +1008,10 @@ function Replication.new(ctx: any)
 			end
 		end)
 		if not ok and reader.overBudget then
-			-- Its own counter, NOT the malformed budget, and deliberately with no
-			-- blocking limit: a frame over this budget may be a legal payload from the
-			-- game's own client carrying more elements than the default allows, and a
-			-- 32-strike session-permanent budget would drop that player for playing the
-			-- game. No reply, for the same reason the rate limiter is silent.
+			-- Its own counter, not the malformed budget, and deliberately with no blocking
+			-- limit: a frame over this budget may be a legal payload from the game's own
+			-- client, and a 32-strike session-permanent budget would drop that player for
+			-- playing the game. Silent, like the rate limiter.
 			entry.WorkLimitCount = (entry.WorkLimitCount or 0) + 1
 			Metrics.Add("InboundWorkLimited")
 			local now = Clock.Monotonic()

@@ -32,11 +32,10 @@ In a multi-client test the full toolset lives in the **server** view. Switching 
 
 Watching Emberfall in the Sessions panel is the quickest way to confirm that `Level` really does move when you grant `Xp`, and the Changes feed will show you the derived recompute arriving as its own op.
 
-:::caution Restore, erase, and profile edits mutate real data
-The Production panel operates on real player profiles using Studio's own DataStore access. Reads are side-effect free, but restore, erase, and profile edits are not. Those three are blocked while a session lock is held, meaning a player is actively online, require a typed confirmation, and are recorded in a local audit log.
+!!! warning "Restore, erase, and profile edits mutate real data"
+    The Production panel operates on real player profiles using Studio's own DataStore access. Reads are side-effect free, but restore, erase, and profile edits are not. Those three are blocked while a session lock is held, meaning a player is actively online, require a typed confirmation, and are recorded in a local audit log.
 
-Enable **File, Experience Settings, Security, "Enable Studio Access to API Services"** and publish the place before any of it works. It operates against the opened game's universe.
-:::
+    Enable **File, Experience Settings, Security, "Enable Studio Access to API Services"** and publish the place before any of it works. It operates against the opened game's universe.
 
 ??? note "Why editing real data here is safe to allow"
     Editing production data is a serious capability, so the plugin is built so that you do not have to take its word for anything.

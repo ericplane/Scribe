@@ -2,7 +2,7 @@
 -- Fake Player objects for driving the persistence lifecycle. Tests cannot
 -- create real Player instances; Scribe's runtime only reads UserId/Name/
 -- Parent/MembershipType and calls Kick, so a table suffices (the `Data[player]`
--- sugar has a typeof guard — tests use Data.Get(player)/ctx internals instead).
+-- sugar has a typeof guard, so tests use Data.Get(player)/ctx internals instead).
 
 local Players = game:GetService("Players")
 

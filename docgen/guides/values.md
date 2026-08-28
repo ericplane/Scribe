@@ -75,35 +75,34 @@ data.Settings.Set(data.Settings.Default())  -- reset settings to the template de
 
 `Default` is read-only schema metadata, so it works on the client, on the server, and before any data has loaded. That makes it the right way to build a "reset to defaults" button, and the right way to tell whether a player has ever changed something.
 
-:::caution `Get` on a table hands you the stored table
-For a **table** field, `Get` returns the stored table itself, not a copy. Mutating it writes straight into authoritative state behind Scribe's back: no validation, no replication, and no `Changed`. The value changes on the server and even saves, and the client never hears about it.
+!!! warning "`Get` on a table hands you the stored table"
+    For a **table** field, `Get` returns the stored table itself, not a copy. Mutating it writes straight into authoritative state behind Scribe's back: no validation, no replication, and no `Changed`. The value changes on the server and even saves, and the client never hears about it.
 
-```lua
--- WRONG: edits real state silently, and never replicates
-for itemId, entry in data.Inventory.Get() do
-    entry.Rarity = "Legendary"
-end
+    ```lua
+    -- WRONG: edits real state silently, and never replicates
+    for itemId, entry in data.Inventory.Get() do
+        entry.Rarity = "Legendary"
+    end
 
--- RIGHT: write through the accessor at that key
-for itemId in data.Inventory.Get() do
-    data.Inventory[itemId].Rarity.Set("Legendary")
-end
-```
+    -- RIGHT: write through the accessor at that key
+    for itemId in data.Inventory.Get() do
+        data.Inventory[itemId].Rarity.Set("Legendary")
+    end
+    ```
 
-`data.Inventory[itemId]` is a real accessor, so `.Set` validates, replicates, and fires listeners like any other write. The entry `Get` handed you is a plain Lua table with no `.Set` of its own.
+    `data.Inventory[itemId]` is a real accessor, so `.Set` validates, replicates, and fires listeners like any other write. The entry `Get` handed you is a plain Lua table with no `.Set` of its own.
 
-The same trap sits inside `Update`, which passes your function exactly what `Get` returns. Mutating that table in place is a silent write, and worse, a transform that throws partway leaves the mutation in the profile with nothing reporting it. Build a new table and return that:
+    The same trap sits inside `Update`, which passes your function exactly what `Get` returns. Mutating that table in place is a silent write, and worse, a transform that throws partway leaves the mutation in the profile with nothing reporting it. Build a new table and return that:
 
-```lua
-data.Inventory.Update(function(current)
-    local updated = table.clone(current)
-    updated.Emberblade = { Qty = 1, Rarity = "Legendary" }
-    return updated
-end)
-```
+    ```lua
+    data.Inventory.Update(function(current)
+        local updated = table.clone(current)
+        updated.Emberblade = { Qty = 1, Rarity = "Legendary" }
+        return updated
+    end)
+    ```
 
-Use `Clone` whenever you want a table you can edit freely.
-:::
+    Use `Clone` whenever you want a table you can edit freely.
 
 ??? note "Why the rule is blanket rather than conditional"
     A subtree that contains packed datatypes **is** rebuilt on the way out, so mutating that one is silently discarded rather than silently applied. Two different silent failures depending on the shape of your template is worse than one rule, so treat everything `Get` returns as read-only.
@@ -269,9 +268,8 @@ end)
 
     A write that **replaces** the container's own table is different: a whole-container `Set` or `Update`, and the set and flags mutators, which rewrite the whole value. Those carry a real prior table as `old` and are not coalesced, because collapsing them would throw that prior value away.
 
-:::caution The container `key` argument was removed in 1.3.0
-A container `Changed` listener used to take a third `key` argument. One fire can now cover several children, so naming one of them would imply the others did not change. Scribe errors at connect time on a container listener that declares a third parameter, rather than passing `nil` forever. Move that logic to `OnChildChanged`. Leaf listeners are unchanged.
-:::
+!!! warning "The container `key` argument was removed in 1.3.0"
+    A container `Changed` listener used to take a third `key` argument. One fire can now cover several children, so naming one of them would imply the others did not change. Scribe errors at connect time on a container listener that declares a third parameter, rather than passing `nil` forever. Move that logic to `OnChildChanged`. Leaf listeners are unchanged.
 
 ## The whole surface at a glance
 

@@ -183,22 +183,21 @@ Those eleven strings are also available as named constants on [`Scribe.RequestRe
 
 Three failures produce no sentinel and instead raise on the calling thread, because they are caller bugs rather than runtime conditions: passing more than 16 arguments, passing a value the wire cannot encode, and handing `Data.RequestOnce` a key that is empty, over 64 bytes, or not valid UTF-8. The client checks the key before it sends, so the `bad-idempotency-key` sentinel above reaches you only when the command and the key disagree.
 
-:::caution The first two values cannot tell you who refused, but the third can
-A handler's return values reach the caller verbatim. A handler that returns `false, "not owned"` hands the client the same two values as any of the eleven sentinels above, and a handler that returns `false, "timeout"` is byte-identical to Scribe's own timeout. A naive `showToast(reason)` will eventually show an Emberfall player the words `rate-limited`.
+!!! warning "The first two values cannot tell you who refused, but the third can"
+    A handler's return values reach the caller verbatim. A handler that returns `false, "not owned"` hands the client the same two values as any of the eleven sentinels above, and a handler that returns `false, "timeout"` is byte-identical to Scribe's own timeout. A naive `showToast(reason)` will eventually show an Emberfall player the words `rate-limited`.
 
-**Read the third return value.** Every framework refusal appends `Scribe.RequestFailed`, a frozen table Scribe owns. Handler values never carry it, because they cross the wire and the wire has no representation for a reference, so a handler that returns a table gets a copy on the other side and can never produce this one.
+    **Read the third return value.** Every framework refusal appends `Scribe.RequestFailed`, a frozen table Scribe owns. Handler values never carry it, because they cross the wire and the wire has no representation for a reference, so a handler that returns a table gets a copy on the other side and can never produce this one.
 
-```lua
-local ok, reason, failed = Data.Request("BuyPotion", "Health", 3)
-if failed == Scribe.RequestFailed then
-    warn(`BuyPotion never ran: {reason}`) -- one of the sentinels above
-elseif not ok then
-    showToast(reason)                     -- your handler's reason, safe to show a player
-end
-```
+    ```lua
+    local ok, reason, failed = Data.Request("BuyPotion", "Health", 3)
+    if failed == Scribe.RequestFailed then
+        warn(`BuyPotion never ran: {reason}`) -- one of the sentinels above
+    elseif not ok then
+        showToast(reason)                     -- your handler's reason, safe to show a player
+    end
+    ```
 
-The third value is `nil` on success and `nil` whenever the values are the handler's, so a plain `if failed then` is enough unless your own handlers return a third value.
-:::
+    The third value is `nil` on success and `nil` whenever the values are the handler's, so a plain `if failed then` is enough unless your own handlers return a third value.
 
 Returning a shape that cannot collide also works, and it is worth it when the handler has more to say than a string. A table is unambiguous on its own, since Scribe's own refusals are always `false` plus a plain string.
 
@@ -228,11 +227,10 @@ A handler runs inside an `xpcall` on the inbound frame thread, so it **may yield
 
 The client is the side with a clock. `Data.Request` arms a timer for `RequestTimeout`, ten seconds by default, and resolves the caller with `false, "timeout"` when it expires. The reply that arrives afterwards finds no waiter and is discarded. No log code fires on either side.
 
-:::caution A timeout is not a rollback
-The handler kept running. Its `Set`, `Increment` and `Insert` calls committed and will save normally. The client was told the command failed while the server durably succeeded, and nothing reconciles the two. On a command that spends Emberfall gems, that is a player who paid and saw an error.
+!!! warning "A timeout is not a rollback"
+    The handler kept running. Its `Set`, `Increment` and `Insert` calls committed and will save normally. The client was told the command failed while the server durably succeeded, and nothing reconciles the two. On a command that spends Emberfall gems, that is a player who paid and saw an error.
 
-Keep handlers inside `RequestTimeout`. When a handler has to make a yielding web call whose worst case you do not control, either raise `RequestTimeout` to cover it, or return immediately and deliver the outcome through the replicated data itself with an `Observe` on the field the handler eventually writes.
-:::
+    Keep handlers inside `RequestTimeout`. When a handler has to make a yielding web call whose worst case you do not control, either raise `RequestTimeout` to cover it, or return immediately and deliver the outcome through the replicated data itself with an `Observe` on the field the handler eventually writes.
 
 A handler may yield, but the `Batch` and `Transaction` blocks inside it still must not. See [Session Lifecycle](./lifecycle).
 

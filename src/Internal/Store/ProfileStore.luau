@@ -7,85 +7,19 @@
 --   with the source package at licenses/ProfileStore-Apache-2.0.txt.
 --   Upstream project: ProfileStore by MAD STUDIO, on GitHub under MadStudioRoblox.
 --
--- No off-platform URLs anywhere in this file, deliberately: Roblox flags links
--- that send players off-platform, and the whole of src/ is packed into the
--- released .rbxm. Attribution is given by name instead, which the licence
--- requires and a URL is not needed for.
+-- No off-platform URLs anywhere, deliberately: Roblox flags links that send
+-- players off-platform and the whole of src/ is packed into the released .rbxm.
+-- Attribution is given by name, which is what the licence requires.
 --
 -- THIS FILE HAS BEEN MODIFIED BY SCRIBE, as Apache-2.0 section 4(b) requires it
--- to say. Every change is marked `SCRIBE PATCH` and listed under WHAT IS PATCHED
--- below; nothing else in the file has been altered.
+-- to say. Every change is marked `SCRIBE PATCH` and nothing else is touched --
+-- no reformatting, no renaming, no style fixes -- so a future upstream release
+-- can still be diffed against this one. That is also why this file is excluded
+-- from stylua and selene (see .styluaignore and selene.toml).
 --
--- Deliberately kept as close to line-identical with upstream as possible, so a
--- future upstream change can still be diffed against it. Every Scribe change is
--- marked `SCRIBE PATCH` and nothing else is touched -- no reformatting, no
--- renaming, no style fixes. That is also why this one file is excluded from
--- stylua and selene (see .styluaignore and selene.toml): letting either tool
--- rewrite 2,242 lines of upstream code would destroy the diff for no benefit,
--- and nobody is going to hand-edit this body.
---
--- Scribe's own additions live in the sibling init.luau, which is fully linted.
---
--- WHAT IS PATCHED (all additive; every upstream code path is unchanged):
---   * SaveProfileAsync tracks and returns an outcome: "Saved" | "NotOwned" |
---     "Failed". Callers that ignore the return value behave exactly as before.
---   * Profile:SaveAwait() -- Save(), but yields and reports what happened to THIS
---     call. Profile:Save() itself is untouched, so anything relying on its
---     fire-and-forget semantics is unaffected.
---   * OnSave fires with a per-call context table, returned alongside the outcome,
---     so a handler can record something about the save it is running inside
---     without parking it in state shared by every in-flight save.
---   * ProfileStore:UpdateOfflineAsync(key, expected, new_data) -- a compare-and-set
---     write for an absent player, so the "is it still offline" check and the write
---     are one DataStore call instead of two. Declines write nothing.
---   * ProfileStore.BeginClose / AwaitClose, plus ProfileStore.ExternalShutdown, so
---     the owner can drive shutdown in its own order rather than racing this
---     module's BindToClose.
---   * Profile:EndSessionWithoutSaving() -- releases the lock but writes no Data, so
---     a fail-closed load can leave the stored bytes exactly as it found them.
---   * profile.OnSettled -- fires once per save call with (context, outcome),
---     whatever happened, so an observer can pair it with OnSave and count in-flight
---     saves without leaking on failure.
---   * Profile:HasCompletedSave() / Profile:SessionsStarted() / Profile:SetSaveSource()
---     -- named accessors for three things Scribe was reading straight off the
---     profile table. Each one depended on an UNDOCUMENTED property of this module
---     (UserIds is written only by a completed save; a view skips the session-start
---     increment; the save transform reads Data after OnSave has fired), so the
---     contract lived in a comment at the call site and could not be checked against
---     upstream. Stating it here is what makes the next upstream diff answer whether
---     it still holds. Purely additive: the fields are untouched and still public.
---   * Profile:SetRetainLastSaved(false) -- release the decoded save response once
---     OnAfterSave has fired, instead of holding a second full copy of the profile
---     for the whole session. That copy measures 83% of the live set's allocation;
---     see the note at the release for what that number does and does not say.
---     Opt-in; retention is unchanged for an owner that never calls it.
---   * ProfileStore:MessageAsync answers a THIRD value, provably_clean -- true only
---     where NOTHING can have been written by the call. A bare `false` used to come
---     from two opposite places (the IsClosing guard, which attempts nothing, and the
---     end of the retry loop, whose attempts may each have committed), and
---     `(false, "QueueFull")` describes only the attempt that answered, never the
---     call. A caller with money on the line cannot classify either one. The value is
---     a POSITIVE claim, so an old caller, an old test double, or a new exit that
---     forgets it all read as "cannot be sure" -- the cheap direction. Purely
---     additive: existing callers destructure two values and are unaffected.
---     It is derived from the ERROR CLASS of each failed attempt, not from how many
---     attempts there were: UpdateAsync now hands its error back on transform_params
---     instead of only reporting it, and Failure.Classify decides. Only "Rejected"
---     (1xx) and "Throttled" (3xx) are proof that an attempt never reached storage.
---     The earlier attempt COUNT inverted the cost -- one throttle in front of an
---     ordinary full inbox reported doubt about a call that wrote nothing, and ate a
---     buyer's paid gift credit.
---   * The MessagingService nudge handler DEFERS a message that arrives inside its
---     six-second throttle window instead of discarding it, and collapses any number
---     of them into ONE save when the window expires. The spacing is unchanged -- see
---     NUDGE_FIRE_MARGIN -- so the write budget the throttle protects is untouched;
---     what changes is that a lost nudge no longer drops the request off the ~1s
---     cross-server path onto AUTO_SAVE_PERIOD, 300 seconds by default.
---
--- The tri-state matters and a boolean would have been wrong: UpdateAsync can
--- SUCCEED while the transform writes nothing, because the session was superseded
--- (session_owns_profile == false). Reporting that as success is the exact defect
--- class this fork exists to remove.
+-- Most of the patches remove one defect class: a save that SUCCEEDS while
+-- writing nothing, because the session was superseded. A boolean cannot report
+-- that, so SaveProfileAsync answers "Saved" | "NotOwned" | "Failed".
 
 --[[
 MAD STUDIO (by loleris)
@@ -286,36 +220,25 @@ local MAX_MESSAGE_QUEUE = 1000 -- Max messages saved in a profile that were sent
 -- local Util = require(game.ReplicatedStorage.Shared.Util)
 -- local Signal = Util.Signal
 
--- SCRIBE PATCH: the error classifier, INJECTED rather than required, and still
--- the file's only dependency of any kind.
+-- SCRIBE PATCH: the error classifier, INJECTED rather than required, and the
+-- file's only dependency of any kind.
 --
--- `MessageAsync`'s third return has to answer "could ANY attempt in this call have
--- written?", and the only evidence that answers it is the error each failed
--- attempt raised. Scribe already owns that classifier in Internal/Failure.luau:
--- 1xx is "Rejected" and 3xx is "Throttled", both of which provably never reached
--- storage, while 504 is "Unresolved" -- the write MAY have landed -- and anything
--- else is "Failed". Restating that table here is the exact duplication Failure was
--- written to end, so it is handed in instead. Persistence installs it as it adopts
--- the store module (findProfileStoreModule), which is the single seam every route
--- to this file goes through.
+-- MessageAsync's third return has to answer "could ANY attempt in this call have
+-- written?", and the evidence is the error each failed attempt raised. Scribe
+-- already owns that classifier in Internal/Failure.luau, so it is handed in rather
+-- than restated here. Persistence installs it as it adopts the store module
+-- (findProfileStoreModule), the single seam every route to this file goes through.
 --
--- A REQUIRE WAS TRIED FIRST AND IS WRONG. This file has no `require` and no
--- `script`, and that is load-bearing rather than incidental: the simulation loads
--- it as raw source into a synthetic global table so each simulated server gets a
--- private copy of the module state (test/Sim/Server.luau, test/Sim/Loader.luau).
--- `require(script.Parent.Parent.Failure)` fails outright there, and making it work
--- would hand every simulated server the harness's one shared Health/Log/Metrics
--- graph -- the precise isolation the simulation exists to keep.
+-- A require was tried first and is wrong. This file has no `require` and no
+-- `script`, and that is load-bearing: the simulation loads it as raw source into a
+-- synthetic global table so each simulated server gets a private copy of the module
+-- state (test/Sim/Server.luau, test/Sim/Loader.luau). A require fails outright
+-- there, and making it work would hand every simulated server the harness's one
+-- shared Health/Log/Metrics graph.
 --
--- UNSET IS EXACTLY THE OLD BEHAVIOUR, NOT A NEW ONE. Absent a classifier every
--- failed attempt reads as "could have written", and since this loop only continues
--- on failure, that is bit-for-bit what the attempt COUNT it replaced computed. So
--- the hook can only ever move an answer from "cannot be sure" to "provably clean",
--- never the other way, and a caller that forgets to install it is merely back where
--- it started.
---
--- The field itself is declared with the rest of the module table below, because
--- that table does not exist yet at this point in the file.
+-- Unset is exactly the old behaviour: absent a classifier every failed attempt
+-- reads as "could have written", which is bit-for-bit what the attempt COUNT it
+-- replaced computed. The field is declared with the module table below.
 
 local Signal do
 
@@ -532,22 +455,17 @@ local function SessionToken(store_name, profile_key, is_mock)
 end
 
 -- SCRIBE PATCH: buffers are COPIED, not shared. Upstream's DeepCopyTable and
--- ReconcileTable recurse on `type(value) == "table"` and pass everything else
--- through by value -- which is right for numbers and strings and wrong for a
--- buffer, because a buffer IS a mutable reference. (Upstream PR #22, unmerged.)
+-- ReconcileTable recurse on tables and pass everything else through by value,
+-- which is wrong for a buffer, because a buffer IS a mutable reference.
+-- (Upstream PR #22, unmerged.)
 --
--- It matters here because Scribe's persistent template contains buffers:
--- Template.luau lists `buffer` among the types that persist, a datatype field
--- packs to one, and a Scribe.Big stores one. Two copies were therefore aliases:
+-- Scribe's persistent template contains buffers, so two copies were aliases:
 -- template -> Data on every key mint, so every profile on the server shared one
--- buffer with each other AND with the template, and a write through any of them
--- seeded every future profile with the last player's bytes; and
--- Data -> LastSavedData in Profile.New, which is what Scribe's wipe guard diffs
--- against live data -- aliased, it diffs live against live and can never trip.
---
--- Latent rather than live today only because Scribe's own datatype writes always
--- allocate a fresh buffer instead of writing through the existing one. That is a
--- property of the caller, not of this function.
+-- buffer with the template and a write through any of them seeded every future
+-- profile with the last player's bytes; and Data -> LastSavedData in Profile.New,
+-- which the wipe guard diffs against live data -- aliased, it diffs live against
+-- live and can never trip. Latent today only because Scribe's own datatype writes
+-- always allocate a fresh buffer instead of writing through the existing one.
 local function CopyBuffer(source)
 	local size = buffer.len(source)
 	local copy = buffer.create(size)
@@ -750,8 +668,7 @@ local function UpdateAsync(profile_store, profile_key, transform_params, is_user
 			-- to return latest_data, and UpdateAsync commits unless the transform
 			-- returns nil -- so a refused compare-and-set still minted a key version,
 			-- spent a write budget, and (on the missing-profile path above) created a
-			-- stub key that had never existed. Three separate doc comments promised
-			-- "a refusal writes nothing at all"; this is what makes that true.
+			-- stub key that had never existed.
 			if transform_params.AbortWrite == true then
 				return nil
 			end
@@ -821,18 +738,14 @@ local function UpdateAsync(profile_store, profile_key, transform_params, is_user
 	elseif success == true and transform_params.AbortWrite == true then
 		-- SCRIBE PATCH: a transform that DECLINED is not a DataStore error.
 		--
-		-- The AbortWrite patch above made a refusal return nil so that it writes
-		-- nothing at all. Nil is also what a FAILED call returns, and this branch
-		-- could not tell them apart, so every refusal warned to the console, added
-		-- an entry to IssueQueue (five inside the window flip IsCriticalState) and
-		-- fired OnError -- which Scribe reports as PROFILE_STORE_ERROR, counts as
-		-- DataStoreErrors and feeds into Health, where an Outage refuses Robux
-		-- grants for every player on the server.
-		--
-		-- UpdateOfflineAsync's call site already guards the same condition, with a
-		-- comment naming this exact hazard -- but it guards the RETURN VALUE, and
-		-- OnError had already fired by the time it runs. The guard was one layer
-		-- too high. It stays there, because the two answer different questions.
+		-- A refusal returns nil, and so does a FAILED call; this branch could not
+		-- tell them apart, so every refusal warned, added an entry to IssueQueue
+		-- (five inside the window flip IsCriticalState) and fired OnError -- which
+		-- Scribe reports as PROFILE_STORE_ERROR and feeds into Health, where an
+		-- Outage refuses Robux grants for every player on the server.
+		-- UpdateOfflineAsync guards the same condition at its call site, but on the
+		-- RETURN VALUE, by which time OnError has fired; both stay, because they
+		-- answer different questions.
 		--
 		-- `success == true` is load-bearing: a transform that set AbortWrite and
 		-- THEN hit a failing DataStore call must still be registered, so a genuine
@@ -842,16 +755,13 @@ local function UpdateAsync(profile_store, profile_key, transform_params, is_user
 		-- Error handling:
 		-- SCRIBE PATCH: KEEP the error, do not only report it. RegisterError warns,
 		-- queues an issue and fires OnError, and then the string is gone -- every
-		-- failure class reached the caller as the same bare nil. That is what forced
-		-- MessageAsync's `provably_clean` to be guessed from an attempt COUNT, which
-		-- inverted its cost: a 3xx throttle that certainly wrote nothing poisoned the
-		-- whole call exactly like a lost reply. The class is the evidence; see the
-		-- note on `provably_clean` in MessageAsync for what is done with it.
+		-- failure class reached the caller as the same bare nil, which is what forced
+		-- MessageAsync's `provably_clean` to be guessed from an attempt COUNT. See the
+		-- note on `provably_clean` in MessageAsync for what is done with the class.
 		--
 		-- Written onto transform_params, which the caller already owns and already
-		-- reads for AbortWrite and QueueFull. No return signature changes, so the
-		-- `table.pack(UpdateAsync(...))` in StartSessionAsync keeps its arity and
-		-- every other call site is untouched.
+		-- reads for AbortWrite and QueueFull, so the return signature is unchanged and
+		-- the `table.pack(UpdateAsync(...))` in StartSessionAsync keeps its arity.
 		transform_params.ErrorMessage = error_message
 		RegisterError(
 			error_message or "Undefined error",
@@ -921,12 +831,10 @@ local function SaveProfileAsync(profile, is_ending_session, is_overwriting, last
 		error(`[{script.Name}]: Developer code likely set "Profile.Data" to a non-table value! (STORE:{profile.ProfileStore.Name}; KEY:{profile.Key})`)
 	end
 
-	-- SCRIBE PATCH: a context owned by THIS call. A handler can record something
-	-- about the save it is running inside -- Scribe's wipe guard marks a save whose
-	-- payload is the last-good snapshot rather than live data -- and the caller gets
-	-- it back. Anything stored on `entry` instead would be a single slot shared by
-	-- every in-flight save, which is the exact shape this fork exists to remove.
-	-- Existing handlers take no arguments and are unaffected.
+	-- SCRIBE PATCH: a context owned by THIS call, handed to OnSave and returned to
+	-- the caller, so a handler can record something about the save it is running
+	-- inside. Anything stored on `entry` instead would be a single slot shared by
+	-- every in-flight save. Existing handlers take no arguments and are unaffected.
 	local save_context = {}
 	profile.OnSave:Fire(save_context)
 	if is_ending_session == true then
@@ -990,15 +898,13 @@ local function SaveProfileAsync(profile, is_ending_session, is_overwriting, last
 						-- A key REMOVED under a live session (a GDPR erase that raced the
 						-- session start) reaches this transform as UpdateAsync's
 						-- missing-profile stub -- GlobalUpdates and nothing else. Indexing
-						-- MetaData on it threw, inside UpdateAsync's own pcall, so the save
+						-- MetaData on it threw inside UpdateAsync's own pcall, so the save
 						-- neither wrote nor released; and because that repeated on every
 						-- autosave the session stayed ACTIVE FOREVER, accepting writes it
 						-- silently discarded. Measured: 200 s at a 30 s autosave period,
-						-- still Ready, every write gone.
-						--
-						-- No MetaData means no ActiveSession, which means this session does
-						-- not own the profile. Leaving session_owns_profile false routes it
-						-- to the same clean release a STOLEN session takes.
+						-- still Ready, every write gone. No MetaData means no ActiveSession,
+						-- so leaving session_owns_profile false routes it to the same clean
+						-- release a stolen session takes.
 						if type(latest_data.MetaData) == "table" then
 							local active_session = latest_data.MetaData.ActiveSession
 							local session_load_count = latest_data.MetaData.SessionLoadCount
@@ -1042,19 +948,13 @@ local function SaveProfileAsync(profile, is_ending_session, is_overwriting, last
 						-- processed() had acknowledged: the gift was consumed into
 						-- profile.Data, profile.Data was then not written, and the
 						-- message that would have redelivered it was gone from the key.
-						-- One UpdateAsync, both halves, or neither.
 						--
 						-- Skipping the sweep leaves the update in storage, so the next
-						-- session is handed it again. A DUPLICATE delivery is recoverable
-						-- -- Scribe dedupes on ProcessedPurchaseIds for exactly this
-						-- reason -- and a dropped one is not, so at-least-once is the
-						-- only safe direction to fail in.
-						--
-						-- Leaving the ids in locked_global_updates is correct as well as
-						-- safe: processed() is the only thing that ever adds to it, the
+						-- session is handed it again. A duplicate delivery is recoverable
+						-- (Scribe dedupes on ProcessedPurchaseIds) and a dropped one is
+						-- not. Leaving the ids in locked_global_updates is safe: the
 						-- prune after the round trip drops an id once storage stops
-						-- listing it, and a release-only save is ending this session --
-						-- nothing reads the table again.
+						-- listing it, and a release-only save is ending this session.
 						if next(locked_updates) ~= nil and profile.scribe_release_only ~= true then
 							local i = 1
 							while i <= #active_updates do
@@ -1071,63 +971,48 @@ local function SaveProfileAsync(profile, is_ending_session, is_overwriting, last
 
 						-- SCRIBE PATCH: a release that deliberately writes no Data.
 						--
-						-- Scribe has three fail-closed load paths (a failed migration, a
-						-- rejected schema check, a refused load) whose whole promise is
-						-- that the stored bytes are left alone so the profile can be
-						-- inspected and recovered. Ending the session is what breaks that
-						-- promise: EndSession is SaveProfileAsync(..., is_ending_session),
-						-- and by the time those paths run, profile.Data has already been
-						-- through CoerceMapKeys, Reconcile, the version stamp and the whole
-						-- migration chain. Measured: a rejected profile came back with
-						-- template defaults backfilled into storage and the key version
-						-- advanced twice.
+						-- Scribe's three fail-closed load paths (a failed migration, a
+						-- rejected schema check, a refused load) promise the stored bytes
+						-- are left alone so the profile can be inspected and recovered.
+						-- Ending the session breaks that: EndSession is
+						-- SaveProfileAsync(..., is_ending_session), and by the time those
+						-- paths run, profile.Data has already been through CoerceMapKeys,
+						-- Reconcile, the version stamp and the whole migration chain.
+						-- Measured: a rejected profile came back with template defaults
+						-- backfilled into storage and the key version advanced twice.
 						--
 						-- The lock still has to be released or the player cannot rejoin
 						-- anywhere, so this writes MetaData and nothing else. Data,
 						-- RobloxMetaData and UserIds keep whatever is on the key.
 						if profile.scribe_release_only ~= true then
 							latest_data.Data = profile.Data
-							-- SCRIBE PATCH: WHICH table this write serialized.
+							-- SCRIBE PATCH: WHICH table this write serialized, recorded at WRITE
+							-- time. A caller that decided what its payload was when ITS OnSave fired
+							-- is describing the pointer as it stood at SNAPSHOT time, and the line
+							-- above reads it now; see the hazard note on SetSaveSource.
 							--
-							-- Recorded here, at WRITE time, for exactly the reason the
-							-- ReleaseOnly note below gives -- and this one is the case
-							-- SetSaveSource's own hazard note describes: "a swap affects
-							-- every transform that has not run yet, including ones whose
-							-- OnSave fired before the swap". A caller that decided what
-							-- its payload was when ITS OnSave fired is describing the
-							-- pointer as it stood at SNAPSHOT time, and the line above
-							-- reads it now.
-							--
-							-- The identity, not a verdict: the store has no idea what a
-							-- wipe guard is, and does not need one. It reports which table
-							-- went to the key and lets the caller compare that against
-							-- whatever it considers live.
+							-- The identity, not a verdict: the store has no idea what a wipe guard
+							-- is. It reports which table went to the key and lets the caller compare
+							-- that against whatever it considers live.
 							save_context.SavedSource = profile.Data
 							latest_data.RobloxMetaData = profile.RobloxMetaData
 							latest_data.UserIds = profile.UserIds
 						else
 							-- SCRIBE PATCH: tell the caller this write carried no Data.
 							--
-							-- The outcome of a release-only save is still "Saved", and
-							-- correctly so -- it IS a successful write, of MetaData. But an
-							-- AwaitSave that reads only the outcome therefore answers TRUE
-							-- for a save that put none of the caller's bytes on disk.
-							-- Scribe's monetization path returns PurchaseGranted on that
-							-- boolean and Roblox never retries a granted receipt, so the
-							-- lie is paid Robux for data that was never stored. Measured on
-							-- a prototype that set the flag on a Ready profile: one run
-							-- minted 40 coins, another destroyed 40.
+							-- The outcome of a release-only save is still "Saved", and correctly
+							-- so -- it IS a successful write, of MetaData. But an AwaitSave that
+							-- reads only the outcome therefore answers TRUE for a save that put
+							-- none of the caller's bytes on disk. Scribe's monetization path
+							-- returns PurchaseGranted on that boolean and Roblox never retries a
+							-- granted receipt, so the lie is paid Robux for data that was never
+							-- stored. Measured on a prototype that set the flag on a Ready profile:
+							-- one run minted 40 coins, another destroyed 40.
 							--
-							-- Recorded HERE, in the transform, rather than captured when
-							-- OnSave fired the way the wipe guard's Blocked flag is.
-							-- Blocked describes the payload at SNAPSHOT time, which is when
-							-- OnSave runs; release-only is decided at WRITE time, which is
-							-- here, and the two are not the same instant. A save already on
-							-- the wire when the flag was set writes no Data, and an
-							-- OnSave-time capture would still report that it did. That is
-							-- the per-profile-versus-per-save hazard SetSaveSource
-							-- documents, answered the way that note prescribes: anything
-							-- that must be per-call belongs in the per-call context table.
+							-- Recorded here in the transform rather than when OnSave fired:
+							-- release-only is decided at WRITE time, and a save already on the wire
+							-- when the flag was set writes no Data while an OnSave-time capture
+							-- would still report that it did.
 							save_context.ReleaseOnly = true
 						end
 
@@ -1175,6 +1060,10 @@ local function SaveProfileAsync(profile, is_ending_session, is_overwriting, last
 		if loaded_data ~= nil and key_info ~= nil then
 
 			if is_overwriting == true then
+				-- SCRIBE PATCH: the round trip returned, so an overwrite ends here having
+				-- written. Unreachable today (no caller passes is_overwriting), assigned so
+				-- it stays correct if one ever does.
+				outcome = "Saved"
 				break
 			end
 			
@@ -1202,6 +1091,11 @@ local function SaveProfileAsync(profile, is_ending_session, is_overwriting, last
 			-- If another server is trying to start a session for this profile - end the session:
 
 			if force_load_pending == true and session_owns_profile == true then
+				-- SCRIBE PATCH: report what THIS call achieved before handing over. The
+				-- transform wrote and the bytes are on the key; breaking with `outcome`
+				-- unassigned made `outcome or "Failed"` below report a failure for a save
+				-- that persisted, which AwaitSave, Data.Flush and the receipt path all read.
+				outcome = "Saved"
 				if is_active == true then
 					SaveProfileAsync(profile, true, false, "External")
 				end
@@ -1286,27 +1180,19 @@ local function SaveProfileAsync(profile, is_ending_session, is_overwriting, last
 			-- SCRIBE PATCH: drop the decoded response once the handlers have seen it.
 			--
 			-- LastSavedData is a SECOND FULL COPY of the profile, held for the life of
-			-- the session -- the table this round trip decoded, kept so an owner can
-			-- diff against what is stored.
+			-- the session. Measured: 200 deep copies of ~22 KB profiles raised the heap
+			-- counter by 18.2 MiB against the live set's 22.1 MiB -- 83%, and not 100%
+			-- because deep copies share interned strings while the table structure and
+			-- boxed values are duplicated in full.
 			--
-			-- WHAT IS MEASURED, AND WHAT IS NOT. Allocating 200 deep copies of ~22 KB
-			-- profiles alongside the live set raised the heap counter by 18.2 MiB
-			-- against the live set's 22.1 MiB -- 83%, and not 100% because deep copies
-			-- share interned strings while the table structure and boxed values are
-			-- duplicated in full. What is NOT measurable in this environment is whether
-			-- releasing hands that back: Luau exposes only collectgarbage("count") with
-			-- no forced collect, so an end-to-end comparison of two live sets measures
-			-- the collector's schedule instead -- attempted, and it returned a NEGATIVE
-			-- delta, which is how you know the method cannot answer it.
+			-- Whether releasing hands that back is NOT measurable here: Luau exposes only
+			-- collectgarbage("count") with no forced collect, so an end-to-end comparison
+			-- measures the collector's schedule instead, and it returned a NEGATIVE delta.
+			-- The claim that does not need the collector is that this table stops being
+			-- retained for the whole session and becomes collectable as soon as the save
+			-- that produced it is done with.
 			--
-			-- So the claim is the one that does not need the collector: this table stops
-			-- being RETAINED for the whole session and becomes collectable as soon as
-			-- the save that produced it is done with. The decode allocates it either
-			-- way.
-			--
-			-- An owner that only needs a SUMMARY of the last save (which top-level keys
-			-- it had, how big it was) can say so and stop paying for the rest. Released
-			-- AFTER OnAfterSave so the handler that computes the summary still receives
+			-- Released AFTER OnAfterSave so a handler computing a summary still receives
 			-- the real thing; opt-in, so an owner that says nothing is unaffected.
 			if profile.scribe_retain_last_saved == false then
 				profile.LastSavedData = RELEASED_LAST_SAVED
@@ -1459,17 +1345,15 @@ function Profile.New(raw_data, key_info, profile_store, key, is_mock, session_to
 		-- that to UpdateOfflineAsync. Every owning save stamps it, so a key that
 		-- moved between the read and the write fails the comparison.
 		LastUpdate = raw_data.MetaData and raw_data.MetaData.LastUpdate or 0,
-		-- SCRIBE PATCH: the fingerprint LastUpdate cannot be on its own. LastUpdate
-		-- has one-second granularity, so two writers off one snapshot whose first
-		-- commit lands inside that second both passed; and a view-mode SetAsync moves
-		-- neither LastUpdate nor SessionLoadCount at all, so it was invisible to the
-		-- comparison unconditionally. This counter moves on EVERY committing write.
+		-- SCRIBE PATCH: the fingerprint LastUpdate cannot be on its own -- it has
+		-- one-second granularity, and a view-mode SetAsync moves neither it nor
+		-- SessionLoadCount. This counter moves on EVERY committing write; the full
+		-- reasoning is at UpdateOfflineAsync.
 		--
 		-- `or 0` on read, and `or 0` on BOTH sides of the comparison in
 		-- UpdateOfflineAsync: a profile saved by an older build carries no WriteIndex,
 		-- and it must be exactly as permissive as it was before -- neither failing
-		-- every CAS nor passing every one. The first post-upgrade write installs 1,
-		-- which seals the key from then on.
+		-- every CAS nor passing every one. The first post-upgrade write installs 1.
 		WriteIndex = raw_data.MetaData and raw_data.MetaData.WriteIndex or 0,
 		Session = session and {PlaceId = session[1], JobId = session[2]},
 
@@ -1484,10 +1368,9 @@ function Profile.New(raw_data, key_info, profile_store, key, is_mock, session_to
 		--
 		-- OnSave and OnAfterSave cannot be paired up by an observer: OnSave fires per
 		-- call, OnAfterSave only on success, so a save that fails leaves the pair
-		-- unbalanced and anything counting in-flight saves leaks. That is not
-		-- hypothetical -- Scribe tracked "is a save in flight" in a single timestamp
-		-- slot, and a failure arriving after a concurrent success had cleared it was
-		-- dropped on the floor: LastResult stayed "Ok", Dirty stayed false, and
+		-- unbalanced and anything counting in-flight saves leaks. Scribe tracked that
+		-- in a single timestamp slot, and a failure arriving after a concurrent success
+		-- had cleared it was dropped: LastResult stayed "Ok", Dirty stayed false, and
 		-- SavesFailed never moved.
 		OnSettled = Signal.New(),
 		OnLastSave = Signal.New(),
@@ -1522,39 +1405,33 @@ end
 
 -- SCRIBE PATCH: has a save for this profile ever committed?
 --
--- Scribe needs this to tell a returning player who has simply never earned
--- anything from one whose FIRST session crashed before its save landed. Those look
--- identical by every other measure -- SessionLoadCount advances when a session
--- STARTS -- and treating the second as "returning" skips their legacy import and
--- their migrations, then saves an empty profile over the top as canonical.
+-- This tells a returning player who has simply never earned anything from one
+-- whose FIRST session crashed before its save landed. Those look identical by
+-- every other measure -- SessionLoadCount advances when a session STARTS -- and
+-- treating the second as "returning" skips their legacy import and their
+-- migrations, then saves an empty profile over the top as canonical.
 --
--- UserIds answers it, and the answer is a property of THIS module rather than of
--- the DataStore: the list is written to the key only as part of a completed save
--- (SaveProfileAsync's EditProfile, above), and neither key-minting path -- the
--- MissingProfileHandle in StartSessionAsync nor the one in GetAsync -- seeds it.
--- So a non-empty list proves a save committed. It was being read as `#p.UserIds > 0`
--- at the call site with that reasoning in a comment there; naming it here is what
--- makes the next upstream diff show whether the reasoning still holds.
+-- UserIds answers it, and the answer is a property of THIS module rather than
+-- of the DataStore: the list is written to the key only as part of a completed
+-- save (SaveProfileAsync's EditProfile, above), and neither key-minting path --
+-- the MissingProfileHandle in StartSessionAsync nor the one in GetAsync --
+-- seeds it.
 --
--- ONE LIMIT, and a caller relying on this has to know it: AddUserId no-ops for a
--- NEGATIVE user id outside mock (it refuses to hand Roblox's APIs one), so the
--- signal never accumulates for a profile keyed on one. A caller that mints negative
--- ids must exclude them itself.
+-- ONE LIMIT: AddUserId no-ops for a NEGATIVE user id outside mock (it refuses
+-- to hand Roblox's APIs one), so the signal never accumulates for a profile
+-- keyed on one. A caller that mints negative ids must exclude them itself.
 function Profile:HasCompletedSave()
 	return #self.UserIds > 0
 end
 
 -- SCRIBE PATCH: how many sessions have been STARTED for this profile.
 --
--- SessionLoadCount is incremented by the session-start transform, which a view does
--- not run: GetAsync passes EditProfile = nil, so a view of a profile that has been
--- loaded once reports 0 where a live load of the same profile reports 1. A caller
--- comparing the raw field against 1 to mean "brand new" therefore judges every
--- view brand new -- which for Scribe's dry-run mode meant stamping the current
--- version and skipping every migration, i.e. the dry run silently not exercising
--- the thing it exists to exercise.
---
--- Normalising it here rather than at the call site means the caller no longer has
+-- SessionLoadCount is incremented by the session-start transform, which a view
+-- does not run (GetAsync passes EditProfile = nil), so a view of a profile that
+-- has been loaded once reports 0 where a live load reports 1. A caller comparing
+-- the raw field against 1 to mean "brand new" therefore judges every view brand
+-- new -- which for Scribe's dry-run mode meant stamping the current version and
+-- skipping every migration. Normalising it here means the caller no longer has
 -- to know which mode it is in to read the number correctly.
 function Profile:SessionsStarted()
 	return self.SessionLoadCount + (if self.view_mode == true then 1 else 0)
@@ -1563,38 +1440,34 @@ end
 -- SCRIBE PATCH: keep, or stop keeping, the decoded response of each save.
 --
 -- `LastSavedData` is a full second copy of the profile, retained for the whole
--- session. Pass `false` and it is released once OnAfterSave has fired, becoming a
--- shared frozen empty table --
--- which reads as "no baseline" to anything that checks, rather than as stale data
--- that could be mistaken for the real thing. The handler still receives the real
--- table, so a summary can be taken there.
+-- session. Pass `false` and it is released once OnAfterSave has fired, becoming
+-- a shared frozen empty table, which reads as "no baseline" to anything that
+-- checks rather than as stale data that could be mistaken for the real thing.
+-- The handler still receives the real table, so a summary can be taken there.
 --
--- Retention is ON unless this is called, so nothing changes for an owner that does
--- not ask. Anything that needs the BYTES of the last save -- Scribe's wipe guard
--- under `WipeGuardPolicy = "Block"` writes them back as the save payload -- must
--- keep retention on.
+-- Retention is ON unless this is called. Anything that needs the BYTES of the
+-- last save -- Scribe's wipe guard under `WipeGuardPolicy = "Block"` writes them
+-- back as the save payload -- must keep retention on.
 function Profile:SetRetainLastSaved(retain)
 	self.scribe_retain_last_saved = retain ~= false
 end
 
 -- SCRIBE PATCH: choose the table this profile serializes from.
 --
--- Assigning profile.Data works and always has -- but WHEN it works is the part
--- nothing stated. SaveProfileAsync fires OnSave, and only afterwards does its
+-- Assigning profile.Data works and always has, but WHEN it works was stated
+-- nowhere: SaveProfileAsync fires OnSave, and only afterwards does its
 -- UpdateAsync transform read profile.Data, so a handler that swaps the pointer
 -- inside OnSave changes what that save writes. Scribe's wipe guard depends on
--- exactly that: it substitutes the last known-good snapshot for live data that
--- looks like a wipe, then swaps back when the guard clears.
+-- exactly that.
 --
--- THE HAZARD, which was written down nowhere. This is per-PROFILE, not per-save.
--- Saves overlap -- an autosave tick can start while a Flush is in flight -- and the
--- transform reads whatever the pointer holds when IT runs, so a swap affects every
--- transform that has not run yet, including ones whose OnSave fired before the
--- swap. Anything that must be per-call belongs in the OnSave context table instead
--- (Scribe records the wipe guard's verdict there for that reason).
+-- THE HAZARD: this is per-PROFILE, not per-save. Saves overlap -- an autosave
+-- tick can start while a Flush is in flight -- and the transform reads whatever
+-- the pointer holds when IT runs, so a swap affects every transform that has not
+-- run yet, including ones whose OnSave fired before the swap. Anything that must
+-- be per-call belongs in the OnSave context table instead.
 --
--- Validated the same way SaveProfileAsync validates it, so a bad value fails at the
--- assignment rather than at the next save with no clue who wrote it.
+-- Validated the same way SaveProfileAsync validates it, so a bad value fails at
+-- the assignment rather than at the next save with no clue who wrote it.
 function Profile:SetSaveSource(data)
 	if type(data) ~= "table" then
 		error(`[{script.Name}]: SetSaveSource expects a table (got {typeof(data)})`)
@@ -1606,9 +1479,7 @@ end
 --
 -- For the fail-closed load paths: release the lock so the player can rejoin
 -- elsewhere, but leave the stored bytes exactly as they were found. Everything
--- else about the release is unchanged -- the session field is cleared, the
--- message subscription is dropped, OnSessionEnd fires, and the write still
--- retries until it lands.
+-- else about the release is unchanged, including the retry until the write lands.
 function Profile:EndSessionWithoutSaving()
 	if self:IsActive() == true then
 		self.scribe_release_only = true
@@ -1721,10 +1592,9 @@ end
 
 -- SCRIBE PATCH: Save(), but yields and reports what happened to THIS call.
 --
--- Save() cannot answer that question and never could: it task.spawns the work and
--- returns immediately, so a caller can only watch OnAfterSave and guess which save
--- it belonged to. Guessing is what Scribe used to do, and it granted Robux
--- receipts on saves that were still in flight.
+-- Save() task.spawns the work and returns immediately, so a caller can only
+-- watch OnAfterSave and guess which save it belonged to. Guessing is what Scribe
+-- used to do, and it granted Robux receipts on saves that were still in flight.
 function Profile:SaveAwait(): (string, { [string]: any })
 
 	if self.view_mode == true then
@@ -1755,7 +1625,7 @@ local ProfileStore: ProfileStoreModule = {
 	-- Persistence's findProfileStoreModule. Takes a DataStore error message and
 	-- answers its class; MessageAsync reads it to decide whether a failed attempt
 	-- could have written. nil means "assume every failure might have", which is the
-	-- behaviour this file had before the hook existed. See the Dependencies note.
+	-- behaviour this file had before the hook existed.
 	ClassifyError = nil,
 	OnError = OnError, -- (message, store_name, profile_key)
 	OnOverwrite = OnOverwrite, -- (store_name, profile_key)
@@ -1769,12 +1639,10 @@ ProfileStore.__index = ProfileStore
 --
 -- BeginClose stops new work starting; AwaitClose releases whatever is still held
 -- and waits for every outstanding job. Between the two, Scribe runs its leaving
--- hooks and ends its own sessions -- which is the ordering this file cannot
--- provide on its own, because BindToClose callbacks run concurrently.
---
--- AwaitClose is still correct when the owner has already released everything: the
--- release loop finds nothing active and it degrades to the job-drain wait, which
--- is the part that keeps the process alive until saves land.
+-- hooks and ends its own sessions -- an ordering this file cannot provide on its
+-- own, because BindToClose callbacks run concurrently. With everything already
+-- released AwaitClose degrades to the job-drain wait, which is the part that
+-- keeps the process alive until saves land.
 function ProfileStore.BeginClose()
 	ProfileStore.IsClosing = true
 end
@@ -1805,33 +1673,31 @@ end
 
 -- SCRIBE PATCH: compare-and-set for an OFFLINE profile.
 --
--- The problem this exists for: writing to an absent player's key means reading it,
--- letting developer code decide what to change, then writing back. Developer code
--- can yield for as long as it likes, so the player can join a server inside that
--- window -- and a view SetAsync does not merely race for the value. The overwrite
--- path sets session_owns_profile = true unconditionally and clears ActiveSession,
--- so committing over a live session DISOWNS it: its next save writes nothing, its
+-- Writing to an absent player's key means reading it, letting developer code
+-- decide what to change, then writing back, and developer code can yield for as
+-- long as it likes, so the player can join a server inside that window. A view
+-- SetAsync does not merely race for the value: its overwrite path sets
+-- session_owns_profile = true unconditionally and clears ActiveSession, so
+-- committing over a live session DISOWNS it -- its next save writes nothing, its
 -- player is kicked, and everything since its last save is gone.
 --
--- Re-reading before writing narrows that to one round trip. It cannot close it,
--- because the check and the write are two calls. This makes them one.
---
--- The mutation still cannot happen in here -- an UpdateAsync transform must not
--- yield, and developer code does. So the caller prepares `new_data` outside and
--- this commits it only if the key still looks the way they read it:
+-- So the check and the write are made one UpdateAsync. The mutation still cannot
+-- happen in here, because a transform must not yield and developer code does; the
+-- caller prepares `new_data` outside and this commits it only if the key still
+-- looks the way they read it:
 --
 --   * still offline, and
 --   * unchanged since the read, compared on SessionLoadCount, LastUpdate AND
 --     WriteIndex. The first two alone were not enough: LastUpdate has one-second
 --     granularity, so two writers off one snapshot whose first commit lands inside
 --     that second both passed; and a view-mode SetAsync moves neither of them, so
---     an operator's RestoreVersion was invisible to the comparison at any timing.
---     WriteIndex moves on every committing write and closes both.
+--     an operator's RestoreVersion was invisible at any timing. WriteIndex moves
+--     on every committing write and closes both.
 --
--- "Still offline" means ActiveSession == nil, OR -- when the caller passes
+-- "Still offline" means ActiveSession == nil, or -- when the caller passes
 -- `options.StaleSessionAfter` -- a session whose LastUpdate is older than that,
--- which is the same rule StartSessionAsync uses to steal a dead session. Opt-in, so
--- the store's default stays conservative for any other consumer.
+-- the same rule StartSessionAsync uses to steal a dead session. Opt-in, so the
+-- store's default stays conservative for any other consumer.
 --
 -- Returns "Written" | "SessionActive" | "Changed" | "Missing" | "Failed".
 -- Unlike the view path, a decline writes NOTHING: the transform returns nil.
@@ -1866,11 +1732,9 @@ function ProfileStore:UpdateOfflineAsync(profile_key, expected, new_data, option
 				local last_update = latest_data.MetaData.LastUpdate
 				-- The same three clauses StartSessionAsync uses at its own steal
 				-- (ExistingProfileHandle, further down): no usable LastUpdate means
-				-- LIVE, because refusing is the safe direction.
-				--
-				-- Evaluated HERE rather than on the caller's pre-CAS GetAsync
-				-- snapshot: deciding staleness out there is exactly the read-then-
-				-- write race this whole function exists to close.
+				-- LIVE, because refusing is the safe direction. Evaluated HERE rather
+				-- than on the caller's pre-CAS snapshot, because deciding staleness out
+				-- there is exactly the read-then-write race this closes.
 				if
 					type(stale_after) ~= "number"
 					or type(last_update) ~= "number"
@@ -1881,11 +1745,10 @@ function ProfileStore:UpdateOfflineAsync(profile_key, expected, new_data, option
 					transform_params.AbortWrite = true
 					return
 				end
-				-- Past the dead-session threshold, so take the lock off the key --
-				-- the same disowning StartSessionAsync performs when it steals.
-				-- Leaving it set would let the incumbent's next save overwrite this
-				-- write wholesale, and Monetization has already answered
-				-- PurchaseGranted on it.
+				-- Past the dead-session threshold, so take the lock off the key, the
+				-- same disowning StartSessionAsync performs when it steals. Leaving it
+				-- set would let the incumbent's next save overwrite this write wholesale,
+				-- and Monetization has already answered PurchaseGranted on it.
 				latest_data.MetaData.ActiveSession = nil
 				latest_data.MetaData.ForceLoadSession = nil
 			end
@@ -1915,10 +1778,9 @@ function ProfileStore:UpdateOfflineAsync(profile_key, expected, new_data, option
 
 	if loaded_data == nil and transform_params.AbortWrite ~= true then
 		-- The call itself failed; whatever the transform decided is not authoritative
-		-- because it may never have run. Guarded on AbortWrite because a DECLINE now
-		-- also returns nil, and reporting an ordinary refusal as "Failed" would send
-		-- routine contention to Health and degrade the server to Outage -- the exact
-		-- regression HealthScope.spec exists to prevent.
+		-- because it may never have run. Guarded on AbortWrite because a DECLINE also
+		-- returns nil, and reporting an ordinary refusal as "Failed" would send routine
+		-- contention to Health and degrade the server to Outage.
 		return "Failed"
 	end
 
@@ -2058,12 +1920,11 @@ function ProfileStore.New(store_name, template)
 end
 
 -- SCRIBE PATCH: how far PAST the six-second boundary a DEFERRED nudge fires. One
--- frame, and the number is not arbitrary. The immediate path's test is `> 6`, so a
--- deferred fire landing exactly ON the boundary would sit on the equality case,
--- where float error rather than the code decides whether the spacing held. A frame
--- of extra spacing costs nothing; a fire landing one ulp early would be a rate
--- increase, however small, and bounding the rate is the only thing this throttle
--- is for.
+-- frame, and the number is not arbitrary: the immediate path's test is `> 6`, so
+-- a deferred fire landing exactly ON the boundary would sit on the equality case,
+-- where float error rather than the code decides whether the spacing held. A fire
+-- landing one ulp early would be a rate increase, and bounding the rate is the
+-- only thing this throttle is for.
 local NUDGE_FIRE_MARGIN = 1 / 60
 
 -- SCRIBE PATCH: a nudge that arrives inside the throttle window is DEFERRED, not
@@ -2072,30 +1933,23 @@ local NUDGE_FIRE_MARGIN = 1 / 60
 -- Upstream's `if os.clock() - last_roblox_message > 6 then` had no else branch, so
 -- a second message inside six seconds was discarded outright. That looks like a 6x
 -- delay and is not one. This nudge is the ONLY thing that gets a cross-server
--- request acted on quickly -- MessageAsync asking the holding server to "auto-save
--- sooner and receive the message", and a session steal asking it to release --
--- and losing it does not make the request six seconds late. It drops the request
+-- request acted on quickly -- MessageAsync asking the holding server to auto-save
+-- sooner, a session steal asking it to release -- so losing one drops the request
 -- off the ~1s path onto the next autosave: AUTO_SAVE_PERIOD, 300 seconds by
--- default. One discarded packet is a 300x cliff, and two servers touching the same
--- player within six seconds of each other is ordinary traffic, not an edge case.
+-- default. Two servers touching the same player within six seconds is ordinary
+-- traffic, not an edge case.
 --
--- WHAT IS DEFERRED IS THE REQUEST, NEVER THE SPACING. The six seconds exist to
--- protect the DataStore write budget -- the numPlayers x 10 figure named in the
--- comment below is what it is sized against -- so the deferred save fires when the
--- window expires and not a moment sooner, and every nudge that arrived during that
--- window collapses into that ONE save. The maximum save rate this subscription can
--- produce is therefore exactly what it was: one per window. Only the losses are
--- gone.
+-- WHAT IS DEFERRED IS THE REQUEST, NEVER THE SPACING. The six seconds protect the
+-- DataStore write budget (the numPlayers x 10 figure named below), so the deferred
+-- save fires when the window expires and not a moment sooner, and every nudge that
+-- arrived during it collapses into that ONE save. The maximum save rate is
+-- unchanged; only the losses are gone.
 --
--- ENDSESSION WINS THE MERGE. An ordinary nudge asks for a save; an EndSession nudge
--- asks for a release save, because another server is taking the session over.
--- Merging an EndSession down into an ordinary save would leave the lock held and
--- put the stealing server back on the SESSION_STEAL deadline -- the same cliff
--- moved somewhere else -- so the flag is sticky and the coalesced save is a
--- release. The merge the other way loses nothing: a release save writes Data too,
--- so an ordinary nudge's request is served by it. Urgency wins the MERGE and not
--- the WINDOW, deliberately: a release is a DataStore write like any other, and the
--- budget does not care what asked for it.
+-- ENDSESSION WINS THE MERGE. Merging an EndSession down into an ordinary save
+-- would leave the lock held and put the stealing server back on the SESSION_STEAL
+-- deadline, so the flag is sticky and the coalesced save is a release. The merge
+-- the other way loses nothing: a release save writes Data too. Urgency wins the
+-- MERGE and not the WINDOW: a release is a DataStore write like any other.
 local function RobloxMessageSubscription(profile, unique_session_id)
 
 	local last_roblox_message = 0
@@ -2137,13 +1991,11 @@ local function RobloxMessageSubscription(profile, unique_session_id)
 						pending_end_session = false
 						-- ServeNudge's profile:IsActive() test is evaluated HERE, at FIRE time,
 						-- and routing through it is the point. A session can end between a nudge
-						-- arriving and its window expiring -- the player left, another server
-						-- stole the lock, this one began closing -- and a save fired on a dead
-						-- profile is a write from a session that no longer owns the key. Nothing
-						-- cancels this timer, because Disconnect on the subscription cannot reach
-						-- it, so that test is what retires it. It is also why the timer is
-						-- one-shot and never re-arms itself: the longest it can outlive a session
-						-- is the one window it was already waiting out.
+						-- arriving and its window expiring, and a save fired on a dead profile is
+						-- a write from a session that no longer owns the key. Nothing cancels this
+						-- timer -- Disconnect on the subscription cannot reach it -- so that test
+						-- is what retires it, and it is why the timer is one-shot: the longest it
+						-- can outlive a session is the one window it was already waiting out.
 						ServeNudge(end_session)
 					end)
 				end
@@ -2449,11 +2301,10 @@ function ProfileStore:MessageAsync(profile_key, message)
 
 	if ProfileStore.IsClosing == true then
 		-- SCRIBE PATCH: PROVABLY CLEAN. This guard sits above WaitForStoreReady and
-		-- above the retry loop: zero attempts, zero UpdateAsync calls, nothing
-		-- written and no way to have written anything. It used to answer the same
-		-- bare `false` as the loop's give-up below, which is the opposite case, and
-		-- Scribe's gift-credit spend ate a paid credit here for a delivery it never
-		-- made. See the note on `provably_clean` below.
+		-- above the retry loop: zero attempts, nothing written and no way to have
+		-- written anything. It used to answer the same bare `false` as the loop's
+		-- give-up below, which is the opposite case, and Scribe's gift-credit spend ate
+		-- a paid credit here for a delivery it never made.
 		return false, nil, true
 	end
 
@@ -2461,43 +2312,34 @@ function ProfileStore:MessageAsync(profile_key, message)
 
 	local exp_backoff = 1
 
-	-- SCRIBE PATCH: `provably_clean`, the third return, and the evidence it is made of.
+	-- SCRIBE PATCH: `provably_clean`, the third return.
 	--
 	-- A caller with money on the line needs the one thing this method used to
-	-- collapse: COULD ANYTHING HAVE BEEN WRITTEN? Neither of the two values it
-	-- returned answers that. A bare `false` came from the IsClosing guard above,
-	-- which attempts nothing, and from the end of the loop below, whose attempts may
-	-- each have committed before erroring. `(false, "QueueFull")` describes the
-	-- attempt that ANSWERED -- the transform ran, saw the cap and declined -- and
-	-- says nothing about the attempts before it in the same call.
-	--
-	-- Both directions were measured wrong in Scribe: a gift credit refunded on a
-	-- QueueFull that followed a commit bought a SECOND grant off one payment, and a
-	-- credit spent inside a shutdown window was eaten for a send never attempted.
+	-- collapse: COULD ANYTHING HAVE BEEN WRITTEN? Neither of the two old values
+	-- answers it. A bare `false` came from the IsClosing guard above, which attempts
+	-- nothing, and from the end of the loop below, whose attempts may each have
+	-- committed before erroring. `(false, "QueueFull")` describes the attempt that
+	-- ANSWERED and says nothing about the attempts before it in the same call. Both
+	-- directions were measured wrong in Scribe: a gift credit refunded on a QueueFull
+	-- that followed a commit bought a SECOND grant off one payment, and a credit spent
+	-- inside a shutdown window was eaten for a send never attempted.
 	--
 	-- So the third value is a POSITIVE claim: true only where nothing can have been
-	-- written. Absent reads as false, and false means "cannot be sure", which is the
-	-- cheap direction -- an old caller, an old test double, or an exit added later
-	-- that forgets the value all fall back to "do not assume this failed".
+	-- written. Absent reads as false, and false means "cannot be sure" -- the cheap
+	-- direction for an old caller, an old test double, or an exit added later that
+	-- forgets the value.
 	--
-	-- IT IS NOT AN ATTEMPT COUNT, AND A COUNT IS WHAT MADE IT COST THE WRONG WAY.
-	-- This was `attempts == 1` at the QueueFull exit and `attempts == 0` at the
-	-- give-up, which asks "was there a previous attempt?" instead of "could a
-	-- previous attempt have written?". The loop repeats while UpdateAsync answers
-	-- nil, and it answers nil for EVERY failure class -- including the two that never
-	-- reach storage. So one 3xx throttle in front of an ordinary full inbox turned a
-	-- provably clean call into an ambiguous one and ate the buyer's paid gift credit,
-	-- and a give-up after nothing but throttles reported doubt about a key that was
-	-- never even minted. Measured end to end, both.
+	-- IT IS NOT AN ATTEMPT COUNT, and a count is what made it cost the wrong way: it
+	-- asks "was there a previous attempt?" instead of "could a previous attempt have
+	-- written?". The loop repeats while UpdateAsync answers nil, and it answers nil for
+	-- EVERY failure class, including the two that never reach storage, so one 3xx
+	-- throttle in front of an ordinary full inbox ate a buyer's paid gift credit.
 	--
-	-- What replaces it is the error itself, classified once per failed attempt by the
-	-- module Scribe already has for this (see the require at the top of the file).
-	-- Only "Rejected" (1xx: bad key, unencodable or oversize value -- refused before
-	-- storage and refused identically forever) and "Throttled" (3xx: the request was
-	-- dropped at the queue, never dispatched) are proof that an attempt wrote nothing.
-	-- "Unresolved" (504) is the case that cannot be proven either way, and "Failed"
-	-- is the safe default for a code nobody has classified yet, so an error family
-	-- Roblox adds tomorrow lands on "cannot be sure" rather than on a false claim.
+	-- What replaces it is the error itself, classified once per failed attempt. Only
+	-- "Rejected" (1xx: refused before storage, and refused identically forever) and
+	-- "Throttled" (3xx: dropped at the queue, never dispatched) prove an attempt wrote
+	-- nothing. "Unresolved" (504) cannot be proven either way, and "Failed" is the safe
+	-- default, so an error family Roblox adds tomorrow lands on "cannot be sure".
 	local provably_clean = true
 
 	while ProfileStore.IsClosing == false do
@@ -2524,23 +2366,18 @@ function ProfileStore:MessageAsync(profile_key, message)
 
 					-- SCRIBE PATCH: REFUSE at the cap instead of evicting.
 					--
-					-- This was `table.insert` followed by
-					-- `while #update_list > MAX_MESSAGE_QUEUE do table.remove(update_list, 1) end`
-					-- -- which drops the OLDEST entry and still returns true. Measured
-					-- with the cap at 8 and 12 sends: every call reported success and
-					-- the recipient received only sequences 5..12. Scribe's gift
-					-- delivery treats that true as durable and clears the buyer's
-					-- escrow, so a PURCHASED gift was destroyed with nothing recording
-					-- it anywhere. Gifts and Data.SendMessage share this channel.
+					-- This was a `table.insert` followed by a loop dropping the OLDEST entry,
+					-- which still returned true. Measured with the cap at 8 and 12 sends: every
+					-- call reported success and the recipient received only sequences 5..12.
+					-- Scribe's gift delivery treats that true as durable and clears the buyer's
+					-- escrow, so a PURCHASED gift was destroyed with nothing recording it
+					-- anywhere. Gifts and Data.SendMessage share this channel.
 					--
-					-- The reason to refuse is that the eviction is SILENT, not that the
-					-- key is nearly full: a thousand gift-shaped messages is about
-					-- 136 KB, 3.4% of the 4 MB key.
-					--
-					-- No trim loop for a key inherited OVER the cap from an older
-					-- build, either: trimming it here is the same silent drop. It stays
-					-- over cap, refusing sends, until its acks sweep it -- which is
-					-- visible, and recoverable.
+					-- The reason to refuse is that the eviction is SILENT, not that the key is
+					-- nearly full: a thousand gift-shaped messages is about 136 KB, 3.4% of the
+					-- 4 MB key. No trim loop for a key inherited OVER the cap from an older
+					-- build either, for the same reason -- it stays over cap, refusing sends,
+					-- until its acks sweep it, which is visible and recoverable.
 					if #update_list >= MAX_MESSAGE_QUEUE then
 						transform_params.QueueFull = true
 						transform_params.AbortWrite = true
@@ -2559,30 +2396,22 @@ function ProfileStore:MessageAsync(profile_key, message)
 		-- A RAISE OUT OF UpdateAsync IS NOT AN EXIT OF THIS FUNCTION, it is an exit of
 		-- the CALL, and it carries no third value at all. UpdateAsync pcalls the
 		-- DataStore itself, so what can still raise through here is the per-key update
-		-- queue around it and any OnError handler running inside RegisterError --
-		-- either of which can fire after an attempt that may have committed. The
-		-- caller's pcall gets no `provably_clean`, reads absent as false, and treats
-		-- the call as ambiguous. That is both the correct reading and the cheap one.
+		-- queue and any OnError handler inside RegisterError, either of which can fire
+		-- after an attempt that may have committed. The caller's pcall reads absent as
+		-- false and treats the call as ambiguous, which is both correct and cheap.
 		local loaded_data = UpdateAsync(self, profile_key, transform_params, is_mock)
 
 		if transform_params.QueueFull == true then
 			-- Nothing was written BY THE ATTEMPT THAT ANSWERED: the transform ran, saw
 			-- the cap, set AbortWrite and returned nil, so the UpdateAsync it sat inside
-			-- committed nothing at all (see the AbortWrite patches in the transform and
-			-- in UpdateAsync). A boolean-plus-reason keeps every existing caller
-			-- source-compatible while letting one that cares tell a full inbox from a
-			-- DataStore fault.
+			-- committed nothing at all. The reason keeps existing callers source-compatible
+			-- while letting one that cares tell a full inbox from a DataStore fault.
 			--
-			-- `provably_clean` is what turns that into a statement about the CALL, and
-			-- it is carried in from the attempts BEFORE this one rather than inferred
-			-- from how many there were. This loop repeats while UpdateAsync answers nil
-			-- -- which is what a write that committed and then lost its reply leaves
-			-- behind, and equally what a request refused at the throttle queue leaves
-			-- behind -- and re-runs the cap check inside a fresh transform every pass.
-			-- So a QueueFull on a LATER pass can be a refusal reported for a message an
-			-- EARLIER pass of this same call already queued, and the caller must not
-			-- read that as clean; but a QueueFull behind nothing but rejections and
-			-- throttles still IS clean, and a caller holding paid value may act on it.
+			-- `provably_clean` turns that into a statement about the CALL, and it is carried
+			-- in from the attempts BEFORE this one: a QueueFull on a later pass can be a
+			-- refusal reported for a message an earlier pass of this same call already
+			-- queued, and the caller must not read that as clean; but a QueueFull behind
+			-- nothing but rejections and throttles still IS clean.
 			return false, "QueueFull", provably_clean
 		end
 
@@ -2615,14 +2444,11 @@ function ProfileStore:MessageAsync(profile_key, message)
 		else
 
 			-- SCRIBE PATCH: classify the attempt that just failed, before backing off.
-			-- `Rejected` and `Throttled` are the two classes that provably never
-			-- reached storage, so an attempt in either of them leaves the call as clean
-			-- as it found it. Everything else -- `Unresolved` (504, the write may have
-			-- landed), `Failed`, and an error with no code at all -- settles the claim
-			-- to false for the rest of the call, and there is no way back: once one
-			-- attempt might have written, no later attempt can unprove it.
-			--
-			-- No classifier installed means no class, and no class means no proof.
+			-- `Rejected` and `Throttled` provably never reached storage, so an attempt in
+			-- either leaves the call as clean as it found it. Everything else settles the
+			-- claim to false for the rest of the call, with no way back: once one attempt
+			-- might have written, no later attempt can unprove it. No classifier installed
+			-- means no class, and no class means no proof.
 			local classify = ProfileStore.ClassifyError
 			local class = if classify ~= nil then classify(transform_params.ErrorMessage) else nil
 			if class ~= "Rejected" and class ~= "Throttled" then
@@ -2636,12 +2462,11 @@ function ProfileStore:MessageAsync(profile_key, message)
 
 	end
 
-	-- SCRIBE PATCH: the give-up exit. AMBIGUOUS whenever any attempt could have
-	-- written -- the loop ended at BindToClose after attempts that may each have
-	-- committed before erroring -- and clean otherwise, which covers two cases and
-	-- not one: IsClosing can flip while WaitForStoreReady yields, in which case the
-	-- loop body never ran at all; and a loop that ran only into rejections and
-	-- throttles never reached storage either, on a key that may not even exist.
+	-- SCRIBE PATCH: the give-up exit. Ambiguous whenever any attempt could have
+	-- written, and clean otherwise -- which covers two cases and not one: IsClosing
+	-- can flip while WaitForStoreReady yields, so the loop body never ran at all; and
+	-- a loop that ran only into rejections and throttles never reached storage either,
+	-- on a key that may not even exist.
 	return false, nil, provably_clean
 
 end
@@ -3137,18 +2962,17 @@ task.spawn(function()
 		-- profile immediately -- RemoveProfileFromAutoSave runs synchronously inside
 		-- SaveProfileAsync, before any DataStore call -- while Scribe's drain first
 		-- collects the sessions whose profile is still IsActive() so it can run each
-		-- player's OnPlayerLeaving hook before ending them. Whoever is invoked first
-		-- wins outright, because neither yields before it has taken what it needs.
+		-- player's leaving hook. Whoever is invoked first wins outright, because
+		-- neither yields before it has taken what it needs.
 		--
-		-- Measured: with this handler first, ZERO leaving hooks run. Not "they run and
-		-- their writes are lost" -- the drain's list comes back empty, so it skips
-		-- nothing and reports nothing. It only works today because this registration
-		-- waits behind `while DataStoreState == "NotReady"` (a DataStore round trip)
-		-- while Scribe's happens during construction. A game that builds Scribe lazily
-		-- gets the other order.
+		-- Measured: with this handler first, ZERO leaving hooks run -- the drain's list
+		-- comes back empty, so it skips nothing and reports nothing. It only works today
+		-- because this registration waits behind `while DataStoreState == "NotReady"` (a
+		-- DataStore round trip) while Scribe's happens during construction; a game that
+		-- builds Scribe lazily gets the other order.
 		--
-		-- So the owner takes it over instead of racing it: BeginClose() then, after
-		-- its hooks have run and its sessions are ended, AwaitClose().
+		-- So the owner takes it over instead of racing it: BeginClose(), then AwaitClose()
+		-- once its hooks have run and its sessions are ended.
 		if ProfileStore.ExternalShutdown == true then
 			return
 		end

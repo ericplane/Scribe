@@ -25,9 +25,8 @@ return Scribe({
 
 Two smaller options often ride along. `ResetData = true` loads every profile as template defaults and is **destructive**, so keep it out of anything you might publish. `Banner = false` silences the one-line startup message.
 
-:::caution Not saving at all, in any mode?
-Check **File, Experience Settings, Security, "Enable Studio Access to API Services"** before you debug anything else. With it off, ProfileStore falls back to an in-memory store on its own and prints `[ProfileStore]: Roblox API services unavailable - data will not be saved`, so `Mode = "Live"` behaves like `"Mock"` and nothing in your options table will change it.
-:::
+!!! warning "Not saving at all, in any mode?"
+    Check **File, Experience Settings, Security, "Enable Studio Access to API Services"** before you debug anything else. With it off, ProfileStore falls back to an in-memory store on its own and prints `[ProfileStore]: Roblox API services unavailable - data will not be saved`, so `Mode = "Live"` behaves like `"Mock"` and nothing in your options table will change it.
 
 ??? note "The older UseMock and DontSave flags"
     `UseMock`, `DontSave` and `ViewedUserId` still work and map onto the three modes above, so an existing config keeps running. A new config never needs them. Set `Mode` alongside one of them and `Mode` wins, with a `MODE_OVERRIDES_LEGACY` warning at startup. See [configuration](./configuration#persistence-mode).

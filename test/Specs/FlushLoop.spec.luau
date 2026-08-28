@@ -38,6 +38,19 @@ return function()
 		return player, entry, data
 	end
 
+	--- Step until the loop has settled.
+	---
+	--- One Step is one flush headless, where the harness fires the signal itself, and
+	--- a real frame in Studio, where the engine schedules it. So a single Step pins
+	--- nothing there: a write can land on the frame after the one Step waited for. Only
+	--- the op count across a settled burst is answerable in both, which is what the
+	--- header above says and what opsFor exists for.
+	local function settle(harness)
+		for _ = 1, 5 do
+			harness.Step()
+		end
+	end
+
 	describe("PostSimulation flush loop", function()
 		it("flushes a queued write without any hand-called FlushEntry", function()
 			local harness = TestCtx.make()
@@ -72,7 +85,13 @@ return function()
 			harness.Cleanup()
 		end)
 
-		it("flushes every entry in one step, not just the first", function()
+		it("flushes every entry in ONE pass, not one per frame", function()
+			-- Asserted on the loop's OWN metric rather than on frame counts. A loop that
+			-- broke after the first entry still reaches all three eventually, one per
+			-- frame, so op counts cannot tell the two apart: proved by mutation, which
+			-- an earlier op-counting version of this case failed to catch. What only the
+			-- metric answers is how many entries a SINGLE pass flushed.
+			local Metrics = require(Root.Scribe.Internal.Metrics)
 			local harness = TestCtx.make()
 			local p1, _, d1 = ready(harness, 7103)
 			local p2, _, d2 = ready(harness, 7104)
@@ -82,14 +101,21 @@ return function()
 			local b2 = #harness.FramesFor(p2, Wire.Frames.Diff)
 			local b3 = #harness.FramesFor(p3, Wire.Frames.Diff)
 
+			Metrics.Reset()
 			d1.Coins.Set(1)
 			d2.Coins.Set(2)
 			d3.Coins.Set(3)
-			harness.Step()
+			settle(harness)
 
-			expect(#harness.FramesFor(p1, Wire.Frames.Diff)).to.equal(b1 + 1)
-			expect(#harness.FramesFor(p2, Wire.Frames.Diff)).to.equal(b2 + 1)
-			expect(#harness.FramesFor(p3, Wire.Frames.Diff)).to.equal(b3 + 1)
+			local o1 = opsFor(harness, p1, b1, "Coins")
+			local o2 = opsFor(harness, p2, b2, "Coins")
+			local o3 = opsFor(harness, p3, b3, "Coins")
+			local perFrame = Metrics.Get().FlushEntriesPerFrame
+			expect(
+				`{#o1},{#o2},{#o3} value={o1[1].Value},{o2[1].Value},{o3[1].Value} inOnePass={tostring(
+					perFrame ~= nil and perFrame.Max
+				)}`
+			).to.equal("1,1,1 value=1,2,3 inOnePass=3")
 
 			harness.Cleanup()
 		end)
@@ -113,17 +139,20 @@ return function()
 			harness.Cleanup()
 		end)
 
-		it("leaves the queue empty after a step, so a second step is silent", function()
+		it("drains the queue, so a flushed write is never re-sent", function()
+			-- The invariant is that a write leaves the queue once, not that any
+			-- particular step is the silent one. Five steps against one write must
+			-- still produce exactly one op: a queue that did not drain would re-send it
+			-- on every later frame.
 			local harness = TestCtx.make()
 			local player, _, data = ready(harness, 7107)
 
+			local before = #harness.FramesFor(player, Wire.Frames.Diff)
 			data.Coins.Set(9)
-			harness.Step()
-			local after = #harness.FramesFor(player, Wire.Frames.Diff)
-			harness.Step()
-			-- The queue is drained, so a second step re-sends nothing of ours. Scoped
-			-- to Coins ops rather than total frames, which other subsystems can add to.
-			expect(#opsFor(harness, player, after, "Coins")).to.equal(0)
+			settle(harness)
+
+			local coins = opsFor(harness, player, before, "Coins")
+			expect(`{#coins} value={tostring(coins[1] and coins[1].Value)}`).to.equal("1 value=9")
 
 			harness.Cleanup()
 		end)

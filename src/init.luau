@@ -1,10 +1,8 @@
 --!strict
 -- Scribe: persistent, fully-typed, automatically-replicated player data for Roblox
--- Luau, built on ProfileStore. One shared module declares the template and options
--- and returns { Server, Client }.
---
--- The typed accessor tree needs the new Luau type solver; without it the library
--- still runs correctly (use `.Raw` as the untyped escape hatch).
+-- Luau, built on ProfileStore. One shared module declares the template and options and
+-- returns { Server, Client }. The typed accessor tree needs the new Luau type solver;
+-- without it the library still runs correctly (use `.Raw` as the untyped escape hatch).
 
 local RunService = game:GetService("RunService")
 
@@ -17,6 +15,11 @@ local Metrics = require(script.Internal.Metrics)
 local Health = require(script.Internal.Health)
 local Config = require(script.Internal.Config)
 local Budget = require(script.Internal.Budget)
+-- Named BigMath because `Scribe.Big` is the declarator; this is the arithmetic.
+local BigMath = require(script.Internal.Big)
+-- Types only. Both are leaf modules with no services, so this is safe on the client.
+local Exchange = require(script.Internal.Exchange)
+local ExchangeLegType = require(script.Internal.ExchangeLeg)
 
 export type ScribeTransport = Types.ScribeTransport
 export type Op = Types.Op
@@ -27,6 +30,9 @@ export type LogCategory = Types.LogCategory
 export type Status = Types.Status
 export type SaveInfo = Types.SaveInfo
 export type BudgetSnapshot = Budget.Snapshot
+export type ExchangeLeg = ExchangeLegType.Leg
+export type OpenExchange = Exchange.OpenExchange
+export type OpenLeg = Exchange.OpenLeg
 export type LifecycleReason = Types.LifecycleReason
 export type RequestReason = Types.RequestReason
 export type PurchaseReason = Types.PurchaseReason
@@ -79,10 +85,10 @@ export type function ValueType(T)
 		return t
 	end
 
-	-- Recursion budget. A self-referential template type would otherwise blow the
-	-- type-function stack, degrading the whole accessor tree to an error type. One
-	-- past Util.MAX_VALUE_DEPTH, so it can never bind before the runtime does and
-	-- only a cyclic type is ever cut off. Matches StatPathsType's cap below.
+	-- Recursion budget: a self-referential template type would blow the type-function
+	-- stack, degrading the whole accessor tree to an error type. One past
+	-- Util.MAX_VALUE_DEPTH, so it can never bind before the runtime does and only a
+	-- cyclic type is cut off. Matches StatPathsType's cap below.
 	local MAX_DEPTH = 25
 
 	-- One shared Scribe.Big type for the whole template. Luau resolves `<` and `<=`
@@ -104,11 +110,11 @@ export type function ValueType(T)
 		bigProps[ts.singleton("ToNumber")] = ts.newfunction({ head = { ts.any } }, { head = { ts.number } })
 		bigProps[ts.singleton("Log10")] = ts.newfunction({ head = { ts.any } }, { head = { ts.number } })
 
-		-- The metamethods must be typed over this table with its metatable, so the
-		-- table is built first and the metatable attached after. Typed over a
-		-- metatable-less copy they describe a different type from the one Get returns,
-		-- and every operator becomes an error. Operands are widened to the union those
-		-- methods accept, because BIG_MT resolves both sides through Big.from.
+		-- The metamethods must be typed over this table with its metatable, so the table
+		-- is built first and the metatable attached after. Typed over a metatable-less
+		-- copy they describe a different type from the one Get returns, and every
+		-- operator becomes an error. Operands widen to the union those methods accept,
+		-- because BIG_MT resolves both sides through Big.from.
 		local big = ts.newtable(bigProps, nil, nil)
 		-- Pow returns the big type itself, so it cannot go in bigProps: ts.newtable
 		-- snapshots that table. setproperty on the live type object instead.
@@ -210,11 +216,10 @@ export type function ValueType(T)
 		end
 		local t = widen(rawType)
 
-		-- The Scribe.ServerOnly marker has to come off first: every declarator check
-		-- below reads a marker off `t`, so with the wrapper still on,
-		-- ServerOnly(SetOf/Big/Flags/Timed) matches none of them and the node loses its
-		-- whole declarator surface. A second unwrap after the SetOf block handles the
-		-- inverse nesting, e.g. Scribe.Timed(Scribe.ServerOnly(false)).
+		-- The Scribe.ServerOnly marker has to come off first: every declarator check below
+		-- reads a marker off `t`, so with the wrapper on, ServerOnly(SetOf/Big/Flags/Timed)
+		-- matches none of them and the node loses its declarator surface. A second unwrap
+		-- after the SetOf block handles the inverse nesting, e.g. Timed(ServerOnly(false)).
 		if t:is("table") then
 			local inner = t:readproperty(ts.singleton("__scribeServerOnly"))
 			if inner ~= nil then
@@ -233,7 +238,6 @@ export type function ValueType(T)
 			end
 		end
 
-		-- Scribe.Timed fields carry a { __scribeTimed: V } marker type.
 		local isTimed = false
 		if t:is("table") then
 			local inner = t:readproperty(ts.singleton("__scribeTimed"))
@@ -270,11 +274,10 @@ export type function ValueType(T)
 			end
 		end
 
-		-- Scribe.MapOf carries its key type as a singleton, the only way to tell a
-		-- sparse {[number]: V} map from an array: at the type level those are the same
-		-- indexer. Last, so a map wrapped in Scribe.ServerOnly is still seen as a map.
-		-- `t` stays the whole map, not its element; only the element is pulled back
-		-- out, for the key events and Remove.
+		-- Scribe.MapOf carries its key type as a singleton, the only way to tell a sparse
+		-- {[number]: V} map from an array: at the type level those are the same indexer.
+		-- Last, so a map wrapped in Scribe.ServerOnly is still seen as a map. `t` stays the
+		-- whole map; only the element is pulled back out, for the key events and Remove.
 		local mapKey: type? = nil
 		local mapValue: type? = nil
 		local mapElement: type? = nil
@@ -296,10 +299,10 @@ export type function ValueType(T)
 			props[ts.singleton(name)] = ty
 		end
 
-		-- Static children and container methods first, so the common node methods below
-		-- win on name collisions. Maps are excluded: their own block builds the same
-		-- surface with the declared key type, and two ts.singleton("Remove") calls are
-		-- distinct keys, so letting a map through here duplicates rather than overrides.
+		-- Static children and container methods first, so the common node methods below win
+		-- on name collisions. Maps are excluded: their own block builds the same surface
+		-- with the declared key type, and two ts.singleton("Remove") calls are distinct
+		-- keys, so letting a map through here duplicates rather than overrides.
 		if t:is("table") and mapKey == nil and not isTimed and not isFlags and not isSet and not isBig then
 			for key, prop in t:properties() do
 				local childType = prop.read or prop.write
@@ -363,9 +366,8 @@ export type function ValueType(T)
 			if #childKeys > 0 then
 				-- (key, new, old), matching Changed's new-first order. Both values are
 				-- optional: an added key has no old, a removed key has no new. On a
-				-- heterogeneous static table they widen to a union Luau will not narrow
-				-- from the key, which is accepted; that node kind has exact per-field
-				-- leaf listeners already.
+				-- heterogeneous static table they widen to a union Luau will not narrow from
+				-- the key, which is accepted; that node kind has exact per-field listeners.
 				local childKey = ts.unionof(table.unpack(childKeys))
 				local childValue = optional(ts.unionof(table.unpack(childValues)))
 				add("OnChildChanged", fn({ fn({ childKey, childValue, childValue }, {}) }, { disconnectType }))
@@ -388,10 +390,9 @@ export type function ValueType(T)
 
 		-- Common node methods.
 		add("Get", fn({}, { valueType }))
-		-- The root accessor cannot be Set or Updated at runtime, so those are left off
-		-- the root type and the typed API matches. A big field declares its own wider
-		-- Set and Update below; adding them here too would duplicate rather than
-		-- override, since two ts.singleton("Set") calls are distinct keys.
+		-- The root accessor cannot be Set or Updated at runtime, so those are left off the
+		-- root type. A big field declares its own wider Set and Update below; adding them
+		-- here too would duplicate rather than override, as the singletons are distinct keys.
 		if not isRoot and not isBig and not isDerived then
 			-- Writes take the unbranded shape: a caller writing a plain table literal
 			-- has no way to produce a map's metatable brand. Reads still hand back the
@@ -472,10 +473,10 @@ export type function ValueType(T)
 end
 
 -- Union of every static rankable leaf path in the template, dot-joined ("Coins",
--- "Stats.Wins"), for leaderboard `Stat` and purchase cost paths. Dynamic segments
--- cannot be enumerated at type level, so those paths must be cast to `any`; falls
--- back to plain `string` when the template has no such leaf. `IncludeBig` is true
--- for leaderboards and false for cost paths, which must be plain numbers.
+-- "Stats.Wins"), for leaderboard `Stat` and purchase cost paths. Dynamic segments cannot
+-- be enumerated at type level, so those paths must be cast to `any`; falls back to plain
+-- `string` when the template has no such leaf. `IncludeBig` is true for leaderboards and
+-- false for cost paths, which must be plain numbers.
 -- selene: allow(undefined_variable)
 export type function StatPathsType(T, IncludeBig)
 	local ts = types
@@ -537,16 +538,15 @@ export type function StatPathsType(T, IncludeBig)
 			end
 		end
 		if t:is("table") and isMapMarker(t) then
-			-- A map's entries live under dynamic keys, which cannot be enumerated at
-			-- type level. Recursing would offer the unaddressable
-			-- "Field.__scribeMapValue" as a path.
+			-- A map's entries live under dynamic keys, which cannot be enumerated at type
+			-- level. Recursing would offer the unaddressable "Field.__scribeMapValue".
 			return
 		end
 		if t:is("table") and isBigMarker(t) then
-			-- Always terminal: a big's type is its real shape, so recursing would expose
-			-- the object's own M and E and offer "Coins.M" as a stat path. When a big
-			-- counts, the field itself is the path, or a template whose only rankable
-			-- field is big produces an empty union and collapses the gate to `string`.
+			-- Always terminal: a big's type is its real shape, so recursing would expose the
+			-- object's own M and E and offer "Coins.M" as a stat path. When a big counts, the
+			-- field itself is the path, or a template whose only rankable field is big
+			-- produces an empty union and collapses the gate to `string`.
 			if includeBig and prefix ~= "" then
 				table.insert(paths, ts.singleton(prefix))
 			end
@@ -752,9 +752,8 @@ export type function ServerDataType(T, P)
 	entryProps[ts.singleton("Rank")] = ts.number
 	entryProps[ts.singleton("UserId")] = ts.number
 	entryProps[ts.singleton("Name")] = ts.string
-	-- `number | BigScore`, not `number`: a Scribe.Big board hands back the big itself,
-	-- and the board's kind is a runtime property of the name passed in, so the type
-	-- cannot pick one and the caller narrows.
+	-- `number | BigScore`: a Scribe.Big board hands back the big itself, as in
+	-- ClientDataType above.
 	local bigScoreProps: { [type]: type } = {}
 	bigScoreProps[ts.singleton("M")] = ts.number
 	bigScoreProps[ts.singleton("E")] = ts.number
@@ -828,11 +827,10 @@ export type function ServerDataType(T, P)
 	add("GetVersion", fn({ ts.number, ts.string }, { optAnyTable }))
 	add("RestoreVersion", fn({ ts.number, ts.string, restoreOpts }, boolAndReason))
 
-	-- Command(name, spec?, handler): the spec shape and the handler's `player` param
-	-- are typed; per-arg types cannot be recovered, since the Args literals widen.
-	-- Args elements are `any` rather than `string` because Commands.Register also
-	-- accepts declarators and shape tables, and validates the entries itself at
-	-- register time.
+	-- Command(name, spec?, handler): the spec shape and the handler's `player` param are
+	-- typed; per-arg types cannot be recovered, since the Args literals widen. Args
+	-- elements are `any` rather than `string` because Commands.Register also accepts
+	-- declarators and shape tables, and validates the entries itself at register time.
 	local commandArgs = ts.newtable(nil, { index = ts.number, readresult = ts.any, writeresult = ts.any }, nil)
 	local commandSpecProps: { [type]: type } = {}
 	commandSpecProps[ts.singleton("Args")] = optional(commandArgs)
@@ -928,9 +926,9 @@ export type FloatMeta = { Min: number?, Max: number?, Precision: (number | "f32"
 -- a larger literal is already math.huge and the template validator rejects it.
 export type BigMeta = { Min: (number | string)?, Max: (number | string)? }
 export type StringMeta = { MaxLength: number? }
--- Scribe.CFrame only. The same knob as FloatMeta's Precision, but pointing the other
--- way, because a CFrame defaults to the lossy form. "exact" is the only value: a
--- CFrame has no intermediate widths to name.
+-- Scribe.CFrame only. The same knob as FloatMeta's Precision pointing the other way,
+-- since a CFrame defaults to the lossy form. "exact" is the only value: a CFrame has no
+-- intermediate widths to name.
 export type CFrameMeta = { Precision: "exact"? }
 -- Container declarator options. Not generic in the element type on purpose: an
 -- element-typed option would let Luau infer the element type from it rather than
@@ -940,9 +938,8 @@ export type SetOpts = { MaxItems: number? }
 export type CooldownOptions = { IncludeOfflineTime: boolean? }
 export type MapKeyType = "integer" | "string"
 -- What a Scribe.Big field reads back, which is also what the declarator returns.
--- `__scribeBig` lives in the metatable rather than in the fields: an ordinary label
--- field travels with the type into every read, so a whole-table read would show the
--- label and `Get().Wealth.__scribeBig` would typecheck while being nil at runtime.
+-- `__scribeBig` lives in the metatable rather than in the fields: a label field travels
+-- into every read, so `Get().Wealth.__scribeBig` would typecheck while being nil.
 type BigFields = {
 	M: number,
 	E: number,
@@ -972,11 +969,10 @@ end
 export type MapOf<K, V> = MapShape<K, V>
 export type DictOpts = { MaxKeys: number?, MaxKeyLength: number? }
 
--- Template-aware config types. Annotate a config local with one and `Stat` /
--- `Cost.Path` become the template's numeric leaf-path union while `Grant` receives
--- the typed accessor tree. The annotation is required: in the same table literal
--- that declares the template, Luau widens the string literals before the template
--- type is known. Without a type argument they fall back to the loose untyped shape.
+-- Template-aware config types. Annotate a config local with one and `Stat` / `Cost.Path`
+-- become the template's numeric leaf-path union while `Grant` receives the typed accessor
+-- tree. The annotation is required: in the same table literal that declares the template,
+-- Luau widens the string literals before the template type is known.
 export type LeaderboardConfig<T = any> = {
 	Stat: StatPathsType<T, true>,
 	Limit: number?,
@@ -1006,9 +1002,9 @@ export type PurchaseSpec<T = any> = {
 }
 
 -- Loose, read-only option shapes. They deliberately do not depend on T: inside the
--- Scribe({ ... }) literal the template type is still being inferred, so strict
--- fields would widen and reject valid configs. Read-only props keep annotated strict
--- tables assignable.
+-- Scribe({ ... }) literal the template type is still being inferred, so strict fields
+-- would widen and reject valid configs. Read-only props keep annotated strict tables
+-- assignable.
 type LeaderboardConfigLoose = {
 	read Stat: string,
 	read Limit: number?,
@@ -1130,10 +1126,10 @@ export type ServerData<T> = ServerDataType<T, Player>
 
 export type ClientData<T> = ClientDataType<T>
 
--- One player's typed accessor tree: the type of `Data[player]`, `Data.Get(player)`
--- and the client's `Data.Get()`. A plain alias because a type function cannot be
--- invoked across a module boundary: `Scribe.ValueType<T>` silently resolves to `any`
--- rather than erroring, so this is the only way a consumer can name the type.
+-- One player's typed accessor tree: the type of `Data[player]`, `Data.Get(player)` and
+-- the client's `Data.Get()`. A plain alias because a type function cannot be invoked
+-- across a module boundary: `Scribe.ValueType<T>` silently resolves to `any` rather than
+-- erroring, so this is the only way a consumer can name the type.
 export type PlayerData<T> = ValueType<T>
 
 export type Bundle<T> = {
@@ -1172,10 +1168,10 @@ export type Bundle<T> = {
 --------------------------------------------------------------------------------
 -- Exported type reference
 --
--- Doc blocks for the exported types. Gathered here rather than beside the
--- declarations because @interface/@type blocks are keyed by name, and half of these
--- types are re-exported from Types.luau with no declaration here to sit beside. A
--- new exported type needs a block or it renders nowhere.
+-- Doc blocks for the exported types, gathered here rather than beside the declarations:
+-- @interface/@type blocks are keyed by name, and half of these types are re-exported
+-- from Types.luau with nothing here to sit beside. A new exported type needs a block or
+-- it renders nowhere.
 --------------------------------------------------------------------------------
 
 --[=[
@@ -1383,6 +1379,46 @@ export type Bundle<T> = {
 ]=]
 
 --[=[
+	@interface ExchangeLeg
+	.Path { string } -- the exchangeable path, a top-level field or container
+	.Kind ("Key" | "Qty" | "Stack") -- whole entry, an amount, or part of a stacked entry
+	.Key any? -- Key and Stack: the container key, set member or array value
+	.Amount number? -- Qty and Stack: how much to move
+	@tag Exchange
+	One item in a basket handed to [Server.Exchange.Attempt], naming what that player
+	GIVES. Every `Path` must be declared in the `Exchangeable` option, and a leg is
+	checked against that list by path AND by kind before any value moves. See
+	[Exchange](../exchange.md).
+]=]
+
+--[=[
+	@interface OpenLeg
+	.Path { string } -- the path the value came from, or is going to
+	.Kind string -- "Key", "Qty" or "Stack"
+	.Key any? -- the container key, where the leg has one
+	.Amount number? -- how much, for a Qty or Stack leg
+	@tag Exchange
+	One leg of what a player has staked or is owed, as reported by
+	[Server.Exchange.Open]. Freshly built on every call and aliases nothing in Scribe's
+	ledger, so it is safe to keep or mutate.
+]=]
+
+--[=[
+	@interface OpenExchange
+	.Id string -- the exchange id, which the operator verbs take
+	.State ("Claimed" | "Staked" | "Delivering") -- how far this exchange got
+	.Partner number? -- the counterparty's UserId
+	.Staked { OpenLeg } -- what this player handed over
+	.Owed { OpenLeg } -- what this player is owed
+	.Since number? -- Unix timestamp the exchange reached its current state
+	@tag Exchange
+	One open exchange, as reported by [Server.Exchange.Open]. Escrow takes value out of
+	the balance on purpose and resolution is not time bounded, so `Staked` and `Owed`
+	are how a game shows a player where their items went rather than leaving them
+	looking at a hole. See [Exchange](../exchange.md).
+]=]
+
+--[=[
 	@interface SaveInfo
 	.Dirty boolean -- true when there are writes that have not reached the DataStore
 	.LastSaveAt number? -- Unix timestamp of the last successful save, in seconds; nil before the first
@@ -1509,6 +1545,7 @@ export type Bundle<T> = {
 
 local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	Template = true,
+	Exchangeable = true,
 	Transport = true,
 	TransportChannel = true,
 	Migrations = true,
@@ -1577,22 +1614,21 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 		error("Scribe: options.Template is required and must be a table", 2)
 	end
 	local anyOpts = options :: any
-	-- Server only on purpose: the client reads neither of these. Validating them
-	-- before the realm branch would force the live DataStore name and key format into
-	-- the shared module every client requires, where a game can instead set them
-	-- behind `if RunService:IsServer()` and keep them out of client bytecode.
+	-- Server only on purpose: the client reads neither of these. Validating them before
+	-- the realm branch would force the live DataStore name and key format into the shared
+	-- module every client requires, rather than behind `if RunService:IsServer()`.
 	if RunService:IsServer() then
 		-- Storage location is intentional, never defaulted: two games (or a test
 		-- build) accidentally sharing the "Default" store is a silent data hazard.
 		if type(anyOpts.ProfileStoreIndex) ~= "string" or anyOpts.ProfileStoreIndex == "" then
-			error("Scribe: options.ProfileStoreIndex is required — name your game's DataStore explicitly", 2)
+			error("Scribe: options.ProfileStoreIndex is required: name your game's DataStore explicitly", 2)
 		end
 		-- Required, but "" is legitimate: it means bare user-id keys, which is what a
 		-- game adopting an existing store keyed only by user id needs. Absent or
 		-- non-string is still an error, so the choice stays explicit.
 		if type(anyOpts.ProfileKeyPrefix) ~= "string" then
 			error(
-				'Scribe: options.ProfileKeyPrefix is required — set a per-player key prefix (e.g. "PLAYER_"), or "" for bare user-id keys',
+				'Scribe: options.ProfileKeyPrefix is required: set a per-player key prefix (e.g. "PLAYER_"), or "" for bare user-id keys',
 				2
 			)
 		end
@@ -1611,7 +1647,7 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 				Log.Warn(
 					"Lifecycle",
 					"UNKNOWN_OPTION",
-					`unknown Scribe option "{key}" — check the spelling`,
+					`unknown Scribe option "{key}": check the spelling`,
 					{ Option = key }
 				)
 			end
@@ -1650,8 +1686,8 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 	-- Edit mode (a storybook, the command bar, a plugin) has no server, yet
 	-- RunService:IsServer() is still true there. Dispatching on that alone builds the
 	-- server half, which resolves the transport and leaves RemoteEvents saved into the
-	-- place file; the client half is the one that understands edit mode. `IsRunning`
-	-- is also the seam specs use, since RunService cannot be patched.
+	-- place file; the client half understands edit mode. `IsRunning` is also the seam
+	-- specs use, since RunService cannot be patched.
 	local isRunning = if anyOptions.IsRunning ~= nil then anyOptions.IsRunning == true else RunService:IsRunning()
 
 	local bundle: any
@@ -2090,9 +2126,9 @@ function Scribe.SetOf<T>(element: T, opts: SetOpts?): SetOf<T>
 			end
 		end
 	end
-	-- A set is deduplicated and sorted, neither of which is meaningful for a record:
-	-- table.sort on tables throws a bare comparison error on the second member.
-	-- Refuse it here rather than at the surprising second Add.
+	-- A set is deduplicated and sorted, neither of which works on a record: table.sort
+	-- throws a bare comparison error on the second member. Refuse it here rather than at
+	-- the surprising second Add.
 	if type(element) == "table" and (element :: any).__scribeMarker == nil then
 		error("Scribe.SetOf takes a scalar element (Scribe.String, Scribe.Int, ...), not a record shape", 2)
 	end
@@ -2360,6 +2396,53 @@ Scribe.Datatypes = require(script.Internal.Datatypes)
 ]=]
 --[=[
 	@within Scribe
+	@param value number | BigValue
+	@param decimals number?
+	@return string
+	Renders a quantity the short way a player reads it: `1.5K`, `100M`, `2.4B`.
+
+	```lua
+	local label = Scribe.Short(data.Coins.Get()) -- "1.5M"
+	```
+
+	Takes a plain number or a `Scribe.Big` value, so a balance label does not have to
+	know which numeric type the field was declared as.
+
+	`decimals` defaults to 2 and rounds rather than truncates, so `Scribe.Short(1500, 0)`
+	gives `"2K"`. Anything past the suffix table renders in full rather than losing
+	its magnitude.
+]=]
+function Scribe.Short(value: (number | BigValue)?, decimals: number?): string
+	if decimals ~= nil and (type(decimals) ~= "number" or decimals < 0 or decimals % 1 ~= 0) then
+		error(`Scribe.Short: decimals must be a non-negative whole number, got {tostring(decimals)}`, 2)
+	end
+	local big = BigMath.from(value)
+	if big == nil then
+		error(`Scribe.Short: expected a number or a Scribe.Big value, got {typeof(value)}`, 2)
+	end
+	return BigMath.toShort(big, decimals)
+end
+
+--[=[
+	@within Scribe
+	@param suffixes { string }
+	Replaces the suffix table [Scribe.Short] and `BigValue:Short()` render with.
+
+	```lua
+	Scribe.SetShortSuffixes({ "", "K", "M", "B", "T", "aa", "ab", "ac" })
+	```
+
+	The defaults run `K, M, B, T, Qa, Qi, Sx` and on up. The conventions diverge past
+	`T`, so this exists rather than leaving a game to write its own formatter and stop
+	using this one. Index 1 is the units tier and must be empty, because it is what
+	renders a small number unchanged.
+]=]
+function Scribe.SetShortSuffixes(suffixes: { string })
+	BigMath.SetSuffixes(suffixes)
+end
+
+--[=[
+	@within Scribe
 	@tag Configuration
 	@function Configure
 	@param config { AutoSaveInterval: number? }
@@ -2620,20 +2703,17 @@ end
 	reports as a `{ Count, Average, Max }` record: save durations, profile sizes,
 	per-frame flush costs, bytes per send.
 	
-	This is the half `GetMetrics` cannot give you. An average hides the tail, and
-	the tail is the interesting part of every one of these: a P99 save duration is
-	what a player actually waits for on a bad key, and a mean over a few thousand
-	fast saves will not show it moving.
-	
+	The half `GetMetrics` cannot give you: an average hides the tail, and a P99 save
+	duration is what a player actually waits for on a bad key.
+
 	Keyed by metric name. A name that has never been observed is **absent** rather
 	than present with zeroes, so `next()` on the result tells you whether anything
 	has been measured at all.
-	
-	Computed over a rolling window of the most recent 256 samples per name, not
-	over all time. The window is bounded on purpose, because an unbounded sample list on a
-	metric observed once per save is a slow leak. So these describe recent
-	behaviour; `GetMetrics().<name>.Count` is the all-time count and does not
-	agree with the window, which is intended.
+
+	Computed over a rolling window of the most recent 256 samples per name, bounded
+	because an unbounded sample list on a metric observed once per save is a slow
+	leak. So these describe recent behaviour, and `GetMetrics().<name>.Count` is the
+	all-time count, which deliberately does not agree with the window.
 ]=]
 function Scribe.GetPercentiles(): { [string]: { P50: number, P90: number, P99: number } }
 	return Metrics.GetPercentiles()

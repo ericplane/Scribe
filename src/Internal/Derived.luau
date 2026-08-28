@@ -1,11 +1,9 @@
 --!strict
--- Derived fields. A derived field is computed from other declared fields instead
--- of accepting writes: never persisted, recomputed when an input changes, and
--- replicated only when the receiving realm cannot compute it for itself.
---
--- This module owns the compile-time half (resolve input paths, order the graph,
--- decide who computes, build the write index) and a realm-agnostic evaluator used
--- by the accessor tree, the client's Shared mirrors and offline profile snapshots.
+-- Derived fields. A derived field is computed from other declared fields instead of
+-- accepting writes: never persisted, recomputed when an input changes, and replicated
+-- only when the receiving realm cannot compute it for itself. This module owns the
+-- compile-time half (resolve input paths, order the graph, decide who computes, build
+-- the write index) plus a realm-agnostic evaluator.
 --
 -- Schema nodes are typed `any` throughout: Template requires this module for its
 -- post-compile pass, so importing Template's SchemaNode back would be a cycle.
@@ -107,8 +105,8 @@ end
 	Resolves every collected derived field against the finished schema tree.
 
 	`pending` is what buildNode collected, in template order: each entry is
-	{ Node, InputPaths (dotted strings), Compute }. `fail(path, message)` is
-	Template's compileError, passed in so the error text keeps one format.
+	{ Node, InputPaths (dotted strings), Compute }. `fail` is Template's compileError,
+	passed in so the error text keeps one format.
 
 	Returns the topologically ordered node list and the write index.
 ]]
@@ -252,10 +250,10 @@ function Derived.Resolve(
 		end
 		node.Derived.Transmit = transmit
 
-		-- Offline reads see stored data only, so a root-level field whose every
-		-- input persists can be computed over a snapshot. A derived input never
-		-- persists but is filled in first (both passes run in topological order),
-		-- so it counts as available exactly when it is itself computable.
+		-- Offline reads see stored data only, so a root-level field whose every input
+		-- persists can be computed over a snapshot. A derived input never persists but
+		-- is filled in first (both passes run in topological order), so it counts as
+		-- available exactly when it is itself computable.
 		local offline = #node.Path == 1
 		if offline then
 			for _, input in node.Derived.Inputs do
@@ -377,7 +375,7 @@ local function readPlain(data: { [string]: any }, segments: { string }): (boolea
 end
 
 --[[
-	Evaluates derived fields over a PLAIN data table (an offline profile snapshot, a
+	Evaluates derived fields over a plain data table (an offline profile snapshot, a
 	client's Shared mirror for another player) rather than over an accessor tree.
 
 	`filter` selects which fields apply; a field whose parent table is absent from

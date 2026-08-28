@@ -1,7 +1,7 @@
 --!strict
--- Transport. The transport moves opaque buffers; Scribe owns
--- serialization, batching, and RPC correlation. "Default" is two RemoteEvents
--- carrying buffers under a Scribe folder in ReplicatedStorage.
+-- Transport. A transport moves opaque buffers; Scribe owns serialization, batching
+-- and RPC correlation. "Default" is two RemoteEvents under a folder in
+-- ReplicatedStorage.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -12,8 +12,7 @@ local Types = require(script.Parent.Parent.Types)
 --- inside the handshake and from the per-frame flush, and one that parks there
 --- stalls that frame's remaining work for every player. Buffer and return instead.
 ---
---- Re-exported from Types rather than restated, so what a game sees and what
---- Resolve returns cannot drift apart.
+--- Re-exported from Types so what a game sees and what Resolve returns cannot drift.
 export type ScribeTransport = Types.ScribeTransport
 
 local FOLDER_PREFIX = "ScribeTransport"
@@ -24,12 +23,10 @@ local Transport = {}
 -- other's frames and fail schema decoding; fail loudly at startup instead.
 local boundServerChannels: { [string]: boolean } = {}
 
--- How to hand a claimed channel back. Keyed by folder name, populated by the
--- server branch of buildDefault, consumed by ReleaseChannel.
---
--- The claim above is module-global and outlives any one bundle: without a release,
--- a stopped bundle keeps its channel and its OnServerEvent listener for the rest
--- of the process, so client frames still reach a bundle whose save paths are dead.
+-- How to hand a claimed channel back, keyed by folder name. The claim above is
+-- module-global and outlives any one bundle: without a release, a stopped bundle
+-- keeps its channel and its OnServerEvent listener for the rest of the process, so
+-- client frames still reach a bundle whose save paths are dead.
 local channelReleases: { [string]: () -> () } = {}
 
 local function folderName(channel: string?): string
@@ -44,14 +41,14 @@ local function buildDefault(channel: string?): ScribeTransport
 	local down: RemoteEvent
 	local up: RemoteEvent
 	-- Everything this channel connects, so ReleaseChannel can undo it. Declared out
-	-- here because ListenServer closes over it; stays nil on the client, which has
-	-- no claim to release.
+	-- here because ListenServer closes over it; stays nil on the client, which has no
+	-- claim to release.
 	local serverConnections: { RBXScriptConnection }? = nil
 
 	if RunService:IsServer() then
 		if boundServerChannels[name] then
 			error(
-				`Scribe: another Scribe instance is already using the "{channel or "Default"}" transport channel — `
+				`Scribe: another Scribe instance is already using the "{channel or "Default"}" transport channel; `
 					.. "give each instance a distinct TransportChannel option",
 				0
 			)
@@ -104,14 +101,12 @@ local function buildDefault(channel: string?): ScribeTransport
 		end,
 		ListenServer = function(_, callback: (player: Player, bytes: buffer) -> ())
 			local connection = up.OnServerEvent:Connect(function(player: Player, bytes: any)
-				-- Payload type is validated here so adapters and Scribe's
-				-- decoder can assume buffers.
+				-- Validated here so adapters and Scribe's decoder can assume buffers.
 				if typeof(bytes) == "buffer" then
 					callback(player, bytes)
 				end
 			end)
-			-- Only on the server, where serverConnections exists; a client-side
-			-- channel has no claim to release.
+			-- Only on the server, where serverConnections exists.
 			if serverConnections ~= nil then
 				table.insert(serverConnections, connection)
 			end
@@ -131,10 +126,9 @@ end
 
 --- Hand a Default channel back, so a later bundle in this process can claim it.
 --- Disconnects what the channel connected and clears the claim. Idempotent, and a
---- no-op for a name that was never bound.
----
---- Call it only from the scope that built the channel: a bundle on a custom
---- transport releasing Default would take it from whoever legitimately holds it.
+--- no-op for a name that was never bound. Call it only from the scope that built the
+--- channel: a bundle on a custom transport releasing Default would take it from
+--- whoever legitimately holds it.
 function Transport.ReleaseChannel(channel: string?)
 	local name = folderName(channel)
 	local release = channelReleases[name]

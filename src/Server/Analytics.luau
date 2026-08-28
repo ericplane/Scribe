@@ -1,10 +1,8 @@
 --!strict
--- Economy source/sink analytics. Currency mutations tagged via
--- Increment/Decrement (and Data.Purchase) auto-emit
--- AnalyticsService:LogEconomyEvent. The currency is the mutated field's name;
--- per-currency custom fields, an ambient Resolve, and a currency-label override
--- are declared once in options.Economy. Failures log at Debug and never block
--- gameplay.
+-- Economy source/sink analytics. Currency mutations tagged via Increment/Decrement (and
+-- Data.Purchase) auto-emit AnalyticsService:LogEconomyEvent, with the currency taken from
+-- the mutated field's name. Custom fields, an ambient Resolve and a label override are
+-- declared once in options.Economy. Failures log at Debug and never block gameplay.
 
 local AnalyticsService = game:GetService("AnalyticsService")
 
@@ -139,8 +137,8 @@ function Analytics.new(ctx: any)
 	end
 
 	local function buildCustomFields(player: Player, currency: Currency?, tags: { [string]: any }): { [string]: any }?
-		-- Custom fields need a declared slot mapping; an undeclared currency (or
-		-- one with no Fields) logs a plain event.
+		-- Custom fields need a declared slot mapping; an undeclared currency, or one with
+		-- no Fields, logs a plain event.
 		if not currency or #currency.Fields == 0 then
 			return nil
 		end
@@ -189,9 +187,9 @@ function Analytics.new(ctx: any)
 		-- caller-supplied Currency is the value that threw.
 		local currencyLabel = fieldName
 
-		-- Formatting, field building and the log all sit inside one guard: every value
-		-- here is caller-supplied, and a throwing `__tostring` or `__iter` must not
-		-- escape into the Increment/Decrement caller after the write already applied.
+		-- One guard around formatting, field building and the log: every value here is
+		-- caller-supplied, and a throwing `__tostring` or `__iter` must not escape into
+		-- the Increment/Decrement caller after the write already applied.
 		local ok, err = pcall(function()
 			currencyLabel = tostring(tags.Currency or (currency and currency.Label) or fieldName)
 			local transactionType = txnName(if tags.TransactionType ~= nil then tags.TransactionType else tags.Source)

@@ -99,9 +99,8 @@ Keys that could not have survived that round trip are refused at the write: frac
 
 `MaxKeys` caps the entry count. `MaxKeyLength` applies to string keys only and is refused on an integer map, where it would read as a cap that does nothing.
 
-:::caution `MaxKeyLength` counts bytes, not characters
-A three-character CJK key is nine bytes and trips a `MaxKeyLength` of eight. Size it for the alphabets your players actually type.
-:::
+!!! warning "`MaxKeyLength` counts bytes, not characters"
+    A three-character CJK key is nine bytes and trips a `MaxKeyLength` of eight. Size it for the alphabets your players actually type.
 
 ## Sets of unique values
 
@@ -202,6 +201,22 @@ end)
 
 All of a container's `OnChildChanged` fires arrive before its `Changed`, so you can accumulate keys and act once at the end. `OnKeyAdded` and `OnKeyRemoved` report a key appearing or disappearing and never one changing, so `OnChildChanged` is the only way to learn that an existing entry's value moved.
 
+!!! warning "Never yield inside a container listener"
+
+    `OnChildChanged`, `OnKeyAdded`, `OnKeyRemoved`, `OnInsert` and `OnRemove` fire **immediately**, which means inside any `Data.Transaction` that is open. A handler that yields closes the transaction's thread and **rolls the whole transaction back**, including the write that triggered the handler:
+
+    ```lua
+    data.Inventory.OnChildChanged(function(itemId)
+        task.wait()                  -- rolls back the write that got you here
+    end)
+    ```
+
+    Measured: a transaction setting `Qty` to 5 and `Coins` to 42 with that handler connected reverted both, and reported `a transaction function must not yield`. The message names the **transaction body**, not the listener, so the file you go looking in is the wrong one.
+
+    A handler that **raises** is the opposite problem: the error is routed to the log and the transaction still commits, so a listener can fail silently for a long time.
+
+    Keep listeners synchronous and cheap. Anything slow, anything that touches a DataStore, and anything that waits belongs in a `task.spawn` or after the transaction returns.
+
 ??? note "Why `old` is often the same table as `new`"
     Scribe does not snapshot a container, so for writes **beneath** the container `Changed` hands you the same reference twice.
 
@@ -209,9 +224,8 @@ All of a container's `OnChildChanged` fires arrive before its `Changed`, so you 
 
     The same rule applies to `OnChildChanged`: `old` is a real prior value when the child is a leaf, and the same reference as `new` when the child is itself a container.
 
-:::caution The container `key` argument was removed in 1.3.0
-A container `Changed` listener used to take a third `key` argument. One fire can now cover several children, so naming one of them would imply the others did not change. Scribe errors at connect time on a container listener that declares a third parameter, rather than passing `nil` forever. Move that logic to `OnChildChanged`. Leaf listeners are unchanged.
-:::
+!!! warning "The container `key` argument was removed in 1.3.0"
+    A container `Changed` listener used to take a third `key` argument. One fire can now cover several children, so naming one of them would imply the others did not change. Scribe errors at connect time on a container listener that declares a third parameter, rather than passing `nil` forever. Move that logic to `OnChildChanged`. Leaf listeners are unchanged.
 
 ## Element rules
 

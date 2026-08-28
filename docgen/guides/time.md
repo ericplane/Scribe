@@ -64,9 +64,8 @@ Two more behaviours to know:
 - **Durations floor to 1 second.** Expiries are checked by a once-per-second sweep, so sub-second timers are not possible.
 - **Durations cap at a finite value of roughly 126 years**, so `SetTimed(value, math.huge)` means "effectively permanent".
 
-:::caution A plain `Set` does not cancel a running timer
-If you `Set` a permanent value while an earlier `SetTimed` is still armed, the old timer still lapses and resets the field to its template default, throwing your value away. To convert a timed value into a permanent one, re-issue `SetTimed(value, math.huge)`, or wait until `Active()` reports false before the plain `Set`.
-:::
+!!! warning "A plain `Set` does not cancel a running timer"
+    If you `Set` a permanent value while an earlier `SetTimed` is still armed, the old timer still lapses and resets the field to its template default, throwing your value away. To convert a timed value into a permanent one, re-issue `SetTimed(value, math.huge)`, or wait until `Active()` reports false before the plain `Set`.
 
 ## Extending a running timer
 

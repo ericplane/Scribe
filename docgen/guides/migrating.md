@@ -50,19 +50,17 @@ Pair it with `SchemaPolicy = "Warn"` the first time, never `"Reject"`. The store
 
     Some of what `SchemaPolicy` reports is advisory and would not kick anyone even under `"Reject"`: containers over a `MaxKeys` you have only just declared, and arrays with holes in them. Old data had no reason to avoid either. Imported data is also exactly where the findings that **do** reject turn up, though: a table mixing array indices with string keys, a wrong type, a value outside a bound you have just added.
 
-:::danger Never build the ProfileStore envelope yourself
-Do not copy old data in by writing DataStore values directly, for example `SetAsync(key, { Data = old, MetaData = {}, GlobalUpdates = {0, {} } })`. ProfileStore treats any value whose `Data`, `MetaData` and `GlobalUpdates` are all tables as a real profile and leaves that `MetaData` untouched, so the fields it would otherwise fill in are never added. Missing `MetaData.SessionLoadCount` is the one that bites: the next load throws `attempt to perform arithmetic (add) on nil and number` from `EditProfile`.
+!!! danger "Never build the ProfileStore envelope yourself"
+    Do not copy old data in by writing DataStore values directly, for example `SetAsync(key, { Data = old, MetaData = {}, GlobalUpdates = {0, {} } })`. ProfileStore treats any value whose `Data`, `MetaData` and `GlobalUpdates` are all tables as a real profile and leaves that `MetaData` untouched, so the fields it would otherwise fill in are never added. Missing `MetaData.SessionLoadCount` is the one that bites: the next load throws `attempt to perform arithmetic (add) on nil and number` from `EditProfile`.
 
-**The key does not heal itself.** The error is raised inside the DataStore transform, so nothing is ever written back, every retry reads the same broken value, and the player is stuck in a join loop. Scribe reports this as a `PROFILE_STORE_ERROR` with an opaque message, because Roblox traps transform errors before ProfileStore can see them.
+    **The key does not heal itself.** The error is raised inside the DataStore transform, so nothing is ever written back, every retry reads the same broken value, and the player is stuck in a join loop. Scribe reports this as a `PROFILE_STORE_ERROR` with an opaque message, because Roblox traps transform errors before ProfileStore can see them.
 
-Neither `UpdateOffline` nor `RestoreVersion` can repair such a key. Both write through a path that never sets `SessionLoadCount`, so they report success and the key still fails on the next join. Use [`Erase(userId)`](/api/Server#Erase), which deletes the key outright so the next join builds a correct profile, then re-import from your old store. That is the GDPR erasure path, so it also clears the user from every leaderboard, and a `false` return can mean the profile went but a board key did not. Retry rather than assuming nothing happened.
-:::
+    Neither `UpdateOffline` nor `RestoreVersion` can repair such a key. Both write through a path that never sets `SessionLoadCount`, so they report success and the key still fails on the next join. Use [`Erase(userId)`](/api/Server#Erase), which deletes the key outright so the next join builds a correct profile, then re-import from your old store. That is the GDPR erasure path, so it also clears the user from every leaderboard, and a `false` return can mean the profile went but a board key did not. Retry rather than assuming nothing happened.
 
-:::caution Adopting in place while you already have Migrations
-Scribe stores its migration version under the reserved `_Scribe` root. Data written before you adopted Scribe has no such key, so it reads as **version 1**, and every migration step from 2 upward then runs against your pre-Scribe shape on first load. Migration failure is fail-closed, so a step that throws kicks the player rather than loading them with half-migrated data.
+!!! warning "Adopting in place while you already have Migrations"
+    Scribe stores its migration version under the reserved `_Scribe` root. Data written before you adopted Scribe has no such key, so it reads as **version 1**, and every migration step from 2 upward then runs against your pre-Scribe shape on first load. Migration failure is fail-closed, so a step that throws kicks the player rather than loading them with half-migrated data.
 
-If you adopt in place while already carrying a `Migrations` table, **step 2 itself must tolerate legacy input**. There is no step 1 to bridge in: keys below 2 are rejected at startup with `Scribe: Migrations keys must be integers >= 2`. `OnPlayerInit` cannot pre-bridge either, because it runs after the migration chain.
-:::
+    If you adopt in place while already carrying a `Migrations` table, **step 2 itself must tolerate legacy input**. There is no step 1 to bridge in: keys below 2 are rejected at startup with `Scribe: Migrations keys must be integers >= 2`. `OnPlayerInit` cannot pre-bridge either, because it runs after the migration chain.
 
 ### Coming from ProfileService
 
@@ -112,19 +110,17 @@ The adopted keys are written before everything else the load does, and that orde
 
 Pair the cutover with `SchemaPolicy = "Warn"`, for the same reason you paired the dry run with it. Every imported value that does not match a declarator is then listed on the load that imported it.
 
-:::danger Return nil only when you know there is nothing to carry
-`nil` means "this player has nothing in the old store", and Scribe acts on it by loading them as a new player. If your read failed and you cannot tell which it was, **throw**. The two answers are indistinguishable to Scribe, and only one of them is safe to act on.
+!!! danger "Return nil only when you know there is nothing to carry"
+    `nil` means "this player has nothing in the old store", and Scribe acts on it by loading them as a new player. If your read failed and you cannot tell which it was, **throw**. The two answers are indistinguishable to Scribe, and only one of them is safe to act on.
 
-A throw refuses the load. Scribe releases the profile, kicks the player with your `LoadFailureMessage`, counts `LegacyImportFailures` and logs `LEGACY_IMPORT_FAIL`. The next join imports normally, because a refused load records no completed save against that key. Returning `nil` from a read that failed does the opposite: the player loads empty, their first save makes that emptiness canonical, and the import never runs for them again.
-:::
+    A throw refuses the load. Scribe releases the profile, kicks the player with your `LoadFailureMessage`, counts `LegacyImportFailures` and logs `LEGACY_IMPORT_FAIL`. The next join imports normally, because a refused load records no completed save against that key. Returning `nil` from a read that failed does the opposite: the player loads empty, their first save makes that emptiness canonical, and the import never runs for them again.
 
 Scribe never adopts a top-level key beginning with `_Scribe`. That covers the reserved `_Scribe` root, which holds purchase dedupe ids, gift escrow, granted perks, `Scribe.Timed` deadlines and the migration version, and it covers `_ScribeSession`, which is rebuilt every session. Every other key in the table you return is copied straight in.
 
-:::caution Do not combine an import with adopting in place
-`ImportLegacyData` decides whether a player is new to Scribe by asking whether a completed save has ever recorded a user id against their key. A profile written by a library that never recorded one carries no such mark, so it reads as never saved and the hook fires for a genuine returning player on their first join after the cutover. Whatever your importer returns is then written straight over the top-level keys they already had.
+!!! warning "Do not combine an import with adopting in place"
+    `ImportLegacyData` decides whether a player is new to Scribe by asking whether a completed save has ever recorded a user id against their key. A profile written by a library that never recorded one carries no such mark, so it reads as never saved and the hook fires for a genuine returning player on their first join after the cutover. Whatever your importer returns is then written straight over the top-level keys they already had.
 
-Pick one path per store. Adopt in place when the data is already in ProfileStore or ProfileService, and use `ImportLegacyData` when it lives somewhere Scribe cannot read.
-:::
+    Pick one path per store. Adopt in place when the data is already in ProfileStore or ProfileService, and use `ImportLegacyData` when it lives somewhere Scribe cannot read.
 
 ??? warning "Three ways an import quietly does nothing"
     **A return value that is neither a table nor `nil` is discarded**, with no log and no counter. An importer that ends in `return true`, or that hands its values back in the wrong order, looks exactly like an ordinary new player.

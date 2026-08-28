@@ -31,6 +31,11 @@ return function()
 	end
 
 	local function makeHarness(extra)
+		-- Same reason as ExchangeRealBackend: a throttled request still spends its
+		-- allowance slot, so entering a harness with an empty budget makes the whole
+		-- run slower rather than merely later. Both real-backend specs share one
+		-- server-wide allowance, so both have to wait for it.
+		ConformanceStore.AwaitBudget(10)
 		local options = {
 			ProfileStore = realStore,
 			ProfileStoreIndex = ConformanceStore.STORE,

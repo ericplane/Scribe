@@ -2,13 +2,13 @@
 -- The half of Flush's durability answer that only exists when a save takes time.
 --
 -- FlushDurability drives the same question against the non-sim harness, where the
--- store saves synchronously — so `SavesInFlight` is never above zero at the moment
+-- store saves synchronously, so `SavesInFlight` is never above zero at the moment
 -- a spec looks, and deleting that clause from the predicate leaves every one of
 -- those tests green. Measured, as a mutation: it survived all 23.
 --
 -- That clause is the only one not implied by `Dirty`. Without it the predicate is
 -- satisfied the instant a save STARTS, because the payload snapshot clears the
--- flag — so `Flush` would answer "already durable" for writes still on the wire,
+-- flag, so `Flush` would answer "already durable" for writes still on the wire,
 -- which is the exact shape of the receipt-granted-on-an-unsaved-write defect the
 -- fork was built to remove. It needs modelled latency to be reachable at all,
 -- which is what this file is for.

@@ -45,6 +45,10 @@ export type TreeParams = {
 	OnDerivedIssue: ((code: string, field: string, detail: string) -> ())?,
 }
 
+-- Cast once: Big.from is optional because parsing can fail, which a literal cannot,
+-- and the economy path below would otherwise compare through `any`.
+local BIG_ZERO = Big.from(0) :: Big.Big
+
 local Node = {}
 
 -- The message RunTransaction returns when `fn` yielded. Exported so a caller can tell
@@ -93,6 +97,8 @@ export type Tree = typeof(setmetatable(
 			Below: { [string]: { [string]: boolean } },
 			Ops: { { Op: Op, Schema: SchemaNode? } },
 			Created: { { string | number } },
+			Seeded: { { string | number } },
+			Economy: { { Path: { string | number }, Delta: number, New: number, Tags: { [string]: any } } },
 			RawRestores: { [string]: { Store: { [string]: any }, Value: any } },
 		}?,
 		-- Scribe.Derived: fields whose inputs changed and have not been recomputed
@@ -121,21 +127,18 @@ local F_CHILDREN = {} :: any
 -- parent, which re-grants it.
 local PRIVILEGED: { [any]: true } = setmetatable({}, { __mode = "k" }) :: any
 
--- The ONE tree whose transaction is open right now, or nil.
---
--- `Tree._txn` is per-tree, which is right for the journal but wrong as the admission
--- test: a transaction can only undo writes to its own tree, and another player is
--- another tree behind another DataStore key.
---
--- A module upvalue is sound because a transaction is synchronous by construction:
--- `fn` runs on its own coroutine and a yield is refused, so nothing interleaves
--- between the set and the clear. Cleared BEFORE the rollback restores and before the
--- queued fires drain, so a listener writing after a rollback is an ordinary write.
+-- The ONE tree whose transaction is open right now, or nil. `Tree._txn` is per-tree,
+-- right for the journal but wrong as the admission test: a transaction can only undo
+-- writes to its own tree, and another player is another tree behind another DataStore
+-- key. A module upvalue is sound because a transaction is synchronous by construction:
+-- `fn` runs on its own coroutine and a yield is refused. Cleared BEFORE the rollback
+-- restores and before the queued fires drain, so a listener writing after a rollback is
+-- an ordinary write.
 local OPEN_TXN_TREE: Tree? = nil
 
 -- The shared half of both cross-tree refusals: why, and the durable outbox to use
--- instead. One player handing value to another is a real need; it just cannot be a
--- transaction, so the refusal has to name the route that works.
+-- instead. One player handing value to another is a real need, so the refusal has to
+-- name the route that works.
 local CROSS_TREE_TXN_WHY = "a transaction can only roll back its OWN player, because another player is "
 	.. "another tree behind another DataStore key -- the same reason a yield inside a transaction is "
 	.. "refused. For one-sided value (a gift, mail, a reward, a bounty payout) use the durable outbox that "
@@ -143,11 +146,10 @@ local CROSS_TREE_TXN_WHY = "a transaction can only roll back its OWN player, bec
 	.. "Data.Flush it, then deliver with Data.SendMessage and apply it idempotently at the far end. See the "
 	.. "Transactions guide."
 
--- The cross-tree refusal, in one place: accessorIndex is not the only writer.
--- Server/Timed writes the flat `_Scribe.Timed` store raw and never reaches it, and two
--- copies of this test would drift. `subject` names what was written, `level` is the
--- caller's own blame depth. Gate on OPEN_TXN_TREE before building `subject`, which is
--- not worth allocating on every write.
+-- The cross-tree refusal, in one place: accessorIndex is not the only writer, since
+-- Server/Timed writes the flat `_Scribe.Timed` store raw. `subject` names what was
+-- written, `level` is the caller's own blame depth. Callers gate on OPEN_TXN_TREE
+-- before building `subject`, which is not worth allocating on every write.
 local function assertSameTreeWrite(tree: Tree?, subject: string, level: number)
 	if OPEN_TXN_TREE ~= nil and tree ~= OPEN_TXN_TREE then
 		error(
@@ -194,7 +196,7 @@ function Node.NewTree(params: TreeParams): Tree
 		_derivedDirty = nil,
 		_derivedSettling = false,
 		_derivedLogged = nil,
-	}, Tree)
+	}, Tree) :: Tree
 	self.Accessor = newAccessor(self, {}, params.Compiled.Root)
 	-- The schema is read straight off Root.Children, not through ChildSchema: a template
 	-- lacking the reserved root must not get an AnyChild node synthesized and cached onto
@@ -206,7 +208,7 @@ function Node.NewTree(params: TreeParams): Tree
 		if rootChildren then rootChildren[Template.RESERVED_ROOT] else nil,
 		true
 	)
-	return self :: any
+	return self
 end
 
 local function assertAlive(tree: Tree)
@@ -245,9 +247,9 @@ end
 --
 -- Key count and "holds a string key", memoised by container identity so building a
 -- capped or integer-keyed dictionary key by key is not O(n^2). Weak-keyed, and safe
--- because a whole-table Set installs a different table, which has no entry yet.
--- Maintained where a container is ASSIGNED INTO, not where a write is validated:
--- NoValidate and FromRemote writes skip validation entirely.
+-- because a whole-table Set installs a different table with no entry yet. Maintained
+-- where a container is ASSIGNED INTO, not where a write is validated: NoValidate and
+-- FromRemote writes skip validation entirely.
 local containerCounts: { [any]: number } = setmetatable({}, { __mode = "k" }) :: any
 -- The offending string key of an integer-keyed container, or `false` for
 -- "walked it, there is none".
@@ -276,13 +278,11 @@ local function noteKeyDelta(container: any, key: any, had: boolean, has: boolean
 	if had == has then
 		return
 	end
-	-- A cached "holds no string key" stops being true the moment one is added, and
-	-- mixedKeyBlocker asks that of undeclared containers, where string keys arrive at
-	-- runtime. Upgraded here rather than in the guard because NoValidate and FromRemote
-	-- writes assign without reaching validation, and this hook still sees them.
-	--
-	-- A string key going AWAY is deliberately not tracked: that only leaves a stale
-	-- "yes", which blockingStringKey re-derives before acting on.
+	-- A cached "holds no string key" stops being true the moment one is added. Upgraded
+	-- here rather than in the guard because NoValidate and FromRemote writes assign
+	-- without reaching validation, and this hook still sees them. A string key going AWAY
+	-- is deliberately not tracked: that only leaves a stale "yes", which
+	-- blockingStringKey re-derives before acting on.
 	if has and type(key) == "string" and stringKeyed[container] == false then
 		stringKeyed[container] = key
 	end
@@ -317,11 +317,11 @@ local function scanStringKey(container: any): string?
 	return nil
 end
 
--- Does this container still hold a string key? Only a Scribe.MapOf("integer") asks,
--- and only when adding a key, so the answer is almost always no, which is the case
--- worth memoising. A cached "yes" is NOT trusted: such a key goes away by a raw fix-up
--- of the stored table (a migration, an operator edit) that this module never sees, so
--- re-deriving lets the repair take effect instead of locking the container forever.
+-- Does this container still hold a string key? Only a Scribe.MapOf("integer") asks, and
+-- only when adding a key, so "no" is the case worth memoising. A cached "yes" is NOT
+-- trusted: such a key goes away by a raw fix-up of the stored table (a migration, an
+-- operator edit) this module never sees, so re-deriving lets the repair take effect
+-- instead of locking the container forever.
 local function blockingStringKey(container: any): string?
 	local cached = stringKeyed[container]
 	if cached == false then
@@ -335,8 +335,8 @@ end
 -- description of the blocker, or nil.
 --
 -- Deliberately asymmetric: a numeric key is refused whenever a string key is present,
--- but a string key only when index 1 is occupied, because `{ [7] = ... }` is a
--- legitimate sparse bag that encodes cleanly.
+-- but a string key only when index 1 is occupied, since `{ [7] = ... }` is a legitimate
+-- sparse bag that encodes cleanly.
 local function mixedKeyBlocker(container: any, key: any): string?
 	if type(key) == "number" then
 		if container[1] ~= nil then
@@ -501,7 +501,7 @@ local function resolveContainer(
 	end
 	local chain: { SchemaNode }? = nil
 	if create and schema ~= nil and n > 1 then
-		local c: { SchemaNode } = table.create(n)
+		local c = table.create(n) :: { SchemaNode }
 		local cursor: SchemaNode? = schema
 		for i = n, 1, -1 do
 			if cursor == nil then
@@ -554,19 +554,17 @@ local function resolveContainer(
 			-- Recorded so a rollback can prune containers that never existed pre-txn.
 			local txn = tree._txn
 			if txn then
-				txn.Created[#txn.Created + 1] = table.move(path, 1, i, 1, table.create(i))
+				txn.Created[#txn.Created + 1] = table.move(path, 1, i, 1, table.create(i) :: { string | number })
 			end
 		elseif type(nextContainer) ~= "table" then
 			if not create then
 				-- A READ through a segment that now holds a scalar answers nil, as a
-				-- read through an absent segment does. Raising here would break the
-				-- never-throw-on-apply rule above: readValue is on that path twice
-				-- (snapshotDescendants and fireDescendants), so a listener bound under a
-				-- path that later held a scalar would kill the frame and desync the
-				-- mirror for good. Only a WRITE raises, since that is a real mistake.
+				-- read through an absent segment does. readValue is on the apply path
+				-- twice (snapshotDescendants and fireDescendants), so raising here would
+				-- kill the frame and desync the mirror for good. Only a WRITE raises.
 				return nil, nil
 			end
-			error(`Scribe: cannot index "{Util.pathString(path)}" — "{tostring(seg)}" is not a table`, 0)
+			error(`Scribe: cannot index "{Util.pathString(path)}": "{tostring(seg)}" is not a table`, 0)
 		end
 		container = nextContainer
 	end
@@ -715,10 +713,10 @@ local function fire(tree: Tree, pathKey: string, event: string, ...: any)
 	end
 end
 
--- Walks up from `path` firing two kinds of event on each ancestor. OnChildChanged is
--- a TRANSITION, so it fires immediately and is never deferred or deduplicated;
--- coalescing it would destroy what it reports. Changed is STATE, and its `old` is the
--- same reference as `new`, so a batch can collapse it without losing anything.
+-- Walks up from `path` firing two kinds of event on each ancestor. OnChildChanged is a
+-- TRANSITION, so it fires immediately and is never coalesced, which would destroy what
+-- it reports. Changed is STATE, and its `old` is the same reference as `new`, so a batch
+-- can collapse it losing nothing.
 --
 -- `childOld` is the deepest ancestor's immediate child's prior value, passed only by
 -- applySet. It needs its own `known` flag because nil is a legitimate prior value.
@@ -731,7 +729,7 @@ local function fireAncestors(tree: Tree, path: { string | number }, childOld: an
 	-- the previous iteration's already-allocated prefix. Starts as `path` itself.
 	local childPrefix: { string | number } = path
 	for depth = #path - 1, 0, -1 do
-		local prefix = table.move(path, 1, depth, 1, table.create(depth)) :: { string | number }
+		local prefix = table.move(path, 1, depth, 1, table.create(depth) :: { string | number })
 		local pathKey = Util.pathKey(prefix)
 		local byEvent = tree._listeners[pathKey]
 		if byEvent ~= nil then
@@ -771,8 +769,8 @@ end
 -- A container's own STATE fire, routed through the defer queue fireAncestors uses.
 -- Insert/Remove/Clear mutate at the container's own path, so they never reach
 -- fireAncestors for that node and would otherwise fire N times in a batch where every
--- other container fires once. Safe to collapse: the fire is (value, value), and the
--- per-entry transitions are carried separately by OnInsert and OnRemove.
+-- other container fires once. Safe to collapse: the fire is (value, value), and OnInsert
+-- and OnRemove carry the per-entry transitions separately.
 local function deferSelfState(tree: Tree, pathKey: string, path: { string | number }): boolean
 	if tree._replaying then
 		-- Same suppression `fire` applies: ReplayFire fires every observed path
@@ -823,11 +821,9 @@ local function flushPendingAncestors(tree: Tree)
 end
 
 -- Drop a rolled-back transaction's deferred fires; the restores below fire their own
--- Changed with the pre-transaction values.
---
--- Scoped by a mark taken when the transaction opened, because the queue is tree-wide:
--- a transaction nested in a Data.Batch shares it with the batch's surviving writes,
--- and clearing it wholesale would swallow those too.
+-- Changed with the pre-transaction values. Scoped by a mark taken when the transaction
+-- opened, because the queue is tree-wide: a transaction nested in a Data.Batch shares it
+-- with the batch's surviving writes, and clearing it wholesale would swallow those too.
 local function discardPendingAncestors(tree: Tree, mark: number)
 	local order = tree._pendingAncestorOrder
 	if order == nil then
@@ -905,13 +901,11 @@ local function fireDescendants(tree: Tree, olds: { [string]: any }?)
 	end
 end
 
--- Key transitions for the containers a whole-table write REWRITES. applySet reports
--- only the one key it wrote, so a Set at an ancestor would add or drop keys further
--- down with nothing saying so. Scoped to STRICT descendants, like
--- `snapshotDescendants`: the written path's own contents are a bulk state change.
---
--- The snapshot is a shallow key -> value map per observed container, taken only for a
--- path bound to OnKeyAdded/OnKeyRemoved.
+-- Key transitions for the containers a whole-table write REWRITES. applySet reports only
+-- the one key it wrote, so a Set at an ancestor would add or drop keys further down with
+-- nothing saying so. Scoped to STRICT descendants, like `snapshotDescendants`: the
+-- written path's own contents are a bulk state change. The snapshot is a shallow
+-- key -> value map per container bound to OnKeyAdded/OnKeyRemoved.
 type KeyedSnapshot = {
 	Key: string,
 	Path: { string | number },
@@ -1007,10 +1001,9 @@ end
 -- validation must always be encodable, so over-deep tables are rejected here.
 local MAX_VALUE_DEPTH = Util.MAX_VALUE_DEPTH
 
--- Truncate `s` to at most `maxBytes` without splitting a multi-byte UTF-8 character.
--- A plain string.sub would leave a half-encoded trailing character, and invalid UTF-8
--- fails the DataStore save. Callers pass an already-validated string, so any byte in
--- 0x80..0xBF is a continuation byte and the loop runs at most 3 times.
+-- Truncate `s` to at most `maxBytes` without splitting a multi-byte UTF-8 character; a
+-- half-encoded trailing character fails the DataStore save. Callers pass an
+-- already-validated string, so the loop runs at most 3 times.
 local function truncateUtf8(s: string, maxBytes: number): string
 	if #s <= maxBytes then
 		return s
@@ -1499,8 +1492,7 @@ local function setNested(root: { [any]: any }, relPath: { string | number }, val
 end
 
 -- Remove `relPath` from `root` WITHOUT creating any intermediate tables (unlike
--- setNested): if an ancestor along the way is already absent, there is nothing to
--- remove. Used to strip txn-materialized descendant containers out of a rollback
+-- setNested). Used to strip txn-materialized descendant containers out of a rollback
 -- reconstruction so no phantom empty sub-table survives.
 local function removeNested(root: { [any]: any }, relPath: { string | number })
 	local container = root
@@ -1522,11 +1514,10 @@ local function snapshotForTxn(tree: Tree, path: { string | number }, pathKey: st
 	if not txn or txn.Snapshots[pathKey] ~= nil then
 		return
 	end
-	-- Already covered by an ancestor snapshot? Walk THIS path's ancestor keys rather
-	-- than every snapshot taken so far, which made a transaction quadratic in the
-	-- number of distinct paths it touched. pathKey is 1:1 with path in a validated
-	-- tree, but the real path comparison still runs on a hit: it is O(depth) and it
-	-- decides whether a rollback restores the correct subtree.
+	-- Already covered by an ancestor snapshot? Walk THIS path's ancestor keys rather than
+	-- every snapshot taken so far, which made a transaction quadratic in the number of
+	-- distinct paths it touched. The real path comparison still runs on a hit: it is
+	-- O(depth) and it decides whether a rollback restores the correct subtree.
 	local at = string.find(pathKey, "\31", 1, true)
 	while at do
 		local ancestorSnap = txn.Snapshots[string.sub(pathKey, 1, at - 1)]
@@ -1553,7 +1544,13 @@ local function snapshotForTxn(tree: Tree, path: { string | number }, pathKey: st
 				if type(value) ~= "table" then
 					value = {}
 				end
-				local relPath = table.move(snap.Path, #path + 1, #snap.Path, 1, table.create(#snap.Path - #path))
+				local relPath = table.move(
+					snap.Path,
+					#path + 1,
+					#snap.Path,
+					1,
+					table.create(#snap.Path - #path) :: { string | number }
+				)
 				setNested(value, relPath, snap.Value)
 				overlaid = overlaid or {}
 				table.insert(overlaid :: { { string | number } }, snap.Path)
@@ -1563,13 +1560,11 @@ local function snapshotForTxn(tree: Tree, path: { string | number }, pathKey: st
 		end
 	end
 	-- Reconcile against containers materialized during this txn, so a rollback cannot
-	-- resurrect them as phantom empty tables: either the snapshotted container itself
-	-- was created (pre-txn value is nil), or a strict descendant was (strip it out).
-	--
-	-- Only strip a created path when NO overlaid snapshot sits at or above it. Created
-	-- also records a pre-existing container deleted and recreated inside this txn,
-	-- whose overlay just re-established genuine pre-txn state; stripping that would
-	-- destroy committed data on rollback.
+	-- resurrect them as phantom empty tables: either the snapshotted container itself was
+	-- created (pre-txn value is nil), or a strict descendant was (strip it out). Only
+	-- strip a created path when NO overlaid snapshot sits at or above it: Created also
+	-- records a pre-existing container deleted and recreated inside this txn, whose
+	-- overlay re-established genuine pre-txn state that stripping would destroy.
 	local function establishedByOverlay(createdPath: { string | number }): boolean
 		if not overlaid then
 			return false
@@ -1628,18 +1623,18 @@ end
 local applySet: (Tree, { string | number }, SchemaNode?, any, WriteOpts) -> any
 
 -- Materializes every missing DECLARED-ELEMENT intermediate along `path` as a real
--- applySet write of the element's defaults, before the caller's own write resolves
--- the chain. That makes materialization visible everywhere a write is: the element
--- Set replicates (so a schema-less Shared mirror rebuilds the full element, not a
--- bare {}), OnKeyAdded fires, and a transaction can roll the creation back. It also
--- lets a later leaf write equal to the default no-op safely. Untyped intermediates
--- keep their silent plain-{} materialization in resolveContainer.
+-- applySet write of the element's defaults, before the caller's own write resolves the
+-- chain. That makes materialization visible everywhere a write is: the element Set
+-- replicates (so a schema-less Shared mirror rebuilds the full element, not a bare {}),
+-- OnKeyAdded fires, a transaction can roll the creation back, and a later leaf write
+-- equal to the default no-ops safely. Untyped intermediates keep their silent plain-{}
+-- materialization in resolveContainer.
 local function seedMissingElements(tree: Tree, path: { string | number }, schema: SchemaNode?, opts: WriteOpts)
 	local n = #path
 	if n < 2 or schema == nil then
 		return
 	end
-	local chain: { SchemaNode } = table.create(n)
+	local chain = table.create(n) :: { SchemaNode }
 	local cursor: SchemaNode? = schema
 	for i = n, 1, -1 do
 		if cursor == nil then
@@ -1672,8 +1667,8 @@ local function seedMissingElements(tree: Tree, path: { string | number }, schema
 						)
 						-- The same alias guard resolveContainer applies. Seeding reaches the
 						-- container first, so resolveContainer's own check would see a key
-						-- that already exists and never run. Unreachable today because
-						-- checkContainerKey above rejects the mismatched form, but that is a
+						-- that already exists and never run. Unreachable today only because
+						-- checkContainerKey above rejects the mismatched form, which is a
 						-- guard in another function, so this stays.
 						local alias = aliasForm(seg)
 						if alias ~= nil and container[alias] ~= nil then
@@ -1685,11 +1680,11 @@ local function seedMissingElements(tree: Tree, path: { string | number }, schema
 							)
 						end
 					end
-					local prefix = table.move(path, 1, i, 1, table.create(i))
+					local prefix = table.move(path, 1, i, 1, table.create(i) :: { string | number })
 					-- This element exists because a write descended THROUGH its key, not
-					-- because anything asked for it. Recorded inside transactions only, so
-					-- the receipt path can report it. Deliberately NOT txn.Created, which
-					-- rollback consumes: this list is observational.
+					-- because anything asked for it. Recorded inside transactions only, for
+					-- the receipt path. Deliberately NOT txn.Created, which rollback
+					-- consumes: this list is observational.
 					local seedTxn = tree._txn
 					if seedTxn then
 						seedTxn.Seeded[#seedTxn.Seeded + 1] = prefix
@@ -1711,12 +1706,12 @@ local function seedMissingElements(tree: Tree, path: { string | number }, schema
 end
 
 -- Value equality for the three leaves whose canonical stored form is a table or a
--- buffer, which `Util.leafEquals` always reports as changed. Safe because validateWrite
--- has just rebuilt the value into Scribe's own normal form, of bounded size and never
--- handed out by reference; without it a no-op Set on one fires Changed and replicates.
---
--- Deliberately NOT extended to user tables, Scribe.SetOf or containers: a deep compare
--- there is unbounded, and a whole-table Set is how a caller replaces a table.
+-- buffer, which `Util.leafEquals` always reports as changed; without it a no-op Set on
+-- one fires Changed and replicates. Safe because validateWrite has just rebuilt the
+-- value into Scribe's own normal form, of bounded size and never handed out by
+-- reference. Deliberately NOT extended to user tables, Scribe.SetOf or containers: a
+-- deep compare there is unbounded, and a whole-table Set is how a caller replaces a
+-- table.
 local function canonicalStoredEquals(schema: SchemaNode?, old: any, new: any): boolean
 	if schema == nil then
 		return false
@@ -1868,7 +1863,7 @@ function applySet(tree: Tree, path: { string | number }, schema: SchemaNode?, va
 	fireDescendants(tree, descendantOlds)
 	-- Dictionary key events on the parent (dynamic keys only).
 	if #path >= 1 then
-		local parentPath = table.move(path, 1, #path - 1, 1, table.create(#path - 1)) :: { string | number }
+		local parentPath = table.move(path, 1, #path - 1, 1, table.create(#path - 1) :: { string | number })
 		local parentSchema = if schema then schema.Parent else nil
 		local isDynamic = parentSchema == nil
 			or parentSchema.Children == nil
@@ -1909,11 +1904,10 @@ end
 local applyArrayRemove: (Tree, { string | number }, SchemaNode?, number?, WriteOpts) -> any
 
 -- Scribe.Big and Scribe.Flags are leaves whose stored form happens to be a table, and
--- every container mutation gates on the stored value being one: without this, Insert
--- on a big rewrites its mantissa pair and Clear leaves a non-Optional field nil.
---
--- A Scribe.SetOf is a real container, but Insert and positional writes bypass the
--- dedupe and ordering its stored form depends on, so it is refused too.
+-- every container mutation gates on the stored value being one: without this, Insert on
+-- a big rewrites its mantissa pair and Clear leaves a non-Optional field nil. A
+-- Scribe.SetOf is a real container, but Insert and positional writes bypass the dedupe
+-- and ordering its stored form depends on, so it is refused too.
 local function refuseStructuralWrite(schema: SchemaNode?, path: { string | number }, method: string)
 	if schema == nil then
 		return
@@ -1957,10 +1951,9 @@ local function applyInsert(
 		if schema and schema.Container == "Dict" then
 			error(`Scribe: "{Util.pathString(path)}" is a Scribe.DictOf; write a key instead of calling Insert`, 0)
 		end
-		-- Ahead of the other refusals because the `math.clamp` below raises its own
-		-- error on a non-number position, which would make this message unreachable,
-		-- and a NaN or fractional position would silently write a hash-part index.
-		-- The cost: `Insert(nil, "x")` names the position rather than the nil.
+		-- Ahead of the other refusals because the `math.clamp` below raises its own error
+		-- on a non-number position, and a NaN or fractional position would silently write
+		-- a hash-part index. The cost: `Insert(nil, "x")` names the position, not the nil.
 		if pos ~= nil and (type(pos) ~= "number" or pos ~= pos or pos % 1 ~= 0) then
 			error(`Scribe: Insert position must be an integer, got {tostring(pos)}`, 0)
 		end
@@ -1999,8 +1992,8 @@ local function applyInsert(
 		end
 		-- Insert creates an array index, so it can mix an undeclared container just as a
 		-- keyed write can, and it is the one path checkContainerKey never sees. Checked
-		-- before validateWrite, seedMissingElements and ensureContainerValue, so a
-		-- refusal leaves nothing materialized.
+		-- before validateWrite, seedMissingElements and ensureContainerValue, so a refusal
+		-- leaves nothing materialized.
 		if (schema == nil or schema.Container == nil) and type(preValue) == "table" then
 			local blocker = mixedKeyBlocker(preValue, index)
 			if blocker ~= nil then
@@ -2149,10 +2142,9 @@ local function applyClear(tree: Tree, path: { string | number }, schema: SchemaN
 	emitOp(tree, { Kind = "Clear", Path = table.clone(path) }, schema, opts)
 	-- Bulk semantics: the parent Changed fires once and per-entry key events do not. A
 	-- descendant leaf listener is not a per-entry event: its value really did change.
-	--
 	-- Descendants come BEFORE the container's own state, the only order both paths can
-	-- share: inside a batch the self fire is deferred to the flush and lands last
-	-- anyway, so firing it first when unbatched gave one Clear two orders.
+	-- share: inside a batch the self fire is deferred to the flush and lands last anyway,
+	-- so firing it first when unbatched gave one Clear two orders.
 	fireDescendants(tree, descendantOlds)
 	if not deferSelfState(tree, pathKey, path) then
 		fire(tree, pathKey, "Changed", value, value)
@@ -2255,10 +2247,6 @@ settleDerived = function(tree: Tree)
 	end
 end
 
--- Applies a whole frame's ops as ONE batch, so N ops under the same container give
--- one container Changed. The receiving half of Server.Batch: the server already
--- coalesced the batch into one frame, and unpacking it back into N fires is exactly
--- what a container listener is trying to avoid. Leaf fires are untouched.
 --- Compares each derived value the server sent this frame against the one this realm
 --- computed, once the local recompute has run. A disagreement is an impure compute
 --- function, which nothing else can detect.
@@ -2285,6 +2273,9 @@ local function runDerivedAudit(tree: Tree)
 	end
 end
 
+-- Applies a whole frame's ops as ONE batch, so N ops under the same container give one
+-- container Changed. The receiving half of Server.Batch: the server already coalesced
+-- the batch into one frame. Leaf fires are untouched.
 function Tree.ApplyOps(self: Tree, ops: { Op })
 	if self.Dead then
 		return
@@ -2349,12 +2340,10 @@ function Tree.ApplyOp(self: Tree, op: Op)
 	-- Purity audit. A locally computed derived field is not sent in production, so
 	-- receiving one means the server is in dev mode and wants the two compared.
 	--
-	-- The comparison cannot happen HERE. This realm recomputes derived fields at the
-	-- end of the frame, not per op: ApplyOps holds _batchDepth up for the whole frame
-	-- so every settleAfterWrite returns early. Reading the path now returns the value
-	-- from before this frame, and since a derived op is only emitted when the value
-	-- changed, that stale read differs on every single one. Record the server's value
-	-- and let runDerivedAudit compare once both realms have seen the same inputs.
+	-- The comparison cannot happen HERE: this realm recomputes at the end of the frame,
+	-- not per op, so reading the path now returns the pre-frame value, which differs on
+	-- every derived op (one is emitted only when the value changed). Record the server's
+	-- value and let runDerivedAudit compare once both realms have seen the same inputs.
 	if exactSchema ~= nil and exactSchema.Derived ~= nil and not exactSchema.Derived.Transmit then
 		if self.Params.OnDerivedIssue then
 			local audit = self._derivedAudit
@@ -2457,8 +2446,9 @@ function Tree.RunBatch(self: Tree, fn: () -> ())
 		settleDerived(self)
 		-- Listeners before replication, matching the unbatched ordering.
 		flushPendingAncestors(self)
-		if self.Params.OnBatchEnd then
-			self.Params.OnBatchEnd()
+		local onBatchEnd: (() -> ())? = self.Params.OnBatchEnd
+		if onBatchEnd then
+			onBatchEnd()
 		end
 	end
 	if not ok then
@@ -2487,11 +2477,9 @@ local function rollbackTransaction(self: Tree, txn: any)
 	--
 	-- Restores EMIT replication ops. A listener woken by the drain can write a field this
 	-- txn also touched, and that write replicates, so only an emitted restore keeps the
-	-- client's baseline equal to the server's.
-	--
-	-- ORDERED, because the listener writes the restores trigger are neither snapshotted
-	-- nor rolled back. Sorting does not stop the write; it makes the outcome the same
-	-- every run, which Universe.Digest depends on outright.
+	-- client's baseline equal to the server's. ORDERED, because those listener writes are
+	-- neither snapshotted nor rolled back. Sorting does not stop the write; it makes the
+	-- outcome the same every run, which Universe.Digest depends on outright.
 	local ordered: { { Path: { string | number }, Value: any } } = {}
 	local orderKeys: { [any]: string } = {}
 	for pathKey, snapshot in txn.Snapshots :: { [string]: { Path: { string | number }, Value: any } } do
@@ -2500,12 +2488,15 @@ local function rollbackTransaction(self: Tree, txn: any)
 	end
 	-- Shallowest first, then by path key: if a snapshot pair is ever not disjoint, the
 	-- ancestor must land before the descendant it contains, not be overwritten by it.
-	table.sort(ordered, function(a, b)
-		if #a.Path ~= #b.Path then
-			return #a.Path < #b.Path
+	table.sort(
+		ordered,
+		function(a: { Path: { string | number }, Value: any }, b: { Path: { string | number }, Value: any })
+			if #a.Path ~= #b.Path then
+				return #a.Path < #b.Path
+			end
+			return orderKeys[a] < orderKeys[b]
 		end
-		return orderKeys[a] < orderKeys[b]
-	end)
+	)
 	for _, snapshot in ordered do
 		local baseSchema, dynStart = Template.Resolve(self.Compiled, snapshot.Path)
 		local exactSchema: SchemaNode? = baseSchema
@@ -2647,25 +2638,24 @@ function Tree.RunTransaction(
 	end
 
 	if ok then
-		local onOp = self.Params.OnOp
+		local onOp: ((op: Op, schema: SchemaNode?) -> ())? = self.Params.OnOp
 		if onOp then
 			for _, entry in txn.Ops :: { { Op: Op, Schema: SchemaNode? } } do
 				onOp(entry.Op, entry.Schema)
 			end
 		end
-		local onEconomy = self.Params.OnEconomy
+		local onEconomy: ((path: { string | number }, delta: number, newValue: number, tags: { [string]: any }) -> ())? =
+			self.Params.OnEconomy
 		if onEconomy then
 			for _, event in txn.Economy :: { { Path: { string | number }, Delta: number, New: number, Tags: any } } do
 				onEconomy(event.Path, event.Delta, event.New, event.Tags)
 			end
 		end
-		-- After the ops, so anything reported here describes journaled writes, and only
-		-- on the committed path.
-		--
-		-- pcall, unlike the two callbacks above, because this one is a DIAGNOSTIC and the
-		-- transaction has already committed: a throw would skip flushPendingAncestors and
-		-- surface as a failed grant, which Roblox retries into a double grant. OnOp and
-		-- OnEconomy are load-bearing and stay unguarded.
+		-- After the ops, so anything reported here describes journaled writes, and only on
+		-- the committed path. pcall, unlike the two callbacks above, because this one is a
+		-- DIAGNOSTIC and the transaction has already committed: a throw would skip
+		-- flushPendingAncestors and surface as a failed grant, which Roblox retries into a
+		-- double grant. OnOp and OnEconomy are load-bearing and stay unguarded.
 		if onSeeded and #txn.Seeded > 0 then
 			local reported = pcall(onSeeded, txn.Seeded :: { { string | number } })
 			if not reported then
@@ -2674,8 +2664,9 @@ function Tree.RunTransaction(
 		end
 		if self._batchDepth == 0 then
 			flushPendingAncestors(self)
-			if self.Params.OnBatchEnd then
-				self.Params.OnBatchEnd()
+			local onBatchEnd: (() -> ())? = self.Params.OnBatchEnd
+			if onBatchEnd then
+				onBatchEnd()
 			end
 		end
 		return true, nil
@@ -2728,25 +2719,22 @@ end
 	`SetTimed`/`ExtendTimed`/`Active`.
 	On the client, `Set` writes are local-only (optimistic UI).
 
-	:::caution Reserved names
-	Because method names live on the node, a template field named `Get`, `Set`,
-	`Count`, `Remove`, etc. is unreachable through the typed accessor. Scribe
-	warns about this in Studio.
-	:::
+	!!! warning "Reserved names"
+	    Because method names live on the node, a template field named `Get`, `Set`,
+	    `Count`, `Remove`, etc. is unreachable through the typed accessor. Scribe
+	    warns about this in Studio.
 
-	:::caution Scribe's own `_Scribe` root is read-only to game code
-	Every mutator is refused on a path inside the reserved `_Scribe` root, and a
-	read of it hands back a detached copy rather than the live table. That root is
-	Scribe's ledger, not your data. [Value.Set] says what it holds and which APIs
-	own it.
-	:::
+	!!! warning "Scribe's own `_Scribe` root is read-only to game code"
+	    Every mutator is refused on a path inside the reserved `_Scribe` root, and a
+	    read of it hands back a detached copy rather than the live table. That root is
+	    Scribe's ledger, not your data. [Value.Set] says what it holds and which APIs
+	    own it.
 
-	:::caution The callable shorthand is not API
-	A node is callable at runtime, so `data.Coins()` reads, `data.Coins(5)` writes
-	and `data.Coins(fn)` updates. The generated accessor type does not carry it, so
-	every such call site is a type error, and nothing tests it. Treat it as an
-	implementation detail and call `Get`, `Set` and `Update` by name.
-	:::
+	!!! warning "The callable shorthand is not API"
+	    A node is callable at runtime, so `data.Coins()` reads, `data.Coins(5)` writes
+	    and `data.Coins(fn)` updates. The generated accessor type does not carry it, so
+	    every such call site is a type error, and nothing tests it. Treat it as an
+	    implementation detail and call `Get`, `Set` and `Update` by name.
 ]=]
 
 --[=[
@@ -2876,12 +2864,11 @@ end
 	one per [Server.Batch] and one per client replication frame, however many
 	children moved. Use [Value.OnChildChanged] to learn which child moved.
 
-	:::caution The container `key` argument was removed
-	A container listener declaring a **third parameter errors at connect time**: one
-	fire now covers every child a batch or a frame touched, so naming one of them
-	would imply the others did not change. A node beneath an untyped `{}` subtree is
-	classified by what is stored there now, so connect after the container exists.
-	:::
+	!!! warning "The container `key` argument was removed"
+	    A container listener declaring a **third parameter errors at connect time**: one
+	    fire now covers every child a batch or a frame touched, so naming one of them
+	    would imply the others did not change. A node beneath an untyped `{}` subtree is
+	    classified by what is stored there now, so connect after the container exists.
 
 	[Reading & Writing Values](../values.md) puts the three container listeners side
 	by side.
@@ -3347,7 +3334,7 @@ local function unpackRead(schema: SchemaNode?, value: any): any
 		return if value == nil then nil else Big.from(value)
 	end
 	if type(value) == "table" then
-		if Template.IsPacked(schema) then
+		if schema ~= nil and Template.IsPacked(schema) then
 			local out: { [any]: any } = {}
 			for k, v in value do
 				out[k] = unpackRead(Template.ChildSchema(schema, k), v)
@@ -3382,8 +3369,8 @@ end
 -- Canonical packed form of a datatype, for comparison only. Packing is not
 -- byte-canonical for every codec, so a value Get() handed out would not re-pack to the
 -- bytes it came from; routing both sides through the same unpack+repack lands them on
--- one representative, which is what makes `Has(Get()[i])` work. `precision` must be
--- the same on both sides, hence threaded rather than defaulted.
+-- one representative, which makes `Has(Get()[i])` work. `precision` must be the same on
+-- both sides, hence threaded rather than defaulted.
 local function canonicalDatatype(name: string, value: any, precision: (string | number)?): buffer?
 	local packed: buffer
 	if type(value) == "buffer" then
@@ -3489,9 +3476,9 @@ local function cloneUnpack(schema: SchemaNode?, value: any): any
 end
 
 -- Is this accessor GAME CODE's handle on Scribe's own ledger? Shared by both
--- reserved-root guards: the write refusal in accessorIndex and the copy-on-read
--- below. Neither term can change for a given accessor, so callers evaluate this once
--- when a method is built and a read pays one boolean test.
+-- reserved-root guards: the write refusal in accessorIndex and the copy-on-read below.
+-- Neither term can change for a given accessor, so callers evaluate this once when a
+-- method is built.
 local function isPublicReserved(accessor: Accessor): boolean
 	return accessorPath(accessor)[1] == Template.RESERVED_ROOT and not PRIVILEGED[accessor]
 end
@@ -3507,12 +3494,11 @@ local function detachedCopy(schema: SchemaNode?, value: any): any
 end
 
 -- The read boundary. An ordinary read unpacks and hands back the live stored table by
--- reference, which is deliberate; a read of the reserved root BY GAME CODE hands back
--- a detached deep copy, or the write guard in accessorIndex is decorative and clearing
--- the ledger through a reader lets the next retried receipt grant twice.
---
--- Deep, because the ledger nests. Not table.freeze, which is permanent in Luau and
--- would break the library's own writes through Tree.Reserved.
+-- reference, which is deliberate; a read of the reserved root BY GAME CODE hands back a
+-- detached deep copy, or the write guard in accessorIndex is decorative and clearing the
+-- ledger through a reader lets the next retried receipt grant twice. Deep, because the
+-- ledger nests. Not table.freeze, which is permanent in Luau and would break the
+-- library's own writes through Tree.Reserved.
 local function readOut(guarded: boolean, schema: SchemaNode?, value: any): any
 	if guarded and type(value) == "table" then
 		return detachedCopy(schema, value)
@@ -3520,13 +3506,11 @@ local function readOut(guarded: boolean, schema: SchemaNode?, value: any): any
 	return unpackRead(schema, value)
 end
 
--- The whole-data value the ROOT accessor reads. Reading the store directly is wrong
--- in both directions: it carries Scribe's library-owned roots, which the declared
--- type never had, and it is only one of the two stores, so Session roots go missing.
--- Building from the DECLARED roots gives exactly the keys the template promises.
---
--- Scribe's internals stay reachable by indexing the accessor (`data._Scribe.Perks`);
--- only a whole-data read is affected.
+-- The whole-data value the ROOT accessor reads. Reading the store directly is wrong in
+-- both directions: it carries Scribe's library-owned roots, which the declared type
+-- never had, and it is only one of the two stores, so Session roots go missing. Building
+-- from the DECLARED roots gives exactly the keys the template promises. Scribe's
+-- internals stay reachable by indexing the accessor (`data._Scribe.Perks`).
 local function rootShell(tree: Tree, clone: boolean): { [string]: any }
 	local out: { [string]: any } = {}
 	local children = tree.Compiled.Root.Children
@@ -3559,12 +3543,11 @@ local function frozenRootShell(tree: Tree): { [string]: any }
 end
 
 -- A root Observe/Changed re-reads every root on every write, and a root holding a
--- datatype or a Scribe.Big must be rebuilt key by key to be read at all, so over a
--- few thousand packed elements one unrelated write costs milliseconds.
---
--- The library cannot make that cheap safely: skipping the rebuild means sharing one
--- view, and that view aliases live store tables. The fix belongs in the game, which
--- should listen to the container it cares about. Said once, in DevMode.
+-- datatype or a Scribe.Big must be rebuilt key by key to be read at all, so over a few
+-- thousand packed elements one unrelated write costs milliseconds. The library cannot
+-- make that cheap safely: skipping the rebuild means sharing one view, and that view
+-- aliases live store tables. The fix belongs in the game, which should listen to the
+-- container it cares about. Said once, in DevMode.
 local ROOT_OBSERVE_WARN_NODES = 512
 local warnedRootObserve: { [any]: boolean } = setmetatable({}, { __mode = "k" }) :: any
 
@@ -3854,22 +3837,20 @@ local function incrementImpl(accessor: Accessor, delta: any, tagsOrReplicate: an
 			signed = Big.negate(signed)
 		end
 		local tags, replicate = parseIncrementArgs(tagsOrReplicate)
-		local before = Big.from(readValue(tree, path)) or Big.from(bigNode.Default)
-		if before == nil then
-			if bigNode.Nullable then
-				validationError(path, `{method} on an absent Scribe.Optional value`)
-			end
-			before = Big.from(0)
+		local stored = Big.from(readValue(tree, path)) or Big.from(bigNode.Default)
+		if stored == nil and bigNode.Nullable then
+			validationError(path, `{method} on an absent Scribe.Optional value`)
 		end
+		local before: Big.Big = stored or BIG_ZERO
 		local result = bigApply(accessor, method, signed, replicate, Big.add)
 		if tags and tree.Params.OnEconomy then
-			local after = Big.from(result) or Big.from(0)
+			local after: Big.Big = Big.from(result) or BIG_ZERO
 			-- Report the EFFECTIVE change so a Min/Max clamp does not over-report.
 			-- LogEconomyEvent takes a double, so the conversion happens here;
 			-- Big.toNumber saturates past the double range, which is lossy but
 			-- reaches the log, unlike a table that Analytics' pcall would swallow.
 			local effective = Big.sub(after, before)
-			if Big.compare(effective, Big.from(0) :: any) ~= 0 then
+			if Big.compare(effective, BIG_ZERO) ~= 0 then
 				local applied = table.clone(tags)
 				if applied.Flow == nil then
 					applied.Flow = defaultFlow
@@ -3878,10 +3859,7 @@ local function incrementImpl(accessor: Accessor, delta: any, tagsOrReplicate: an
 				local newValue = Big.toNumber(after)
 				local txn = tree._txn
 				if txn then
-					table.insert(
-						(txn :: any).Economy,
-						{ Path = path, Delta = effectiveDelta, New = newValue, Tags = applied }
-					)
+					table.insert(txn.Economy, { Path = path, Delta = effectiveDelta, New = newValue, Tags = applied })
 				else
 					tree.Params.OnEconomy(path, effectiveDelta, newValue, applied)
 				end
@@ -3920,7 +3898,7 @@ local function incrementImpl(accessor: Accessor, delta: any, tagsOrReplicate: an
 		if txn then
 			-- Deferred like replication ops: fired on commit, dropped on rollback,
 			-- so a rolled-back Increment never logs a transaction.
-			table.insert((txn :: any).Economy, { Path = path, Delta = effectiveDelta, New = newValue, Tags = applied })
+			table.insert(txn.Economy, { Path = path, Delta = effectiveDelta, New = newValue, Tags = applied })
 		else
 			tree.Params.OnEconomy(path, effectiveDelta, newValue, applied)
 		end
@@ -3941,7 +3919,7 @@ METHOD_FACTORIES.Decrement = function(accessor)
 			local warnFn = tree.Params.LogWarn
 			if warnFn then
 				warnFn(
-					`Decrement called with a negative delta at "{Util.pathString(accessorPath(accessor))}" — likely a sign error`
+					`Decrement called with a negative delta at "{Util.pathString(accessorPath(accessor))}", likely a sign error`
 				)
 			end
 		end
@@ -4248,8 +4226,7 @@ for _, event in { "OnInsert", "OnRemove", "OnKeyAdded", "OnKeyRemoved", "OnChild
 		-- The root accessor's own path is empty, so isPublicReserved answers false for it,
 		-- but these events carry a CHILD and one of the root's children IS the reserved
 		-- root: without this, binding data.OnChildChanged hands game code the live ledger
-		-- by reference. Hoisted out of the wrappers because neither term can change for a
-		-- given accessor. The PRIVILEGED term is unreachable today and stays, so a
+		-- by reference. The PRIVILEGED term is unreachable today and stays, so a
 		-- privileged root added later does not silently start receiving copies.
 		local rootGuard = #accessorPath(accessor) == 0 and not PRIVILEGED[accessor]
 		return function(fn: (...any) -> ())
@@ -4280,8 +4257,8 @@ for _, event in { "OnInsert", "OnRemove", "OnKeyAdded", "OnKeyRemoved", "OnChild
 					local childSchema = if schema then Template.ChildSchema(schema, key) else nil
 					-- Same key-derived guard. Unreachable today, since the reserved root is
 					-- created with the tree and never appears or disappears
-					-- (RootChildLedgerGuard.spec pins that), but leaving one sibling wrapper on
-					-- the container-only guard would be a difference with no reason behind it.
+					-- (RootChildLedgerGuard.spec pins that), but kept so the sibling wrappers
+					-- do not differ for no reason.
 					local g = guarded or (rootGuard and key == Template.RESERVED_ROOT)
 					inner(key, entryValueForListener(g, childSchema, value))
 				end
@@ -4366,12 +4343,10 @@ local function accessorIndex(accessor: Accessor, key: any): any
 		if MUTATOR_METHODS[key] then
 			-- A write to a DIFFERENT player's tree is refused while a transaction is open: it
 			-- cannot be rolled back with the transaction, so one half of a trade could commit
-			-- while the other is undone. Reads never enter this branch.
-			--
-			-- The residual: a handle taken BEFORE the transaction opened
-			-- (`local inc = other.Coins.Increment`) is not refused, since no index happens at
-			-- the call. Gated on OPEN_TXN_TREE because pathString allocates; level 3 blames the
-			-- game code that indexed the mutator.
+			-- while the other is undone. Reads never enter this branch. The residual: a handle
+			-- taken BEFORE the transaction opened (`local inc = other.Coins.Increment`) is not
+			-- refused, since no index happens at the call. Gated on OPEN_TXN_TREE because
+			-- pathString allocates; level 3 blames the game code that indexed the mutator.
 			if OPEN_TXN_TREE ~= nil then
 				assertSameTreeWrite(accessorTree(accessor), Util.pathString(accessorPath(accessor)), 3)
 			end
@@ -4405,11 +4380,11 @@ local function accessorIndex(accessor: Accessor, key: any): any
 				)
 			end
 			-- Cached under a module-private identity rather than under `key`, so every
-			-- `x.Set` keeps going through __index and past the guards. A plain
-			-- rawset under `key`, which the non-mutator branch below does, would be
-			-- satisfied off the accessor table on the second read: harmless for the fixed
-			-- refusals, wrong for the transaction one, which changes with the caller.
-			-- Cache the method; do not cache the decision.
+			-- `x.Set` keeps going through __index and past the guards. A plain rawset under
+			-- `key`, as the non-mutator branch below does, would be satisfied off the
+			-- accessor table on the second read: harmless for the fixed refusals, wrong for
+			-- the transaction one, which changes with the caller. Cache the method, not the
+			-- decision.
 			local cached = rawget(accessor, MUTATOR_CACHE_KEY[key])
 			if cached ~= nil then
 				return cached
@@ -4486,12 +4461,31 @@ local function accessorCall(accessor: Accessor, ...: any): any
 	if type(first) == "function" then
 		return accessor.Update(first, select(2, ...))
 	end
+	-- `node(nil, nil)` is what a generalized `for` used to produce before __iter
+	-- existed, and it reaches Set(nil) which deletes the node. A deliberate clear is
+	-- `node.Set(nil)` with one argument; two nils is never intentional.
+	if n == 2 and first == nil and select(2, ...) == nil then
+		error("Scribe: accessor(nil, nil) would delete this node; use Set(nil) if that is what you mean", 2)
+	end
 	return accessor.Set(...)
+end
+
+-- Without __iter, a generalized `for` falls back to __call and invokes it as the
+-- iterator with two nil arguments, which reaches `accessor.Set(nil, nil)` and DELETES
+-- the node. The loop body never runs, so `for k, v in data.Inventory do` reads as a
+-- no-op and silently destroys the container, then replicates and persists the deletion.
+local function accessorIter(): ()
+	error(
+		"Scribe: an accessor is not iterable. Iterate the value instead: "
+			.. "`for key, entry in data.Inventory.Get() do` (read-only) or `.Clone()` for a table you may edit",
+		2
+	)
 end
 
 ACCESSOR_MT = {
 	__index = accessorIndex,
 	__call = accessorCall,
+	__iter = accessorIter,
 }
 
 Node.METHOD_NAMES = {} :: { [string]: boolean }

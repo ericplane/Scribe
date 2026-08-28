@@ -14,8 +14,8 @@ local Sched = require(script.Parent.Sched)
 
 type LogEntry = Types.LogEntry
 
--- Default entries retained for Log.GetRecent; the bundle option LogRingSize
--- raises it for runs long enough that 512 truncates the interesting part.
+-- Entries retained for Log.GetRecent; the bundle option LogRingSize raises it for
+-- runs long enough that 512 truncates the interesting part.
 local DEFAULT_RING_SIZE = 512
 local ringSize = DEFAULT_RING_SIZE
 local MAX_STRUCTURED_CONTEXT_BYTES = 1000 -- keep structured-log context under ~1 KiB
@@ -114,8 +114,8 @@ local function emit(
 	message: string,
 	context: { [string]: any }?
 )
-	-- Cap the message so a client-supplied string or a long traceback can't
-	-- bloat the ring buffer, the console fallback, or the structured context.
+	-- Capped so a client-supplied string or a long traceback cannot bloat the ring
+	-- buffer, the console fallback, or the structured context.
 	if #message > MAX_MESSAGE_LEN then
 		message = string.sub(message, 1, MAX_MESSAGE_LEN) .. "…"
 	end
@@ -175,11 +175,9 @@ function Log.Fatal(category: Types.LogCategory, code: Types.LogCode, message: st
 	emit("Fatal", category, code, message, context)
 end
 
---- Register a sink, and hand back a function that removes it. Every entry spawns
---- one thread per sink, so a sink nobody detaches keeps costing on the hottest
---- failure path.
----
---- The remover is idempotent: calling it twice is a no-op rather than removing
+--- Register a sink, and hand back a function that removes it. Every entry spawns one
+--- thread per sink, so a sink nobody detaches keeps costing on the hottest failure
+--- path. The remover is idempotent: calling it twice is a no-op rather than removing
 --- whatever has since taken that index.
 function Log.AddSink(fn: (entry: LogEntry) -> ()): () -> ()
 	table.insert(sinks, fn)

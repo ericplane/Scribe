@@ -1,13 +1,11 @@
 --!strict
--- Signal: the de-facto-standard batched, yield-safe Roblox signal (GoodSignal),
--- vendored so Scribe carries no external Signal dependency. Handlers run on a
--- cached runner thread (cheap yielding), connections form a linked list (so a
--- listener can disconnect another mid-fire safely), and a throwing handler is
--- surfaced by the scheduler rather than swallowed.
+-- Signal: the batched, yield-safe Roblox signal (GoodSignal), vendored so Scribe carries
+-- no external Signal dependency. Handlers run on a cached runner thread (cheap yielding),
+-- connections form a linked list so a listener can disconnect another mid-fire, and a
+-- throwing handler is surfaced by the scheduler rather than swallowed.
 --
 -- Adapted from GoodSignal by stravant (2021) and sleitnick's typed copy; both
--- MIT-licensed. Trimmed to the surface Scribe uses (new / Connect / Once /
--- Fire / Wait / DisconnectAll / Destroy).
+-- MIT-licensed. Trimmed to new / Connect / Once / Fire / Wait / DisconnectAll / Destroy.
 
 export type Connection = {
 	Disconnect: (self: Connection) -> (),
@@ -208,17 +206,15 @@ function Signal.Fire(self: any, ...: any)
 end
 
 -- Fires like Fire does, one isolated thread per handler, then hands
--- `onSettled(ran, ok, err)` the outcome once the last handler has returned or
--- raised. Fire alone cannot say whether a handler ran, finished or blew up, and
--- the cross-server message drain has to know: retiring a message whose handler
--- never observed it destroys it.
+-- `onSettled(ran, ok, err)` the outcome once the last handler has returned or raised.
+-- Fire alone cannot say whether a handler ran, finished or blew up, and the cross-server
+-- message drain has to know: retiring a message whose handler never observed it destroys
+-- it. Not on the exported Signal type, like HasListeners.
 --
--- `ran` is how many connections were live at the call, `ok` is false if any of
--- them raised, `err` is the first error. onSettled runs synchronously when no
--- handler yielded, otherwise on the last handler's thread. A handler that yields
--- and never returns never settles, so the caller is never told to acknowledge.
---
--- Not on the exported Signal type: internal machinery, like HasListeners.
+-- `ran` is how many connections were live at the call, `ok` is false if any raised,
+-- `err` is the first error. onSettled runs synchronously when no handler yielded,
+-- otherwise on the last handler's thread. A handler that yields and never returns never
+-- settles, so the caller is never told to acknowledge.
 function Signal.FireTracked(self: any, onSettled: (number, boolean, any) -> (), ...: any)
 	local ran, settled = 0, 0
 	local failed, firstError = false, nil

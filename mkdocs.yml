@@ -101,10 +101,12 @@ nav:
           - Economy Analytics: economy.md
           - Leaderboards: leaderboards.md
           - Diagnostics: diagnostics.md
+          - What It Costs: cost.md
       - Advanced:
           - Offline Profiles: profiles.md
           - Gifting: gifting.md
           - Cross-Key Transactions: transactions.md
+          - Exchange: exchange.md
           - Custom Transports: transports.md
           - Security: security.md
           - Migrating to Scribe: migrating.md

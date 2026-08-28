@@ -25,7 +25,37 @@ Products = {
 Passes = { VIP = { Id = 987654321 } },
 ```
 
-That is the entire setup. When a server script first requires the shared module, Scribe takes over `MarketplaceService.ProcessReceipt` and runs every Robux purchase through it. Prompt the sale however you like, with `MarketplaceService:PromptProductPurchase(player, 1234567890)`, and Scribe does the rest: it grants the coins, writes a Robux purchase-log entry, and waits for the save to confirm before answering `PurchaseGranted`. If anything fails, it answers `NotProcessedYet` and Roblox retries later.
+That is the entire setup. When a server script first requires the shared module, Scribe takes over `MarketplaceService.ProcessReceipt` and runs every Robux purchase through it: it grants the coins, writes a Robux purchase-log entry, and waits for the save to confirm before answering `PurchaseGranted`. If anything fails, it answers `NotProcessedYet` and Roblox retries later.
+
+## Prompting the sale
+
+Ask by the name you declared, not the numeric Id. The same call handles both tables:
+
+```lua
+Data.PromptPurchase(player, "CoinPack500")   -- a product
+Data.PromptPurchase(player, "VIP")           -- a pass
+```
+
+Scribe resolves the name against `Products` and `Passes` and makes the matching engine call, so a shop button does not have to know which table an item lives in. The Id stays in one place, and a re-published product leaves no stale number in a shop script.
+
+A name declared in **both** tables is a startup error. Resolution is by name, so otherwise the order of two tables would decide what the player is charged for.
+
+**It refuses something the player already owns.** A pass is its own ownership key. A product is checked against its `Grants` perk, and one with no `Grants` is a consumable, has nothing to own, and always prompts. So you do not have to pair every prompt with its own [`Owns`](/api/Server#Owns) check.
+
+You also get `(false, reason)` for an unknown name, a player whose data is not loaded, and a prompt the engine itself refused, which is what an unpublished product looks like. None of those raise, so a shop handler needs no `pcall` of its own.
+
+Prompting is all it does. The grant happens on the receipt through the same path every purchase takes, so a player who buys and then leaves is still granted on their next load.
+
+!!! note "You can still prompt it yourself"
+    `MarketplaceService:PromptProductPurchase` and `PromptGamePassPurchase` keep working, and Scribe still handles what follows. `Data.PromptPurchase` is the shorter route with name resolution and the ownership check attached.
+
+### A finished pass purchase is confirmed, not trusted
+
+A game pass has no `ProcessReceipt`. The only signal is `PromptGamePassPurchaseFinished`, which reports that the purchase **dialog closed**, not that a transaction completed.
+
+Scribe re-checks ownership before crediting anything. If the check does not confirm it, nothing is credited, no purchase-history entry is written, and `PASS_PURCHASE_UNCONFIRMED` is logged. A genuine purchase the ownership API has not caught up with is credited on the player's next load, because the join scan re-resolves every declared pass.
+
+The reason this matters is not the session cache, which heals itself. It is the purchase history: that is persisted, and an unconfirmed event would have written a permanent record of Robux that may never have been spent.
 
 The meta table on `Increment` is optional. It makes the grant show up in Roblox's economy dashboard, which is worth having for your largest source of currency. See [Economy Analytics](./economy).
 
@@ -131,34 +161,33 @@ If the player has 200 coins, nothing happens at all: no debit, no lantern, and `
 
 Notice the grant uses a whole-element `Set` rather than `data.Inventory.EmberLantern.Qty.Increment(1)`. Both work, but `Set` states plainly that a new element is being created, and it keeps the seeded-element warning below quiet.
 
-:::danger A grant that writes through an unresolved key takes the Robux and delivers nothing
+!!! danger "A grant that writes through an unresolved key takes the Robux and delivers nothing"
 
-A container key that names no element is **created** by a write rather than refused. So the obvious way to write an upgrade grant succeeds end to end, even when `itemId` names nothing the player owns:
+    A container key that names no element is **created** by a write rather than refused. So the obvious way to write an upgrade grant succeeds end to end, even when `itemId` names nothing the player owns:
 
-```lua
--- itemId came from the shop UI, so the player chose it
-Grant = function(data)
-    data.Inventory[itemId].Qty.Increment(1) -- no error, ever
-end,
-```
+    ```lua
+    -- itemId came from the shop UI, so the player chose it
+    Grant = function(data)
+        data.Inventory[itemId].Qty.Increment(1) -- no error, ever
+    end,
+    ```
 
-The element materialises from its declared defaults, the transaction commits, the profile saves, and the purchase reports success. The player paid, and the item sits on a key no UI will ever show.
+    The element materialises from its declared defaults, the transaction commits, the profile saves, and the purchase reports success. The player paid, and the item sits on a key no UI will ever show.
 
-Resolve the id before you spend it. A `Grant` that throws is rolled back in full, so the coins stay in the player's pocket:
+    Resolve the id before you spend it. A `Grant` that throws is rolled back in full, so the coins stay in the player's pocket:
 
-```lua
-Grant = function(data)
-    if data.Inventory[itemId].Qty.Get() == nil then
-        error(`Emberfall: no inventory entry "{itemId}" to upgrade`)
-    end
-    data.Inventory[itemId].Qty.Increment(1)
-end,
-```
+    ```lua
+    Grant = function(data)
+        if data.Inventory[itemId].Qty.Get() == nil then
+            error(`Emberfall: no inventory entry "{itemId}" to upgrade`)
+        end
+        data.Inventory[itemId].Qty.Increment(1)
+    end,
+    ```
 
-`Get()` on an unwritten key is `nil` and reading never creates the key, so the check costs nothing. The rule generalises: inside a `Grant`, treat any id that came from a client or from stored data as unresolved until you have checked it. On the receipt path the same mistake costs Robux instead of coins, and the receipt still settles as `PurchaseGranted`.
+    `Get()` on an unwritten key is `nil` and reading never creates the key, so the check costs nothing. The rule generalises: inside a `Grant`, treat any id that came from a client or from stored data as unresolved until you have checked it. On the receipt path the same mistake costs Robux instead of coins, and the receipt still settles as `PurchaseGranted`.
 
-In DevMode Scribe warns about the first shape with [`GRANT_SEEDED_ELEMENT`](./log-codes#monetization), naming the product and the path. It is a warning and not a refusal because Scribe cannot tell a dangling id from one you just minted.
-:::
+    In DevMode Scribe warns about the first shape with [`GRANT_SEEDED_ELEMENT`](./log-codes#monetization), naming the product and the path. It is a warning and not a refusal because Scribe cannot tell a dangling id from one you just minted.
 
 ### Making a purchase idempotent
 
@@ -256,9 +285,8 @@ The filter accepts `Kind`, `Category`, `ItemId`, `Since` and `Limit`, and it is 
 
 ## If your game already handles receipts
 
-:::caution Roblox allows exactly one `ProcessReceipt` callback
-Scribe installs its own the moment a server script requires the shared module, whenever you have declared any `Products`. That **silently overrides a receipt handler your game already had**. A pass-only or data-only game is left alone, and a second Scribe bundle errors loudly at startup instead. Assignment order is not a safe fix either: a handler your game assigns afterwards silently wins, and every Scribe product goes dark with no warning.
-:::
+!!! warning "Roblox allows exactly one `ProcessReceipt` callback"
+    Scribe installs its own the moment a server script requires the shared module, whenever you have declared any `Products`. That **silently overrides a receipt handler your game already had**. A pass-only or data-only game is left alone, and a second Scribe bundle errors loudly at startup instead. Assignment order is not a safe fix either: a handler your game assigns afterwards silently wins, and every Scribe product goes dark with no warning.
 
 You have two ways out, and the first is usually better.
 

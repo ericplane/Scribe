@@ -76,11 +76,10 @@ Always read the version before you restore it. `GetVersion` is how you confirm t
 
 A restore stamps `RestoredFrom = { VersionId, At }` into the profile's reserved `_Scribe` block, so a later read shows where the data came from. It needs a live key to write over, so restoring a profile that was erased fails with `no live profile exists for this user to restore over`.
 
-:::danger A restore does not roll back the money
-Your own fields go back to the snapshot, which is the whole point. The reserved `_Scribe` root is carried across from the live profile untouched.
+!!! danger "A restore does not roll back the money"
+    Your own fields go back to the snapshot, which is the whole point. The reserved `_Scribe` root is carried across from the live profile untouched.
 
-That root is not game state. It is the record of things that happened in the real world: the receipt-dedupe ring, gift escrow and gift credits, perks, the purchase log, and running cooldowns. Ben does not un-buy `GemPack100` because you restored yesterday's backup, so rolling that root back would not undo a mistake, it would create one.
-:::
+    That root is not game state. It is the record of things that happened in the real world: the receipt-dedupe ring, gift escrow and gift credits, perks, the purchase log, and running cooldowns. Ben does not un-buy `GemPack100` because you restored yesterday's backup, so rolling that root back would not undo a mistake, it would create one.
 
 ??? note "What rolling the reserved root back would actually break"
     A granted receipt would be forgotten and grantable a **second** time off the same `PurchaseId`. A delivered gift would be resurrected, or an undelivered paid one destroyed. Paid credits and perks would be stripped, and the audit trail rewound.
@@ -166,11 +165,10 @@ Migrations are **fail-closed**. If any step throws, nothing is stamped, nothing 
 
 Each profile stores the version its last successful run stamped, so **never renumber or remove a step you have shipped**. A profile stamped `3` resumes at step `4`, and repointing `3` at different code can no longer reach it. Following from that, the table has to be contiguous from `2` up to your highest key. A gap fails loudly at startup with `Scribe: Migrations table is missing step 3` rather than being skipped.
 
-:::caution Template defaults are backfilled before your step runs
-Scribe reconciles the stored data against the current template first, so every missing template key already holds its default by the time step 2 sees it. A step guarded on `if data.Inventory == nil`, or written as `data.Coins = data.Coins or 0`, therefore reads the default instead of the absence and silently does nothing for returning players.
+!!! warning "Template defaults are backfilled before your step runs"
+    Scribe reconciles the stored data against the current template first, so every missing template key already holds its default by the time step 2 sees it. A step guarded on `if data.Inventory == nil`, or written as `data.Coins = data.Coins or 0`, therefore reads the default instead of the absence and silently does nothing for returning players.
 
-Key your steps off something the reconcile cannot manufacture: a field you removed from the template, like `Bag` above, or a value only stored data could hold.
-:::
+    Key your steps off something the reconcile cannot manufacture: a field you removed from the template, like `Bag` above, or a value only stored data could hold.
 
 ??? note "Shadow mode, for while you are writing a chain"
     Set `MigrationShadow = true` and Scribe re-runs the same steps against the raw pre-reconcile bytes, warning under `MIGRATION_RECONCILE_DEPENDENT` wherever the two results diverge. It is opt-in rather than automatic, and it **re-executes your migration bodies**, so keep them pure functions of `data` while it is on.

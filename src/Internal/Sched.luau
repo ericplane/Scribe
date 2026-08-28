@@ -1,24 +1,21 @@
 --!strict
 -- The scheduling seam: starting a thread goes through here, so a simulation can
--- decide the interleaving instead of the engine. Separate from Clock, which
--- answers what time it is rather than who runs next.
+-- decide the interleaving instead of the engine. Separate from Clock, which answers
+-- what time it is rather than who runs next. A replacement must keep the engine's
+-- semantics, or it finds bugs that cannot happen and hides ones that can:
 --
--- The semantics are the engine's, and a replacement that gets them wrong finds
--- bugs that cannot happen or hides ones that can:
---
---   Spawn(fn, ...)   runs `fn` immediately, on the caller's stack, until it
---                    yields or returns, exactly like task.spawn. Code all over
---                    Scribe relies on a spawned load that never yields having
---                    already finished by the time Spawn returns.
+--   Spawn(fn, ...)   runs `fn` immediately on the caller's stack, exactly like
+--                    task.spawn. Code all over Scribe relies on a spawned load that
+--                    never yields having finished by the time Spawn returns.
 --   Defer(fn, ...)   queues `fn` to run after the current resumption point.
---   Resume(thr, ...) resumes an already existing suspended coroutine. Distinct
---                    from Spawn because nothing is created, and because these
---                    resumptions are the moments a request completes, which is
---                    what an interleaving search most wants to move around.
+--   Resume(thr, ...) resumes an already existing suspended coroutine. Distinct from
+--                    Spawn because nothing is created, and because these are the
+--                    moments a request completes, which is what an interleaving
+--                    search most wants to move around.
 --
--- Signal's dispatch and the DebugHook pair are deliberately not routed: the
--- signal runner is never blocked, so simulating it buys no new orderings on
--- Scribe's hottest path, and the hooks are Studio tooling.
+-- Signal's dispatch and the DebugHook pair are deliberately not routed: the signal
+-- runner is never blocked, so simulating it buys no new orderings on Scribe's
+-- hottest path, and the hooks are Studio tooling.
 
 local Sched = {}
 
@@ -31,7 +28,7 @@ export type Impl = {
 local DEFAULT_SPAWN: (fn: (...any) -> (), ...any) -> thread = task.spawn
 local DEFAULT_DEFER: (fn: (...any) -> (), ...any) -> thread = task.defer
 -- Wrapped rather than assigned directly: task.spawn returns the thread, and Resume
--- returns nothing on purpose, so nobody mistakes a resumption for a spawn.
+-- returns nothing so nobody mistakes a resumption for a spawn.
 local DEFAULT_RESUME: (thread: thread, ...any) -> () = function(thread: thread, ...: any)
 	task.spawn(thread, ...)
 end

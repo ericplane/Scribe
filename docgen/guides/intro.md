@@ -72,9 +72,8 @@ return Scribe({
 
 Read that template top to bottom and you have already met most of Scribe's vocabulary. `Scribe.Int` and `Scribe.Enum` are **declarators**: they give a field a default, a Luau type, and runtime rules such as a minimum. `Stats` is a plain nested table, which is fine when the fields inside it need nothing special. [Templates](./templates) covers all of them.
 
-:::caution Turn on Studio access to API services first
-Studio cannot reach DataStores until you publish the place and enable **File, Experience Settings, Security, "Enable Studio Access to API Services"**. This is the most common first-run surprise, and it does not look like an error. ProfileStore quietly falls back to an in-memory store, so a play-test appears to work while every session starts from template defaults and nothing survives a restart. The tell is one line in the Output: `[ProfileStore]: Roblox API services unavailable - data will not be saved`. When you *want* that isolation, ask for it with `Mode = "Mock"` (see [Testing](./testing)) rather than leaving it to a Studio setting.
-:::
+!!! warning "Turn on Studio access to API services first"
+    Studio cannot reach DataStores until you publish the place and enable **File, Experience Settings, Security, "Enable Studio Access to API Services"**. This is the most common first-run surprise, and it does not look like an error. ProfileStore quietly falls back to an in-memory store, so a play-test appears to work while every session starts from template defaults and nothing survives a restart. The tell is one line in the Output: `[ProfileStore]: Roblox API services unavailable - data will not be saved`. When you *want* that isolation, ask for it with `Mode = "Mock"` (see [Testing](./testing)) rather than leaving it to a Studio setting.
 
 ## Writing data on the server
 
@@ -127,9 +126,8 @@ end)
 
 `Level` is derived from `Xp`, and `Xp` is visible to its owner, so the client computes `Level` itself rather than receiving it over the wire. You do not have to know that to use it, which is the point.
 
-:::caution The client must require the module too
-Replication only starts when the bundle is required from a **client-side script**. That `require` runs the client's half of the handshake. Set Scribe up on the server and never require it on the client, and the client never syncs: `Observe` and `Changed` never fire with real data, reads stay at your template defaults, and the server logs a `CLIENT_HANDSHAKE_TIMEOUT` warning saying the client never sent Hello. Requiring the same shared module on both realms is the whole setup.
-:::
+!!! warning "The client must require the module too"
+    Replication only starts when the bundle is required from a **client-side script**. That `require` runs the client's half of the handshake. Set Scribe up on the server and never require it on the client, and the client never syncs: `Observe` and `Changed` never fire with real data, reads stay at your template defaults, and the server logs a `CLIENT_HANDSHAKE_TIMEOUT` warning saying the client never sent Hello. Requiring the same shared module on both realms is the whole setup.
 
 The accessor tree never makes you wait. Reads return your template defaults until the first sync lands, and `Observe` fires again the moment real data arrives, so reactive UI needs no gating at all. For a one-off imperative read at startup, where a default would be the wrong answer, check `Data.IsReady()` or yield on `Data.WaitForData(timeout)` first.
 

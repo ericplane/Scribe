@@ -29,37 +29,21 @@ local receiptsBound = false
 local PROCESSED_CAP = 200 -- default ceiling on the receipt-dedupe ring
 local PURCHASE_ID_TTL = 7 * 24 * 3600
 
--- Durable gift aims. When a gift intent goes stale the load sweep MOVES it into
--- _Scribe.GiftAims rather than deleting it, and the no-intent receipt paths consult
--- it before granting the buyer. Without that record a late receipt is
--- indistinguishable from a self-purchase, so one payment produces two grants.
---
--- Separate from GiftIntentTTL, which only bounds how long a buyer may sit at the
--- Robux dialog. This bounds how long the recipient's identity must survive, so it is
--- a floor at purchaseIdTTL (see giftAimTTL): forgetting the recipient sooner than we
--- forget the receipt is the defect being closed.
---
--- Past the horizon an aim is pruned loudly (GIFT_AIM_EXPIRED) and the receipt goes to
--- the buyer: refusing it would be a permanent NotProcessedYet that eats the Robux.
+-- Durable gift aims. The load sweep MOVES a stale gift intent into _Scribe.GiftAims
+-- rather than deleting it, and the no-intent receipt paths consult it before granting
+-- the buyer: without that record a late receipt is indistinguishable from a
+-- self-purchase, so one payment produces two grants. This bounds how long the
+-- recipient's identity must survive, so it is floored at purchaseIdTTL (see giftAimTTL).
 local GIFT_AIM_TTL = 7 * 24 * 3600
--- Eviction from the aim store is AGE-ONLY: an aim inside the receipt-retry window is
--- never dropped to make room, because it may be the only record of a gift that has
--- already been paid for. At the cap the store refuses INTAKE instead.
---
--- PromptGift reserves against aims PLUS the pending intents whose product Id does not
--- already hold one, because every pending intent is a slot the load sweep owes this
--- store. Counting only the archived aims let a buyer arm their whole pending budget
--- against a handful of free slots and lose the rest of the recipients at the next
--- sweep. archiveGiftAim's own check counts the store alone: by then the intent is
--- being spent into a slot, and counting it too would charge the same gift twice.
+-- Eviction is age-only: an aim inside the receipt-retry window may be the only record
+-- of a gift already paid for, so at the cap the store refuses intake instead.
 local GIFT_AIM_CAP = 64
 -- Caller-supplied idempotency keys live in the Timed store under this prefix, which
 -- keeps them out of the capped ProcessedPurchaseIds ring.
 local PURCHASE_IDEM_PREFIX = "@pi|"
 -- Runaway guard on how many claims can be live at once, not a working limit: an
--- eviction can let a retry apply a purchase twice, so it should be rare and loud
--- (PURCHASE_CLAIM_EVICTED). A game that outruns it should shorten PurchaseClaimTTL
--- rather than raise this.
+-- eviction can let a retry apply a purchase twice (PURCHASE_CLAIM_EVICTED). A game that
+-- outruns it should shorten PurchaseClaimTTL rather than raise this.
 local PURCHASE_CLAIM_CAP = 1000
 
 function Monetization.new(ctx: any)
@@ -80,9 +64,8 @@ function Monetization.new(ctx: any)
 		end
 	end
 
-	-- Which (userId, purchaseId) pairs are mid-grant on THIS server right now. An
-	-- in-flight marker, never persisted; the ProcessedPurchaseIds ring remains the only
-	-- durable completion record.
+	-- Which (userId, purchaseId) pairs are mid-grant on THIS server. An in-flight marker,
+	-- never persisted; the ProcessedPurchaseIds ring is the only durable completion record.
 	local receiptsInFlight: { [string]: true } = {}
 
 	local giftCooldown: number = options.GiftCooldown or 5
@@ -90,16 +73,14 @@ function Monetization.new(ctx: any)
 	local giftIntentTTL: number = options.GiftIntentTTL or 3600
 	local purchaseIdTTL: number = options.PurchaseIdTTL or PURCHASE_ID_TTL
 	local processedCap: number = options.MaxProcessedPurchaseIds or PROCESSED_CAP
-	-- Separate from PurchaseIdTTL: that governs Roblox's receipt-retry window, where
-	-- shortening risks double-granting real money. A caller-supplied Data.Purchase key
-	-- is retried by the game, usually within seconds, so heavy shop traffic can be
-	-- bounded here without touching receipt safety.
+	-- Separate from PurchaseIdTTL, which governs Roblox's receipt-retry window where
+	-- shortening risks double-granting real money. A caller-supplied Data.Purchase key is
+	-- retried by the game within seconds, so it can be bounded here without touching that.
 	local purchaseClaimTTL: number = options.PurchaseClaimTTL or purchaseIdTTL
 	local purchaseClaimCap: number = math.max(1, tonumber(options.MaxPurchaseClaims) or PURCHASE_CLAIM_CAP)
-	-- How long a same-product re-gift is blocked while a purchase could still be in
-	-- flight, so a second gift cannot overwrite a live intent and misdeliver the first
-	-- purchase. Past this a lingering intent is an abandoned prompt and may be
-	-- overwritten.
+	-- How long a same-product re-gift is blocked while a purchase could still be in flight,
+	-- so a second gift cannot overwrite a live intent and misdeliver the first purchase.
+	-- Past this a lingering intent is an abandoned prompt and may be overwritten.
 	local giftPromptWindow: number = math.min(120, giftIntentTTL)
 	-- A floor, never an alias: lengthening the receipt horizon lengthens this, and
 	-- shortening PurchaseIdTTL cannot shorten it.
@@ -112,6 +93,11 @@ function Monetization.new(ctx: any)
 	local promptProductPurchase: (player: Player, productId: number) -> () = options.PromptProductPurchase
 		or function(player: Player, productId: number)
 			MarketplaceService:PromptProductPurchase(player, productId)
+		end
+
+	local promptGamePassPurchase: (player: Player, passId: number) -> () = options.PromptGamePassPurchase
+		or function(player: Player, passId: number)
+			MarketplaceService:PromptGamePassPurchase(player, passId)
 		end
 
 	-- Same seam as the prompt above: patching MarketplaceService itself is illegal on a
@@ -175,11 +161,18 @@ function Monetization.new(ctx: any)
 		if config.Category ~= nil and not Util.isUtf8(config.Category) then
 			error(`Scribe: pass "{name}" Category contains invalid UTF-8 bytes`, 0)
 		end
+		-- One name, one thing. PromptPurchase resolves a name against both registries, so a
+		-- name in both would leave resolution order deciding what the player is charged for.
+		if productsByName[name] then
+			error(
+				`Scribe: "{name}" is declared as both a product and a pass; one name cannot mean two `
+					.. "purchasable things, because a prompt resolves by name",
+				0
+			)
+		end
 		passesByName[name] = { Id = config.Id, Category = config.Category }
 		-- Only this reverse map can collide, and PromptGamePassPurchaseFinished is its one
-		-- reader: the sole place an engine-supplied Id must become a name again. Two names
-		-- sharing an Id would credit whichever pairs() reached last, leaving the other
-		-- reading Owns false for the session with the Robux already spent.
+		-- reader: the sole place an engine-supplied Id must become a name again.
 		if passNamesById[config.Id] then
 			error(
 				`Scribe: duplicate pass Id {config.Id}; two pass names cannot share one gamepass Id, because a `
@@ -213,8 +206,14 @@ function Monetization.new(ctx: any)
 		if product.Grants then
 			knownOwnsKeys[product.Grants] = true
 			-- Otherwise a typo here only surfaces once a player buys the product: the perk
-			-- lands under the wrong key and Owns keeps answering false.
-			if ctx.DevMode and declaredPerks and not declaredPerks[product.Grants] then
+			-- lands under the wrong key and Owns keeps answering false. A declared PASS
+			-- name is a legitimate target, not a typo; see checkPerkName.
+			if
+				ctx.DevMode
+				and declaredPerks
+				and not declaredPerks[product.Grants]
+				and not passesByName[product.Grants]
+			then
 				Log.Warn(
 					"Monetization",
 					"UNDECLARED_PERK",
@@ -231,7 +230,7 @@ function Monetization.new(ctx: any)
 			Log.Warn(
 				"Monetization",
 				"UNKNOWN_OWNS_KEY",
-				`Owns("{key}") — "{key}" is not a registered pass, declared perk, or product grant (typo?); it will always return false`,
+				`Owns("{key}"): "{key}" is not a registered pass, declared perk, or product grant (typo?); it will always return false`,
 				{}
 			)
 		end
@@ -290,13 +289,11 @@ function Monetization.new(ctx: any)
 		return entry.LiveData ~= nil and isProcessedRaw(entry.LiveData, purchaseId)
 	end
 
-	-- The ring is the only thing between a retried receipt and a second grant. Age is
-	-- the primary rule: past PurchaseIdTTL a receipt is beyond any retry and is provably
-	-- safe to forget. The count backstop is for a player buying faster than the TTL
-	-- drains, and it is the one eviction that can lose a live entry, so it says so.
-	--
-	-- A legacy bare string is stamped with `now` rather than treated as expired;
-	-- guessing old is precisely the guess that double-grants.
+	-- The ring is the only thing between a retried receipt and a second grant. Age is the
+	-- primary rule: past PurchaseIdTTL a receipt is beyond any retry. The count backstop is
+	-- for a player buying faster than the TTL drains, and it is the one eviction that can
+	-- lose a live entry, so it says so. A legacy bare string is stamped with `now` rather
+	-- than treated as expired; guessing old is precisely the guess that double-grants.
 	local function pruneProcessed(list: { any }, player: any?): { any }
 		local now = Clock.Now()
 		local kept = {}
@@ -350,9 +347,9 @@ function Monetization.new(ctx: any)
 
 	-- Gift records: the live intent and the archived aim -------------------------
 	--
-	-- Both have the same shape ({ RecipientId, GiftId, Ts, Product }), so the receipt
-	-- arms settle an aim with the code that settles an intent rather than a
-	-- hand-mirrored copy that drifts. `fromAim` selects the container everywhere.
+	-- Both have the same shape ({ RecipientId, GiftId, Ts, Product }), so the receipt arms
+	-- settle an aim with the code that settles an intent rather than a hand-mirrored copy
+	-- that drifts. `fromAim` selects the container everywhere.
 	local PENDING_GIFTS = "PendingGifts"
 	local GIFT_AIMS = "GiftAims"
 
@@ -388,8 +385,8 @@ function Monetization.new(ctx: any)
 
 	--- Clear a gift record, and only if it is still ours. Every caller has yielded by the
 	--- time it gets here, and a second PromptGift past giftPromptWindow can take the slot
-	--- over: a blind clear would delete that gift's record, whose receipt then grants the
-	--- perk to the buyer. Identity is the GiftId, never the slot.
+	--- over: a blind clear would strand that gift, whose receipt then grants the perk to
+	--- the buyer. Identity is the GiftId, never the slot.
 	local function clearGiftRecord(entry: any, fromAim: boolean, productIdStr: string, giftId: string)
 		local key = giftRecordKey(fromAim)
 		local live = reservedRaw(entry.LiveData)[key][productIdStr]
@@ -425,10 +422,10 @@ function Monetization.new(ctx: any)
 
 	--- Reclaim room in the aim store, and say what it cost. Returns how many went.
 	---
-	--- Only aims past the presumption horizon are ever dropped. An aim inside it may be
-	--- the last durable record of a gift already paid for, so at the cap the store
-	--- refuses intake instead. Called on intake, not on load: an aim nobody is competing
-	--- for costs nothing to keep, and keeping it is what lets it still prove a delivery.
+	--- Only aims past the presumption horizon are dropped; inside it an aim may be the last
+	--- durable record of a gift already paid for, so at the cap the store refuses intake.
+	--- Called on intake, not on load: an aim nobody competes for costs nothing to keep, and
+	--- keeping it is what lets it still prove a delivery.
 	local function reclaimGiftAims(entry: any): number
 		local aims = reservedRaw(entry.LiveData).GiftAims
 		local now = Clock.Now()
@@ -458,10 +455,9 @@ function Monetization.new(ctx: any)
 	end
 
 	--- Move a stale intent into the aim store, called by the OnLoad sweep. Deleting it
-	--- instead is what made a late receipt indistinguishable from a self-purchase.
-	---
-	--- The cap refuses INTAKE, not eviction: a stored aim may be the only surviving
-	--- record of a gift already paid for, so the NEW aim is refused and says so.
+	--- instead is what made a late receipt indistinguishable from a self-purchase. The cap
+	--- refuses INTAKE, not eviction: a stored aim may be the only surviving record of a
+	--- gift already paid for, so the NEW aim is refused and says so.
 	local function archiveGiftAim(entry: any, productIdStr: string, intent: any)
 		if type(intent) ~= "table" or (tonumber(intent.RecipientId) or 0) <= 0 or intent.GiftId == nil then
 			return -- nothing to route a receipt with; the sweep just drops it
@@ -525,8 +521,11 @@ function Monetization.new(ctx: any)
 
 	-- Perks and unified ownership ---------------------------------------------------
 
+	--- A declared PASS is a legitimate perk name, for the same reason it is a legitimate
+	--- Grants target: a pass cannot be transferred, so granting the perk of the same name
+	--- is how a gift confers it, and Owns answers across both namespaces.
 	local function checkPerkName(key: string)
-		if ctx.DevMode and declaredPerks and not declaredPerks[key] then
+		if ctx.DevMode and declaredPerks and not declaredPerks[key] and not passesByName[key] then
 			Log.Warn("Monetization", "UNDECLARED_PERK", `perk "{key}" is not in the Perks registry (typo?)`, {})
 		end
 	end
@@ -550,9 +549,9 @@ function Monetization.new(ctx: any)
 		Log.Info("Monetization", "PERK_REVOKED", `perk "{key}" revoked`, { Player = player, Perk = key })
 	end
 
-	-- The ownership predicate: perk flag, cached pass ownership, or Roblox Plus. No
-	-- DevMode unknown-key warning and no entry lookup, because internal scans
-	-- legitimately walk keys that were never registered.
+	-- The ownership predicate: perk flag, cached pass ownership, or Roblox Plus. No DevMode
+	-- warning and no entry lookup, because internal scans legitimately walk keys that were
+	-- never registered.
 	local function ownsInternal(player: Player, entry: any, key: string): boolean
 		local reserved = reservedRaw(entry.LiveData)
 		if reserved.Perks[key] == true then
@@ -625,11 +624,10 @@ function Monetization.new(ctx: any)
 		end
 		local candidates = ownershipCandidates(entry)
 		-- A key that went away still needs its false. ownershipCandidates is built from
-		-- current state, so a perk revoked under a name outside the Perks registry is
-		-- listed nowhere and its false would never fire. The baseline is the record of
-		-- what was last reported, so unioning it in is exactly the set that could still
-		-- owe a transition. It does not grow without bound: a false fired here is written
-		-- back as false and never fires again.
+		-- current state, so a perk revoked under a name outside the Perks registry is listed
+		-- nowhere and its false would never fire. The baseline records what was last
+		-- reported, so unioning it in is exactly the set that could still owe a transition,
+		-- and it cannot grow without bound: a false fired here never fires again.
 		for key in last do
 			candidates[key] = true
 		end
@@ -655,18 +653,18 @@ function Monetization.new(ctx: any)
 			scanOwnership(entry)
 		end
 		entry.OwnsWatchers = {
-			-- Through the privileged handle, not the public child: a public read hands
-			-- back a detached deep copy (readOut in Node.luau), and this callback ignores
-			-- the value entirely.
+			-- Through the privileged handle, not the public child: a public read hands back
+			-- a detached deep copy (readOut in Node.luau), and this callback ignores the
+			-- value entirely.
 			reservedAcc(entry).Perks.Changed(onChange),
 			accessor[Template.SESSION_ROOT].OwnsCache.Changed(onChange),
 		}
 	end
 
-	-- Push the player's current ownership of `key`, then again on every change, deduped
-	-- so only real transitions fire. Returns a disconnect. The public doc-comment lives
-	-- on Data.ObserveOwned (Server/init.luau); keep this a plain comment so docgen does
-	-- not emit a duplicate entry.
+	-- Push the player's current ownership of `key`, then again on every change, deduped so
+	-- only real transitions fire. Returns a disconnect. The public doc-comment lives on
+	-- Data.ObserveOwned (Server/init.luau); keep this a plain comment so docgen does not
+	-- emit a duplicate entry.
 	function self.ObserveOwned(player: Player, key: string, callback: (owned: boolean) -> ()): () -> ()
 		checkOwnsKey(key)
 		local entry = ctx.Persistence.EntryFor(player)
@@ -730,21 +728,17 @@ function Monetization.new(ctx: any)
 					-- Fold this resolution into the join baseline before writing it.
 					-- watchOwnership takes its silent baseline while this network round trip
 					-- is still out, so without this every player who already owned a pass got
-					-- a spurious owned=true.
-					--
-					-- OR, never assign: ownership is the union of Perks, OwnsCache and
-					-- RobloxPlus, so a player already holding the perk is owned at baseline
-					-- whatever the pass says. A nil OwnsLast means the baseline has not been
-					-- taken yet and that scan will absorb this by itself.
+					-- a spurious owned=true. OR, never assign: ownership is the union of
+					-- Perks, OwnsCache and RobloxPlus. A nil OwnsLast means the baseline has
+					-- not been taken yet and that scan absorbs this by itself.
 					local last = entry.OwnsLast
 					if last ~= nil and entry.Tree and not entry.Tree.Dead then
 						last[name] = last[name] == true or owned == true
 					end
 					setOwnsCache(entry, name, owned == true)
 				elseif not ok then
-					-- A throw or throttle leaves this pass unresolved and the cache
-					-- not-owned. Surface it rather than treating a failed check as a
-					-- confirmed not-owned.
+					-- A throw or throttle leaves this pass unresolved and the cache not-owned.
+					-- Surface it rather than treating a failed check as a confirmed not-owned.
 					Metrics.Add("OwnershipCheckFailures")
 					Log.Warn(
 						"Monetization",
@@ -761,11 +755,11 @@ function Monetization.new(ctx: any)
 		end
 	end
 
-	-- Like self.Owns, but AUTHORITATIVE: a cached "owned" is returned as-is, anything
-	-- else is verified live against MarketplaceService, so a pass bought moments ago
-	-- shows immediately. Yields. `_timeout` exists only for parity with the client
-	-- version. The public doc-comment lives on Data.OwnsAsync (Server/init.luau); keep
-	-- this a plain comment so docgen does not emit a duplicate entry.
+	-- Like self.Owns, but AUTHORITATIVE: a cached "owned" is returned as-is, anything else
+	-- is verified live against MarketplaceService, so a pass bought moments ago shows
+	-- immediately. Yields. `_timeout` exists only for parity with the client version. The
+	-- public doc-comment lives on Data.OwnsAsync (Server/init.luau); keep this a plain
+	-- comment so docgen does not emit a duplicate entry.
 	function self.OwnsAsync(player: Player, key: string, _timeout: number?): boolean
 		checkOwnsKey(key)
 		local entry = ctx.Persistence.EntryFor(player)
@@ -777,10 +771,9 @@ function Monetization.new(ctx: any)
 		if self.Owns(player, key) then
 			return true
 		end
-		-- Not owned per the cache. Verify live on every call with the server-side
-		-- UserOwnsGamePassAsync: this is the exploit-proof check to gate grants on, and
-		-- the client's Owns/OwnsAsync are mirror reads that must never gate one. Refresh
-		-- the cache so a later plain Owns read is correct too.
+		-- Not owned per the cache. Verify live with the server-side UserOwnsGamePassAsync:
+		-- this is the exploit-proof check to gate grants on, and the client's Owns/OwnsAsync
+		-- are mirror reads that must never gate one. Refresh the cache while we are here.
 		local pass = passesByName[key]
 		if pass and not entry.TornDown then
 			local ok, owned = pcall(function()
@@ -808,9 +801,7 @@ function Monetization.new(ctx: any)
 	-- DevMode only. A Grant that writes THROUGH a key naming no element dereferences a
 	-- dangling pointer: the element seeds from its defaults, the receipt settles
 	-- PurchaseGranted, and the goods land where the player can never see them. A warning
-	-- and not a refusal, because a dangling id is indistinguishable from a deliberate
-	-- one. A whole-element `Set` does not descend, so it stays silent. Returns nil
-	-- outside DevMode.
+	-- and not a refusal, because a dangling id is indistinguishable from a deliberate one.
 	local function seedWatcher(entry: any, label: string): ((seeded: { { string | number } }) -> ())?
 		if not ctx.DevMode then
 			return nil
@@ -836,18 +827,18 @@ function Monetization.new(ctx: any)
 		end
 	end
 
-	-- Applies a product's effects to a Ready entry. Returns (granted, partial):
-	-- `granted` false means a Grant callback threw, and `partial` says whether writes
-	-- from before the throw are still in the tree. Only the yielding path can leave
-	-- them, and the caller has to know because retrying a partial re-applies it.
+	-- Applies a product's effects to a Ready entry. Returns (granted, partial): `granted`
+	-- false means a Grant callback threw, and `partial` says whether writes from before the
+	-- throw are still in the tree. Only the yielding path can leave them, and the caller has
+	-- to know because retrying a partial re-applies it.
 	local function applyProductGrant(entry: any, product: Product): (boolean, boolean)
 		if not product.Grant and not product.Grants then
 			return true, false
 		end
-		-- Atomic, because a receipt is retried: a Grant that wrote part-way and then
-		-- threw would leave those writes in the profile while markProcessed never ran,
-		-- so every retry re-applies them. The Grant therefore runs inside a transaction
-		-- and must not yield, which is refused loudly rather than silently rolled back.
+		-- Atomic, because a receipt is retried: a Grant that wrote part-way and then threw
+		-- would leave those writes in the profile while markProcessed never ran, so every
+		-- retry re-applies them. The Grant must therefore not yield, which is refused loudly
+		-- rather than silently rolled back.
 		local function apply()
 			if product.Grant then
 				(product.Grant :: (any) -> ())(entry.Tree.Accessor)
@@ -864,10 +855,10 @@ function Monetization.new(ctx: any)
 		end
 
 		if err == Node.YIELD_ERROR then
-			-- The Grant yielded, so it cannot be made atomic: a rollback across a yield
-			-- would revert unrelated writes that landed meanwhile, which here means
-			-- destroying paid currency. Refusing outright is worse still, being a
-			-- permanent NotProcessedYet. Run it non-atomically and say so loudly.
+			-- The Grant yielded, so it cannot be made atomic: a rollback across a yield would
+			-- revert unrelated writes that landed meanwhile, which here means destroying paid
+			-- currency. Refusing outright is a permanent NotProcessedYet, which is worse. Run
+			-- it non-atomically and say so loudly.
 			Log.Error(
 				"Monetization",
 				"GRANT_FAIL",
@@ -884,8 +875,7 @@ function Monetization.new(ctx: any)
 				Log.Error("Monetization", "GRANT_FAIL", `product "{product.Name}" Grant threw: {ranErr}`, {
 					Player = entry.Player,
 				})
-				-- PARTIAL: whatever the Grant wrote before it threw is in the tree and
-				-- cannot be rolled back.
+				-- PARTIAL: the pre-throw writes are in the tree and cannot be rolled back.
 				return false, true
 			end
 			return true, false
@@ -899,13 +889,10 @@ function Monetization.new(ctx: any)
 	end
 
 	-- Gift delivery to a Ready entry on this server. Returns (applied, durable,
-	-- refundable): `applied` means the grant is in the recipient's memory, `durable`
-	-- that it is confirmed saved. Callers reporting PurchaseGranted must require
-	-- `durable`.
-	--
-	-- `refundable` means the delivery PROVABLY did not happen, and only then may a
-	-- caller hand paid value back. It is false by default: every other failure is
-	-- ambiguous, and refunding a delivery that did happen lets one payment grant twice.
+	-- refundable): `applied` means the grant is in the recipient's memory, `durable` that it
+	-- is confirmed saved, and callers reporting PurchaseGranted must require `durable`.
+	-- `refundable` means the delivery PROVABLY did not happen, and is false by default:
+	-- every other failure is ambiguous, and refunding one that did happen grants twice.
 	local function deliverGiftLocal(
 		recipientEntry: any,
 		product: Product,
@@ -916,8 +903,7 @@ function Monetization.new(ctx: any)
 		if isProcessed(recipientEntry, purchaseId) then
 			-- Already granted in memory (possibly on a prior attempt whose save failed);
 			-- confirm it is durable before acknowledging. Held in a local rather than
-			-- tail-returned: a tail call expands the whole result list, so a second return
-			-- from AwaitSave would land silently in `refundable`.
+			-- tail-returned: a tail call would land AwaitSave's second return in `refundable`.
 			local durable = ctx.Persistence.AwaitSave(recipientEntry, 10)
 			return true, durable, false
 		end
@@ -994,21 +980,18 @@ function Monetization.new(ctx: any)
 		if ok and reason == "QueueFull" then
 			-- The recipient's inbox is at its cap. `durable = false` keeps the PAID gift
 			-- alive: the buyer's escrow intent stands, the receipt answers NotProcessedYet
-			-- and Roblox's retry re-sends.
+			-- and Roblox's retry re-sends. This arm cannot say on its own that the CALL wrote
+			-- nothing, because MessageAsync retries UpdateAsync inside one call, so a
+			-- QueueFull can be reported for a message an earlier attempt already queued;
+			-- `provablyClean` is the only value entitled to claim otherwise.
 			--
-			-- This arm cannot say on its own that the CALL wrote nothing. MessageAsync
-			-- retries UpdateAsync inside one call, so a QueueFull can be reported for a
-			-- message an earlier attempt already queued; `provablyClean` is the only value
-			-- entitled to claim otherwise.
-			--
-			-- Not reported through Failure.Report: that degrades health, and a full inbox
-			-- is a property of one player's profile rather than a DataStore fault.
-			-- Degrading to Outage would start refusing every Robux grant, including this
-			-- receipt's retry.
+			-- Not reported through Failure.Report: a full inbox is a property of one player's
+			-- profile rather than a DataStore fault, and degrading to Outage would start
+			-- refusing every Robux grant, including this receipt's retry.
 			Metrics.Add("MessageQueueFull")
 			if provablyClean ~= true then
-				-- The ambiguous shape, the one that can end in two grants off one payment.
-				-- A second counter rather than a split, so a dashboard watching
+				-- The ambiguous shape, the one that can end in two grants off one payment. A
+				-- second counter rather than a split, so a dashboard watching
 				-- MessageQueueFull still sees every refusal.
 				Metrics.Add("MessageQueueFullAmbiguous")
 			end
@@ -1023,17 +1006,15 @@ function Monetization.new(ctx: any)
 				{
 					RecipientId = recipientUserId,
 					Product = product.Name,
-					-- False means this refusal is NOT evidence that the gift is absent
-					-- from the inbox.
+					-- False means this refusal is not evidence the gift is absent.
 					ProvablyClean = provablyClean == true,
 				}
 			)
-			-- Refundable only where the store says the whole call is clean. A refund after
-			-- a commit hands back a credit whose retry mints a fresh giftId the
-			-- recipient's dedupe ring has never seen, so one credit grants twice. It is
-			-- not "was this the first attempt?" either: a throttled request never reaches
-			-- storage, so a full inbox behind one is as clean as a full inbox behind
-			-- nothing.
+			-- Refundable only where the store says the whole call is clean. A refund after a
+			-- commit hands back a credit whose retry mints a fresh giftId the recipient's
+			-- dedupe ring has never seen, so one credit grants twice. Not "was this the first
+			-- attempt?" either: a throttled request never reaches storage, so a full inbox
+			-- behind one is as clean as a full inbox behind nothing.
 			return false, false, provablyClean == true
 		end
 		-- Keyed by recipient. Past this point the send threw, MessageAsync gave up
@@ -1048,16 +1029,13 @@ function Monetization.new(ctx: any)
 			Message = "MessageAsync failed; receipt will retry",
 			Context = { RecipientId = recipientUserId, Product = product.Name },
 		})
-		-- AMBIGUOUS BY DEFAULT, refundable only where the store says otherwise. This is
-		-- the lost-answer exit: a throw carries the doubt inside one attempt (a 504 may
-		-- have landed), and a bare `false` carries it whenever the retry loop ended at
-		-- BindToClose after an attempt that could have committed.
-		--
-		-- Guessing from here is refused: ProfileStore retries inside this call, so the
-		-- class of the last attempt says nothing about the ones before it. Aggregating
-		-- across them is the store's job, and `provablyClean` is that aggregate. Every
-		-- throw therefore reads as ambiguous, even the provably clean ones, because one
-		-- lost credit is preferred over one double grant.
+		-- AMBIGUOUS BY DEFAULT, refundable only where the store says otherwise. This is the
+		-- lost-answer exit: a throw carries the doubt inside one attempt (a 504 may have
+		-- landed), and a bare `false` carries it whenever the retry loop ended at BindToClose
+		-- after an attempt that could have committed. ProfileStore retries inside this call,
+		-- so the class of the last attempt says nothing about the ones before it;
+		-- `provablyClean` is its aggregate across them. Every throw therefore reads as
+		-- ambiguous, because one lost credit is preferred over one double grant.
 		return false, false, ok and provablyClean == true
 	end
 
@@ -1084,16 +1062,14 @@ function Monetization.new(ctx: any)
 			return -- keep the message; a later deploy can process it
 		end
 		-- Gate on `durable` (2nd return), NOT `applied` (1st): this queued message is the
-		-- only surviving durable copy of the paid gift, and processed() removes it for
-		-- good. Ack-ing a merely in-memory grant loses the gift on a crash.
+		-- only surviving durable copy of the paid gift, and processed() removes it for good.
+		-- Ack-ing a merely in-memory grant loses the gift on a crash.
 		--
-		-- Re-delivery is dedupe-safe for PurchaseIdTTL and NOT after. The guard is the
-		-- recipient's ProcessedPurchaseIds ring, which expires and is capped, while the
-		-- GlobalUpdates queue that re-delivers has no horizon at all: past the TTL the
-		-- marker is gone and the still-queued message grants again. Closing that is a
-		-- design decision with a storage or correctness cost, so it is written up for the
-		-- owner. DO NOT "fix" it by widening the TTL; that moves the boundary rather than
-		-- removing it.
+		-- Re-delivery is dedupe-safe for PurchaseIdTTL and NOT after: the recipient's
+		-- ProcessedPurchaseIds ring expires and is capped, while the GlobalUpdates queue
+		-- that re-delivers has no horizon at all. Closing that has a storage or correctness
+		-- cost and is written up for the owner. Widening the TTL moves the boundary rather
+		-- than removing it.
 		local _, durable =
 			deliverGiftLocal(entry, product, purchaseId, tostring(message.GiftId), tonumber(message.FromUserId) or 0)
 		if durable then
@@ -1165,9 +1141,9 @@ function Monetization.new(ctx: any)
 		if type(intent) ~= "table" then
 			return nil
 		end
-		-- Intents are keyed by product Id, so if a deploy retired the product and reused
-		-- its Id within the TTL the stored intent belongs to the OLD product. Honouring
-		-- it would gift the new product to the old recipient, so expire it.
+		-- Intents are keyed by product Id, so if a deploy retired the product and reused its
+		-- Id within the TTL the stored intent belongs to the OLD product. Honouring it would
+		-- gift the new product to the old recipient, so expire it.
 		if intent.Product ~= nil and intent.Product ~= product.Name then
 			reservedAcc(entry).PendingGifts[tostring(product.Id)].Set(nil)
 			Log.Warn("Gifting", "GIFT_INTENT_EXPIRED", "gift intent belonged to a retired product reusing this Id", {
@@ -1188,10 +1164,10 @@ function Monetization.new(ctx: any)
 		return intent
 	end
 
-	--- Settle a receipt as the gift it was bought as. `fromAim` says which container
-	--- holds the record: false for a live PendingGifts intent, true for an archived
-	--- GiftAims aim the sweep kept after the intent went stale. One implementation for
-	--- both, because a hand-mirrored copy drifts and every drift here is real money.
+	--- Settle a receipt as the gift it was bought as. `fromAim` says which container holds
+	--- the record: false for a live PendingGifts intent, true for an archived GiftAims aim
+	--- the sweep kept after the intent went stale. One implementation for both, because a
+	--- hand-mirrored copy drifts and every drift here is real money.
 	local function handleGiftReceipt(
 		entry: any,
 		product: Product,
@@ -1205,9 +1181,9 @@ function Monetization.new(ctx: any)
 		local productIdStr = tostring(product.Id)
 
 		-- The recipient may have acquired the perk between the prompt and the receipt, so
-		-- delivering would be a no-op grant that burns the buyer's Robux; convert to a
-		-- gift credit instead. Only if this purchase was not already delivered on a prior
-		-- attempt whose buyer-commit failed, or one payment yields both a gift and a credit.
+		-- delivering would be a no-op grant that burns the buyer's Robux; convert to a gift
+		-- credit instead. Only if this purchase was not already delivered on a prior attempt
+		-- whose buyer-commit failed, or one payment yields both a gift and a credit.
 		if
 			product.Grants
 			and not product.Grant
@@ -1217,11 +1193,10 @@ function Monetization.new(ctx: any)
 		then
 			local creditsAccessor = reservedAcc(entry).GiftCredits[product.Name]
 			creditsAccessor.Set((tonumber(creditsAccessor.Get()) or 0) + 1)
-			-- Clear OUR intent, and only ours. Both legs of the condition above yield on
-			-- the recipient's profile, and a second PromptGift past giftPromptWindow can
-			-- take the one-per-product slot over inside that window. A blind clear would
-			-- delete that gift's intent, whose receipt then grants the perk to the BUYER
-			-- on top of the credit just minted. Identity is the GiftId, never the slot.
+			-- Clear OUR intent, and only ours: both legs of the condition above yield on the
+			-- recipient's profile, and a second PromptGift past giftPromptWindow can take the
+			-- one-per-product slot over inside that window. Identity is the GiftId, never the
+			-- slot.
 			clearGiftRecord(entry, fromAim, productIdStr, giftId)
 			robuxLog(entry, {
 				PurchaseId = purchaseId,
@@ -1252,28 +1227,26 @@ function Monetization.new(ctx: any)
 
 		local _, durable = deliverGift(product, recipientId, purchaseId, giftId, entry.UserId)
 		if not durable then
-			-- Not confirmed durable; the intent persists, the receipt retries and the
-			-- retry dedupes on the recipient. Refresh the Ts so giftPromptWindow keeps
-			-- refusing a second same-product gift while this paid purchase is still
-			-- retrying, since an overwrite would route its value to the second recipient.
-			-- deliverGift YIELDS, so the refresh re-checks the intent is still ours: a
-			-- blind Ts write would materialize a phantom intent delivered to userId 0.
+			-- Not confirmed durable; the intent persists, the receipt retries and the retry
+			-- dedupes on the recipient. Refresh the Ts so giftPromptWindow keeps refusing a
+			-- second same-product gift while this paid purchase is still retrying, since an
+			-- overwrite would route its value to the second recipient. deliverGift YIELDS, so
+			-- the refresh re-checks the intent is still ours rather than materializing a
+			-- phantom delivered to userId 0.
 			refreshGiftRecordTs(entry, fromAim, productIdStr, giftId)
 			Metrics.Add("ReceiptsRetried")
 			return NOT_PROCESSED
 		end
 
-		-- Clear OUR intent, and only ours. deliverGift yielded above, so a second
-		-- PromptGift past giftPromptWindow may hold the slot by now; a blind clear would
-		-- strand that gift. Identity is the GiftId, never the slot.
+		-- Clear OUR intent, and only ours: deliverGift yielded above, so a second PromptGift
+		-- past giftPromptWindow may hold the slot by now. Identity is the GiftId, never the slot.
 		clearGiftRecord(entry, fromAim, productIdStr, giftId)
 		robuxLog(entry, {
 			PurchaseId = purchaseId,
 			Product = product.Name,
 			Category = product.Category,
 			PriceInRobux = receiptInfo.CurrencySpent,
-			-- IntendedFor only on an aim-settled line: that is a purchase whose intent had
-			-- already been swept when the receipt landed, and it is the field every other
+			-- IntendedFor only on an aim-settled line: it is the field every other
 			-- aim-resolved line carries, so one query finds them all.
 			From = {
 				Type = "GiftSent",
@@ -1300,9 +1273,8 @@ function Monetization.new(ctx: any)
 
 	local function handleOnlineReceipt(entry: any, product: Product, receiptInfo: any): Enum.ProductPurchaseDecision
 		local purchaseId = tostring(receiptInfo.PurchaseId)
-		-- No duplicate check here, deliberately: handleReceipt does it and there is no
-		-- yield between the two, so a copy here could never see anything its caller had
-		-- not already seen.
+		-- No duplicate check here, deliberately: handleReceipt does it and there is no yield
+		-- between the two, so a copy here could never see anything new.
 
 		-- Read the slot BEFORE intentFor, which clears it when it expires one. What is in
 		-- it decides which of the two questions below may be asked.
@@ -1316,20 +1288,17 @@ function Monetization.new(ctx: any)
 		-- NO LIVE INTENT. Two questions before the no-intent policy may grant this to the
 		-- buyer.
 		--
-		-- (1) PROOF: has THIS PurchaseId already been delivered to the recipient the
-		--     record names? A self-purchase's PurchaseId can never appear in someone
-		--     else's dedupe ring, so a hit means granting the buyer too is one payment
-		--     and two grants. Carries no clock.
-		-- (2) PRESUMPTION: no proof, but a record says a gift of this product was aimed
-		--     somewhere and never settled. A guess, so it is bounded twice: only from an
-		--     ARCHIVED aim, and only inside giftAimTTL.
+		-- (1) PROOF: has THIS PurchaseId already been delivered to the recipient the record
+		--     names? A self-purchase's PurchaseId can never appear in someone else's dedupe
+		--     ring, so a hit means one payment and two grants. Carries no clock.
+		-- (2) PRESUMPTION: a record says a gift of this product was aimed somewhere and
+		--     never settled. A guess, so it is bounded twice: only from an ARCHIVED aim,
+		--     and only inside giftAimTTL. A stale slot still holding its intent means the
+		--     buyer sat out the whole intent TTL online, which is an abandoned prompt.
 		--
-		-- A stale slot still holding its intent means the buyer sat through the whole
-		-- intent TTL online with no receipt, which is an abandoned prompt; presumption is
-		-- granted only to an aim the load sweep archived. Past giftAimTTL the presumption
-		-- lapses and this falls through to the no-intent policy: value to the wrong
-		-- player rather than a receipt refused forever. The proof leg still works past
-		-- the horizon, so the double grant does not come back with it.
+		-- Past giftAimTTL the presumption lapses and this falls through to the no-intent
+		-- policy: value to the wrong player rather than a receipt refused forever. The proof
+		-- leg still works past the horizon, so the double grant does not come back with it.
 		local record, fromAim = staleIntent, false
 		if record == nil then
 			record = readGiftRecord(reservedRaw(entry.LiveData), true, product)
@@ -1338,8 +1307,7 @@ function Monetization.new(ctx: any)
 		if record then
 			local aimedAt = tonumber(record.RecipientId) or 0
 			local presumable = fromAim and Clock.Now() - (tonumber(record.Ts) or 0) <= giftAimTTL
-			-- `or` short-circuits: the presumable case does not spend a round trip on the
-			-- recipient's profile.
+			-- `or` short-circuits: a presumable aim spends no round trip on the recipient.
 			if presumable or giftAlreadyDelivered(aimedAt, purchaseId) == true then
 				if fromAim then
 					Log.Warn(
@@ -1363,10 +1331,10 @@ function Monetization.new(ctx: any)
 		-- No matching intent: NoGiftIntentPolicy. A product with a consumable Grant still
 		-- delivers real value, so the credit path only covers pure perk products.
 		if product.Grants and not product.Grant and self.Owns(entry.Player, product.Grants) then
-			-- An unused gift credit means a previous purchase already converted to
-			-- re-aimable value, so this money could only stack a second credit. Decline;
-			-- Roblox retries and refunds a never-processed purchase, and if the credit is
-			-- spent meanwhile the retry processes normally.
+			-- An unused gift credit means a previous purchase already converted to re-aimable
+			-- value, so this money could only stack a second credit. Decline; Roblox retries
+			-- and refunds a never-processed purchase, and a credit spent meanwhile lets the
+			-- retry process normally.
 			if (tonumber(reservedRaw(entry.LiveData).GiftCredits[product.Name]) or 0) > 0 then
 				Log.Warn(
 					"Gifting",
@@ -1392,10 +1360,9 @@ function Monetization.new(ctx: any)
 				)
 				return NOT_PROCESSED
 			end
-			-- GrantOrCredit: a no-op grant would burn Robux, so write a durable gift
-			-- credit. A no-intent purchase never stacks onto a pending credit (declined
-			-- above), but an aimed-gift conversion in handleGiftReceipt may, since that
-			-- money is already taken.
+			-- GrantOrCredit: a no-op grant would burn Robux, so write a durable gift credit.
+			-- A no-intent purchase never stacks onto a pending credit (declined above), but
+			-- an aimed-gift conversion in handleGiftReceipt may, since that money is taken.
 			local creditsAccessor = reservedAcc(entry).GiftCredits[product.Name]
 			creditsAccessor.Set((creditsAccessor.Get() or 0) + 1)
 			robuxLog(entry, {
@@ -1432,10 +1399,9 @@ function Monetization.new(ctx: any)
 			return NOT_PROCESSED
 		end
 		if not granted then
-			-- The Grant yielded and then threw, so its writes cannot be taken back and
-			-- every NotProcessedYet retry re-applies them. Settle it as delivered-once and
-			-- be loud so an operator can compensate; unbounded inflation is worse than one
-			-- partial delivery.
+			-- The Grant yielded and then threw, so its writes cannot be taken back and every
+			-- NotProcessedYet retry re-applies them. Settle it as delivered-once and be loud
+			-- so an operator can compensate; unbounded inflation is worse than one partial.
 			Metrics.Add("ReceiptsPartial")
 			Failure.Report({
 				Subsystem = "Receipt",
@@ -1480,7 +1446,7 @@ function Monetization.new(ctx: any)
 	--- `fromAim` selects the container exactly as it does online.
 	---
 	--- Hand-mirrored rather than shared with the online arm because the two write through
-	--- different machinery (accessor tree vs. an UpdateOffline compare-and-set);
+	--- different machinery (accessor tree vs. an UpdateOffline compare-and-set), so
 	--- GiftArmParity.spec is what holds them level.
 	local function settleOfflineGift(
 		userId: number,
@@ -1495,8 +1461,7 @@ function Monetization.new(ctx: any)
 		local productIdStr = tostring(product.Id)
 
 		-- Same recipient re-check as the online intent path: a no-op delivery burns the
-		-- buyer's Robux, so convert to a gift credit, but only if we did not already
-		-- deliver this exact purchase.
+		-- buyer's Robux, so convert to a credit, but only if this exact purchase is undelivered.
 		if
 			product.Grants
 			and not product.Grant
@@ -1506,22 +1471,20 @@ function Monetization.new(ctx: any)
 		then
 			local ok = ctx.Persistence.UpdateOffline(userId, function(offlineData)
 				-- The dedupe marker, re-read INSIDE the transaction: the decision above was
-				-- made against a GetOffline snapshot, so a cycle that committed in between
-				-- is invisible both to it and to the compare-and-set, whose fingerprint is
-				-- by now the fresh one. Returning early still commits the unchanged draft,
-				-- so the caller answers GRANTED, which is correct: the purchase IS granted,
-				-- just not by this cycle.
+				-- made against a GetOffline snapshot, so a cycle that committed in between is
+				-- invisible both to it and to the compare-and-set, whose fingerprint is by
+				-- now the fresh one. Returning early still commits the unchanged draft, so
+				-- the caller answers GRANTED, which is correct: the purchase IS granted, just
+				-- not by this cycle.
 				if isProcessedRaw(offlineData, purchaseId) then
 					return
 				end
 				local offlineReserved = reservedRaw(offlineData)
 				-- Clear OUR record, and only ours. Re-reading the slot inside the transform
 				-- is NOT this guard: the decision that this receipt owns one was made from a
-				-- snapshot taken before two round trips. A buyer who prompted a second gift
-				-- of the same product elsewhere in that window leaves gift B in this
-				-- one-per-product slot with the key unlocked, so nothing refuses; deleting it
-				-- blind strands B and its receipt grants the perk to the BUYER. Identity is
-				-- the GiftId, never the slot.
+				-- snapshot taken before two round trips, and a second gift of the same
+				-- product can hold the slot by now with the key unlocked, so nothing refuses.
+				-- Identity is the GiftId, never the slot.
 				clearGiftRecordRaw(offlineReserved, fromAim, productIdStr, giftId)
 				offlineReserved.GiftCredits[product.Name] = (tonumber(offlineReserved.GiftCredits[product.Name]) or 0)
 					+ 1
@@ -1552,19 +1515,17 @@ function Monetization.new(ctx: any)
 
 		local _, durable = deliverGift(product, recipientId, purchaseId, giftId, userId)
 		if not durable then
-			-- Mirror of the online failure arm's guarded Ts refresh, and needed here too:
-			-- the record's age is wall time, which keeps running while Roblox retries.
-			-- Without it an offline buyer's retries outlive giftIntentTTL, the next attempt
-			-- falls into the no-intent policy, grants the perk to the BUYER and answers
-			-- PurchaseGranted, so the paid gift is gone for good.
+			-- Mirror of the online failure arm's guarded Ts refresh, and needed here too: the
+			-- record's age is wall time, which keeps running while Roblox retries. Without it
+			-- an offline buyer's retries outlive giftIntentTTL, the next attempt falls into
+			-- the no-intent policy, grants the perk to the BUYER and answers PurchaseGranted,
+			-- so the paid gift is gone for good.
 			--
 			-- Through an UpdateOffline transform, never a bare write on the GetOffline
-			-- snapshot: that snapshot is a dead copy and the slot has to be re-read inside
-			-- the compare-and-set. deliverGift YIELDED, so the slot may have been cleared
-			-- (a bare Ts write would materialize a phantom intent) or taken over by a
-			-- second gift that is not ours to extend, and there is no accessor tree out
-			-- here to raise on either mistake. Best effort; the answer stays
-			-- NotProcessedYet whatever the write does.
+			-- snapshot: that snapshot is a dead copy, and deliverGift YIELDED, so the slot
+			-- may have been cleared or taken over by a second gift that is not ours to
+			-- extend, with no accessor tree out here to raise on either mistake. Best effort;
+			-- the answer stays NotProcessedYet whatever the write does.
 			ctx.Persistence.UpdateOffline(userId, function(offlineData)
 				local offlineReserved = reservedRaw(offlineData)
 				local live = offlineReserved[giftRecordKey(fromAim)][productIdStr]
@@ -1575,21 +1536,15 @@ function Monetization.new(ctx: any)
 			return NOT_PROCESSED
 		end
 		local ok = ctx.Persistence.UpdateOffline(userId, function(offlineData)
-			-- The dedupe marker, re-read INSIDE the transaction: the decision above was
-			-- made against a GetOffline snapshot, so a cycle that committed in between is
-			-- invisible both to it and to the compare-and-set, whose fingerprint is by now
-			-- the fresh one. Returning early still commits the unchanged draft, so the
-			-- caller answers GRANTED, which is correct: the purchase IS granted, just not
-			-- by this cycle.
+			-- The dedupe marker, re-read INSIDE the transaction; see the credit arm above.
 			if isProcessedRaw(offlineData, purchaseId) then
 				return
 			end
 			local offlineReserved = reservedRaw(offlineData)
 			-- Clear OUR record, and only ours. The decision that this receipt owns one was
-			-- made from a snapshot taken before deliverGift's cross-server round trip, and
-			-- a second gift of the same product can hold the slot by now with the key
-			-- unlocked, so nothing refuses; deleting it blind strands that gift. Identity
-			-- is the GiftId, never the slot.
+			-- made from a snapshot taken before deliverGift's cross-server round trip, and a
+			-- second gift of the same product can hold the slot by now. Identity is the
+			-- GiftId, never the slot.
 			clearGiftRecordRaw(offlineReserved, fromAim, productIdStr, giftId)
 			robuxLogRaw(offlineData, {
 				PurchaseId = purchaseId,
@@ -1638,8 +1593,7 @@ function Monetization.new(ctx: any)
 		local reserved = reservedRaw(data)
 		local intent = reserved.PendingGifts[tostring(product.Id)]
 		-- Mirror intentFor's reused-Id guard: an intent whose stored Product name differs
-		-- belongs to a retired product that reused this Id, so honouring it would gift
-		-- the new product to the old recipient. Treat as no-intent.
+		-- belongs to a retired product that reused this Id. Treat as no-intent.
 		if type(intent) == "table" and intent.Product ~= nil and intent.Product ~= product.Name then
 			Log.Warn(
 				"Gifting",
@@ -1656,10 +1610,9 @@ function Monetization.new(ctx: any)
 			return settleOfflineGift(userId, product, receiptInfo, intent, false)
 		end
 
-		-- NO LIVE INTENT, offline: the same two questions the online arm asks, in the
-		-- same order. Both are here because the arm a receipt takes depends only on
-		-- whether the buyer happens to still be on this server, which is not a fact about
-		-- the purchase.
+		-- NO LIVE INTENT, offline: the same two questions the online arm asks, in the same
+		-- order. Both are here because the arm a receipt takes depends only on whether the
+		-- buyer is still on this server, which is not a fact about the purchase.
 		local record, fromAim = readGiftRecord(reserved, false, product), false
 		if record == nil then
 			record = readGiftRecord(reserved, true, product)
@@ -1714,12 +1667,7 @@ function Monetization.new(ctx: any)
 				return NOT_PROCESSED
 			end
 			local ok = ctx.Persistence.UpdateOffline(userId, function(offlineData)
-				-- The dedupe marker, re-read INSIDE the transaction: the decision above was
-				-- made against a GetOffline snapshot, so a cycle that committed in between
-				-- is invisible both to it and to the compare-and-set, whose fingerprint is
-				-- by now the fresh one. Returning early still commits the unchanged draft,
-				-- so the caller answers GRANTED, which is correct: the purchase IS granted,
-				-- just not by this cycle.
+				-- The dedupe marker, re-read INSIDE the transaction; see settleOfflineGift.
 				if isProcessedRaw(offlineData, purchaseId) then
 					return
 				end
@@ -1761,9 +1709,8 @@ function Monetization.new(ctx: any)
 	-- Shared receipt path. `strict` decides what an UNREGISTERED product means:
 	--  * true (Scribe owns ProcessReceipt): a configuration mistake. Log it and return
 	--    NotProcessedYet, so Roblox retries and the Robux are never eaten.
-	--  * false (an external router owns it): simply not ours. Return nil with no log so
-	--    the caller falls through; NotProcessedYet would stall their own purchase in a
-	--    permanent retry loop.
+	--  * false (an external router owns it): not ours. Return nil with no log so the
+	--    caller falls through; NotProcessedYet would stall their purchase in a retry loop.
 	local function handleReceipt(receiptInfo: any, strict: boolean): Enum.ProductPurchaseDecision?
 		local userId = tonumber(receiptInfo.PlayerId) or 0
 		local productId = tonumber(receiptInfo.ProductId) or 0
@@ -1777,7 +1724,7 @@ function Monetization.new(ctx: any)
 			Log.Error(
 				"Monetization",
 				"RECEIPT_UNKNOWN_PRODUCT",
-				`receipt for unregistered product {productId} — register it in Products`,
+				`receipt for unregistered product {productId}: register it in Products`,
 				{
 					UserId = userId,
 					ProductId = productId,
@@ -1787,7 +1734,7 @@ function Monetization.new(ctx: any)
 		end
 		Metrics.Add("ReceiptsReceived")
 
-		local entry = ctx.Persistence.EntryForUserId(userId)
+		local entry: { [string]: any }? = ctx.Persistence.EntryForUserId(userId)
 		if entry and entry.State == "Ready" and isProcessed(entry, tostring(receiptInfo.PurchaseId)) then
 			Metrics.Add("ReceiptsDuplicate")
 			-- Logged as well as counted: the metric alone leaves an operator with no
@@ -1798,9 +1745,9 @@ function Monetization.new(ctx: any)
 				ProductId = productId,
 			})
 			-- Acknowledge a duplicate only when the grant that set this marker is durable.
-			-- Dirty alone is not enough: it resets when a save's payload is serialized, so
-			-- a clean flag with a save still in flight means the covering save may yet
-			-- fail, and a crash after GRANTED would lose both the grant and the marker.
+			-- Dirty alone is not enough: it resets when a save's payload is serialized, so a
+			-- clean flag with a save still in flight means the covering save may yet fail,
+			-- and a crash after GRANTED would lose both the grant and the marker.
 			if (not entry.SaveInfo.Dirty and entry.SavesInFlight == 0) or ctx.Persistence.AwaitSave(entry, 10) then
 				return GRANTED
 			end
@@ -1814,16 +1761,13 @@ function Monetization.new(ctx: any)
 			return NOT_PROCESSED
 		end
 
-		-- The in-flight guard sits here because all three delivery paths dispatch from
-		-- the two lines below. The persisted ring is a COMPLETION record, written only
-		-- after the grant commits, so between the duplicate check above and that write a
-		-- second delivery of the same receipt sees "not yet granted", and every yield
-		-- inside widens the window.
-		--
-		-- It does NOT wait for the other invocation: Roblox retries a NotProcessedYet,
-		-- and by then the first call has either marked the receipt processed or failed.
-		-- Waiting would park one ProcessReceipt callback across another's AwaitSave, and
-		-- on the gift path could wait on the offline lock it is queued behind.
+		-- The in-flight guard sits here because all three delivery paths dispatch from the
+		-- two lines below. The persisted ring is a COMPLETION record, written only after the
+		-- grant commits, so between the duplicate check above and that write a second
+		-- delivery of the same receipt sees "not yet granted", and every yield inside widens
+		-- the window. It does NOT wait for the other invocation: that would park one
+		-- ProcessReceipt callback across another's AwaitSave, and on the gift path could wait
+		-- on the offline lock it is queued behind. Roblox retries a NotProcessedYet instead.
 		local flightKey = `{userId}|{tostring(receiptInfo.PurchaseId)}`
 		if receiptsInFlight[flightKey] then
 			Metrics.Add("ReceiptsRetried")
@@ -1836,10 +1780,9 @@ function Monetization.new(ctx: any)
 			return NOT_PROCESSED
 		end
 		receiptsInFlight[flightKey] = true
-		-- pcall because applyProductGrant calls Tree:RunTransaction unguarded and
-		-- assertAlive raises on a torn-down tree, the receipt-vs-departure race.
-		-- Releasing only on a normal return would leak this key and refuse the receipt
-		-- for the rest of the session.
+		-- pcall because applyProductGrant calls Tree:RunTransaction unguarded and assertAlive
+		-- raises on a torn-down tree, the receipt-vs-departure race. Releasing only on a
+		-- normal return would leak this key and refuse the receipt for the rest of the session.
 		local dispatchOk, decision = pcall(function()
 			if entry and entry.State == "Ready" then
 				return handleOnlineReceipt(entry, product, receiptInfo)
@@ -1862,6 +1805,96 @@ function Monetization.new(ctx: any)
 	end
 
 	-- Gifting flow --------------------------------------------------------------------
+
+	--- What a finished gamepass purchase does. Named rather than inline in the Connect so a
+	--- spec can drive it: a real RBXScriptSignal has no Fire, so the only other way to
+	--- reach this is a real purchase.
+	function self.OnPassPurchaseFinished(player: Player, passId: number, purchased: boolean)
+		if not purchased then
+			return
+		end
+		local passName = passNamesById[passId]
+		if not passName then
+			return
+		end
+		local entry = ctx.Persistence.EntryFor(player)
+		if not entry or entry.State ~= "Ready" then
+			return
+		end
+		-- CONFIRM BEFORE CREDITING. This reports that the purchase DIALOG closed, not a
+		-- completed transaction: a gamepass has no ProcessReceipt to be authoritative. The
+		-- session cache would heal on the next join, but robuxLog writes the PERSISTED
+		-- purchase history, so an unconfirmed event falsifies it.
+		Sched.Spawn(function()
+			local ok, owned = pcall(function()
+				return userOwnsGamePass(entry.UserId, passId)
+			end)
+			if entry.TornDown then
+				return
+			end
+			if not ok or owned ~= true then
+				-- Self-heals: the join scan re-resolves every declared pass, so a real
+				-- purchase the API had not caught up with is credited on the next load.
+				Metrics.Add("PassPurchasesUnconfirmed")
+				Log.Warn(
+					"Monetization",
+					"PASS_PURCHASE_UNCONFIRMED",
+					if ok then "ownership check says not owned" else tostring(owned),
+					{ Player = player, Pass = passName, PassId = passId, Errored = not ok }
+				)
+				return
+			end
+			setOwnsCache(entry, passName, true)
+			robuxLog(entry, {
+				PurchaseId = `pass:{passId}:{Clock.Now()}`,
+				Product = passName,
+				Category = passesByName[passName].Category or "Gamepass",
+				From = { Type = "GamePass" },
+				Ts = Clock.Now(),
+			})
+			ctx.Persistence.AwaitSave(entry, 15)
+		end)
+	end
+
+	function self.PromptPurchase(player: Player, name: string): (boolean, string?)
+		local product = productsByName[name]
+		local pass = passesByName[name]
+		if not product and not pass then
+			return false, `unknown product or pass "{name}"`
+		end
+		local entry = ctx.Persistence.EntryFor(player)
+		if not entry or entry.State ~= "Ready" then
+			return false, "player data not loaded"
+		end
+
+		local promptId: number
+		local prompt: (player: Player, id: number) -> ()
+		if pass then
+			-- A pass IS its own ownership key, and the join scan warms the cache for every
+			-- declared pass.
+			if self.Owns(player, name) then
+				return false, `player already owns "{name}"`
+			end
+			promptId, prompt = pass.Id, promptGamePassPurchase
+		else
+			-- A product owns nothing unless it Grants a perk. Without one it is a
+			-- consumable and is always promptable.
+			local grants = (product :: any).Grants
+			if grants ~= nil and self.Owns(player, grants) then
+				return false, `player already owns "{grants}"`
+			end
+			promptId, prompt = (product :: any).Id, promptProductPurchase
+		end
+
+		local ok, err = pcall(function()
+			prompt(player, promptId)
+		end)
+		if not ok then
+			return false, `purchase prompt failed: {err}`
+		end
+		Metrics.Add("PurchasePrompts")
+		return true, nil
+	end
 
 	function self.PromptGift(buyer: Player, productName: string, recipientUserId: number): (boolean, string?)
 		local product = productsByName[productName]
@@ -1887,15 +1920,14 @@ function Monetization.new(ctx: any)
 		if Util.count(reservedRaw(entry.LiveData).PendingGifts) >= giftMaxPending then
 			return false, "too many pending gifts"
 		end
-		-- The aim store's cap, enforced at INTAKE before money moves. If this prompt goes
-		-- stale while the buyer is away the load sweep has to be able to archive where it
-		-- was aimed, and refusing an unpaid prompt is the cheap end of that trade.
-		--
-		-- It RESERVES rather than measures: the slot is not claimed until the sweep
-		-- archives it, and every pending intent is a slot this store already owes, so
-		-- counting the archived aims alone counts the wrong thing. A product whose slot
-		-- is already taken is free, since the new record overwrites it.
+		-- The aim store's cap, enforced at INTAKE before money moves: if this prompt goes
+		-- stale while the buyer is away the load sweep has to be able to archive where it was
+		-- aimed, and refusing an unpaid prompt is the cheap end of that trade. It RESERVES
+		-- rather than measures, because every pending intent is a slot this store already
+		-- owes. A product whose slot is already taken is free, since the record overwrites it.
 		local productIdStr = tostring(product.Id)
+		-- Counts the STORE alone, unlike PromptGift's reservation: by now the intent is
+		-- being spent into a slot, and counting it too would charge the same gift twice.
 		local function aimStoreIsFull(): boolean
 			local live = reservedRaw(entry.LiveData)
 			local aims, pending = live.GiftAims, live.PendingGifts
@@ -1928,11 +1960,10 @@ function Monetization.new(ctx: any)
 			return false, "data services are experiencing issues; try again later"
 		end
 
-		-- Charge the sender's cooldown BEFORE the first expensive step:
-		-- recipientAlreadyOwns issues a full-profile GetAsync for an offline recipient,
-		-- and with the stamp below it a refused prompt left the cooldown unspent, letting
-		-- one sender repeat that work without limit. The checks above are all local and
-		-- cheap, so they deliberately still cost nothing.
+		-- Charge the sender's cooldown BEFORE the first expensive step: recipientAlreadyOwns
+		-- issues a full-profile GetAsync for an offline recipient, and with the stamp below
+		-- it a refused prompt left the cooldown unspent, letting one sender repeat that work
+		-- without limit. The checks above are local and cheap, so they still cost nothing.
 		entry.GiftLastAt = now
 
 		-- Step 1: duplicate guard.
@@ -1942,16 +1973,15 @@ function Monetization.new(ctx: any)
 			end
 		end
 
-		-- recipientAlreadyOwns YIELDED, so the buyer has had a network round trip in
-		-- which to leave. Every step below writes through the accessor tree and a
-		-- torn-down tree RAISES, which is the one thing PromptGift is documented not to
-		-- do: its contract is (false, reason), and a raise lands as a script error in the
-		-- caller's remote handler instead. It sits here because both the credit path and
-		-- the intent path take their first accessor write after this point.
+		-- recipientAlreadyOwns YIELDED, so the buyer has had a round trip in which to leave.
+		-- Every step below writes through the accessor tree and a torn-down tree RAISES,
+		-- which is the one thing PromptGift is documented not to do: its contract is
+		-- (false, reason). It sits here because both the credit path and the intent path
+		-- take their first accessor write after this point.
 		--
-		-- State, not entry.Tree.Dead: teardown sets SessionEnded before it destroys the
-		-- tree, so State is the strictly earlier signal and also covers the window where
-		-- the session is going away but the tree is still alive.
+		-- State, not entry.Tree.Dead: teardown sets SessionEnded before it destroys the tree,
+		-- so State is the strictly earlier signal and also covers the window where the
+		-- session is going away but the tree is still alive.
 		if entry.State ~= "Ready" then
 			return false, "buyer data not loaded"
 		end
@@ -1962,15 +1992,12 @@ function Monetization.new(ctx: any)
 		if credits > 0 then
 			local giftId = Util.guid()
 			local creditAccessor = reservedAcc(entry).GiftCredits[productName]
-			-- Refunds re-read the live count instead of restoring the stale pre-read
-			-- value: a receipt retry can issue a credit during the yields below, and an
-			-- absolute restore would erase it.
-			--
-			-- Both steps between the spend and this refund yield, so the buyer can be gone
-			-- by the time a delivery failure brings us back here. Writing through the
-			-- accessor would raise on the dead tree, skipping the refund on a credit that
-			-- is PAID FOR, so a departed buyer is refunded through UpdateOffline instead.
-			-- If even that fails the credit is genuinely lost and says so loudly.
+			-- Refunds re-read the live count instead of restoring the stale pre-read value: a
+			-- receipt retry can issue a credit during the yields below, and an absolute
+			-- restore would erase it. Both steps between the spend and this refund yield, so
+			-- the buyer can be gone by the time a delivery failure brings us back here;
+			-- writing through the accessor would raise on the dead tree and skip the refund
+			-- on a credit that is PAID FOR, so a departed buyer goes through UpdateOffline.
 			local function refundCredit()
 				if entry.State == "Ready" and not entry.Tree.Dead then
 					creditAccessor.Set((tonumber(creditAccessor.Get()) or 0) + 1)
@@ -2002,32 +2029,25 @@ function Monetization.new(ctx: any)
 			end
 			-- ONE RULE AT TWO GATES: prefer a bounded value loss over a double grant. This
 			-- spend has no id a retry could reuse (`giftId` is a fresh guid persisted
-			-- nowhere), so every credit handed back can buy a SECOND grant under a
-			-- purchaseId the recipient's dedupe ring has never seen.
+			-- nowhere), so every credit handed back can buy a SECOND grant under a purchaseId
+			-- the recipient's dedupe ring has never seen.
 			--
-			-- FIRST GATE, on `applied` rather than `durable`: a same-server recipient's
-			-- grant is marked processed under this giftId and persists on their next save,
-			-- so refunding on a merely non-durable save would reopen the re-spend. The
-			-- accepted cost is a recipient crash before autosave losing the in-memory
-			-- grant while the credit is gone.
+			-- FIRST GATE, on `applied` rather than `durable`: a same-server recipient's grant
+			-- is marked processed under this giftId and persists on their next save, so
+			-- refunding on a merely non-durable save would reopen the re-spend.
 			--
-			-- SECOND GATE, on `refundable`. MessageAsync's write can commit and then lose
-			-- its answer, which deliverGift cannot tell from a write that never landed, so
-			-- refunding hands back a credit for a gift that IS queued. The paid-purchase
-			-- path is immune only because it makes its GiftId durable before the money
-			-- moves; nothing here has a durable record to give it that property.
-			--
-			-- A raise out of deliverGift would unwind past both gates, leaving the credit
-			-- spent with no refund, no log and a script error in the buyer's remote
-			-- handler. It is caught here and read as AMBIGUOUS, because a raise can come
-			-- from before the grant or after it.
+			-- SECOND GATE, on `refundable`: MessageAsync's write can commit and then lose its
+			-- answer, which deliverGift cannot tell from a write that never landed. The
+			-- paid-purchase path is immune only because it makes its GiftId durable before
+			-- the money moves. A raise out of deliverGift would unwind past both gates,
+			-- leaving the credit spent with no refund, so it is caught and read as AMBIGUOUS.
 			local deliveryOk, applied, _, refundable =
 				pcall(deliverGift, product, recipientUserId, `credit:{giftId}`, giftId, entry.UserId)
 			local deliveryError = if deliveryOk then nil else tostring(applied)
 			if not deliveryOk then
-				-- `applied` currently holds the error message, which is truthy. Both values
-				-- are forced to the ambiguous reading before either gate reads them, so a
-				-- raise can neither report a delivery nor buy a refund.
+				-- `applied` currently holds the error message, which is truthy. Both values are
+				-- forced to the ambiguous reading before either gate reads them, so a raise can
+				-- neither report a delivery nor buy a refund.
 				applied, refundable = false, false
 			end
 			if not applied and refundable then
@@ -2038,16 +2058,12 @@ function Monetization.new(ctx: any)
 				return false, "could not deliver gift; try again later"
 			end
 			if not applied then
-				-- Ambiguous. The credit STAYS SPENT and the buyer is told not to send it
-				-- again, because the alternative is the double grant above. No save is
-				-- spawned as the refund arm does one: the spend was already made durable.
-				--
-				-- Loud, because this is the one outcome where a player is out paid value
-				-- with no retry that would help, and an operator has to reconcile it by
-				-- hand. Log.Warn rather than Failure.Report: deliverGift already reported
-				-- this once, and a second report would count one fault twice against the
-				-- health window. A raise arrives having reported nothing, so its error in
-				-- the context below is what tells the two apart.
+				-- Ambiguous. The credit STAYS SPENT and the buyer is told not to send it again,
+				-- because the alternative is the double grant above. No save is spawned as the
+				-- refund arm does one: the spend was already made durable. Loud, because this
+				-- is the one outcome where a player is out paid value with no retry that would
+				-- help. Log.Warn rather than Failure.Report: deliverGift already reported this
+				-- once, and a second report would count one fault twice against the health window.
 				Metrics.Add("GiftCreditsUnconfirmed")
 				Log.Warn(
 					"Gifting",
@@ -2075,11 +2091,11 @@ function Monetization.new(ctx: any)
 			return true, nil
 		end
 
-		-- Step 3: durable intent BEFORE money moves. Refuse a second gift of the same
-		-- product only while a purchase could still be in flight: a receipt carries only
-		-- the product Id, never the recipient, so intents are keyed by it and overwriting
-		-- a live one would deliver the first purchase to the second recipient. Past
-		-- giftPromptWindow no receipt ever came and the slot is safe to overwrite.
+		-- Step 3: durable intent BEFORE money moves. Refuse a second gift of the same product
+		-- only while a purchase could still be in flight: a receipt carries only the product
+		-- Id, never the recipient, so intents are keyed by it and overwriting a live one
+		-- would deliver the first purchase to the second recipient. Past giftPromptWindow no
+		-- receipt ever came and the slot is safe to overwrite.
 		local pendingIntent = intentFor(entry, product)
 		if pendingIntent ~= nil and Clock.Now() - (tonumber(pendingIntent.Ts) or 0) < giftPromptWindow then
 			return false, "a gift of this item is already pending; try again shortly"
@@ -2093,12 +2109,11 @@ function Monetization.new(ctx: any)
 			Product = productName,
 		})
 		-- Both rollbacks below clear through clearGiftRecord and neither reuses
-		-- `intentAccessor`: that accessor is a PATH captured before the AwaitSave yields,
-		-- so Set(nil) on it would delete whatever occupies the slot when the rollback
-		-- runs, and inside a ten-second save a second PromptGift can legally have taken
-		-- it over. Deleting that strands a gift that HAS been prompted. Identity is the
-		-- GiftId, never the slot, and a GiftId comparison rather than an existence test
-		-- because in the hazard the slot IS occupied, just by someone else.
+		-- `intentAccessor`: that accessor is a PATH captured before the AwaitSave yields, so
+		-- Set(nil) on it would delete whatever occupies the slot when the rollback runs, and
+		-- inside a ten-second save a second PromptGift can legally have taken it over. A
+		-- GiftId comparison rather than an existence test, because in the hazard the slot IS
+		-- occupied, just by someone else.
 		if not ctx.Persistence.AwaitSave(entry, 10) then
 			clearGiftRecord(entry, false, productIdStr, giftId)
 			Log.Error("Gifting", "GIFT_INTENT_WRITE_FAIL", "could not durably record gift intent; refusing prompt", {
@@ -2147,7 +2162,7 @@ function Monetization.new(ctx: any)
 			return {}
 		end
 		local reserved = reservedRaw(entry.LiveData)
-		local out = {}
+		local out: { { [string]: any } } = {}
 		local function collect(kind: string, ring: { any })
 			if filter and filter.Kind and filter.Kind ~= kind then
 				return
@@ -2191,12 +2206,11 @@ function Monetization.new(ctx: any)
 		end
 		-- Optional caller-supplied idempotency key. Deliberately NOT stored in
 		-- _Scribe.ProcessedPurchaseIds: pushing ordinary shop traffic through that capped
-		-- ring would flush real receipt ids, so these get their own Timed namespace.
+		-- ring would flush real receipt ids.
 		local idemKey = spec.IdempotencyKey
 		if idemKey ~= nil then
-			-- Wire's cap, read at the use site rather than aliased: it is the one
-			-- definition, and a local literal is how this path came to enforce its own 64
-			-- while Wire's comment claimed the cap was shared.
+			-- Wire's cap, read at the use site rather than aliased: a local literal is how
+			-- this path came to enforce its own 64 while Wire's comment claimed it was shared.
 			if type(idemKey) ~= "string" or idemKey == "" or #idemKey > Wire.MAX_IDEMPOTENCY_KEY_BYTES then
 				return false, "invalid IdempotencyKey"
 			end
@@ -2233,7 +2247,7 @@ function Monetization.new(ctx: any)
 		-- Follow the schema the way the accessor above does. Template.Resolve descends
 		-- node.Children only, so a DictOf/ArrayOf element would stop the walk at the
 		-- container, silently disabling the fractional-amount guard and flooring Min at 0.
-		local costSchema, dynStart = Template.Resolve(compiled, costPath)
+		local costSchema, dynStart = Template.Resolve(compiled, costPath :: { string | number })
 		for i = dynStart, #costPath do
 			local next_ = Template.ChildSchema(costSchema, costPath[i])
 			if next_ == nil then
@@ -2248,9 +2262,8 @@ function Monetization.new(ctx: any)
 		end
 		local floor: number = costSchema.Min or 0
 
-		-- A DictOf currency key the player never touched reads nil, but the declared
-		-- element default is its true balance, so without this a player could never spend
-		-- a starting balance.
+		-- A DictOf currency key the player never touched reads nil, but the declared element
+		-- default is its true balance, so without this a starting balance is unspendable.
 		local isElementLeaf = false
 		do
 			local cursor: any = costSchema
@@ -2270,9 +2283,9 @@ function Monetization.new(ctx: any)
 			return value
 		end
 
-		-- Already granted under this key? Return the ORIGINAL outcome, matching the
-		-- receipt path; the "this was a duplicate" signal goes to logs and metrics rather
-		-- than into the return value, where a caller would have to special-case it.
+		-- Already granted under this key? Return the ORIGINAL outcome, matching the receipt
+		-- path; the "this was a duplicate" signal goes to logs and metrics rather than into
+		-- the return value, where a caller would have to special-case it.
 		if idemKey ~= nil and ctx.Timed.IsClaimed(entry, PURCHASE_IDEM_PREFIX .. idemKey) then
 			Metrics.Add("PurchasesDuplicate")
 			Log.Info("Monetization", "PURCHASE_DUPLICATE", "purchase skipped: idempotency key already applied", {
@@ -2285,13 +2298,11 @@ function Monetization.new(ctx: any)
 		local current = readBalance()
 		if type(current) ~= "number" then
 			-- Two different refusals wearing one string. The accessor walk above already
-			-- SUCCEEDED, so the path is not a typo: it resolved to something real that
-			-- cannot be spent, Scribe.Big being the case that bites (stored as a table,
-			-- while Purchase does plain arithmetic).
-			--
-			-- Only for a DECLARED non-numeric type. An element of a dynamic container has
-			-- no ValueType, and there the old string is still the honest answer. This
-			-- picks between two refusal strings and does nothing else.
+			-- SUCCEEDED, so the path is not a typo: it resolved to something real that cannot
+			-- be spent, Scribe.Big being the case that bites (stored as a table, while
+			-- Purchase does plain arithmetic). Only for a DECLARED non-numeric type: an
+			-- element of a dynamic container has no ValueType, and there the old string is
+			-- still the honest answer.
 			local valueType = costSchema.ValueType
 			if valueType ~= nil and valueType ~= "any" and valueType ~= "int" and valueType ~= "number" then
 				return false, "cost path is not a spendable number"
@@ -2312,19 +2323,18 @@ function Monetization.new(ctx: any)
 				(spec.Grant :: (any) -> ())(entry.Tree.Accessor)
 			end
 			checkCategory(spec.Category)
-			-- Claimed INSIDE the transaction, so a Grant that throws rolls the claim back
-			-- with the debit. A claim taken outside would survive the rollback and
-			-- permanently block a retry of a purchase that never happened.
+			-- Claimed INSIDE the transaction, so a Grant that throws rolls the claim back with
+			-- the debit. A claim taken outside would survive the rollback and permanently
+			-- block a retry of a purchase that never happened.
 			if idemKey ~= nil then
-				-- Make room INSIDE the transaction, so an eviction rolls back with the
-				-- purchase that prompted it.
+				-- Make room INSIDE the transaction, so an eviction rolls back with its purchase.
 				local dropped = ctx.Timed.PruneClaims(entry, PURCHASE_IDEM_PREFIX, purchaseClaimCap)
 				if dropped > 0 then
 					Log.Warn(
 						"Monetization",
 						"PURCHASE_CLAIM_EVICTED",
 						`dropped {dropped} un-expired purchase idempotency claim(s) to stay under MaxPurchaseClaims `
-							.. `({purchaseClaimCap}); a retry of one of them would apply the purchase again — `
+							.. `({purchaseClaimCap}); a retry of one of them would apply the purchase again; `
 							.. "raise the cap or shorten PurchaseClaimTTL",
 						{ Player = player, Dropped = dropped, Cap = purchaseClaimCap }
 					)
@@ -2361,10 +2371,9 @@ function Monetization.new(ctx: any)
 
 	function self.OnLoad(entry: any)
 		-- Expire stale gift intents, but ARCHIVE what they aimed at first. Deleting the
-		-- recipient outright leaves a late receipt indistinguishable from a
-		-- self-purchase, so the buyer is granted a gift they already paid to send. The
-		-- intent itself still goes, or the buyer loses gift capacity for good, but the
-		-- aim it carried outlives it by the whole receipt-retry horizon.
+		-- recipient outright leaves a late receipt indistinguishable from a self-purchase, so
+		-- the buyer is granted a gift they already paid to send. The intent itself still
+		-- goes, or the buyer loses gift capacity for good.
 		local reserved = reservedRaw(entry.LiveData)
 		local now = Clock.Now()
 		for productIdStr, intent in reserved.PendingGifts do
@@ -2373,13 +2382,11 @@ function Monetization.new(ctx: any)
 				reservedAcc(entry).PendingGifts[productIdStr].Set(nil)
 			end
 		end
-		-- No prune here on purpose. An aim past the horizon can no longer CLAIM a receipt
-		-- but can still PROVE one was delivered, and that proof is free to keep: the
-		-- store is bounded by its cap and reclaims on intake, where something is actually
-		-- competing for the room.
-		-- Gift credits are durable paid value keyed by product NAME, so a renamed or
-		-- removed product silently strands them. Surface it, never delete: the credit is
-		-- player money.
+		-- No prune here on purpose. An aim past the horizon can no longer CLAIM a receipt but
+		-- can still PROVE one was delivered, and that proof is free to keep: the store is
+		-- bounded by its cap and reclaims on intake, where something competes for the room.
+		-- Gift credits are durable paid value keyed by product NAME, so a renamed or removed
+		-- product silently strands them. Surface it, never delete: the credit is player money.
 		for creditName, count in reserved.GiftCredits do
 			if productsByName[creditName] == nil and (tonumber(count) or 0) > 0 then
 				Log.Warn(
@@ -2435,27 +2442,7 @@ function Monetization.new(ctx: any)
 
 		connections[#connections + 1] = MarketplaceService.PromptGamePassPurchaseFinished:Connect(
 			function(player: Player, passId: number, purchased: boolean)
-				if not purchased then
-					return
-				end
-				local passName = passNamesById[passId]
-				if not passName then
-					return
-				end
-				local entry = ctx.Persistence.EntryFor(player)
-				if entry and entry.State == "Ready" then
-					setOwnsCache(entry, passName, true)
-					robuxLog(entry, {
-						PurchaseId = `pass:{passId}:{Clock.Now()}`,
-						Product = passName,
-						Category = passesByName[passName].Category or "Gamepass",
-						From = { Type = "GamePass" },
-						Ts = Clock.Now(),
-					})
-					Sched.Spawn(function()
-						ctx.Persistence.AwaitSave(entry, 15)
-					end)
-				end
+				self.OnPassPurchaseFinished(player, passId, purchased)
 			end
 		)
 
@@ -2469,7 +2456,7 @@ function Monetization.new(ctx: any)
 
 	-- Release the marketplace listeners and hand ProcessReceipt back. The receiptsBound
 	-- guard is module-global, so leaving it set would make a later bundle in the same
-	-- process throw even though nothing owns the handler any more.
+	-- process throw even though nothing owns the handler.
 	function self.Stop()
 		for _, connection in connections do
 			pcall(function()

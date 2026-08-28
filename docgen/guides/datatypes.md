@@ -95,9 +95,8 @@ end,
 
 `Scribe.Datatypes.Unpack("Vector3", stored)` goes the other way, for reading one out of a raw table. Reads through the accessor are unaffected either way: `data.Checkpoint.Get()` still hands back a real `Vector3`.
 
-:::caution An unpacked datatype in a raw write is silent until the save fails
-Scribe scans raw-written data at load and reports anything unstorable as `PROFILE_UNPERSISTABLE`, so the problem does surface. It surfaces as a log line rather than an error at the line that caused it. Often the simpler fix is to store the plain numbers in ordinary fields and build the datatype where you use it.
-:::
+!!! warning "An unpacked datatype in a raw write is silent until the save fails"
+    Scribe scans raw-written data at load and reports anything unstorable as `PROFILE_UNPERSISTABLE`, so the problem does surface. It surfaces as a log line rather than an error at the line that caused it. Often the simpler fix is to store the plain numbers in ordinary fields and build the datatype where you use it.
 
 ??? note "Why a packed buffer instead of a table of numbers"
     A `Vector3` written as `{ X = 0, Y = 12, Z = 0 }` costs the three numbers plus three key strings, in JSON, every save and every replication frame. The packed form is a fixed-width buffer with no keys at all. On a template with a few hundred placed objects that is the difference between a profile that saves comfortably and one that creeps toward the roughly 4 MB ceiling.

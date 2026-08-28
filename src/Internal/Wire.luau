@@ -11,22 +11,19 @@ type Compiled = Template.Compiled
 
 local Wire = {}
 
--- Bump on any frame layout change, including a purely additive one. The server
--- refuses a Hello whose version differs, and that refusal is the only thing
--- between a mixed deploy and silently mis-decoded frames.
+-- Bump on any frame layout change, even a purely additive one. The server's Hello
+-- version check is all that stands between a mixed deploy and mis-decoded frames.
 Wire.PROTOCOL_VERSION = 6
 
 -- Max arguments a command frame carries. Shared so the client's encode cap and the
 -- server's decode guard cannot drift.
 Wire.MAX_COMMAND_ARGS = 16
 
--- Max bytes in an idempotency key, enforced on both sides. It governs both a
--- Command frame's key, which dies with the session, and a Data.Purchase key,
--- which is persisted, so raising it raises what a profile can carry.
---
--- The number is repeated in prose that nothing binds to this line: Client/init,
--- Server/init and Types.luau doc-comments, plus docgen/guides/monetization.md and
--- docgen/guides/log-codes.md.
+-- Max bytes in an idempotency key, enforced on both sides. It governs a Command
+-- frame's key and the persisted Data.Purchase key, so raising it raises what a
+-- profile can carry. The number is repeated in prose nothing binds to this line:
+-- Client/init, Server/init and Types.luau doc-comments, plus
+-- docgen/guides/monetization.md and docgen/guides/log-codes.md.
 Wire.MAX_IDEMPOTENCY_KEY_BYTES = 64
 
 Wire.Frames = {
@@ -112,8 +109,7 @@ local MAX_VARINT = 2 ^ 53
 -- Unsigned LEB128; arithmetic (not bit32) so values up to 2^53 round-trip.
 local function wvarint(w: Writer, v: number)
 	-- Refuse rather than loop: math.floor(inf) is inf, so a non-finite input grows
-	-- the buffer until the process dies, and a negative wraps buffer.writeu8 into
-	-- garbage the reader would silently mis-decode.
+	-- the buffer until the process dies, and a negative wraps writeu8 into garbage.
 	if v ~= v or v == math.huge or v == -math.huge or v < 0 or v > MAX_VARINT then
 		error(`Scribe: cannot encode {tostring(v)} as a varint (expected an integer from 0 to 2^53)`, 0)
 	end
@@ -163,23 +159,19 @@ export type Reader = {
 	buf: buffer,
 	pos: number,
 	size: number,
-	-- Remaining allocations this frame may still produce, or nil for unlimited.
-	-- See Wire.NewReader.
+	-- Remaining allocations this frame may still produce, nil for unlimited.
 	budget: number?,
 	-- Set when the budget ran out, so the caller can tell "too expensive" from
-	-- "malformed" without matching on the error text, which a crafted frame could
-	-- make contain any marker.
+	-- "malformed" without matching on error text a crafted frame controls.
 	overBudget: boolean?,
 }
 
 --- A reader over `buf`. `retainBudget` caps how many bytes the decoder may retain
 --- from this frame, modelled per object; nil means unlimited.
 ---
---- The budget is caller-supplied and that is load-bearing: the same decoder runs
---- on the client over Init frames, whose size is the player's whole profile, so a
---- module-level budget would refuse a large but legitimate snapshot and read as
---- "replication randomly stops". Only the server's untrusted inbound path passes
---- one.
+--- Caller-supplied on purpose: the same decoder runs on the client over Init
+--- frames the size of a whole profile, so a module-level budget would refuse a
+--- legitimate snapshot. Only the server's untrusted inbound path passes one.
 function Wire.NewReader(buf: buffer, retainBudget: number?): Reader
 	return { buf = buf, pos = 0, size = buffer.len(buf), budget = retainBudget }
 end
@@ -238,11 +230,10 @@ local function rzigzag(r: Reader): number
 	return -(v + 1) / 2
 end
 
--- What one decoded object retains, in bytes. The budget is denominated in these
--- rather than in object counts, because an array slot costs the same whether it
--- holds `true` or a string pointer while the two differ 2.5x in input bytes.
--- Each number is rounded up, and the two Luau grows by doubling are counted at
--- twice their unit size.
+-- What one decoded object retains, in bytes. Denominated in bytes rather than
+-- object counts because an array slot costs the same whether it holds `true` or a
+-- string pointer, while the two differ 2.5x in input bytes. Rounded up, and the two
+-- Luau grows by doubling are counted at twice their unit size.
 local SLOT_BYTES = 32 -- a 16-byte TValue, doubled for power-of-two array growth
 local TABLE_BYTES = 64 -- the Table struct, ~56, rounded
 local HASH_BYTES = 64 -- a 32-byte LuaNode, doubled for power-of-two node growth
@@ -250,19 +241,16 @@ local STRING_BYTES = 24 -- TString header, excluding the payload
 local BUFFER_BYTES = 24 -- Buffer header, excluding the payload
 
 -- The default budget of MaxInboundBytes * 16 (Replication.luau) is a ceiling, not
--- a per-byte retention figure. A nested empty table costs the sender two bytes and
--- retains a whole Table struct on top of the slot holding it, so table-valued
--- elements amplify well past 16:1; WireBitmask.spec pins each path's worst case.
--- Nothing untrusted reaches the schema-typed decoder today, so re-derive the
--- multiplier from those figures before a server-inbound frame ever carries a
--- schema-typed value.
+-- a per-byte figure: a nested empty table costs the sender two bytes and retains a
+-- whole Table struct on top of the slot holding it, so table-valued elements
+-- amplify well past 16:1 (WireBitmask.spec pins each path's worst case). Nothing
+-- untrusted reaches the schema-typed decoder today; re-derive the multiplier from
+-- those figures before one does.
 
--- Charge what one decoded object will retain against the frame's budget, refusing
--- the frame when it runs out. Depth alone does not bound this: a flat table of
--- four thousand empty buffers is depth 1 and two bytes each.
---
--- Raises rather than returning early, because everything downstream assumes a
--- failed decode discards the whole frame.
+-- Charge what one decoded object will retain, refusing the frame when the budget
+-- runs out. Depth alone does not bound this: a flat table of four thousand empty
+-- buffers is depth 1 and two bytes each. Raises rather than returning early, since
+-- everything downstream assumes a failed decode discards the whole frame.
 local function charge(r: Reader, bytes: number)
 	local left = r.budget
 	if left == nil then
@@ -275,9 +263,8 @@ local function charge(r: Reader, bytes: number)
 	r.budget = left - bytes
 end
 
---- Read a string, refusing it from its length prefix instead of after the fact.
---- A cap applied to the result has already paid for the allocation, which is a
---- fine trade below a rate limit and not above one.
+--- Read a string, refusing it from its length prefix instead of after the fact: a
+--- cap applied to the result has already paid for the allocation.
 local function rstrBounded(r: Reader, maxBytes: number): string
 	local len = rvarint(r)
 	if len > maxBytes then
@@ -292,8 +279,8 @@ local function rstrBounded(r: Reader, maxBytes: number): string
 end
 
 --- `headerBytes` is the fixed per-object overhead charged against the frame's
---- retention budget, plus the payload length, taken from the length prefix before
---- the string exists. Omitted by callers not decoding untrusted generic data.
+--- retention budget, plus the payload length taken from the length prefix. Omitted
+--- by callers not decoding untrusted generic data.
 local function rstr(r: Reader, headerBytes: number?): string
 	local len = rvarint(r)
 	if headerBytes ~= nil then
@@ -406,10 +393,9 @@ local function decodeGeneric(r: Reader, depth: number): any
 		local out = {}
 		local arrayLen = rvarint(r)
 		for i = 1, arrayLen do
-			-- Charged per slot, not just per table: a slot is not a GC object, so a
-			-- table of N booleans would otherwise cost one charge while allocating N
-			-- slots, and TAG_TRUE is one byte. Charged before the recursive decode so
-			-- the refusal precedes the allocation.
+			-- Charged per slot, not just per table: a table of N booleans would
+			-- otherwise cost one charge while allocating N slots, at one byte each.
+			-- Charged before the recursive decode so the refusal precedes it.
 			charge(r, SLOT_BYTES)
 			out[i] = decodeGeneric(r, depth + 1)
 		end
@@ -442,24 +428,21 @@ end
 --
 --   bits 0-1 mode, an enumeration rather than independent flags:
 --              GENERIC  the schema cannot describe this value, so it degrades to
---                       the self-describing generic codec instead of writing
---                       bytes the reader would read against the wrong node.
---              DENSE    a schema-typed table whose keys are exactly 1..n; its
---                       body writes values positionally, with no key at all.
---              STATIC   a schema-typed table whose keys are all declared children
---                       of its node; its body is one presence bitmask over the
---                       node's ChildOrder, then the present values in order.
+--                       the self-describing generic codec.
+--              DENSE    keys are exactly 1..n; the body writes values positionally,
+--                       with no key at all.
+--              STATIC   keys are all declared children; the body is one presence
+--                       bitmask over ChildOrder, then the present values in order.
 --              TAGGED   the fallback, and the only mode that can carry a key the
 --                       schema does not know.
---   bits 2-3 key tag, present only when this value is an entry of a tagged table.
---            A static table's children need none; the bitmask is their key.
+--   bits 2-3 key tag, present only for an entry of a tagged table. A static
+--            table's children need none; the bitmask is their key.
 --   bits 4-7 reserved, and refused rather than ignored: a set bit is a drifted
 --            encoder or a crafted frame.
 --
--- So a standalone header is 0..3 and a table entry's is 0..15, each checked
--- against its own range. DENSE and STATIC are additionally refused on a non-table
--- node, which no encoder emits and the scalar readers would otherwise accept in
--- silence.
+-- A standalone header is 0..3 and a table entry's 0..15, each checked against its
+-- own range. DENSE and STATIC are also refused on a non-table node, which the
+-- scalar readers would otherwise accept in silence.
 local VH_TAGGED = 0x00
 local VH_GENERIC = 0x01
 local VH_DENSE = 0x02
@@ -498,13 +481,11 @@ local F32_MIN_NORMAL = Template.F32_MIN_NORMAL
 local floatPlan = Template.FloatPlan
 
 --- The grid index of `v` on this node's fixed-point grid, rounded to nearest.
---- Rounding rather than truncating is the error bound: truncation would double the
---- worst case and bias it, so a quantized field would drift downward over repeated
---- round trips.
+--- Truncating instead would double the worst-case error and bias it, so a quantized
+--- field would drift downward over repeated round trips.
 ---
 --- The clamp is unreachable while canSchemaEncode holds, and stays: without it a
---- value just past Max reaches buffer.writeu8 as index 256, which wraps, and comes
---- back as Min.
+--- value just past Max reaches buffer.writeu8 as 256, wraps, and comes back as Min.
 local function quantIndex(node: SchemaNode, v: number, steps: number): number
 	local q = math.floor((v - (node.Min :: number)) / (node.Precision :: number) + 0.5)
 	if q < 0 then
@@ -517,12 +498,12 @@ end
 
 --- The grid point `q` names, clamped to Max.
 ---
---- The clamp is not about crafted frames. `steps` is ceil((Max - Min)/Precision),
---- so when Precision does not divide the range the top index sits one grid point
---- past Max and quantIndex rounds Max itself onto it: Min=0, Max=100,
---- Precision=0.6 gives 167 steps and 167*0.6 = 100.2 for a legal, in-range 100.
---- The int path deliberately has no such clamp, having no legitimate overshoot to
---- correct. Max is never nil here, since a numeric Precision requires both bounds.
+--- Not about crafted frames: `steps` is ceil((Max - Min)/Precision), so when
+--- Precision does not divide the range the top index sits one grid point past Max
+--- and quantIndex rounds Max itself onto it. Min=0, Max=100, Precision=0.6 gives
+--- 167 steps and 167*0.6 = 100.2 for a legal, in-range 100. The int path has no
+--- legitimate overshoot to correct. Max is never nil here: a numeric Precision
+--- requires both bounds.
 local function quantValue(node: SchemaNode, q: number): number
 	local v = (node.Min :: number) + q * (node.Precision :: number)
 	local max = node.Max :: number
@@ -562,11 +543,10 @@ local function canSchemaEncode(node: SchemaNode, value: any): boolean
 			-- double at all, NaN and both infinities included.
 			return true
 		end
-		-- Narrowed, so the tests below ARE the precision guarantee. Anything the
-		-- narrow form cannot carry within its stated error bound is refused here and
-		-- takes the generic path instead, where it round-trips as an exact f64.
-		-- NaN and the infinities are refused by those same comparisons rather than by
-		-- a guard of their own.
+		-- Narrowed, so the tests below are the precision guarantee: anything outside
+		-- the stated error bound is refused here and takes the generic path, where it
+		-- round-trips as an exact f64. NaN and the infinities fall out of the same
+		-- comparisons.
 		if plan == FLOAT_F32 then
 			local magnitude = math.abs(value)
 			-- Zero is exact in binary32. Above F32_MAX the nearest binary32 is
@@ -574,9 +554,8 @@ local function canSchemaEncode(node: SchemaNode, value: any): boolean
 			-- the width promises.
 			return magnitude == 0 or (magnitude >= F32_MIN_NORMAL and magnitude <= F32_MAX)
 		end
-		-- Fixed-point. The grid only exists between the declared bounds, so a value
-		-- outside them has no index; since both bounds are finite, that also rejects
-		-- the infinities and NaN.
+		-- Fixed-point. The grid only exists between the declared bounds, and both are
+		-- finite, so this also rejects the infinities and NaN.
 		return value >= (node.Min :: number) and value <= (node.Max :: number)
 	elseif vt == "enum" then
 		return type(value) == "string" and node.MemberIndex ~= nil and node.MemberIndex[value] ~= nil
@@ -606,13 +585,12 @@ end
 local TAG_KEY_STATIC, TAG_KEY_STRING, TAG_KEY_UINT, TAG_KEY_F64 = 0, 1, 2, 3
 
 --- Whether `value`'s keys are exactly 1..count, so its body can be written
---- positionally with no key tag and no index per element. The only thing that may
---- set the dense bit.
+--- positionally. The only thing that may set the dense bit.
 ---
---- `#value == count` is NOT equivalent: the length operator on a holey table may
---- return either boundary, so `{[1]=1,[3]=3}` can answer 3, and would then be
---- written as three positional values and read back as a different table. Probing
---- every index is O(count) against an iteration that is already O(count).
+--- `#value == count` is not equivalent: `#` on a holey table may return either
+--- boundary, so `{[1]=1,[3]=3}` can answer 3 and would be written as three
+--- positional values and read back as a different table. Probing every index costs
+--- O(count) against an iteration that is already O(count).
 local function isDenseArray(value: any, count: number): boolean
 	if count == 0 then
 		-- An empty table is trivially dense, but the flag saves nothing and costs
@@ -638,19 +616,15 @@ local function varintLen(v: number): number
 	return n
 end
 
---- Whether every key of `value` is a static child `node` already declares, and
---- whether a presence bitmask costs fewer bytes than tagging each key. The only
---- thing that may set the static mode.
+--- Whether every key of `value` is a static child `node` declares, and whether a
+--- presence bitmask costs fewer bytes than tagging each key. The only thing that
+--- may set the static mode.
 ---
---- The test is over the TABLE's keys, not the schema's: the bitmask's positions
---- are the keys, so a key ChildOrder does not contain has no position to occupy.
---- Walking ChildOrder instead and finding every declared child present would pass
---- a table that also carried undeclared keys, and those would vanish from the
---- frame in silence. Any such table takes the tagged path.
----
---- No empty-table guard is needed, unlike isDenseArray: an empty tagged body is a
---- single zero entry count and no mask fits in fewer than two bytes, so the cost
---- comparison below already refuses one.
+--- The test is over the table's keys, not the schema's: walking ChildOrder instead
+--- and finding every declared child present would pass a table that also carried
+--- undeclared keys, and those would vanish from the frame in silence. No
+--- empty-table guard is needed, unlike isDenseArray: no mask fits in fewer than
+--- two bytes, so the cost comparison below already refuses one.
 local function isStaticStruct(node: SchemaNode, value: any, count: number): boolean
 	local children = node.Children
 	local order = node.ChildOrder
@@ -676,13 +650,12 @@ local function isStaticStruct(node: SchemaNode, value: any, count: number): bool
 	return staticBytes < taggedBytes
 end
 
---- The header bits for `value` under `node`, the node its payload should be
---- written against (nil means the generic codec), and, for a table, its entry
---- count, so the payload writer need not walk it a second time.
+--- The header bits for `value` under `node`, the node its payload is written
+--- against (nil means the generic codec), and a table's entry count, so the payload
+--- writer need not walk it again.
 ---
---- Split out from the payload writer because a table entry has to write its key
---- between the header and the payload: returning the bits instead of writing them
---- lets the caller fold in the key tag and emit one byte.
+--- Split out because a table entry writes its key between the header and the
+--- payload: returning the bits lets the caller fold in the key tag and emit one byte.
 local function valueHeaderBits(node: SchemaNode?, value: any): (number, SchemaNode?, number)
 	if node == nil or not canSchemaEncode(node, value) then
 		return VH_GENERIC, nil, 0
@@ -787,12 +760,10 @@ function encodeValuePayload(w: Writer, node: SchemaNode?, value: any, depth: num
 		end
 		local mode = bits % VH_KEY_SCALE
 		if mode == VH_STATIC then
-			-- Every key is a declared child, so one bit per declared child replaces
-			-- the keys, then the present values in ordinal order. No entry count: it
-			-- would restate the mask's popcount, which the decoder derives anyway.
-			-- Each child still carries its own header, so a field whose value the
-			-- schema cannot describe degrades to generic in place; only an undeclared
-			-- key pushes the whole table back to the tagged path.
+			-- One bit per declared child replaces the keys, then the present values in
+			-- ordinal order. No entry count: it would restate the mask's popcount. Each
+			-- child still carries its own header, so a value the schema cannot describe
+			-- degrades to generic in place; only an undeclared key forces the tagged path.
 			local order = node.ChildOrder :: { string }
 			local children = node.Children :: { [string]: SchemaNode }
 			local declared = #order
@@ -820,9 +791,8 @@ function encodeValuePayload(w: Writer, node: SchemaNode?, value: any, depth: num
 			end
 		elseif mode == VH_DENSE then
 			wvarint(w, count)
-			-- Keys are exactly 1..count and inferable from position, so nothing is
-			-- written for them. Each element still carries its own header, so one the
-			-- schema cannot describe degrades to generic inside a dense parent.
+			-- Keys are 1..count and inferable from position, so nothing is written for
+			-- them. Each element still carries a header and can degrade to generic.
 			for i = 1, count do
 				local child = Template.ChildSchema(node, i)
 				local element = value[i]
@@ -892,9 +862,9 @@ function decodeValuePayload(r: Reader, node: SchemaNode?, depth: number, header:
 		error("Scribe: malformed value mode")
 	end
 	local vt = node.ValueType
-	-- DENSE and STATIC describe a table's body, so claiming either over a scalar
-	-- node is a drifted encoder or a crafted header. Refused rather than ignored:
-	-- none of the scalar readers below looks at the mode.
+	-- DENSE and STATIC describe a table's body, so either over a scalar node is a
+	-- drifted encoder or a crafted header. Refused rather than ignored: none of the
+	-- scalar readers below looks at the mode.
 	if mode >= VH_DENSE and vt ~= "table" then
 		error(`Scribe: table value mode on a "{vt}" node`)
 	end
@@ -925,8 +895,7 @@ function decodeValuePayload(r: Reader, node: SchemaNode?, depth: number, header:
 			return quantValue(node, ru16(r))
 		end
 		-- FLOAT_Q32, as the tail rather than a branch of its own. These arms must
-		-- mirror the encoder's, or a field is written at one width and read at
-		-- another.
+		-- mirror the encoder's, or a field is written and read at different widths.
 		return quantValue(node, ru32(r))
 	elseif vt == "big" then
 		return { rf64(r), rzigzag(r) }
@@ -961,7 +930,9 @@ function decodeValuePayload(r: Reader, node: SchemaNode?, depth: number, header:
 			error("Scribe: value too deep to deserialize")
 		end
 		charge(r, TABLE_BYTES)
-		local out = {}
+		-- Written with a string key in the static branch and a number key in the
+		-- array branch, so the first write alone must not pin the index type.
+		local out: { [string | number]: any } = {}
 		if mode == VH_STATIC then
 			local order = node.ChildOrder
 			local children = node.Children
@@ -972,10 +943,9 @@ function decodeValuePayload(r: Reader, node: SchemaNode?, depth: number, header:
 			end
 			local declared = rvarint(r)
 			-- The mask's width comes from the frame and is checked against the schema,
-			-- so a disagreeing frame desyncs here, at the table that is wrong, rather
-			-- than reading the wrong number of mask bytes and mis-parsing everything
-			-- after it. It also bounds the read below by the schema rather than by an
-			-- attacker-chosen varint.
+			-- so a disagreeing frame fails here, at the table that is wrong, rather than
+			-- mis-parsing everything after it. It also bounds the read below by the
+			-- schema rather than by an attacker-chosen varint.
 			if declared ~= #order then
 				error("Scribe: static bitmask width disagrees with the schema")
 			end
@@ -985,10 +955,8 @@ function decodeValuePayload(r: Reader, node: SchemaNode?, depth: number, header:
 				error("Scribe: static bitmask overruns buffer")
 			end
 			r.pos += maskBytes
-			-- Charged for every present field up front, from the popcount, so a wide
-			-- struct is refused before the first recursive decode rather than during
-			-- it. The mask states the whole entry list, so nothing is gained by
-			-- charging incrementally.
+			-- Charged up front from the popcount, so a wide struct is refused before the
+			-- first recursive decode. The mask already states the whole entry list.
 			local present = 0
 			for b = 0, maskBytes - 1 do
 				local byte = buffer.readu8(r.buf, maskStart + b)
@@ -1020,10 +988,8 @@ function decodeValuePayload(r: Reader, node: SchemaNode?, depth: number, header:
 		if mode == VH_DENSE then
 			for i = 1, count do
 				-- SLOT_BYTES rather than the tagged path's HASH_BYTES because these
-				-- really are array slots, and a dense element's two-byte floor against
-				-- 32 is the same ratio the tagged path gets from four against 64.
-				-- Charged before the recursive decode, from the count, so the refusal
-				-- precedes the allocation.
+				-- really are array slots, and two bytes against 32 is the same ratio as
+				-- the tagged path's four against 64. Charged before the decode.
 				charge(r, SLOT_BYTES)
 				out[i] = decodeValue(r, Template.ChildSchema(node, i), depth + 1)
 			end
@@ -1031,9 +997,8 @@ function decodeValuePayload(r: Reader, node: SchemaNode?, depth: number, header:
 		end
 		for _ = 1, count do
 			-- Charged per declared entry, from the count above, before the key or the
-			-- value is read. Nothing untrusted reaches this decoder today, so the
-			-- charge is a no-op against the client's nil budget; it is here so it is
-			-- not a hole to rediscover.
+			-- value is read. A no-op against the client's nil budget today; it is here
+			-- so it is not a hole to rediscover.
 			charge(r, HASH_BYTES)
 			local entryHeader = ru8(r)
 			if entryHeader >= VH_ENTRY_MAX then
@@ -1046,8 +1011,7 @@ function decodeValuePayload(r: Reader, node: SchemaNode?, depth: number, header:
 				local ordinal = rvarint(r)
 				-- ChildOrder is nil on a node that declares no static children, so a
 				-- frame claiming a static key under one is malformed. Without this it
-				-- surfaces as "attempt to index nil with number", which reads as a
-				-- decoder bug rather than a refusal.
+				-- surfaces as "attempt to index nil with number", reading as a bug.
 				local order = node.ChildOrder
 				local name = if order ~= nil then order[ordinal] else nil
 				if name == nil then
@@ -1066,9 +1030,8 @@ function decodeValuePayload(r: Reader, node: SchemaNode?, depth: number, header:
 				child = Template.ChildSchema(node, key)
 			end
 			local value = decodeValuePayload(r, child, depth + 1, entryHeader % VH_KEY_SCALE)
-			-- Skip a NaN key (only a crafted TAG_KEY_F64 decodes to one): Lua forbids
-			-- t[NaN] and would throw. Decode the value first to keep the reader in
-			-- sync.
+			-- Skip a NaN key (only a crafted TAG_KEY_F64 decodes to one): t[NaN] throws.
+			-- Decode the value first to keep the reader in sync.
 			if key == key then
 				out[key] = value
 			end
@@ -1095,8 +1058,7 @@ function Wire.EncodePath(w: Writer, compiled: Compiled, path: { string | number 
 	wvarint(w, node.Id :: number)
 	local dynCount = #path - dynStart + 1
 	-- The count travels as a u8, so a deeper path would wrap and desync the frame.
-	-- Writes are already capped at MAX_PATH_DYN_SEGMENTS (Node.validateWrite), so
-	-- this only guards against a bug.
+	-- Writes are already capped at MAX_PATH_DYN_SEGMENTS (Node.validateWrite).
 	if dynCount > 255 then
 		error(`Scribe: path has too many dynamic segments ({dynCount})`)
 	end
@@ -1208,12 +1170,10 @@ function Wire.DecodeOp(r: Reader, compiled: Compiled): Op
 	return { Kind = kind, Path = path, Value = value, Index = index }
 end
 
---- The initial writer capacity EncodeOpsFrame will choose for `opCount` ops and
---- an optional `sizeHint`.
----
---- Exported so a spec can pin it: the seeding changes allocation counts and not
---- one output byte, so nothing else could tell a working implementation from one
---- that quietly stopped seeding. InitWriterSeed.spec is what watches it.
+--- The initial writer capacity EncodeOpsFrame will choose for `opCount` ops and an
+--- optional `sizeHint`. Exported so a spec can pin it: seeding changes allocation
+--- counts and not one output byte, so nothing else could tell it from an
+--- implementation that quietly stopped seeding. InitWriterSeed.spec watches it.
 function Wire.OpsFrameCapacity(opCount: number, sizeHint: number?): number
 	-- A hint smaller than the op count implies, from a tiny previous Init before a
 	-- large one, must not shrink the writer below what the ops alone justify.
@@ -1224,18 +1184,16 @@ function Wire.OpsFrameCapacity(opCount: number, sizeHint: number?): number
 	return capacity
 end
 
---- Encodes a frame: a frame-type byte, an optional prelude written by
---- `prelude(w)`, and a u16-counted op list. When `spans` is given it is filled
---- with each op's encoded byte length, in order, measured from the writer's own
---- offset rather than by re-encoding, which would cost a second full pass and
---- over-count by one frame header per op.
+--- Encodes a frame: a frame-type byte, an optional prelude written by `prelude(w)`,
+--- and a u16-counted op list. When `spans` is given it is filled with each op's
+--- encoded byte length, in order, measured from the writer's own offset rather than
+--- by re-encoding, which would cost a second pass and over-count one header per op.
 ---
---- `sizeHint` is a floor for the writer's initial capacity, in bytes, and only
---- the Init path passes one. `#ops` is a fair model for a Diff but not for an
---- Init: ownerSnapshotOps emits one op per ROOT, so a profile of forty thousand
---- fields produces the same handful of ops as a tiny one and the writer doubles
---- its way up from a couple of hundred bytes. The last Init's size estimates the
---- next; a wrong hint costs nothing the doubling did not already cost.
+--- `sizeHint` is a floor for the writer's initial capacity, in bytes, and only the
+--- Init path passes one. `#ops` models a Diff but not an Init: ownerSnapshotOps
+--- emits one op per root, so a forty-thousand-field profile produces the same
+--- handful of ops as a tiny one and the writer doubles its way up from a couple of
+--- hundred bytes. The last Init's size estimates the next.
 function Wire.EncodeOpsFrame(
 	frameType: number,
 	compiled: Compiled,
@@ -1272,33 +1230,26 @@ end
 
 -- Frame fragmentation ------------------------------------------------------------
 --
--- Framing, not replication. An Init snapshot is one op per root, so its size is
--- the player's whole profile and no op-level chunking can divide it; splitting the
--- encoded buffer always works, because it need not understand what it splits.
+-- Framing, not replication. An Init snapshot is one op per root, so no op-level
+-- chunking can divide it; splitting the encoded buffer always works.
 --
 --   u8 Frames.Fragment | u16 seq | u32 total | u16 index | <payload slice>
 --
--- `total` is the reassembled length, repeated in every fragment so the receiver
--- can size its destination from the first one. `index` makes a lost middle
--- fragment detectable, where a gap would otherwise write later bytes at the wrong
--- offset and still reach `total`.
---
--- `seq` is the field whose absence is not obviously a problem. Without it index 0
--- is the only reset trigger, so two interleaved logical frames splice into a
--- buffer whose indices ascend and whose length matches, and that splice decodes
--- cleanly into a mirror holding values that existed in neither snapshot. Scribe
--- never interleaves today, but that rests on a transport contract rather than on
--- anything enforced here.
+-- `total` is the reassembled length, repeated in every fragment so the receiver can
+-- size its destination from the first one. `index` makes a lost middle fragment
+-- detectable, where a gap would otherwise write later bytes at the wrong offset and
+-- still reach `total`. Without `seq`, index 0 is the only reset trigger, so two
+-- interleaved logical frames splice into a buffer whose indices ascend and whose
+-- length matches, and decode cleanly into values that existed in neither snapshot.
+-- Scribe never interleaves today, but only by transport contract.
 Wire.FRAGMENT_HEADER = 9
 
---- Splits `bytes` into fragments no larger than `maxBytes`, handing each to
---- `emit` in order. Returns nil when the frame already fits and `emit` was never
---- called, so an ordinary frame pays one comparison and nothing else; otherwise
---- returns whether every fragment was emitted (`emit` may return false to stop).
+--- Splits `bytes` into fragments no larger than `maxBytes`, handing each to `emit`
+--- in order. Returns nil when the frame already fits and `emit` was never called;
+--- otherwise whether every fragment was emitted (`emit` may return false to stop).
 ---
 --- Streaming rather than list-returning: a materialised list is a second full copy
---- of the frame, and the caller with the largest frames, the unicast Init, has one
---- recipient and needs none. A broadcast builds its own list in `emit`.
+--- of the frame, and the unicast Init has one recipient and needs none.
 function Wire.Fragment(bytes: buffer, maxBytes: number, seq: number, emit: (buffer) -> boolean): boolean?
 	local total = buffer.len(bytes)
 	if total <= maxBytes then
@@ -1334,7 +1285,7 @@ end
 
 function Wire.DecodeOps(r: Reader, compiled: Compiled): { Op }
 	local count = ru16(r)
-	local ops: { Op } = table.create(count)
+	local ops = table.create(count) :: { Op }
 	for _ = 1, count do
 		table.insert(ops, Wire.DecodeOp(r, compiled))
 	end

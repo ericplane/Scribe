@@ -1,20 +1,16 @@
 --!strict
--- Classifies a DataStore failure into one of four outcomes and reports it.
--- Failure.Report at the bottom is the single entry point every failure site uses.
+-- Classifies a DataStore failure into one of four outcomes and reports it. Failure.Report
+-- at the bottom is the single entry point every failure site uses.
 --
---   Throttled   the request was dropped; back off, retrying makes it worse
+--   Throttled   dropped; back off, retrying makes it worse
 --   Failed      a transient service-side failure; a retry may well work
---   Unresolved  the call timed out and the write MAY HAVE LANDED, so it cannot be
---               retried blindly
---   Rejected    permanently invalid (oversize payload, bad key, metadata cap);
---               every retry fails identically forever
+--   Unresolved  timed out and the write may have landed, so it cannot be retried blindly
+--   Rejected    permanently invalid (oversize payload, bad key, metadata cap); every
+--               retry fails identically forever
 --
--- Only the numeric prefix of the error string is read ("504: Datastore request
--- timed out."). The prose after the colon is not a contract and must never be
--- matched on.
---
--- An unrecognised code classifies as Failed, the least harmful of the four. The
--- parsed code rides along in the log context so a family that starts showing up
+-- Only the numeric prefix of the error string is read ("504: Datastore request timed
+-- out."); the prose after the colon is not a contract. An unrecognised code classifies as
+-- Failed, with the parsed code in the log context so a family that starts showing up
 -- unclassified is visible rather than silent.
 
 local Health = require(script.Parent.Health)
@@ -56,10 +52,9 @@ local function byFamily(code: number): Class
 end
 
 --- The numeric code a DataStore error message carries, or nil if it carries none.
----
---- Anchored on purpose: a loose search for digits-then-colon would eventually
---- match a number inside a key name and report a confident wrong class. nil
---- classifies as Failed, which is the safe default.
+--- Anchored on purpose: a loose search for digits-then-colon would eventually match a
+--- number inside a key name and report a confident wrong class. nil classifies as
+--- Failed, the safe default.
 function Failure.CodeOf(message: any): number?
 	if type(message) ~= "string" then
 		return nil
@@ -78,17 +73,14 @@ end
 
 -- One failed operation, reported everywhere it belongs -----------------------
 --
--- Health deliberately collapses retries of one operation into a single problem,
--- because ProfileStore retries a failing key by itself and counting those as N
--- problems drives a server to Outage, which refuses Robux for every player on it.
--- The log follows Health's own verdict rather than approximating it, so the
--- identity rule (subsystem namespacing, the shared throttle subject, the retry
--- cooldown) stays in one place.
+-- Health collapses retries of one operation into a single problem. The log follows
+-- Health's own verdict rather than approximating it, so the identity rule (subsystem
+-- namespacing, the shared throttle subject, the retry cooldown) stays in one place.
 --
 -- Collapsing is keyed on (subsystem, subject), so a report with no Key is never
--- collapsed and always logs. A burst that ends never prints its tail, because the
--- tally dies with its identity; `FailuresCollapsed` always moves, and the Repeats
--- field on the next line covers the rest.
+-- collapsed and always logs. A burst that ends never prints its tail, because the tally
+-- dies with its identity; `FailuresCollapsed` always moves, and the Repeats field on the
+-- next line covers the rest.
 export type Report = {
 	-- Health subsystem: a fixed internal literal, never a value from outside.
 	Subsystem: string,

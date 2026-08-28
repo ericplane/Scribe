@@ -99,7 +99,7 @@ return function()
 		expect(player.Kicked).to.be.ok()
 
 		-- A half-migrated profile must never persist: the session's final save
-		-- wrote the ORIGINAL data — step 2's mutation is absent and the
+		-- wrote the ORIGINAL data: step 2's mutation is absent and the
 		-- version was not stamped.
 		local persisted = harness.Fake.Persisted["Default/PLAYER_600"]
 		expect(persisted.Coins).to.equal(42)

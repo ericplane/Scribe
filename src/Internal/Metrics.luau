@@ -1,10 +1,10 @@
 --!strict
 -- Metrics counters. Library-level singleton.
 --
--- Pull only: a host reads Metrics.Get() (published as Scribe.GetMetrics) on
--- whatever cadence it wants, as DebugHook does on a 1 Hz timer. Do not add a sink
--- hook to Add; counters are bumped on hot paths, and a sink invoked there would
--- put arbitrary game code inside a save.
+-- Pull only: a host reads Metrics.Get() (published as Scribe.GetMetrics) on whatever
+-- cadence it wants, as DebugHook does on a 1 Hz timer. Do not add a sink hook to Add;
+-- counters are bumped on hot paths, and a sink there would put arbitrary game code
+-- inside a save.
 
 local Metrics = {}
 
@@ -62,10 +62,10 @@ function Metrics.Observe(name: string, value: number)
 	end
 end
 
---- Nearest-rank percentiles over the retained samples, or nil if there are none.
---- The sort target is a fresh table per call, not a shared scratch buffer: a
---- buffer left longer by a previous name would mix that name's tail into this
---- one's percentiles, with no error to notice.
+--- Nearest-rank percentiles over the retained samples, or nil if there are none. The
+--- sort target is a fresh table per call, not a shared scratch buffer: a buffer left
+--- longer by a previous name would mix that name's tail into this one's percentiles,
+--- with no error to notice.
 function Metrics.Percentiles(name: string): { P50: number, P90: number, P99: number }?
 	local obs = observations[name]
 	if obs == nil or obs.Filled == 0 then
@@ -110,10 +110,9 @@ function Metrics.Get(): { [string]: any }
 	return out
 end
 
---- Clear every counter, gauge and sample.
----
---- Nothing else holds a reference into these tables: Get returns a fresh table and
---- the observation records are private, so replacing them cannot strand a reader.
+--- Clear every counter, gauge and sample. Nothing else holds a reference into these
+--- tables: Get returns a fresh one and the observation records are private, so
+--- clearing them cannot strand a reader.
 function Metrics.Reset()
 	table.clear(counters)
 	table.clear(gauges)

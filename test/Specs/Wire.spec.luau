@@ -89,7 +89,7 @@ return function()
 		it("round-trips large ints via the generic fallback past 2^52", function()
 			-- Beyond 2^52 the varint/zigzag arithmetic is lossy, so canSchemaEncode
 			-- routes these through MODE_GENERIC (raw f64), which round-trips any
-			-- finite double exactly — no client brick, no silent sign flip.
+			-- finite double exactly: no client brick, no silent sign flip.
 			expect(roundTripValue({ "Gems" }, 2 ^ 57)).to.equal(2 ^ 57)
 			expect(roundTripValue({ "Gems" }, 2 ^ 70)).to.equal(2 ^ 70) -- was undecodable before
 			expect(roundTripValue({ "Delta" }, 2 ^ 55)).to.equal(2 ^ 55)

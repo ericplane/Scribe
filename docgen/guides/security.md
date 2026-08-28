@@ -35,16 +35,15 @@ Two different checks are happening here, and it is worth naming them separately.
 
 Client-side `Set` does exist, but it touches only the local mirror for optimistic UI, and the next server diff overwrites it. Reads work the same way, which leads to the one mistake worth calling out:
 
-:::caution Gate grants on the server, never on the client mirror
-[`Owns`](/api/Client#Owns) on the client reads a replicated mirror that an exploiter can make return `true` locally. Use the server's [`OwnsAsync`](/api/Server#OwnsAsync), which verifies live, before you hand anyone the `VIP` reward.
+!!! warning "Gate grants on the server, never on the client mirror"
+    [`Owns`](/api/Client#Owns) on the client reads a replicated mirror that an exploiter can make return `true` locally. Use the server's [`OwnsAsync`](/api/Server#OwnsAsync), which verifies live, before you hand anyone the `VIP` reward.
 
-```lua
--- Server. This is the one that decides.
-if Data.OwnsAsync(player, "VIP") then
-    Data[player].Gems.Increment(100)
-end
-```
-:::
+    ```lua
+    -- Server. This is the one that decides.
+    if Data.OwnsAsync(player, "VIP") then
+        Data[player].Gems.Increment(100)
+    end
+    ```
 
 ## The inbound gauntlet
 
@@ -128,11 +127,10 @@ Visibility is a compile-time property of each root, and [`ServerOnly`](./visibil
 
 Scribe validates every write against the declared template and fires [`OnAnomaly`](/api/Server#OnAnomaly) with the path, the value and a reason: `OutOfBounds`, `OverMaxLength`, `InvalidUtf8`, `NotAMember`, or `NonFiniteComponent`. Strings are UTF-8 checked and truncated on character boundaries, numbers are bounds-checked according to `BoundsPolicy`, and unserializable values are refused at the write boundary rather than failing a whole profile's save opaquely later.
 
-:::caution OnAnomaly is a correctness signal, not an abuse signal
-Every one of those reasons fires on a server-side write, which means your game code writing a value the template refuses. A client cannot cause them, because a client cannot write. Do not build player-facing enforcement on `OnAnomaly`: you would be kicking players for your own logic errors.
+!!! warning "OnAnomaly is a correctness signal, not an abuse signal"
+    Every one of those reasons fires on a server-side write, which means your game code writing a value the template refuses. A client cannot cause them, because a client cannot write. Do not build player-facing enforcement on `OnAnomaly`: you would be kicking players for your own logic errors.
 
-The abuse-shaped signals are the transport ones, malformed frames, oversize frames and frame rate, because a real Scribe client cannot produce any of them.
-:::
+    The abuse-shaped signals are the transport ones, malformed frames, oversize frames and frame rate, because a real Scribe client cannot produce any of them.
 
 The wipe guard is the same idea at profile scale. Every save is compared against the last good one, and a collapse in size or a vanished top-level key fires `WIPE_GUARD_TRIPPED`. Under `WipeGuardPolicy = "Block"` the last good snapshot persists instead.
 
@@ -142,6 +140,7 @@ The wipe guard is the same idea at profile scale. Every save is compared against
 - **No anti-cheat.** Scribe sees the data layer. Speed hacks, teleports, aimbots and exploit GUIs are invisible to it. Treat it as one high-quality signal feeding your anti-cheat, never as the anti-cheat.
 - **No per-viewer visibility.** `Shared` is all or nothing to every client. Anything conditional, such as party-only or team-only, has to go through a Command.
 - **No ban list.** Banning is irreversible and needs an appeals process. That decision belongs to you.
+- **No sandbox against your own server code.** The `_Scribe` root refuses every write from game code and hands back a detached copy on read, which makes the receipt ring, perks and gift credits safe from being cleared *by accident* through a `Get()`. That is what the guard is for. It is not a boundary against deliberate reflection: server code can `require` Scribe's internals directly, and `pairs()` over an accessor ignores metatables and reaches the same state. Closing that would not be a security win, because nothing stops the `require`. The accidental route is closed, and it is the one that bites: iterating an accessor now raises with the fix in the message, because the old fallback silently deleted the container.
 
 ### Knobs
 

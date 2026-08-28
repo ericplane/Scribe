@@ -1,9 +1,8 @@
 --!strict
--- Template compiler + runtime schema derivation.
--- Walks the user template with sorted keys (deterministic on server and client),
--- strips declarator markers, assigns a u16 field ID to every static path node,
--- and records declared type/bounds/visibility metadata for validation and
--- wire packing.
+-- Template compiler + runtime schema derivation. Walks the user template with
+-- sorted keys (deterministic on server and client), strips declarator markers,
+-- assigns a u16 field ID to every static path node, and records declared
+-- type/bounds/visibility metadata for validation and wire packing.
 
 local Util = require(script.Parent.Util)
 local Marker = require(script.Parent.Marker)
@@ -17,20 +16,14 @@ local function isFiniteBound(n: number): boolean
 	return n == n and n ~= math.huge and n ~= -math.huge
 end
 
--- The wire width a Scribe.Number takes, opt-in via Precision. FLOAT_F64 is the
--- default and is what an undeclared Number stays; declaring Min/Max alone selects
--- nothing here.
---
---   FLOAT_F32   Precision = "f32". IEEE binary32, 4 bytes instead of 8.
---   FLOAT_Q8/16/32
---               Precision = <step>. A fixed-point grid over [Min, Max]: the value
---               travels as the unsigned index of its nearest grid point, in the
---               narrowest of 1, 2 or 4 bytes that holds the step count.
---
--- Lives here rather than in Wire (where its sibling intWidth does) because the
--- compiler has to agree with the encoder and the decoder: "the declared bounds
--- cannot be represented in the chosen width" is a startup refusal, and it cannot
--- refuse a width it computes differently.
+-- The wire width a Scribe.Number takes, opt-in via Precision. FLOAT_F64 is the default
+-- and is what an undeclared Number stays; Min/Max alone select nothing. FLOAT_F32 is
+-- Precision = "f32", IEEE binary32 in 4 bytes. FLOAT_Q8/16/32 is Precision = <step>, a
+-- fixed-point grid over [Min, Max] whose nearest-point index travels in the narrowest
+-- of 1, 2 or 4 bytes that holds the step count.
+-- Lives here rather than in Wire (where its sibling intWidth does) because the compiler
+-- has to agree with the encoder and the decoder: "the declared bounds cannot be
+-- represented in the chosen width" is a startup refusal.
 local FLOAT_F64, FLOAT_F32, FLOAT_Q8, FLOAT_Q16, FLOAT_Q32 = 0, 1, 2, 3, 4
 
 -- The extremes of IEEE binary32: the largest finite value and the smallest normal
@@ -102,18 +95,17 @@ export type SchemaNode = {
 	HasPacked: boolean?, -- true if a declared descendant stores a different shape than
 	-- it reads (a packed datatype buffer, a Scribe.Big pair); lets container reads
 	-- skip the deep-unpack walk when there is nothing to convert
-	-- Scribe.ArrayOf / Scribe.DictOf container declarators. `Container` is the
-	-- discriminator (nil on every other node, including untyped dynamic containers);
-	-- `IsElement` marks the compiled element root hanging off AnyChild; `Closed`
-	-- marks an element record whose field set is fixed, so an undeclared key is a
-	-- write error rather than a silently synthesized `any` child.
+	-- Scribe.ArrayOf / Scribe.DictOf. `Container` is the discriminator (nil on every
+	-- other node, untyped dynamic containers included); `IsElement` marks the compiled
+	-- element root under AnyChild; `Closed` marks an element record whose field set is
+	-- fixed, so an undeclared key is a write error rather than a synthesized `any` child.
 	Container: ("Array" | "Dict")?,
 	IsElement: boolean?,
 	Closed: boolean?,
 	-- Scribe.Optional: the field may legitimately be absent. Its Default is nil, so
 	-- it is not seeded into a new profile and not filled into a partial element.
 	Nullable: boolean?,
-	-- Element default with ServerOnly subtrees removed, used when a CLIENT mirror
+	-- Element default with ServerOnly subtrees removed, used when a client mirror
 	-- materializes a fresh entry (see Node.resolveContainer).
 	ClientDefault: any,
 	MaxItems: number?,
@@ -130,10 +122,9 @@ export type Compiled = {
 	NodeCount: number,
 	Hash: number,
 	RootOrder: { string },
-	-- Does the template declare ANY Scribe.Shared root? Scribe.Shared is rejected
-	-- below the root, so a scan of the root's children is exhaustive. Replication uses
-	-- this to skip the per-player work only Shared data can justify: an O(N) broadcast
-	-- on every leave and an O(N) entry scan on every join.
+	-- Whether the template declares a Scribe.Shared root. Replication uses it to skip
+	-- the per-player work only Shared data justifies: an O(N) broadcast on every leave
+	-- and an O(N) entry scan on every join.
 	HasShared: boolean,
 	DynamicNodes: { SchemaNode }, -- fields with a Scribe.Dynamic factory, in id order
 	DerivedNodes: { SchemaNode }, -- Scribe.Derived fields in topological order
@@ -154,9 +145,9 @@ local SESSION_ROOT = "_ScribeSession"
 -- are namespaced by this prefix. Owned here (not in Server/Timed) so Compile can
 -- reject a root field that would alias a cooldown slot.
 local COOLDOWN_PREFIX = "@cd|"
--- Online-only cooldowns share the flat _Scribe.Timed dict but hold REMAINING
--- seconds rather than a deadline. The prefixes differ at byte 4 ("|" vs "o"), so
--- no wall-clock key text can ever spell an online slot.
+-- Online-only cooldowns share that dict but hold remaining seconds rather than a
+-- deadline. The prefixes differ at byte 4 ("|" vs "o"), so no wall-clock key text can
+-- ever spell an online slot.
 local ONLINE_COOLDOWN_PREFIX = "@cdo|"
 
 local Template = {}
@@ -272,8 +263,8 @@ local function rejectInElementShape(path: { string }, shape: any)
 	walk(shape)
 end
 
--- Whether reading this node (or anything below it) has to convert a stored shape
--- back to its read shape: a datatype packs to a buffer, a Scribe.Big stores a
+-- Whether reading this node (or anything below it) has to convert a stored shape back
+-- to its read shape: a datatype packs to a buffer, a Scribe.Big stores a
 -- { mantissa, exponent } pair. One predicate, so a third such type cannot reach some
 -- read paths and miss the others.
 local function isPacked(node: SchemaNode): boolean
@@ -395,8 +386,7 @@ local function buildNode(
 	parent: SchemaNode?
 ): SchemaNode
 	-- A field name is a persisted JSON object key, so reject invalid UTF-8 at compile
-	-- time rather than at the first save. Names built from external or dynamic data
-	-- are the realistic way this slips in.
+	-- time rather than at the first save.
 	if name ~= nil and not Util.isUtf8(name) then
 		compileError(path, `field name contains invalid UTF-8 bytes`)
 	end
@@ -490,10 +480,9 @@ local function buildNode(
 			containerDeclarator = `Scribe.{kind}`
 			meta = markerMeta
 		elseif kind == "Derived" then
-			-- A derived field is computed, never written, never persisted. Its Default
-			-- is the OUTPUT declarator, so the loop keeps unwrapping into it and the
-			-- type/bounds machinery below is reached unchanged; the input paths are
-			-- resolved in Compile's post-pass, once every root exists.
+			-- A derived field is computed, never written, never persisted. Its Default is
+			-- the output declarator, so the loop keeps unwrapping into it and the
+			-- type/bounds machinery below is reached unchanged.
 			if derivedInputs ~= nil then
 				compileError(path, "Scribe.Derived is already applied to this field")
 			end
@@ -522,9 +511,8 @@ local function buildNode(
 			derivedCompute = compute :: (...any) -> any
 		elseif kind == "Dynamic" then
 			dynamicSeen = true
-			-- `default` is the sample (the factory ran once at declaration). Infer
-			-- the field type from it and carry the factory forward; it seeds the
-			-- field per brand-new profile.
+			-- `default` is the sample (the factory ran once at declaration). Infer the
+			-- field type from it and carry the factory forward.
 			if default == nil then
 				compileError(path, "Scribe.Dynamic factory must return a non-nil value")
 			end
@@ -582,10 +570,10 @@ local function buildNode(
 		end
 	end
 
-	-- Scribe.ArrayOf / Scribe.DictOf: a dynamic container carrying a COMPILED element
-	-- schema. Returns early, before the leaf and default machinery below, because the
-	-- container declares no data of its own and its element shape is hung off
-	-- AnyChild, the node every dynamic key resolves through (Template.ChildSchema).
+	-- Scribe.ArrayOf / Scribe.DictOf: a dynamic container carrying a compiled element
+	-- schema. Returns early, before the leaf and default machinery below: the container
+	-- declares no data of its own, and its element shape hangs off AnyChild, the node
+	-- every dynamic key resolves through (Template.ChildSchema).
 	if containerKind ~= nil then
 		local declarator = containerDeclarator or `Scribe.{containerKind}Of`
 		local elementShape = if meta then meta.Element else nil
@@ -642,11 +630,10 @@ local function buildNode(
 			error("Scribe: template exceeds 65535 static fields", 0)
 		end
 
-		-- Compile the element against a throwaway id counter, then strip the ids.
-		-- Element fields are reachable only through AnyChild, while Template.Resolve
-		-- follows Children and Wire.EncodePath sources ids from it, so an id here
-		-- would be unaddressable at best and a decoder collision at worst. Their
-		-- metadata still reaches the schema hash through the element pass in Compile.
+		-- Compile the element against a throwaway id counter, then strip the ids. Element
+		-- fields are reachable only through AnyChild, while Template.Resolve follows
+		-- Children and Wire.EncodePath sources ids from it, so an id here would be
+		-- unaddressable at best and a decoder collision at worst.
 		local elementPath = table.clone(path)
 		table.insert(elementPath, "[]")
 		local element = buildNode({ NextId = 0, ById = {} }, nil, elementShape, elementPath, visibility, persist, node)
@@ -670,10 +657,9 @@ local function buildNode(
 			end
 		end
 		closeRecords(element)
-		-- A set stores its members deduplicated and sorted, so membership is by value
-		-- and the element has to be orderable. Anything else compiles clean, accepts
-		-- the first Add, then throws a bare "attempt to compare table < table" on the
-		-- second. Refuse it here, where the message can say what to do instead.
+		-- A set stores its members deduplicated and sorted, so the element has to be
+		-- orderable. Anything else compiles clean, accepts the first Add, then throws a
+		-- bare "attempt to compare table < table" on the second.
 		if node.Unique then
 			local vt = element.ValueType
 			if not (vt == "int" or vt == "number" or vt == "string" or vt == "enum") then
@@ -744,9 +730,9 @@ local function buildNode(
 
 	-- checkDefaultValue validates raw persistable leaf data. Run it for leaves and for
 	-- array-like default blobs, whose elements are stored as data rather than recursed
-	-- as schema. A named container's children are validated when buildNode recurses
-	-- into them; here `value` still holds their un-stripped markers, so walking the
-	-- whole container would wrongly reject valid nested declarators.
+	-- as schema. A named container's children are validated when buildNode recurses into
+	-- them; here `value` still holds their un-stripped markers, so walking the whole
+	-- container would wrongly reject valid nested declarators.
 	if type(value) ~= "table" or Util.hasNumericKeys(value) then
 		-- Marker scan FIRST: a declarator holding a non-persistable default would
 		-- otherwise trip checkDefaultValue's generic "unsupported value type" on the
@@ -799,18 +785,15 @@ local function buildNode(
 		end
 	end
 
-	-- Scribe.Dynamic: record a factory that seeds this field on brand-new
-	-- profiles. Datatype results are packed (profile.Data holds the packed form);
-	-- other leaves pass through unchanged.
+	-- Scribe.Dynamic: record the factory. Datatype results are packed (profile.Data
+	-- holds the packed form); other leaves pass through unchanged.
 	if meta and meta.Factory then
 		local rawFactory = meta.Factory
 		if datatypeName then
 			local dtName = datatypeName :: string
-			-- Always nil today, and threaded anyway: a Scribe.Dynamic datatype field is
-			-- inferred from the factory's sample, so there is no way to declare a
-			-- Precision on one. The coupling is the invariant, a seeded value must land
-			-- in the same form a Set would have written, so if Dynamic ever learns to
-			-- carry a declarator that bug is already prevented.
+			-- Always nil today: a Scribe.Dynamic datatype field is inferred from the
+			-- factory's sample, so there is no way to declare a Precision on one. Threaded
+			-- anyway, so a seeded value always lands in the form a Set would have written.
 			local dtPrecision = datatypePrecision
 			node.Factory = function()
 				return Datatypes.Pack(dtName, rawFactory(), dtPrecision)
@@ -820,12 +803,11 @@ local function buildNode(
 		end
 	end
 
-	-- Declarator sanity. Precision names the precision a field is stored and sent at,
-	-- not a direction: on Scribe.Number it narrows from f64, on Scribe.CFrame it widens
-	-- from a lossy quaternion. Anywhere else it would sit in the meta table doing
-	-- nothing, so refuse it rather than accept the word in silence. Datatype fields are
-	-- exempt: they were validated above against the set their codec publishes, which
-	-- has to run before the default is packed.
+	-- Precision names what a field is stored and sent at, not a direction: on
+	-- Scribe.Number it narrows from f64, on Scribe.CFrame it widens from a lossy
+	-- quaternion. Anywhere else it would sit in the meta table doing nothing, so refuse
+	-- it. Datatype fields are exempt, having been validated above against the set their
+	-- codec publishes.
 	if node.Precision ~= nil and node.ValueType ~= "number" and node.ValueType ~= "datatype" then
 		compileError(
 			path,
@@ -847,10 +829,9 @@ local function buildNode(
 			compileError(path, "Scribe.Number default must be a number")
 		end
 		-- A bound that cannot bound anything. A numeric literal above ~1.8e308 IS
-		-- math.huge, so `Max = 1e400` declares a ceiling no value can reach; NaN is
-		-- worse, since `value < nan` and `value > nan` are both false, disabling the
-		-- very check it was written to add. Int already refuses both through its
-		-- integer test and Big through Big.from, so this is the same rule for the third.
+		-- math.huge, so `Max = 1e400` declares a ceiling no value can reach; NaN is worse,
+		-- since `value < nan` and `value > nan` are both false, disabling the very check
+		-- it was written to add.
 		if (node.Min ~= nil and not isFiniteBound(node.Min)) or (node.Max ~= nil and not isFiniteBound(node.Max)) then
 			compileError(path, "Scribe.Number Min/Max must be finite")
 		end
@@ -860,9 +841,9 @@ local function buildNode(
 		local precision = node.Precision
 		if precision == "f32" then
 			-- Not a packing constraint (the bounds do not enter the f32 encoding) but a
-			-- declaration that contradicts itself: a bound past the binary32 range
-			-- describes values the encoder must refuse one by one, so the field would
-			-- silently spend nine bytes at the end of the range it was widened to reach.
+			-- contradiction: a bound past the binary32 range describes values the encoder
+			-- must refuse one by one, so the field would silently spend nine bytes at the
+			-- end of the range it was widened to reach.
 			if
 				(node.Min ~= nil and math.abs(node.Min) > F32_MAX)
 				or (node.Max ~= nil and math.abs(node.Max) > F32_MAX)
@@ -901,11 +882,10 @@ local function buildNode(
 							.. ` a fixed-point field can index; widen Precision, or use Precision = "f32"`
 					)
 				end
-				-- The grid must be coarser than the double under it. At a large
-				-- magnitude a double's own spacing can exceed Precision, and the
-				-- promised error bound is then broken by f64 itself before the codec
-				-- does anything. The step count above stays small in exactly this case,
-				-- so test the bounds directly.
+				-- The grid must be coarser than the double under it: at a large
+				-- magnitude a double's own spacing can exceed Precision, breaking the
+				-- promised error bound before the codec does anything. The step count
+				-- above stays small in that case, so test the bounds directly.
 				local extreme = math.max(math.abs(min), math.abs(max))
 				if extreme + p == extreme or extreme - p == extreme then
 					compileError(
@@ -937,11 +917,11 @@ local function buildNode(
 		if #(node.Members :: { string }) > 32 then
 			compileError(path, `Scribe.Flags takes at most 32 members, got {#(node.Members :: { string })}`)
 		end
-		-- A member NAME is persisted verbatim and is the one persisted string with no
-		-- write-path guard, since it comes from the template rather than from a Set.
-		-- Invalid UTF-8 fails the whole profile save the first time that flag is
-		-- enabled. A duplicate is refused because MemberIndex keeps only the last, so
-		-- the earlier bit is unreachable.
+		-- A member name is persisted verbatim and is the one persisted string with no
+		-- write-path guard, since it comes from the template rather than from a Set:
+		-- invalid UTF-8 fails the whole profile save the first time that flag is enabled.
+		-- A duplicate is refused because MemberIndex keeps only the last, leaving the
+		-- earlier bit unreachable.
 		local seenMember: { [string]: boolean } = {}
 		for _, member in node.Members :: { string } do
 			if type(member) ~= "string" then
@@ -970,11 +950,10 @@ local function buildNode(
 		if type(value) ~= "string" then
 			compileError(path, "Scribe.String default must be a string")
 		end
-		-- MaxLength is a BYTE BUDGET, so it has more ways to be nonsense than a
-		-- comparison bound: inf or NaN leaves the field silently unbounded, and a
-		-- negative value is worse than a no-op, since truncateUtf8 ends in
-		-- string.sub(s, 1, cut) and a negative index counts from the end, quietly
-		-- deleting the tail of every value.
+		-- MaxLength is a byte budget, not a comparison bound: inf or NaN leaves the field
+		-- silently unbounded, and a negative value is worse than a no-op, since
+		-- truncateUtf8 ends in string.sub(s, 1, cut) and a negative index counts from the
+		-- end, quietly deleting the tail of every value.
 		if node.MaxLength ~= nil then
 			local n = node.MaxLength
 			if not isFiniteBound(n) or n % 1 ~= 0 or n < 0 then
@@ -1060,9 +1039,9 @@ local function buildNode(
 		})
 	end
 
-	-- Scribe.Optional: the inner declarator supplied the type and its bounds; the
-	-- default is dropped so the field is neither seeded into a new profile nor
-	-- filled into a partial element write. Absence is the point.
+	-- Scribe.Optional: the inner declarator supplied the type and bounds; the default is
+	-- dropped so the field is neither seeded into a new profile nor filled into a
+	-- partial element write.
 	if nullable then
 		if timed then
 			compileError(path, "Scribe.Optional cannot wrap Scribe.Timed: a lapsed timer restores the default")
@@ -1084,12 +1063,10 @@ end
 -- visibility applied explicitly so the rules are exact.
 local function buildInternalRoots(state: any, root: SchemaNode, config: CompileConfig)
 	local scribeTemplate = {
-		-- GiftAims is not a second PendingGifts. A pending gift is a live intent, the
-		-- buyer at the Robux dialog, and is what PromptGift counts against
-		-- GiftMaxPending. An aim is what survives after the prompt goes stale: the
-		-- recipient's identity, kept so a late receipt can still be routed. Separate
-		-- containers because they expire on separate clocks; see the GIFT AIM block in
-		-- Server/Monetization.
+		-- GiftAims is not a second PendingGifts: a pending gift is a live intent counted
+		-- against GiftMaxPending, an aim is the recipient identity that survives a stale
+		-- prompt so a late receipt can still be routed. They expire on separate clocks;
+		-- see the GIFT AIM block in Server/Monetization.
 		GiftAims = {},
 		GiftCredits = {},
 		PendingGifts = {},
@@ -1099,6 +1076,11 @@ local function buildInternalRoots(state: any, root: SchemaNode, config: CompileC
 			InGame = {},
 			Robux = {},
 		},
+		-- Exchange holds the in-flight record per exchange id; ExchangeInbox holds value
+		-- settled to this player but not yet delivered onto a game path. Untyped, like
+		-- PendingGifts, because a settle must not be refusable by a declared shape.
+		Exchange = {},
+		ExchangeInbox = {},
 		Timed = {},
 		Version = Marker.make("Int", 1, { Min = 0 }),
 	}
@@ -1213,7 +1195,7 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 			)
 		end
 		if string.sub(key, 1, #RESERVED_ROOT) == RESERVED_ROOT then
-			error(`Scribe: template may not declare a "{key}" key — the {RESERVED_ROOT} root is library-owned`, 0)
+			error(`Scribe: template may not declare a "{key}" key: the {RESERVED_ROOT} root is library-owned`, 0)
 		end
 	end
 
@@ -1320,8 +1302,8 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 
 	--- Precision drives a float's wire width, so it belongs in the hash for the same
 	--- reason Min/Max do. %.17g rather than tostring: 17 significant digits round-trip
-	--- every double by construction, so the fold does not depend on tostring's
-	--- shortest-round-trip behaviour, which nothing here pins.
+	--- every double, so the fold does not depend on tostring's shortest-round-trip
+	--- behaviour, which nothing here pins.
 	local function precisionSig(n: SchemaNode): string
 		local p = n.Precision
 		if p == nil then
@@ -1365,8 +1347,8 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 	-- Element subtrees carry no ids, so the ById fold above cannot see them, but their
 	-- Min/Max/Precision drive scalar width and their Members drive enum indexing: an
 	-- element-only drift would pass the Hello schema guard and then decode every
-	-- following op in the frame as garbage. Determinism comes from ChildOrder, sorted
-	-- at compile time and therefore identical on both realms.
+	-- following op in the frame as garbage. ChildOrder is sorted at compile time, so the
+	-- walk order is identical on both realms.
 	local elementOrdinal = 0
 	local function foldElementNode(n: SchemaNode)
 		local members = ""
@@ -1640,16 +1622,15 @@ function Template.CloneVisible(node: SchemaNode, value: any): any
 	return out
 end
 
--- Backfills element fields added to an ArrayOf/DictOf shape after profiles already
--- exist. ProfileStore's Reconcile walks the STATIC template only and an element shape
--- is reachable solely through AnyChild, so without this a field added in v2 stays
--- missing on every stored entry forever. Mirrors Reconcile's semantics: fill a missing
--- key, never touch an existing one. Nullable fields have a nil default and are
--- correctly skipped. Returns true when anything changed.
+-- Backfills element fields added to an ArrayOf/DictOf shape after profiles exist.
+-- ProfileStore's Reconcile walks the static template only, and an element shape is
+-- reachable solely through AnyChild, so without this a field added in v2 stays missing
+-- on every stored entry forever. Fills a missing key, never touches an existing one;
+-- a Nullable field has a nil default and is skipped. Returns true when anything changed.
 function Template.ReconcileElements(compiled: Compiled, data: { [string]: any }): boolean
-	-- One recursive walk. `inElement` flips true under a container's AnyChild and stays
-	-- true beneath it, so fills happen at every depth of an element subtree. Static
-	-- template fields are never filled here; profile:Reconcile owns those.
+	-- `inElement` flips true under a container's AnyChild and stays true beneath it, so
+	-- fills happen at every depth of an element subtree. Static template fields are
+	-- never filled here; profile:Reconcile owns those.
 	local function walk(node: SchemaNode, value: any, inElement: boolean): boolean
 		if type(value) ~= "table" then
 			return false
@@ -1689,8 +1670,8 @@ function Template.ReconcileElements(compiled: Compiled, data: { [string]: any })
 	return changed
 end
 
--- Top-level keys present in `data` but absent from the schema (dev-mode
--- warning; note that `nil :: T?` template fields are invisible at runtime).
+-- Top-level keys present in `data` but absent from the schema (dev-mode warning;
+-- `nil :: T?` template fields are invisible at runtime).
 function Template.UnknownRootKeys(compiled: Compiled, data: { [string]: any }): { string }
 	local unknown = {}
 	local children = compiled.Root.Children :: { [string]: SchemaNode }

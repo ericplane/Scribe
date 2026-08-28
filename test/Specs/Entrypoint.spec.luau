@@ -127,7 +127,7 @@ return function()
 				return bundle.Server.Command
 			end)
 			expect(ok).to.equal(false)
-			-- Not the "on the client — use Data.Request" wording: in a storybook
+			-- Not the "on the client, use Data.Request" wording: in a storybook
 			-- there is no server to request from.
 			expect(string.find(tostring(err), "edit mode", 1, true) ~= nil).to.equal(true)
 		end)

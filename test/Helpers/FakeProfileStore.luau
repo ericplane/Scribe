@@ -8,8 +8,8 @@
 -- Unlike the real module (and its .Mock), saves are synchronous and only
 -- happen when requested, so tests are deterministic. Failure injection:
 --   fake.FailNextLoad / fake.FailSaves / fake.FailMessages
--- Crucially, Save() reads profile.Data AFTER firing OnSave — the same ordering
--- the real module uses — which is what the wipe guard's pointer swap relies on.
+-- Crucially, Save() reads profile.Data AFTER firing OnSave, the same ordering
+-- the real module uses, which is what the wipe guard's pointer swap relies on.
 
 local ScribeRoot = script.Parent.Parent.Parent.Scribe
 local Signal = require(ScribeRoot.Internal.Signal)

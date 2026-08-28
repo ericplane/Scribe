@@ -122,21 +122,20 @@ Both hand you every `Shared` root keyed by its template name, so index through t
 
 `OnSharedChanged` gives you a `userId` rather than a `Player` on purpose. The owner may have already left, and a departed player has no `Player` object, which is exactly when the `nil` update fires. The id is the stable key, and `GetShared` accepts it directly, so the two compose.
 
-:::caution `GetShared` never returns your own data
-The server broadcasts a player's `Shared` roots to every client **except** that player's own, at join and on every diff. So on Ava's client `Data.GetShared(Players.LocalPlayer)` is always `nil`, and `OnSharedChanged` never fires with Ava's own userId. A nameplate loop over `Players:GetPlayers()` silently skips one player, with no error and no log.
+!!! warning "`GetShared` never returns your own data"
+    The server broadcasts a player's `Shared` roots to every client **except** that player's own, at join and on every diff. So on Ava's client `Data.GetShared(Players.LocalPlayer)` is always `nil`, and `OnSharedChanged` never fires with Ava's own userId. A nameplate loop over `Players:GetPlayers()` silently skips one player, with no error and no log.
 
-Ava still sees her own `Shared` roots through the **ordinary accessor** (`Data.Nameplate.Title`), which stays live like any other field. The two read paths are separate, so handle the local player on the accessor and everyone else on `GetShared`:
+    Ava still sees her own `Shared` roots through the **ordinary accessor** (`Data.Nameplate.Title`), which stays live like any other field. The two read paths are separate, so handle the local player on the accessor and everyone else on `GetShared`:
 
-```lua
-local function titleFor(player: Player): string?
-    if player == Players.LocalPlayer then
-        return Data.Nameplate.Title.Get()  -- your own Shared root
+    ```lua
+    local function titleFor(player: Player): string?
+        if player == Players.LocalPlayer then
+            return Data.Nameplate.Title.Get()  -- your own Shared root
+        end
+        local shared = Data.GetShared(player)
+        return if shared then shared.Nameplate.Title else nil
     end
-    local shared = Data.GetShared(player)
-    return if shared then shared.Nameplate.Title else nil
-end
-```
-:::
+    ```
 
 ## What a Session root costs
 
@@ -175,9 +174,8 @@ You never wire up a RemoteEvent. The `"Default"` transport uses two RemoteEvents
 
     The client always ends at the correct current value. To have it observe a *sequence* of values, produce those changes after the client is synced and space them across frames, since same-frame writes to one field coalesce to the latest. For UI, read the value passed to `Observe` rather than counting fires.
 
-:::caution Client writes are optimistic
-`data.Coins.Set(5)` on the client updates the local mirror only. That is fine for snappy UI, but the server's value always wins on the next diff. Authoritative changes go through [`Data.Request`](/api/Client#Request) to a server [`Command`](/api/Server#Command). See [Commands & Requests](./commands).
-:::
+!!! warning "Client writes are optimistic"
+    `data.Coins.Set(5)` on the client updates the local mirror only. That is fine for snappy UI, but the server's value always wins on the next diff. Authoritative changes go through [`Data.Request`](/api/Client#Request) to a server [`Command`](/api/Server#Command). See [Commands & Requests](./commands).
 
 ## Where to next
 

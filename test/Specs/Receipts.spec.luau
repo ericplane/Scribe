@@ -272,7 +272,7 @@ return function()
 		harness.Fake.FailSaves = true
 		expect(harness.Data.HandleReceipt(receipt(entry.UserId, 111, "p-2"))).to.equal(NOT_PROCESSED)
 
-		-- The retry succeeds once saves recover — and stays exactly-once.
+		-- The retry succeeds once saves recover, and stays exactly-once.
 		harness.Fake.FailSaves = false
 		expect(harness.Data.HandleReceipt(receipt(entry.UserId, 111, "p-2"))).to.equal(GRANTED)
 		expect(data.Coins.Get()).to.equal(1000)
@@ -393,7 +393,7 @@ return function()
 		)
 		expect(harness.Data.Owns(buyer, "VIP")).to.equal(true)
 
-		-- Buyer already owns it: a no-op grant would burn Robux — issue a
+		-- Buyer already owns it: a no-op grant would burn Robux, so issue a
 		-- durable gift credit instead.
 		local creditEvent = nil
 		harness.Data.OnGiftCredit:Connect(function(player, productName)
@@ -406,7 +406,7 @@ return function()
 		expect(creditEvent).to.be.ok()
 		expect(creditEvent.Product).to.equal("GiftVIP")
 
-		-- A later PromptGift consumes the credit — no prompt, no charge.
+		-- A later PromptGift consumes the credit: no prompt, no charge.
 		local recipient = harness.Join(3003)
 		expect(harness.Data.PromptGift(buyer, "GiftVIP", 3003)).to.equal(true)
 		expect(#promptLog).to.equal(0)
@@ -427,7 +427,7 @@ return function()
 
 		-- A second purchase while that credit is unused could only stack
 		-- another credit: declined, nothing stacked, logged, or marked
-		-- processed — the unprocessed purchase is refunded by Roblox.
+		-- processed; the unprocessed purchase is refunded by Roblox.
 		expect(harness.Data.HandleReceipt(receipt(entry.UserId, 222, "pc-2"))).to.equal(NOT_PROCESSED)
 		expect(harness.Data.GetGiftCredits(buyer).GiftVIP).to.equal(1)
 		expect(#harness.Data.GetPurchases(buyer, { Kind = "Robux" })).to.equal(1)
@@ -733,7 +733,7 @@ return function()
 		harness.Cleanup()
 	end)
 
-	it("Data.Purchase debits, grants, and logs atomically — full rollback on failure", function()
+	it("Data.Purchase debits, grants, and logs atomically, with full rollback on failure", function()
 		local harness = makeHarness()
 		local player, _, data = harness.Join()
 		data.Coins.Set(500)

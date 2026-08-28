@@ -56,9 +56,8 @@ end)
 
 A polling loop cannot align with the schedule, because boards are staggered across their cycle, so it reads a cache anywhere from fresh to a full interval stale. The server's signal fires for every board, including server-only ones.
 
-:::caution The client's `OnLeaderboard` hands you the table it caches
-On the server, `entries` is a fresh copy you may keep or mutate freely. The **client's** signal is the exception: it fires the very table it caches, not a clone. A client listener that sorts, trims, or annotates `entries` in place corrupts what that client's own `Data.GetLeaderboard` serves until the next board frame arrives. Copy it first, or read through `GetLeaderboard`, which clones on the way out.
-:::
+!!! warning "The client's `OnLeaderboard` hands you the table it caches"
+    On the server, `entries` is a fresh copy you may keep or mutate freely. The **client's** signal is the exception: it fires the very table it caches, not a clone. A client listener that sorts, trims, or annotates `entries` in place corrupts what that client's own `Data.GetLeaderboard` serves until the next board frame arrives. Copy it first, or read through `GetLeaderboard`, which clones on the way out.
 
 ## When a board fills in
 

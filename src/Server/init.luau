@@ -22,30 +22,29 @@ local Commands = require(script.Commands)
 local Timed = require(script.Timed)
 local Analytics = require(script.Analytics)
 local Leaderboards = require(script.Leaderboards)
+local Exchanges = require(script.Exchanges)
 local Monetization = require(script.Monetization)
 
 local Server = {}
 
 -- Builds the server context and public Data API without the engine-level wiring
--- (PlayerAdded/Removing, BindToClose). `Server.new` is the production entry point;
--- the test harness calls `build` directly to drive the player lifecycle by hand
--- against stub transports and a fake ProfileStore. Returns (Data, ctx).
+-- (PlayerAdded/Removing, BindToClose). The test harness calls this directly to drive
+-- the player lifecycle by hand against stub transports. Returns (Data, ctx).
 function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	local ctx = {} :: any
 	ctx.Options = options
 	ctx.Compiled = compiled
-	-- Studio by default. Overridable because patching RunService is illegal on a
-	-- real service Instance, so a spec needing DevMode could not otherwise run in
-	-- Studio.
+	-- Studio by default. Overridable because patching RunService is illegal on a real
+	-- service Instance, so a spec needing DevMode could not otherwise run in Studio.
 	ctx.DevMode = if options.DevMode ~= nil then options.DevMode == true else RunService:IsStudio()
-	-- Coarse per-player ceiling on raw inbound frames, spent before a frame is read
-	-- at all. Resolved here because Persistence seeds each entry's bucket and
-	-- Replication enforces it, and a default derived in two places drifts.
+	-- Coarse per-player ceiling on raw inbound frames, spent before a frame is read at
+	-- all. Resolved here because Persistence seeds each entry's bucket and Replication
+	-- enforces it, and a default derived in two places drifts.
 	--
-	-- Well above CommandRateLimit on purpose: this tier drops silently, and a
-	-- silently dropped Command strands the client until its RequestTimeout, so a
-	-- merely chatty client should hit the command token bucket instead. The floor
-	-- keeps a tiny CommandRateLimit from throttling handshake and status traffic.
+	-- Well above CommandRateLimit on purpose: this tier drops silently, and a silently
+	-- dropped Command strands the client until its RequestTimeout, so a merely chatty
+	-- client should hit the command token bucket instead. The floor keeps a tiny
+	-- CommandRateLimit from throttling handshake and status traffic.
 	ctx.InboundFrameRate = options.MaxInboundFrameRate or math.max(60, (options.CommandRateLimit or 20) * 4)
 	ctx.Signals = {
 		OnSave = Signal.new(), -- { Player, Ok, Duration, At }
@@ -68,25 +67,17 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	Health.Configure(options.StatusThresholds)
 
 	ctx.Transport = TransportModule.Resolve(options.Transport, options.TransportChannel)
-	-- Did we claim the built-in channel? Only the scope that claimed it may release
-	-- it, or a bundle on a custom transport would take the Default channel away
-	-- from whichever bundle holds it. Read from the option rather than
-	-- ctx.Transport.Name, because a custom adapter may call itself "Default".
+	-- Did we claim the built-in channel? Only the claiming scope may release it, or a
+	-- bundle on a custom transport would take Default away from whoever holds it. Read
+	-- the option, not ctx.Transport.Name: a custom adapter may call itself "Default".
 	local ownsDefaultChannel = options.Transport == nil or options.Transport == "Default"
 
-	-- Build order matters only for construction-time dependencies; runtime calls
-	-- flow through ctx.
-	--
-	-- Pcalled, and the unwind releases what was already built. Replication.new
-	-- installs a RunService.PostSimulation handler and a Health.OnStatusChanged
-	-- connection, both process-global singletons, and Leaderboards.new and
-	-- Monetization.new validate their config and throw after it; a failed build
-	-- leaves no Data object for anyone to call Stop() on, so those listeners would
-	-- stay attached to a half-built ctx for the life of the process.
-	--
-	-- Same subsystem list and reverse order as Data.Stop, each Stop pcalled so one
-	-- failing teardown cannot hide the others, or replace the config error the
-	-- developer is here to read.
+	-- Build order matters only for construction-time dependencies; runtime calls flow
+	-- through ctx. Pcalled, and the unwind releases what was already built: Replication.new
+	-- installs process-global listeners and the constructors after it throw on bad config,
+	-- and a failed build leaves no Data object for anyone to call Stop() on. Same list and
+	-- reverse order as Data.Stop, each Stop pcalled so one failing teardown cannot replace
+	-- the config error the developer is here to read.
 	local constructed, constructErr = pcall(function()
 		ctx.Analytics = Analytics.new(ctx)
 		ctx.Timed = Timed.new(ctx)
@@ -95,18 +86,22 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		ctx.Commands = Commands.new(ctx)
 		ctx.Leaderboards = Leaderboards.new(ctx)
 		ctx.Monetization = Monetization.new(ctx)
+		-- After Persistence: it reads the resolved mode to decide whether the verdict
+		-- key is real or mocked.
+		ctx.Exchanges = Exchanges.new(ctx)
 	end)
 	if not constructed then
-		for _, subsystem in { ctx.Leaderboards, ctx.Timed, ctx.Monetization, ctx.Replication, ctx.Persistence } do
+		for _, subsystem in
+			{ ctx.Exchanges, ctx.Leaderboards, ctx.Timed, ctx.Monetization, ctx.Replication, ctx.Persistence }
+		do
 			if subsystem ~= nil and type(subsystem.Stop) == "function" then
 				pcall(subsystem.Stop)
 			end
 		end
-		-- The same release Stop performs: the channel claim is taken in
-		-- Transport.Resolve and the inbound listener in Replication.new, both above
-		-- this pcall, so leaving them held turns a config error into "channel already
-		-- in use" on the corrected retry. After the subsystems, so nothing is still
-		-- sending when the listener goes.
+		-- The same release Stop performs: the channel claim and the inbound listener are
+		-- both taken above this pcall, so leaving them held turns a config error into
+		-- "channel already in use" on the corrected retry. After the subsystems, so
+		-- nothing is still sending when the listener goes.
 		if ownsDefaultChannel then
 			pcall(TransportModule.ReleaseChannel, options.TransportChannel)
 		end
@@ -115,12 +110,12 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		error(constructErr, 0)
 	end
 
-	-- Background loops start only after every subsystem exists: a constructor
-	-- throwing partway must never leave an orphaned loop running against a
-	-- half-built ctx.
+	-- Background loops start only after every subsystem exists: a constructor throwing
+	-- partway must never leave an orphaned loop running against a half-built ctx.
 	ctx.Monetization.Start()
 	ctx.Timed.Start()
 	ctx.Leaderboards.Start()
+	ctx.Exchanges.Start()
 
 	-- Public API --------------------------------------------------------------------
 
@@ -136,18 +131,17 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		Use [Server.WaitForData] first (or read inside a command handler, which
 		only runs once the player is Ready).
 
-		:::note Indexing
-		`Data[player]` returns the same accessor tree as `Data.Get(player)`. The
-		methods on individual fields (`.Get`, `.Set`, `.Increment`, …) are
-		documented on the [Value] class.
-		:::
+		!!! note "Indexing"
+		    `Data[player]` returns the same accessor tree as `Data.Get(player)`. The
+		    methods on individual fields (`.Get`, `.Set`, `.Increment`, …) are
+		    documented on the [Value] class.
 	]=]
 	local Data = {} :: any
 
-	-- Luau does not flag an unknown key in an inline table literal passed to an
-	-- optional table parameter, only in one bound to a local first, so a typo like
-	-- `{ Forcce = true }` type-checks clean and silently does nothing. This runtime
-	-- check is the only layer that catches it.
+	-- Luau does not flag an unknown key in an inline table literal passed to an optional
+	-- table parameter, only in one bound to a local first, so a typo like
+	-- `{ Forcce = true }` type-checks clean and silently does nothing. This is the only
+	-- layer that catches it.
 	local function checkOptions(given: any, what: string, allowed: { [string]: true })
 		if given == nil then
 			return
@@ -173,7 +167,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 			error(`Scribe: {what}: no data session for {player.Name}`, 3)
 		end
 		if entry.State ~= "Ready" then
-			error(`Scribe: {what}: data for {player.Name} is {entry.State} — use Data.WaitForData(player)`, 3)
+			error(`Scribe: {what}: data for {player.Name} is {entry.State}: use Data.WaitForData(player)`, 3)
 		end
 		return entry
 	end
@@ -464,17 +458,29 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@tag Commands
 		@server
 		@param name string
-		@param specOrHandler ({ Args: { string }?, Idempotent: boolean? } | (player: Player, ...any) -> ...any)
+		@param specOrHandler ({ Args: { any }?, Idempotent: boolean? } | (player: Player, ...any) -> ...any)
 		@param handler ((player: Player, ...any) -> ...any)?
 		Registers a named command clients can call via [Client.Request]. Sender identity
 		is always the real player; args are shape-validated and rate-limited, and the
 		handler only runs once the caller is Ready.
+
+		An `Args` entry is a type string (`"string"`, `"number?"`), a Scribe declarator
+		(`Scribe.Int`, `Number`, `String`, `Enum`, `Flags`, `Optional`, `ArrayOf`,
+		`SetOf`, `DictOf`, `MapOf`), or a shape table describing a table argument. A
+		declarator brings its own constraints, so the range is checked before the
+		handler runs rather than inside it.
 
 		```lua
 		Data.Command("EquipItem", { Args = { "string" } }, function(player, itemId)
 		    if not Data[player].Inventory[itemId].Get() then return false, "not owned" end
 		    Data[player].Equipped.Set(itemId)
 		    return true
+		end)
+
+		Data.Command("CreateSaveSlot", {
+		    Args = { Scribe.Int(1, { Min = 1, Max = 4 }) },
+		}, function(player, slotNumber)
+		    -- slotNumber is an integer in [1, 4]; anything else was refused already.
 		end)
 		```
 
@@ -490,6 +496,145 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	function Data.Command(name: string, specOrHandler: any, handler: any?)
 		ctx.Commands.Register(name, specOrHandler, handler)
 	end
+
+	--[=[
+		@within Server
+		@tag Exchange
+		@server
+		@yields
+		@function Exchange.Attempt
+		@param playerA Player
+		@param basketA { ExchangeLeg }
+		@param playerB Player
+		@param basketB { ExchangeLeg }
+		@return ("Committed" | "Aborted")?, string?
+		Exchanges two baskets between two players who are both loaded on THIS server.
+
+		Each basket lists what that player GIVES. A leg is one of three kinds:
+
+		| Kind | Shape | Moves |
+		| --- | --- | --- |
+		| `Key` | `{ Path = { "Inventory" }, Kind = "Key", Key = itemId }` | One whole container entry |
+		| `Qty` | `{ Path = { "Coins" }, Kind = "Qty", Amount = n }` | An amount of a bounded `Scribe.Int` |
+		| `Stack` | `{ Path = { "Inventory" }, Kind = "Stack", Key = itemId, Amount = n }` | Part of one stacked entry |
+
+		Every path must be declared in the `Exchangeable` option. That list is proved safe
+		to move at startup, and every leg of both baskets is checked against it, by path
+		AND by kind, before a slot is claimed or any value moves. So a basket may be
+		built straight from what a client asked for: the worst a client can name is a
+		refusal that costs nothing.
+
+		```lua
+		local outcome, why = Data.Exchange.Attempt(alice, {
+		    { Path = { "Inventory" }, Kind = "Key", Key = "Emberblade" },
+		    { Path = { "Coins" }, Kind = "Qty", Amount = 250 },
+		}, bob, {
+		    { Path = { "Inventory" }, Kind = "Key", Key = "Frostbrand" },
+		})
+		if outcome ~= "Committed" then
+		    return false, why
+		end
+		```
+
+		`"Aborted"` is a completed operation, not a failure to clean up after: every basket
+		has been returned to its owner. A `nil` outcome is either a refusal before anything
+		moved, or an attempt that could not establish a verdict, and the reason says which.
+
+		**What this guarantees, stated exactly.** Atomic commit at a single verdict key.
+		ZERO isolation across the two profiles. Conservation without a bounded resolution
+		time: nothing is ever duplicated or destroyed, but an exchange interrupted at the
+		wrong moment can take until the next load to finish. The attempt itself IS
+		bounded and cancels rather than hanging.
+
+		[Exchange](../exchange.md) covers the whole model, including what a player sees
+		while an exchange is in flight.
+	]=]
+
+	--[=[
+		@within Server
+		@tag Exchange
+		@server
+		@function Exchange.Open
+		@param player Player
+		@return { OpenExchange }
+		What this player still has in flight, and what it is holding while it does.
+
+		One entry per open exchange: `Id`, `State` (`"Claimed"`, `"Staked"` or
+		`"Delivering"`), `Partner`, `Staked` (what they handed over) and `Owed` (what they
+		are owed). Escrow takes value out of the balance on purpose and the resolution time
+		is not bounded, so this is how a game tells a player where their coins went rather
+		than leaving them looking at a hole. Empty when nothing is open.
+	]=]
+
+	--[=[
+		@within Server
+		@tag Exchange
+		@server
+		@yields
+		@function Exchange.Discard
+		@param exchangeId string
+		@return boolean, string?
+		Drops an abandoned claim that never took value.
+
+		An operator verb, and verdict-gated like the other two: it refuses anything with a
+		verdict and anything holding staked value. Use it for a claim left behind by a
+		server that died between claiming a slot and staking into it.
+	]=]
+
+	--[=[
+		@within Server
+		@tag Exchange
+		@server
+		@yields
+		@function Exchange.Settle
+		@param exchangeId string
+		@param verdict string
+		@return boolean, string?
+		Forces `"Commit"` or `"Abort"` on an exchange that cannot resolve itself.
+
+		There is no default and a missing `verdict` is refused: guessing `Abort` would, in
+		exactly the situation this verb exists for, land a fresh Abort against a Commit the
+		other side already acted on. `Commit` is additionally refused when it cannot be
+		proved safe, which is when either loaded record holds escrow with no take recorded,
+		or when only one side is loaded. `Abort` needs neither check.
+
+		Loses to a verdict that already exists rather than overwriting it.
+	]=]
+
+	--[=[
+		@within Server
+		@tag Exchange
+		@server
+		@yields
+		@function Exchange.Redirect
+		@param exchangeId string
+		@param userId number
+		@param newKey string
+		@return boolean, string?
+		Lands a parked delivery on a different key of the same container.
+
+		For a delivery that cannot apply because its destination key is taken. Refuses a
+		different container, a set (where the key IS the value, so re-keying substitutes a
+		different item), and a parked entry holding more than one key leg, since one new key
+		cannot name several destinations without collapsing them onto each other.
+	]=]
+	Data.Exchange = {
+		Attempt = function(playerA: Player, basketA: { any }, playerB: Player, basketB: { any })
+			return ctx.Exchanges.Attempt(playerA, basketA, playerB, basketB)
+		end,
+		Open = function(player: Player)
+			return ctx.Exchanges.Open(player)
+		end,
+		Discard = function(exchangeId: string)
+			return ctx.Exchanges.Discard(exchangeId)
+		end,
+		Settle = function(exchangeId: string, verdict: string)
+			return ctx.Exchanges.Settle(exchangeId, verdict)
+		end,
+		Redirect = function(exchangeId: string, userId: number, newKey: string)
+			return ctx.Exchanges.Redirect(exchangeId, userId, newKey)
+		end,
+	}
 
 	--[=[
 		@within Server
@@ -517,6 +662,51 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		return ctx.Leaderboards.GetMyRank(player, name)
 	end
 
+	--[=[
+		@within Server
+		@tag Monetization
+		@server
+		@param player Player
+		@param name string
+		@return (boolean, string?)
+		Prompts `player` to buy a declared product or pass for themselves, by the name you
+		gave it rather than its numeric Id.
+
+		```lua
+		local ok, why = Data.PromptPurchase(player, "CoinPack500")   -- a product
+		local ok, why = Data.PromptPurchase(player, "VIP")           -- a pass
+		if not ok then
+		    warn(why)
+		end
+		```
+
+		The name is resolved against `Products` and `Passes`, and the matching engine call
+		is made: `PromptProductPurchase` for one, `PromptGamePassPurchase` for the other.
+		A name declared in **both** tables is a startup error, because resolution is by
+		name and table order would otherwise decide what the player is charged for.
+
+		**Refuses something the player already owns**, so a caller does not have to pair
+		every prompt with its own [Server.Owns] check. A pass is its own ownership key. A
+		product is checked against its `Grants` perk, and a product with no `Grants` is a
+		consumable, has nothing to own, and always prompts.
+
+		Ownership is read from Scribe's cache rather than a live Marketplace call, because
+		this is a UI gate: for a product the receipt path is what actually prevents a
+		double grant, and Roblox itself refuses a pass the player holds.
+
+		Returns `(false, reason)` for an unknown name, a player whose data is not loaded,
+		something they already own, or a prompt the engine refused, which is what an
+		unpublished product looks like. None of those raise.
+
+		Prompting is all it does. The grant happens on the receipt, through the same path
+		every purchase takes, so a player who buys and then leaves is still granted on
+		their next load.
+
+		See [Monetization](../monetization.md).
+	]=]
+	function Data.PromptPurchase(player: Player, name: string)
+		return ctx.Monetization.PromptPurchase(player, name)
+	end
 	--[=[
 		@within Server
 		@tag Monetization
@@ -927,7 +1117,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		next load, whenever nothing was connected here (logged as
 		`MESSAGE_NO_LISTENER`), a handler raised (`MESSAGE_HANDLER_ERROR`), or the save
 		carrying its effect never landed. Payloads carry no id of their own, so put one
-		in yours (a trade id, a payout id) and ignore a repeat. Seeing a message twice
+		in yours (an exchange id, a payout id) and ignore a repeat. Seeing a message twice
 		is recoverable; losing one is not, which is the trade this makes.
 
 		Redelivery is bounded rather than continuous: an unacknowledged message is
@@ -972,10 +1162,9 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		that is what the idempotent payload above is for.
 	]=]
 	function Data.SendMessage(userId: number, message: any): boolean
-		-- `provablyClean` is MessageAsync's third return: true only where no attempt
-		-- inside its own retry loop could have written. Read only so the log can stop
-		-- asserting something it does not know; the boolean this function returns is
-		-- unchanged.
+		-- `provablyClean` is MessageAsync's third return: true only where no attempt in
+		-- its own retry loop could have written. Read for the log line alone; the boolean
+		-- this function returns is unchanged.
 		local ok, delivered, reason, provablyClean = pcall(function()
 			return ctx.Persistence.Store:MessageAsync(ctx.Persistence.KeyFor(userId), {
 				ScribeMessage = true,
@@ -987,15 +1176,11 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 			return true
 		end
 		if ok and reason == "QueueFull" then
-			-- Logged and counted, but deliberately not through Failure.Report: that
-			-- calls Health.ReportFailure, and a full inbox is a property of one
-			-- player's profile rather than a DataStore fault, so routing it there
-			-- would let a single jammed queue degrade the whole server to Outage and
-			-- refuse every Robux grant.
-			--
-			-- An earlier attempt of the same call may have committed and lost only its
-			-- answer, so the refusal can be reported for a message that is already in
-			-- the recipient's inbox. ProvablyClean says which happened.
+			-- Deliberately not Failure.Report: that calls Health.ReportFailure, and a full
+			-- inbox is one player's profile rather than a DataStore fault, so a single
+			-- jammed queue would degrade the whole server to Outage and refuse every Robux
+			-- grant. An earlier attempt of the same call may also have committed and lost
+			-- only its answer, so this can be reported for a message already in the inbox.
 			Metrics.Add("MessageQueueFull")
 			if provablyClean ~= true then
 				Metrics.Add("MessageQueueFullAmbiguous")
@@ -1012,15 +1197,11 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 			)
 			return false
 		end
-		-- Keyed by recipient, so a shutdown that fails to deliver for one player
-		-- counts as one problem instead of one per attempt. Past this point the send
-		-- threw, MessageAsync gave up retrying, or it refused at its IsClosing door
-		-- without attempting anything; a full queue is handled above and does not come
-		-- through here, because it is not a DataStore fault.
-		--
-		-- Those are not the same answer, and `provablyClean` is what separates them.
-		-- The return is `false` either way and the caller keeps the message retryable
-		-- either way, because at-least-once is this channel's contract.
+		-- Keyed by recipient, so a shutdown that fails to deliver for one player counts as
+		-- one problem instead of one per attempt. Past this point the send threw,
+		-- MessageAsync gave up retrying, or it refused at its IsClosing door without
+		-- attempting anything; `provablyClean` separates them. The return is `false` either
+		-- way, because at-least-once is this channel's contract.
 		Failure.Report({
 			Subsystem = "SendMessage",
 			Key = tostring(userId),
@@ -1053,9 +1234,9 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	]=]
 	Data.ProfileStore = ctx.Persistence.Store
 
-	-- Dev-mode misuse guard: a template key shadowed by an accessor method, at any
-	-- depth, is silently unreachable through the typed API. The root-level half of
-	-- this guard runs at the very end of build; see the comment on it for why.
+	-- Dev-mode misuse guard: a template key shadowed by an accessor method, at any depth,
+	-- is silently unreachable through the typed API. The root-level half runs at the very
+	-- end of build; see the comment on it for why.
 	if ctx.DevMode then
 		local function warnCollision(node: any)
 			local name = node.Name
@@ -1105,7 +1286,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 	-- Data[player] -> typed accessor tree.
 	setmetatable(Data :: any, {
-		__index = function(_, key: any)
+		__index = function(_, key: unknown)
 			if typeof(key) == "Instance" and key:IsA("Player") then
 				return entryOrError(key, "Data[player]").Tree.Accessor
 			end
@@ -1156,9 +1337,10 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 			return
 		end
 		stopped = true
-		-- Reverse of the Start order at the top of build: stop producing work
-		-- before releasing what consumes it.
-		for _, subsystem in { ctx.Leaderboards, ctx.Timed, ctx.Monetization, ctx.Replication, ctx.Persistence } do
+		-- Reverse of the Start order: stop producing work before releasing what consumes it.
+		for _, subsystem in
+			{ ctx.Exchanges, ctx.Leaderboards, ctx.Timed, ctx.Monetization, ctx.Replication, ctx.Persistence }
+		do
 			if subsystem ~= nil and type(subsystem.Stop) == "function" then
 				local ok, err = pcall(subsystem.Stop)
 				if not ok then
@@ -1166,30 +1348,27 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 				end
 			end
 		end
-		-- After the subsystems, so nothing is still sending when the channel's
-		-- listener goes. The claim is a module global that outlives this bundle, so
-		-- leaving it set means the channel can never be rebound and client frames
-		-- keep reaching a bundle whose save paths are dead.
+		-- After the subsystems, so nothing is still sending when the channel's listener
+		-- goes. The claim is a module global that outlives this bundle, so leaving it set
+		-- means the channel can never be rebound.
 		if ownsDefaultChannel then
 			pcall(TransportModule.ReleaseChannel, options.TransportChannel)
 		end
 	end
 
-	-- A root field named like a Data API name is silently shadowed by that real key
-	-- (a real key always wins over __index), so it is unreachable as `Data.<name>`
-	-- on the server.
+	-- A root field named like a Data API name is silently shadowed by that real key (a
+	-- real key always wins over __index), so it is unreachable as `Data.<name>`.
 	--
-	-- Keep this last, after every Data key is assigned: `for key in Data` sees only
-	-- the keys that exist when it runs, so a guard placed higher exempts every key
-	-- added below it. Raw iteration, so the metatable installed above is not
-	-- consulted. Server.new redefines Data.Stop later but adds no new key, so this
-	-- sees the whole public surface.
+	-- Keep this last, after every Data key is assigned: `for key in Data` sees only the
+	-- keys that exist when it runs, so a guard placed higher exempts everything below it.
+	-- Server.new redefines Data.Stop after this but adds no new key, so this still sees
+	-- the whole public surface.
+	-- Raw iteration, so the metatable installed above is not consulted.
 	if ctx.DevMode then
 		local rootChildren = compiled.Root.Children :: { [string]: any }
 		for key in Data do
 			if type(key) == "string" and rootChildren[key] then
-				-- Field in the context as well as the message, so a log sink does not
-				-- have to parse prose to learn which field collided.
+				-- In the context as well as the message, so a sink need not parse prose.
 				Log.Warn(
 					"Lifecycle",
 					"API_NAME_COLLISION",
@@ -1206,13 +1385,10 @@ end
 function Server.new(options: any, compiled: Template.Compiled): any
 	local Data, ctx = Server.build(options, compiled)
 
-	-- Studio-only debug hook for the Scribe Studio companion plugin.
-	--
-	-- The remover Attach hands back is kept: it releases a Log sink and a
-	-- Health.OnStatusChanged listener, both library-level singletons that outlive
-	-- the bundle, and ends the digest pump. Nil on the refusal path (a second bundle
-	-- in one process gets DEBUG_HOOK_DUPLICATE) and on the pcall's failure path, and
-	-- Stop below tolerates both.
+	-- Studio-only debug hook for the Scribe Studio companion plugin. The remover Attach
+	-- hands back is kept: it releases a Log sink and a Health.OnStatusChanged listener,
+	-- both library-level singletons that outlive the bundle, and ends the digest pump.
+	-- Nil on the refusal and pcall failure paths, and Stop below tolerates both.
 	local detachDebugHook: (() -> ())? = nil
 	if RunService:IsStudio() then
 		local ok, err = pcall(function()
@@ -1247,10 +1423,9 @@ function Server.new(options: any, compiled: Template.Compiled): any
 			end)
 		end
 		table.clear(playerConnections)
-		-- Before the subsystems, and cleared so a second Stop cannot call it twice:
-		-- the digest pump reads Persistence.Entries once a tick, so the hook has to
-		-- let go before what it watches is dismantled. pcalled because a debug
-		-- facility must never be the reason a teardown fails.
+		-- Before the subsystems, and cleared so a second Stop cannot call it twice: the
+		-- digest pump reads Persistence.Entries once a tick, so the hook lets go before
+		-- what it watches is dismantled. pcalled: a debug facility must not fail teardown.
 		local detach = detachDebugHook
 		detachDebugHook = nil
 		if detach ~= nil then
@@ -1263,7 +1438,7 @@ function Server.new(options: any, compiled: Template.Compiled): any
 	end
 
 	if options.Banner ~= false then
-		print(`Running Scribe v{Version} by ericplane — server is now initialized`)
+		print(`Running Scribe v{Version} by ericplane. Server is now initialized`)
 	end
 
 	return Data

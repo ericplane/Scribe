@@ -669,7 +669,7 @@ local function typedApis(player: Player)
 	-- GetPurchases: the filter is a typed record (not a { [string]: any } bag).
 	local purchases = Data.GetPurchases(player, { Kind = "Robux", Category = "Gems", Limit = 5 })
 
-	-- GetSaveInfo.LastResult narrows to ("Ok" | "Fail")? — this assignment would
+	-- GetSaveInfo.LastResult narrows to ("Ok" | "Fail")?, so this assignment would
 	-- fail if it were still `string?`.
 	local lastResult: ("Ok" | "Fail")? = Data.GetSaveInfo(player).LastResult
 

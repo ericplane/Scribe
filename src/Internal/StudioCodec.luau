@@ -1,13 +1,12 @@
 --!strict
--- Studio debug-hook codec: self-describing text encoding for arbitrary Luau
--- data tables crossing the plugin<->game VM boundary. Length-prefixed (no
--- escaping); handles string/number/boolean/nil/buffer values and
--- string/number keys, including mixed and sparse tables that neither JSON nor
--- cross-VM reflection can carry.
+-- Studio debug-hook codec: a self-describing, length-prefixed text encoding for
+-- arbitrary Luau data tables crossing the plugin/game VM boundary. Carries
+-- string/number/boolean/nil/buffer values under string/number keys, including the
+-- mixed and sparse tables neither JSON nor cross-VM reflection can carry.
 --
--- Shared by the server hook (Server/DebugHook.luau) and the client hook
--- (Client/DebugHook.luau). Byte-compatible with the Scribe Studio plugin's copy
--- (src/Codec.luau) and versioned by the hooks' PROTOCOL_VERSIONs; change together.
+-- Shared by Server/DebugHook.luau and Client/DebugHook.luau, byte-compatible with the
+-- Studio plugin's copy (src/Codec.luau) and versioned by the hooks'
+-- PROTOCOL_VERSIONs; change together.
 
 local StudioCodec = {}
 

@@ -1,18 +1,14 @@
 --!strict
--- The randomness seam: every draw in Scribe goes through here, so a simulation
--- can replay a run exactly. Next() returns a float in [0, 1) and nothing else;
--- anything more is one more thing a simulation has to implement correctly.
+-- The randomness seam: every draw goes through here, so a simulation can replay a
+-- run exactly. Next() returns a float in [0, 1) and nothing else. Not math.random,
+-- whose state is shared with the game, and not Random.new, which does not exist
+-- outside Roblox.
 --
--- Not math.random, whose state is shared with the game, and not Random.new, which
--- does not exist outside Roblox. The default is a self-contained xorshift32.
---
--- Seeded from JobId rather than from time alone: a fleet booted by one deploy
--- reads nearly the same wall clock, and neighbouring seeds leave the herd
--- synchronised, which is the failure jitter exists to prevent. Clock.Now() is
--- mixed in so a Studio session, where JobId is empty, still varies between runs.
---
--- Seeded lazily, on the first draw: a module that samples the clock while loading
--- reads it before Clock.Install has run.
+-- Seeded from JobId mixed with Clock.Now(): a fleet booted by one deploy reads
+-- nearly the same wall clock, and a herd left synchronised by neighbouring seeds
+-- is the failure that jitter exists to prevent. Clock.Now() covers Studio, where
+-- JobId is empty. Seeded lazily, on the first draw, so a module that draws while
+-- loading does not sample the clock before Clock.Install has run.
 
 local Clock = require(script.Parent.Clock)
 
@@ -28,7 +24,7 @@ local ZERO_SEED_SUBSTITUTE = 0x9E3779B9
 local state: number? = nil
 
 --- FNV-1a over this server's job id, mixed with wall time. Inlined rather than
---- taken from Util so this seam keeps its one small dependency.
+--- taken from Util to keep this seam's dependencies small.
 local function makeSeed(): number
 	local hash = 2166136261
 	local jobId = tostring((game :: any).JobId)
@@ -67,23 +63,23 @@ end
 local JITTER_FRACTION = 0.25
 
 -- Floor for a jittered delay, guarding an installed Next that breaks its [0, 1)
--- contract. Must be strictly positive: the simulation scheduler re-queues a wait
--- of <= 0 without advancing virtual time, so the run stalls at its step limit and
+-- contract. Must be strictly positive: the simulation scheduler re-queues a wait of
+-- <= 0 without advancing virtual time, so the run stalls at its step limit and
 -- reads as a deadlocked workload.
 local MIN_DELAY = 1 / 60
 
 --- `seconds`, moved up or down by up to a quarter. Two-sided and bounded at both
 --- ends, so it is safe inside loops that already assert timing.
 ---
---- For delays, not for timeouts: a timeout is a promise to a caller about when
---- they will be answered, so moving it changes a contract.
+--- For delays, not for timeouts: a timeout is a promise about when a caller will be
+--- answered, so moving it changes a contract.
 function Rng.Jitter(seconds: number): number
 	return math.max(seconds * (1 + (Rng.Next() - 0.5) * 2 * JITTER_FRACTION), MIN_DELAY)
 end
 
---- Restore the default. A test that installs must reset, or it hands its
---- generator to every spec that runs afterwards. The default's own state is not
---- rewound, so nothing can depend on the sequence a reset produces.
+--- Restore the default. A test that installs must reset, or it hands its generator
+--- to every spec that runs afterwards. The default's own state is not rewound, so
+--- nothing can depend on the sequence a reset produces.
 function Rng.Reset()
 	Rng.Next = DEFAULT_NEXT
 end

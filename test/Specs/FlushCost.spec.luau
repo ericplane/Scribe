@@ -30,18 +30,39 @@ return function()
 		return Scribe.GetMetrics()[name]
 	end
 
+	--- Flush what the joins queued, so a Reset after this leaves an empty window.
+	--- Under Studio the join yields across real frames, so how much of it has already
+	--- gone out when Reset lands is otherwise a race.
+	local function settle(harness)
+		for _ = 1, 3 do
+			harness.Step()
+		end
+	end
+
+	--- Step until `name` has at least `count` samples.
+	--- A single Step is one frame in Studio, and the engine decides whether the
+	--- resumption lands before or after that frame's flush, so reading straight after
+	--- one reads an empty distribution about half the time.
+	local function stepFor(harness, name: string, count: number?)
+		harness.StepUntil(function()
+			local d = dist(name)
+			return d ~= nil and d.Count >= (count or 1)
+		end)
+	end
+
 	describe("per-frame flush cost", function()
 		it("records how many entries one frame flushed", function()
 			local harness = TestCtx.make()
 			local _, _, d1 = ready(harness, 7301)
 			local _, _, d2 = ready(harness, 7302)
 			local _, _, d3 = ready(harness, 7303)
+			settle(harness)
 			Metrics.Reset()
 
 			d1.Coins.Set(1)
 			d2.Coins.Set(2)
 			d3.Coins.Set(3)
-			harness.Step()
+			stepFor(harness, "FlushEntriesPerFrame")
 
 			local entries = dist("FlushEntriesPerFrame")
 			expect(entries).to.be.ok()
@@ -55,13 +76,14 @@ return function()
 		it("records the queued ops a frame had to consider", function()
 			local harness = TestCtx.make()
 			local _, _, data = ready(harness, 7304)
+			settle(harness)
 			Metrics.Reset()
 
 			-- Distinct paths, so nothing coalesces in the queue: three real ops.
 			data.Coins.Set(5)
 			data.Gems.Set(6)
 			data.Nick.Set("x")
-			harness.Step()
+			stepFor(harness, "FlushQueuedPerFrame")
 
 			local queued = dist("FlushQueuedPerFrame")
 			expect(queued).to.be.ok()
@@ -95,12 +117,13 @@ return function()
 			local function measure(userId: number, writes: number): (number, any)
 				local harness = TestCtx.make()
 				local _, _, data = ready(harness, userId)
+				settle(harness)
 				Metrics.Reset()
 
 				for i = 1, writes do
 					data.Coins.Set(i)
 				end
-				harness.Step()
+				stepFor(harness, "FlushQueuedPerFrame")
 
 				local sent = Scribe.GetMetrics().OpsSent
 				local queued = dist("FlushQueuedPerFrame")
@@ -126,6 +149,7 @@ return function()
 			-- only ones worth looking at.
 			local harness = TestCtx.make()
 			ready(harness, 7306)
+			settle(harness)
 			Metrics.Reset()
 
 			for _ = 1, 10 do
@@ -144,12 +168,15 @@ return function()
 			local harness = TestCtx.make()
 			local _, _, d1 = ready(harness, 7307)
 			local _, _, d2 = ready(harness, 7308)
+			settle(harness)
 			Metrics.Reset()
 
+			-- Waiting for the FIRST frame to be recorded before writing the second is
+			-- what keeps the two entries out of one frame under Studio.
 			d1.Coins.Set(1)
-			harness.Step()
+			stepFor(harness, "FlushEntriesPerFrame", 1)
 			d2.Coins.Set(2)
-			harness.Step()
+			stepFor(harness, "FlushEntriesPerFrame", 2)
 
 			local entries = dist("FlushEntriesPerFrame")
 			expect(`count={entries.Count} max={entries.Max}`).to.equal("count=2 max=1")

@@ -177,11 +177,48 @@ function TestCtx.make(
 	--- what breaks under Studio. `typeof` answers it without touching the member.
 	function harness.Step()
 		local signal = RunService.PostSimulation :: any
-		if typeof(signal) == "RBXScriptSignal" then
-			task.wait() -- real engine: it fires PostSimulation itself, once a frame
-		else
+		if typeof(signal) ~= "RBXScriptSignal" then
 			signal:Fire(1 / 60) -- headless shim: a FakeSignal we drive ourselves
+			return
 		end
+		-- Real engine. A bare task.wait() is NOT one flush: the engine decides where
+		-- the resumption sits relative to PostSimulation, so it can return before the
+		-- frame's flush and a spec reads what the flush has not written yet. That cost
+		-- three rounds of Studio-only failures. Waiting on the signal is worse -- it
+		-- can return inside the current frame, so several Steps collapse into one.
+		--
+		-- So watch for the dispatch instead. This connection is made after Scribe's, and
+		-- the wake only happens at a task.wait boundary, which is outside the dispatch:
+		-- when Step returns, one whole flush has run since it was called.
+		local fired = false
+		local conn = signal:Connect(function()
+			fired = true
+		end)
+		-- Bounded so a signal that never fires fails the spec's own assertion rather
+		-- than the runner's timeout.
+		for _ = 1, 10 do
+			task.wait()
+			if fired then
+				break
+			end
+		end
+		conn:Disconnect()
+	end
+
+	--- Step until `done` answers true, or give up after `budget` frames.
+	---
+	--- For assertions that need a specific observation rather than a fixed number of
+	--- frames. Step now guarantees a completed flush per call, so this is belt and
+	--- braces on the specs that read a per-frame metric: it costs one predicate call
+	--- and it holds even if that guarantee ever weakens.
+	function harness.StepUntil(done: () -> boolean, budget: number?): boolean
+		for _ = 1, budget or 20 do
+			if done() then
+				return true
+			end
+			harness.Step()
+		end
+		return done()
 	end
 
 	function harness.Leave(player: any)

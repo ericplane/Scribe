@@ -1,21 +1,17 @@
 --!strict
--- The clock seam: every reading of time and every timed wait in Scribe goes
--- through here, so a test or a simulation can replace them and fast-forward.
+-- The clock seam: every reading of time and every timed wait goes through here, so
+-- a test or a simulation can replace them and fast-forward. Two clocks, because
+-- conflating them is a real bug:
 --
--- Two clocks, because conflating them is a real bug:
---
---   Now()       wall time, unix seconds (os.time). Use for anything persisted or
---               compared across sessions and servers. It can jump when the
+--   Now()       wall time in unix seconds (os.time). For anything persisted or
+--               compared across sessions and servers; it can jump when the
 --               machine's clock is corrected, so never measure an interval with it.
---   Monotonic() a steadily-increasing process timer (os.clock). Use for measuring
---               intervals inside one session. Never persist it; it is meaningless
---               outside this process.
+--   Monotonic() a steadily-increasing process timer (os.clock). For intervals
+--               inside one session; never persist it, it means nothing elsewhere.
 --
--- Not a scheduler. A seeded interleaving of ready threads is Internal/Sched.
---
--- ProfileStore measures its own deadlines with its own os.clock, but it reaches
--- the outside world only through globals, so loading it under a per-server
--- environment (test/Sim/Env.luau) virtualises its clock without a fork.
+-- ProfileStore measures its own deadlines with its own os.clock but reaches the
+-- outside world only through globals, so loading it under a per-server environment
+-- (test/Sim/Env.luau) virtualises its clock without a fork.
 
 local Clock = {}
 
@@ -26,10 +22,9 @@ export type Impl = {
 	Delay: ((seconds: number, fn: (...any) -> (), ...any) -> thread)?,
 }
 
--- Held separately so Reset can restore them. os.time is wrapped rather than
--- assigned directly because its Roblox signature is `(DateTypeArg?) -> number`,
--- which does not satisfy `() -> number`; typing Impl to match would force every
--- virtual clock to declare a parameter it ignores.
+-- Held separately so Reset can restore them. os.time is wrapped because its Roblox
+-- signature is `(DateTypeArg?) -> number`, which does not satisfy `() -> number`;
+-- widening Impl to match would force every virtual clock to declare that parameter.
 local DEFAULT_NOW: () -> number = function()
 	return os.time()
 end
@@ -46,8 +41,7 @@ Clock.Delay = DEFAULT_DELAY
 ---
 --- A replacement `Wait` must still yield. Scribe's background loops are shaped
 --- `while ... do Clock.Wait(n) ... end`, so a Wait that returns without yielding
---- starves the scheduler and hangs the process with nothing to point at. Yield
---- without sleeping the requested duration instead.
+--- hangs the process with nothing to point at. Yield without sleeping instead.
 function Clock.Install(impl: Impl)
 	if impl.Now ~= nil then
 		Clock.Now = impl.Now

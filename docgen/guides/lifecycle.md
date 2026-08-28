@@ -109,18 +109,17 @@ The table you get is the raw profile data, not the accessor tree, so writes here
 
 Because it is the raw table, [derived fields](./derived) are not in it. They are computed, never stored, and Scribe evaluates them right after this hook and before the session is Ready. A value you would otherwise compute here and write is usually a derived field.
 
-:::caution Datatype fields need packing here
-Bypassing the accessor also bypasses [datatype packing](./datatypes). A raw assignment stores the userdata itself, which no DataStore can serialize:
+!!! warning "Datatype fields need packing here"
+    Bypassing the accessor also bypasses [datatype packing](./datatypes). A raw assignment stores the userdata itself, which no DataStore can serialize:
 
-```lua
-OnPlayerInit = function(player, data)
-    data.Checkpoint = Vector3.new(0, 12, 0)                                   -- PROFILE_UNPERSISTABLE
-    data.Checkpoint = Scribe.Datatypes.Pack("Vector3", Vector3.new(0, 12, 0))  -- correct
-end,
-```
+    ```lua
+    OnPlayerInit = function(player, data)
+        data.Checkpoint = Vector3.new(0, 12, 0)                                   -- PROFILE_UNPERSISTABLE
+        data.Checkpoint = Scribe.Datatypes.Pack("Vector3", Vector3.new(0, 12, 0))  -- correct
+    end,
+    ```
 
-Reads are unaffected either way: `data.Checkpoint.Get()` still hands back a real `Vector3`. The same applies inside a [migration](./profiles#migrations), which also receives raw data.
-:::
+    Reads are unaffected either way: `data.Checkpoint.Get()` still hands back a real `Vector3`. The same applies inside a [migration](./profiles#migrations), which also receives raw data.
 
 ## Migrations
 
@@ -143,11 +142,10 @@ Data.Flush(player, { Force = true })   -- persist immediately
 
 Flushing costs nothing when there is nothing to save. If the profile has not changed since its last successful save and none is still in flight, `Flush` answers `true` straight away with no DataStore request. So flushing on a checkpoint or a timer is cheap, and flushing after a grant still always saves, because a grant leaves the profile dirty by definition.
 
-:::caution A `false` from `Flush` does not mean the save failed
-`Flush` waits at most `Timeout` seconds, 15 by default, and then returns `false` even though the save may still complete afterwards. It also returns `false` immediately, without attempting a save at all, if the profile is not Ready, which a `Flush` fired from `PlayerAdded` before `WaitForData` always is.
+!!! warning "A `false` from `Flush` does not mean the save failed"
+    `Flush` waits at most `Timeout` seconds, 15 by default, and then returns `false` even though the save may still complete afterwards. It also returns `false` immediately, without attempting a save at all, if the profile is not Ready, which a `Flush` fired from `PlayerAdded` before `WaitForData` always is.
 
-Log it or retry the flush. Never re-grant the purchase on `false`, or you double-grant the common case.
-:::
+    Log it or retry the flush. Never re-grant the purchase on `false`, or you double-grant the common case.
 
 Watch save state for "Saving... / Saved" UI:
 

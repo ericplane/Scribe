@@ -28,19 +28,14 @@ local thresholds = {
 -- A throttle is one problem no matter how many keys hit it, so every throttled failure
 -- in a subsystem shares this subject. Being throttled is not the store being broken, and
 -- counting a join burst as N problems drives the server past Outage, which refuses Robux
--- receipts while nothing is actually wrong.
---
--- Not namespaced per key: the burst is simultaneous, so per-key dedup would let N through
--- at once, which is the shape being fixed.
+-- receipts while nothing is wrong. Not namespaced per key: the burst is simultaneous, so
+-- per-key dedup would let N through at once.
 local THROTTLE_SUBJECT = "~throttled"
 
 -- Smallest gap between two failures of the same operation that counts as two separate
 -- problems. ProfileStore retries a failing key on its own backoff and every attempt
--- arrives here, so without this one stuck profile reaches Outage alone and refuses Robux
--- receipts for every player on the server.
---
--- Set above ProfileStore's 20 s backoff ceiling so a genuinely new failure of the same
--- key still counts.
+-- arrives here, so without this one stuck profile reaches Outage alone. Set above
+-- ProfileStore's 20 s backoff ceiling so a genuinely new failure of the same key counts.
 local RETRY_COOLDOWN = 25
 
 local status: Status = "Healthy"
@@ -52,9 +47,9 @@ local failures: { { At: number, Id: string? } } = {}
 local lastAt: { [string]: number } = {}
 local counts: { [string]: number } = {}
 -- How many reports have been folded into the identity's current live problem, so the
--- line that eventually is logged can say how many it stands for. Kept here because
--- `forget` already retires an identity at exactly the right moment; a tally that
--- outlives its identity is a leak on a long-lived server.
+-- line eventually logged can say how many it stands for. Kept beside `counts` because
+-- `forget` retires an identity at the right moment; a tally that outlives its identity
+-- is a leak on a long-lived server.
 local folded: { [string]: number } = {}
 -- Maintained incrementally so evaluate() stays O(1) on a path that only runs while
 -- things are already going wrong.
@@ -108,13 +103,11 @@ end
 -- burst that ends leaves the status at Outage forever, with no traffic to feed the
 -- success streak that would lift it.
 --
--- The step condition is that the window is genuinely EMPTY, not that the count dipped
--- below the Outage threshold. With a sparse failure stream, which the retry cooldown
+-- The step condition is that the window is genuinely empty, not that the count dipped
+-- below the Outage threshold: with a sparse failure stream, which the retry cooldown
 -- guarantees for a few keys, the count dips constantly between retries and the status
--- would flap, opening the money gate mid-outage.
---
--- It stops at Degraded. "Nobody reported a failure" is not evidence anything worked, and
--- Degraded gates nothing, so reaching Healthy still costs a success streak.
+-- would flap, opening the money gate mid-outage. It stops at Degraded, because "nobody
+-- reported a failure" is not evidence anything worked; reaching Healthy costs a streak.
 local DECAY_MIN_DELAY = 1 -- seconds; the horizon can land on the prune boundary, where an entry survives
 local decayPending = false
 local armDecay: () -> ()
@@ -176,11 +169,10 @@ local function evaluate()
 	armDecay()
 end
 
--- What has been explicitly configured, and which conflicts have been reported.
--- StatusThresholds is a process global, because this machine is a library-level
--- singleton, so a second bundle in the same process retunes the first's Outage gate,
--- which is what refuses Robux grants during a DataStore failure. The later value still
--- wins, matching SAVE_INTERVAL_CONFLICT, but it warns.
+-- What has been explicitly configured, and which conflicts have been reported. This
+-- machine is a library-level singleton, so a second bundle in the same process retunes
+-- the first's Outage gate, the gate that refuses Robux grants during a DataStore
+-- failure. The later value still wins, matching SAVE_INTERVAL_CONFLICT, but it warns.
 local configured: { [string]: number } = {}
 local conflictWarned: { [string]: true } = {}
 
@@ -218,8 +210,7 @@ end
 
 -- The thresholds as they currently stand, copied so a reader cannot edit the singleton
 -- by accident. OutageFailCount is the interesting member: it gates money, it is rebuilt
--- from FailCount on every Configure, and there is otherwise no way to see which bundle
--- won.
+-- from FailCount on every Configure, and there is otherwise no way to see which won.
 function Health.Thresholds(): { [string]: number }
 	return table.clone(thresholds)
 end
@@ -244,11 +235,10 @@ end
 --- subject. Of the `class` verdicts only "Throttled" changes anything: see
 --- THROTTLE_SUBJECT.
 ---
---- Returns `(counted, folded)` so an observer can follow this machine's dedup instead of
---- re-deriving it. `counted` is whether the report became a distinct problem rather than
---- being absorbed into a live one. `folded` is how many reports were absorbed: on a
---- counted call the previous problem's tally, now flushed; on an absorbed call the
---- running tally including this one.
+--- Returns `(counted, folded)`. `counted` is whether the report became a distinct
+--- problem rather than being absorbed into a live one. `folded` is how many reports were
+--- absorbed: on a counted call the previous problem's tally, now flushed; on an absorbed
+--- call the running tally including this one.
 function Health.ReportFailure(subsystem: string, key: string?, class: string?): (boolean, number)
 	successStreak = 0
 	-- The metric still counts every report; only the state machine below dedupes.
@@ -314,9 +304,8 @@ function Health.SetCritical(isCritical: boolean)
 		if not criticalSince then
 			criticalSince = Clock.Monotonic()
 			-- evaluate() runs only on ReportFailure/SetCritical, so a sustained critical
-			-- window with no further failures would never escalate. Re-check once the delay
-			-- elapses; evaluate() re-reads elapsed time, so a cleared or freshly-reset
-			-- critical state won't escalate prematurely.
+			-- window with no further failures would never escalate. It re-reads elapsed
+			-- time, so a cleared or freshly-reset critical state won't escalate early.
 			Clock.Delay(thresholds.CriticalOutageDelay, function()
 				if criticalSince then
 					evaluate()

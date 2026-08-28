@@ -35,17 +35,14 @@ export type Unpersistable = {
 -- Depth-first scan for the first value or key a DataStore cannot store: invalid UTF-8
 -- (error 104), or an unserializable leaf. Used by the raw-table save boundaries that
 -- bypass Node.validateWrite (OnPlayerInit, UpdateOffline, migrations, Dynamic seeds),
--- where the alternative is the entire profile save failing opaquely.
+-- where the alternative is the entire profile save failing opaquely. The offender's
+-- ancestor keys are all valid UTF-8, because a bad key is reported before recursing
+-- under it. `stats`, when supplied, collects the deepest nesting reached, which reports
+-- data stored deeper than a write can reach at load rather than at the first Set.
 --
--- Returns the first offender, whose ancestor keys are all valid UTF-8 because a bad key
--- is reported before recursing under it, or nil when the structure is DataStore-safe.
--- `stats`, when supplied, collects the deepest nesting reached; stored data may legally
--- be nested deeper than a write can reach, and riding along here reports that at load
--- instead of at the first Set. It is only as complete as the walk.
---
--- The path rides a scratch stack rather than a fresh array per child. `n` is the number
--- of LIVE entries and is passed by value, so a frame only reads `stack[1..n]` and stale
--- entries past it are unreachable; that is why there is no pop.
+-- The path rides a scratch stack rather than a fresh array per child. `n` is the count
+-- of live entries and is passed by value, so a frame only reads `stack[1..n]`; stale
+-- entries past it are unreachable, hence no pop.
 local function snapshotPath(stack: { string | number }, n: number, extra: (string | number)?): { string | number }
 	local out: { string | number } = {}
 	table.move(stack, 1, n, 1, out)
@@ -68,7 +65,7 @@ local function scanUnpersistable(
 	-- Checked first, and on typeof rather than type: a Roblox datatype is storable but not
 	-- raw, and it is userdata on Roblox yet a plain table under the headless shim, so
 	-- recursing into one reports a confusing key-type error instead of the real problem.
-	-- Do not gate this on `type(value)` to skip the typeof call: a mistake here is a false
+	-- Do not gate it on `type(value)` to skip the typeof call: a miss here is a false
 	-- negative, and every future save then fails with no path in the log.
 	local typeName = typeof(value)
 	if Datatypes.IsSupported(typeName) then
@@ -218,7 +215,6 @@ function Util.sortedKeys(t: { [string]: any }): { string }
 	return keys
 end
 
--- Whether the table has any array-part (numeric key) entries.
 function Util.hasNumericKeys(t: { [any]: any }): boolean
 	for k in t do
 		if type(k) == "number" then
@@ -301,20 +297,16 @@ local function jsonNumberBytes(v: number): number
 	return #string.format("%.17g", v)
 end
 
--- Approximate serialized size in bytes, as an UPPER bound on what the DataStore would
+-- Approximate serialized size in bytes, as an upper bound on what the DataStore would
 -- store, which is the number the ~4 MB per-key ceiling is measured against. Buffer-aware
 -- (DataStores store buffers as base64, 4/3 of their raw length rounded up to a 4-byte
 -- group), so it works where JSONEncode would throw.
 --
 -- Upper bound rather than best guess: PROFILE_SIZE warns before saves start failing at the
--- ceiling, so an under-count is silent while an over-count only costs an early warning.
---
--- Only array positions inside 1..#t are free. The encoder writes {[123]="a"} as
--- {"123":"a"}, which is why Template.CoerceMapKeys exists, so a numeric key outside the
--- array part is charged like a string one.
---
--- Still approximate, deliberately: it never builds the string. The slack that remains is
--- non-integral numbers whose shortest round-trip form is short, which errs upward.
+-- ceiling, so an under-count is silent while an over-count only costs an early warning. It
+-- never builds the string, and only array positions inside 1..#t are free: the encoder
+-- writes {[123]="a"} as {"123":"a"} (hence Template.CoerceMapKeys), so a numeric key
+-- outside the array part is charged like a string one.
 function Util.approxSize(value: any, depth: number?): number
 	local d = depth or 0
 	local t = type(value)
@@ -340,12 +332,12 @@ function Util.approxSize(value: any, depth: number?): number
 			if type(k) == "number" and k >= 1 and k <= arrayLength and k % 1 == 0 then
 				total += Util.approxSize(v, d + 1)
 			else
-				-- The key dispatch TESTS the key type rather than asserting it. Casting a
+				-- The key dispatch tests the key type rather than asserting it. Casting a
 				-- key to number here raises on a boolean or table key, and approxSize runs
 				-- inside a save-path Signal handler that swallows the raise, so the
 				-- PROFILE_SIZE warning silently stops firing. The 6 for an unencodable key
-				-- measures nothing (findUnpersistable is what reports it); what matters is
-				-- that the walk continues past the key.
+				-- measures nothing (findUnpersistable reports it); what matters is that the
+				-- walk continues past it.
 				local kt = type(k)
 				local keyBytes = if kt == "string"
 					then jsonStringBytes(k :: string)
@@ -453,8 +445,8 @@ function Util.parsePath(s: string): { string }
 	return out
 end
 
--- Call `fn` through xpcall with a logged traceback; never throws.
--- Returns ok plus up to four results.
+-- Call `fn` through xpcall with a logged traceback; never throws. Returns ok plus
+-- whatever `fn` returned.
 function Util.safeCall(onError: (err: string) -> (), fn: (...any) -> ...any, ...: any): (boolean, ...any)
 	local args = table.pack(...)
 	local results: any

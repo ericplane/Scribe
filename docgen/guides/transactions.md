@@ -52,11 +52,10 @@ Three writes land together or none of them do. If the `Inventory` write throws b
 
 `Flush` returns a boolean, and a `false` return is the interesting case.
 
-:::caution A false Flush means unresolved, not failed
-`Timeout` bounds how long you wait for confirmation. It does not bound whether the write happens. A `false` return means the save may still land a moment later.
+!!! warning "A false Flush means unresolved, not failed"
+    `Timeout` bounds how long you wait for confirmation. It does not bound whether the write happens. A `false` return means the save may still land a moment later.
 
-Never compensate for a timed out flush by undoing the work. Re-credit the 250 coins, have that save land after all, and the player now owns the Ember Blade *and* the coins. You minted an item out of a network hiccup. Retry the same idempotent operation instead, or show the player a pending state and let the next load tell you the truth. "Unresolved" is a third state alongside committed and not committed, and every durable design on this platform has to carry it.
-:::
+    Never compensate for a timed out flush by undoing the work. Re-credit the 250 coins, have that save land after all, and the player now owns the Ember Blade *and* the coins. You minted an item out of a network hiccup. Retry the same idempotent operation instead, or show the player a pending state and let the next load tell you the truth. "Unresolved" is a third state alongside committed and not committed, and every durable design on this platform has to carry it.
 
 ??? tip "Flush is free when there is nothing to save"
 
@@ -205,11 +204,10 @@ Scribe has no API for this. What follows is the cost, so you can judge whether t
 - **It is asynchronous, not live.** Delivery to a player on another server rides the message queue, dispatched inside a save round trip and bounded by the autosave period. That is minutes by default, not a countdown in a trade window.
 - **None of it is dupe prevention.** The largest duplication incidents on this platform were application logic bugs: client authoritative item movement, single server check then use races, and operational version restores that re-mint an item already traded away. No storage protocol touches any of them.
 
-:::caution A Transaction refuses to leave one player's tree
-While a `Data.Transaction` is open, a write to a different player's accessor is refused, whether it is a bare write to their data or a nested `Data.Transaction` on them. The refusal fails the enclosing transaction, so its own writes roll back and the call returns `(false, error)`. Nothing lands on either player.
+!!! warning "A Transaction refuses to leave one player's tree"
+    While a `Data.Transaction` is open, a write to a different player's accessor is refused, whether it is a bare write to their data or a nested `Data.Transaction` on them. The refusal fails the enclosing transaction, so its own writes roll back and the call returns `(false, error)`. Nothing lands on either player.
 
-This is the same rule Scribe applies to a yield inside a transaction, and it exists for the same reason. A rollback cannot reach a different DataStore key, so a write it could never undo must not look as though it is covered. No arrangement of nesting, batching or ordering makes two keys commit together. Use the durable outbox above.
-:::
+    This is the same rule Scribe applies to a yield inside a transaction, and it exists for the same reason. A rollback cannot reach a different DataStore key, so a write it could never undo must not look as though it is covered. No arrangement of nesting, batching or ordering makes two keys commit together. Use the durable outbox above.
 
 ### What you can do today
 
@@ -227,7 +225,7 @@ This is the same rule Scribe applies to a yield inside a transaction, and it exi
 | `Coins >= 0`, an inventory cap, "afford it first", "grant and log together" | one | `Transaction` then `Flush`, or [`Data.Purchase`](./monetization) |
 | Gift, mail, quest reward, bounty payout, "send Ben 500 coins" | two, add only at the far side | durable outbox: record, `Flush`, `SendMessage`, idempotent apply |
 | An achievement someone else triggers, a max merge high score | two, monotone | the same outbox |
-| Two sided trade, "exactly one owner of this blade", a conserved global supply | two, not monotone | nothing covers it, read the section above first |
+| Two sided trade, "exactly one owner of this blade", a conserved global supply | two, not monotone | [Exchange](./exchange), for two players on ONE server; otherwise the outbox above |
 
 If you came here to find out whether you need a cross-key transaction, the most likely correct answer is the first row.
 

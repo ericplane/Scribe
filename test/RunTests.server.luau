@@ -1,6 +1,6 @@
 --!nonstrict
 -- Studio entry point for the Scribe test suite. Build and open the test
--- place, then press Run (F8) — TestEZ output appears in the Output window:
+-- place, then press Run (F8); TestEZ output appears in the Output window:
 --
 --   rojo build test.project.json -o ScribeTest.rbxlx
 --

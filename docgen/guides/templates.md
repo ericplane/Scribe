@@ -162,9 +162,8 @@ A numeric `Precision` is a **fixed-point step**. The field travels as the index 
 
     `Precision` also appears on [`Scribe.CFrame`](./datatypes), where it names the same thing and points the other way: a `CFrame`'s default is the lossy form, so there it buys precision with bytes rather than the reverse. Those are the only two declarators that take it.
 
-:::caution Narrowing is a wire change
-`Precision` is folded into the schema hash and the wire protocol version, so a client and a server that disagree about it refuse the handshake rather than mis-decoding. Adding or changing `Precision` needs both realms deployed together, like any other template change.
-:::
+!!! warning "Narrowing is a wire change"
+    `Precision` is folded into the schema hash and the wire protocol version, so a client and a server that disagree about it refuse the handshake rather than mis-decoding. Adding or changing `Precision` needs both realms deployed together, like any other template change.
 
 ## Names Scribe will not let you use
 

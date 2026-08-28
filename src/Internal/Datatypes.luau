@@ -1,11 +1,9 @@
 --!strict
 -- Packed-buffer codecs for Roblox datatypes. Declared fields (Scribe.Vector3,
--- Scribe.CFrame, ...) store this packed form in profile data. Persistence,
--- replication, cloning, and the wipe guard only ever see plain buffers, and
--- the node accessor converts at the boundary (Set packs, Get unpacks).
---
--- Roblox stores these types as f32 internally, so f32 packing is lossless.
--- DataStores keep buffers as base64, about 4/3 of the raw size.
+-- Scribe.CFrame, ...) store this packed form; persistence, replication, cloning and the
+-- wipe guard only ever see plain buffers, and the node accessor converts at the boundary
+-- (Set packs, Get unpacks). Roblox stores these types as f32 internally, so f32 packing
+-- is lossless; DataStores keep buffers as base64, about 4/3 of the raw size.
 
 local Datatypes = {}
 
@@ -111,18 +109,15 @@ codecs.Vector2int16 = {
 
 local AXIS_EPSILON = 1e-4
 
--- Full-precision CFrame, opt-in via Precision = "exact". 49 bytes:
--- [u8 254][3xf32 position][9xf32 rotation, in GetComponents order].
---
--- The 29-byte default re-derives nine rotation components from four, so a stored
--- orientation comes back slightly turned; the loss is the re-derivation, not the
+-- Full-precision CFrame, opt-in via Precision = "exact": the nine rotation components as
+-- f32, in GetComponents order. The 29-byte default re-derives those nine from four, so a
+-- stored orientation comes back slightly turned; the loss is the re-derivation, not the
 -- float width, so widening the quaternion cannot close it. Roblox stores CFrame
--- components as f32, which is what makes all twelve as f32 a bit-for-bit round
--- trip.
+-- components as f32, which makes all twelve as f32 a bit-for-bit round trip.
 --
--- Tag 254 sits just below the quaternion's 255, leaving 36..253 contiguous for a
--- future compact orientation code. No buffer written before it existed carries tag
--- 254 or is 49 bytes long, so old data stays distinguishable.
+-- 254 sits just below the quaternion's 255, leaving 36..253 contiguous for a future
+-- compact orientation code. No buffer written before it existed carries tag 254 or is
+-- 49 bytes long, so old data stays distinguishable.
 local CFRAME_FULL = 254
 
 -- Returns 0-5 (axis index * 2 + negative bit) when the vector is a unit axis.
@@ -154,11 +149,10 @@ codecs.CFrame = {
 	Pack = function(cf: CFrame, precision: (string | number)?): buffer
 		local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
 
-		-- Declared exact always writes 49 bytes, even where the 13-byte path would
-		-- fit: that path snaps. unitAxisCode accepts an axis within AXIS_EPSILON of
-		-- a unit axis and then rebuilds the exact axis, so a rotation a fraction of
-		-- a degree off square silently becomes square, a larger loss than the
-		-- quaternion's. A flat width is also a cost a developer can budget.
+		-- Declared exact always writes 49 bytes, even where the 13-byte path would fit:
+		-- that path snaps. unitAxisCode accepts an axis within AXIS_EPSILON of a unit
+		-- axis and rebuilds the exact axis, so a rotation a fraction of a degree off
+		-- square silently becomes square, a larger loss than the quaternion's.
 		if precision == "exact" then
 			local b = buffer.create(49)
 			buffer.writeu8(b, 0, CFRAME_FULL)
@@ -233,13 +227,11 @@ codecs.CFrame = {
 		local tag = buffer.readu8(b, 0)
 		local position = Vector3.new(buffer.readf32(b, 1), buffer.readf32(b, 5), buffer.readf32(b, 9))
 		if tag == CFRAME_FULL then
-			-- Re-check before reading the 36-byte rotation payload: a truncated or
-			-- hostile buffer must fail as a clean malformed-CFrame error, not an
-			-- out-of-bounds read.
+			-- Re-check before reading the 36-byte rotation payload: a truncated or hostile
+			-- buffer must fail as a clean malformed error, not an out-of-bounds read.
 			checkLen(b, 49, "CFrame")
-			-- The twelve-argument CFrame.new is the exact inverse of GetComponents
-			-- and does not re-orthonormalize, which is what makes the round trip
-			-- the identity.
+			-- The twelve-argument CFrame.new is the exact inverse of GetComponents and
+			-- does not re-orthonormalize, so the round trip is the identity.
 			return CFrame.new(
 				position.X,
 				position.Y,
@@ -324,10 +316,9 @@ codecs.Color3 = {
 	end,
 	Unpack = function(b: buffer): Color3
 		checkLen(b, 4, "Color3")
-		-- checkLen(4) only covers the mode byte plus the mode-0 RGB path, and
-		-- unpackColor3From takes the 13-byte branch for any non-zero mode, so
-		-- re-check on `~= 0` rather than `== 1`: a hostile buffer with mode 2..255
-		-- must fail as a clean malformed-Color3 error, not an out-of-bounds read.
+		-- checkLen(4) covers only the mode byte plus the mode-0 RGB path, and
+		-- unpackColor3From takes the 13-byte branch for any non-zero mode, so re-check
+		-- on `~= 0` rather than `== 1`: mode 2..255 must not read out of bounds.
 		if buffer.readu8(b, 0) ~= 0 then
 			checkLen(b, 13, "Color3")
 		end
@@ -629,10 +620,10 @@ function Datatypes.PrecisionValues(name: string): { string }?
 	return out
 end
 
---- Packs `value` as `name`. `precision` is optional; omitted, every datatype packs
---- its default form. Validated here rather than inside each codec so a codec with
---- no Precision option gets the refusal for free, and so a typo is reported
---- instead of quietly yielding the default form.
+--- Packs `value` as `name`. `precision` is optional; omitted, every datatype packs its
+--- default form. Validated here rather than inside each codec so a codec with no
+--- Precision option gets the refusal for free, and so a typo is reported instead of
+--- quietly yielding the default form.
 function Datatypes.Pack(name: string, value: any, precision: (string | number)?): buffer
 	local codec = codecs[name]
 	if not codec then

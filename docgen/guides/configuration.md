@@ -194,6 +194,46 @@ These bound how many gifts are in flight and how long Scribe remembers a settled
 
     **The claim store** dedupes **your own** `Data.Purchase` calls, which your code retries in seconds rather than days. Lowering `PurchaseClaimTTL` is the right way to bound what a heavy shop accumulates. `MaxPurchaseClaims` is a runaway guard rather than a working limit: claims expire on their own, so reaching 1000 means a player buys faster than the TTL drains. The claim nearest to expiring is dropped and `PURCHASE_CLAIM_EVICTED` is logged. Prefer shortening the TTL to raising the cap.
 
+## Exchanging
+
+One option, and nothing is exchangeable until it names the path. Every entry is proved safe to move **at startup**, so a mistake here stops the server rather than surfacing mid-exchange with value already in escrow.
+
+| Option | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `Exchangeable` | `{ [string]: LegSpec }?` | none | The paths players may exchange, each with the kind of move allowed. Absent means exchanging is off entirely. |
+
+Each entry is a `LegSpec`:
+
+| Field | Type | Required | What it does |
+| --- | --- | --- | --- |
+| `Path` | `{ string }` | yes | A top-level field or container, never a path inside one. |
+| `Kind` | `"Key" \| "Qty" \| "Stack"` | yes | A whole container entry, an amount of a bounded `Scribe.Int`, or part of one stacked entry. |
+| `Count` | `string?` | `Stack` on a record element | The element field holding how many. Omit it when the element IS the count, as in a `DictOf(Scribe.Int(...))`. |
+| `Identity` | `{ string }?` | `Stack` on a record element | Element fields that travel with a split. Both halves keep them. |
+| `Ignore` | `{ string }?` | no | Element fields that do NOT travel. The receiver's copy starts at the declared default and the giver keeps theirs. Valid on `Key` and `Stack`. |
+
+```lua
+Exchangeable = {
+    Money = { Path = { "Coins" },     Kind = "Qty" },
+    Pet   = { Path = { "Pets" },      Kind = "Key",   Ignore = { "TotalDamageDealt" } },
+    Item  = { Path = { "Inventory" }, Kind = "Stack",
+              Count = "Qty", Identity = { "ItemId", "Rarity" }, Ignore = { "TimesUsed" } },
+    Ore   = { Path = { "Resources" }, Kind = "Stack" },
+}
+```
+
+??? note "Why a `Stack` must account for every element field"
+    A split **duplicates** whatever it does not drop. `{ Qty = 5, Rarity = 3 }` split by two becomes `{ Qty = 3, Rarity = 3 }` and `{ Qty = 2, Rarity = 3 }`. For `Rarity` that is correct, because it describes the item. For a field like `TimesUsed` it is a mint, and no check inside the exchange can tell the two apart: the count itself is exactly conserved either way.
+
+    Only you know which is which, so every declared element field must appear in `Identity` or `Ignore`. One in neither **refuses to start** and names the field. That is deliberate rather than strict for its own sake: the day you add a field to the element is exactly the day you want to be asked whether it duplicates.
+
+    A `Key` leg duplicates nothing, so its `Ignore` is optional and a field you do not list simply travels, which always conserves.
+
+!!! warning "`Ignore` destroys the field in transit"
+    An ignored field goes nowhere. It is not held, not escrowed, and not returned by an abort. Never ignore anything that represents value.
+
+The full list of shapes Scribe refuses to start on, and why each one is unsafe to move, is in [Exchange](./exchange.md).
+
 ## Behaviour & limits
 
 | Option | Type | Default | What it does |
@@ -230,7 +270,7 @@ These bound how many gifts are in flight and how long Scribe remembers a settled
 
     A custom transport is also free to refuse a payload outright. Before fragmentation existed that left the client re-`Hello`ing forever without loading, so declare [`MaxFrameBytes`](./transports) on your adapter if that is your channel.
 
-    Roblox does not document a payload ceiling to set this against, so the default sits far below any plausible one while leaving ordinary traffic unsplit. A diff is bytes to a few kilobytes. The `Init` snapshot of a 1,000-record inventory measures 29,810 bytes, pinned by a spec so the figure and the encoder cannot drift apart.
+    Roblox does not document a payload ceiling to set this against, so the default sits far below any plausible one while leaving ordinary traffic unsplit. A diff is bytes to a few kilobytes. The `Init` snapshot of a 1,000-record inventory measures 29,811 bytes, pinned by a spec so the figure and the encoder cannot drift apart.
 
 ??? note "Keep the frame rate limit well above the command limit"
     `MaxInboundFrameRate` is the only limit covering every frame whatever its type, size or validity, and an oversized frame counts against no other budget. Unlike `CommandRateLimit` it drops **silently** rather than replying. A client that trips it is stranded until its `RequestTimeout` instead of being told it was rate-limited, so keep the two well apart.

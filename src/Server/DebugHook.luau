@@ -1,20 +1,16 @@
 --!strict
--- Studio debug hook: the game-side half of the Scribe Studio companion plugin.
--- Server.new gates the require on RunService:IsStudio(), so outside Studio nothing here
--- exists for an exploiter to find.
+-- Studio debug hook: the game-side half of the Scribe Studio companion plugin. Server.new
+-- gates the require on RunService:IsStudio(), so outside Studio nothing here exists.
 --
 -- Transport is one BindableFunction (request/response) and one BindableEvent (stream
 -- digests) under ServerStorage._ScribeDebugHook. The plugin runs in a different Luau VM,
--- so every variable-shaped payload crosses as a Codec-encoded string; plain-table
--- reflection between VMs rejects mixed keys and mangles sparse arrays.
+-- so payloads cross as Codec-encoded strings: plain-table reflection between VMs rejects
+-- mixed keys and mangles sparse arrays.
 --
--- Reads are always available once a plugin attaches. Writes need an explicit per-session
--- opt-in and go through the public server Value API, so the hook can never do something
--- game code could not; receipt injection additionally requires the resolved Mode be
--- "Mock".
---
--- Interception installs at Attach, i.e. game boot, so ops from before the plugin window
--- opened are recorded into a capped ring and replay when a plugin subscribes.
+-- Writes need a per-session opt-in and go through the public server Value API, so the
+-- hook can never do what game code could not; receipt injection also needs the resolved
+-- Mode to be "Mock". Interception installs at Attach, so ops from before the plugin
+-- window opened replay from a capped ring when a plugin subscribes.
 
 local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")
@@ -34,9 +30,8 @@ local DebugHook = {}
 -- [MinProtocolVersion, Version] it can speak and the hook accepts when its own version
 -- falls inside, so a newer plugin emulates older hooks and games never have to update
 -- Scribe just for the plugin. A plugin older than the hook is refused: the hook cannot
--- know future semantics.
--- v9 adds Derived info to schema nodes and refuses a write to a derived field. The
--- full version history lives in the plugin's src/Protocol.luau, which is the one copy
+-- know future semantics. v9 adds Derived info to schema nodes and refuses a write to a
+-- derived field. The full history lives in the plugin's src/Protocol.luau, the one copy
 -- kept complete; bump both together.
 DebugHook.PROTOCOL_VERSION = 9
 DebugHook.CONTAINER_NAME = "_ScribeDebugHook"
@@ -114,8 +109,7 @@ local function applyPlainOp(root: { [any]: any }, op: any)
 			container[key] = arr
 		end
 		-- An Insert op's Value is the live-stored element reference, so inserting it raw
-		-- would alias live data into this mirror, and a later op descending through that
-		-- element would corrupt the real saved data.
+		-- aliases live data into this mirror and a later op would corrupt the real save.
 		table.insert(arr, math.clamp(op.Index or #arr + 1, 1, #arr + 1), Util.deepClone(op.Value))
 	elseif op.Kind == "Remove" then
 		local arr = container[key]
@@ -140,9 +134,9 @@ end
 
 local attached = false
 
-function DebugHook.Attach(Data: any, ctx: any)
+function DebugHook.Attach(Data: any, ctx: any): (() -> ())?
 	if not RunService:IsStudio() then
-		return
+		return nil
 	end
 	if attached or ServerStorage:FindFirstChild(DebugHook.CONTAINER_NAME) then
 		Log.Warn(
@@ -151,7 +145,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 			"a Scribe debug hook already exists; only the first bundle is inspectable",
 			{}
 		)
-		return
+		return nil
 	end
 	attached = true
 
@@ -172,8 +166,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 	local statusHistory: { { T: number, WallAt: number, From: string, To: string } } = {}
 	local armedLoadFailures: { [string]: number } = {}
 	-- Removers for registrations on library-level singletons: the Log sink list and
-	-- Health.OnStatusChanged. Everything else this hook installs is ctx-scoped and dies
-	-- with the bundle; these two outlive it and nothing else clears them.
+	-- Health.OnStatusChanged. Everything else here is ctx-scoped and dies with the bundle.
 	local teardown: { () -> () } = {}
 	local detached = false
 	local wrapsInstalled = false
@@ -223,9 +216,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 	local sendSeq = 0
 	local metricSeq = 0
 
-	-- Writes initiated by the plugin are attributed Source=ScribeStudio. Tracked
-	-- per-coroutine rather than by a depth counter, so game writes that happen while a
-	-- hook call yields are never mislabeled.
+	-- Writes initiated by the plugin are attributed Source=ScribeStudio. Per-coroutine
+	-- rather than a depth counter, so game writes during a hook yield are not mislabeled.
 	local hookWriteThreads: { [thread]: boolean } = {}
 
 	local function studioCall(fn: any, ...: any): (boolean, ...any)
@@ -265,8 +257,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 
 	--- Release the process-singleton registrations (the Log sink, the Health listener) and
 	--- stop the pump. Idempotent, and deliberately does not clear `attached`, so a second
-	--- Attach still refuses with DEBUG_HOOK_DUPLICATE. The ctx-scoped wraps stay installed
-	--- and die with the bundle.
+	--- Attach still refuses with DEBUG_HOOK_DUPLICATE.
 	local function detach()
 		if detached then
 			return
@@ -399,8 +390,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 			elseif state == "SessionEnded" then
 				mirrors[entry] = nil
 				sizeCache[entry] = nil
-				-- Drop the strong reference or the profile stays pinned for the rest of
-				-- the play session.
+				-- Drop the strong reference or the profile stays pinned all session.
 				entryConnections[entry] = nil
 				connection:Disconnect()
 			end
@@ -458,8 +448,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 		wrapsInstalled = true
 
 		-- Every replication-worthy op, including the ServerOnly paths the original PushOp
-		-- filters out after us. Recorded whether or not anything is subscribed, so ops
-		-- from before the plugin opened can replay into the Changes feed later.
+		-- filters out after us. Recorded whether or not anything is subscribed, so early
+		-- ops can replay into the Changes feed later.
 		local origPushOp = ctx.Replication.PushOp
 		ctx.Replication.PushOp = function(entry: any, op: any, schema: any?)
 			local ok, err = pcall(function()
@@ -468,8 +458,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 				local old: any = nil
 				if op.Kind == "Set" or op.Kind == "Clear" then
 					-- For Clear this is the full contents, not a count, so the plugin's
-					-- replay can undo it; the clone below snapshots it before
-					-- applyPlainOp mutates.
+					-- replay can undo it; the clone below snapshots it before applyPlainOp.
 					old = readPath(mirror, op.Path)
 				elseif op.Kind == "Remove" then
 					local arr = readPath(mirror, op.Path)
@@ -480,8 +469,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 				local visibility = if schema then schema.Visibility else Template.VisibilityOf(compiled, op.Path)
 				opSeq += 1
 				-- Value/Old are cloned because the ring outlives the flush window and both
-				-- game code and the mirror keep mutating what they reference. The clone
-				-- runs before applyPlainOp so Clear's old contents survive.
+				-- game code and the mirror keep mutating what they reference.
 				local record = {
 					HookSeq = opSeq,
 					T = os.clock(),
@@ -592,17 +580,16 @@ function DebugHook.Attach(Data: any, ctx: any)
 				task.wait(1 / OPS_FLUSH_HZ)
 				local ok, err = pcall(function()
 					local now = os.clock()
-					-- Seed every Ready entry each tick: the mirror must exist before the
-					-- entry's first op, or Old reads back as the new value.
+					-- Seed every Ready entry each tick, or Old reads back as the new value.
 					for _, entry in ctx.Persistence.Entries do
 						if entry.State == "Ready" and mirrors[entry] == nil then
 							watchEntry(entry)
 							mirrorFor(entry)
 						end
 					end
-					-- Writes with Replicate=false bypass the op stream and drift the
-					-- old-value mirrors. Gated on a plugin having attached, so an
-					-- unwatched game never pays a recurring deep clone of every profile.
+					-- Writes with Replicate=false bypass the op stream and drift the mirrors.
+					-- Gated on a plugin having attached, so an unwatched game never pays a
+					-- recurring deep clone of every profile.
 					if everHandshaken and now - lastResync >= 10 then
 						lastResync = now
 						local mirrored = {}
@@ -749,7 +736,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 	-- Dotted input paths of a derived node, for the schema export and the write
 	-- refusal. The spec's Compute is a function and never crosses the wire.
 	local function derivedInputPaths(spec: any): { string }
-		local out = table.create(#spec.InputPaths)
+		local out = table.create(#spec.InputPaths) :: { string }
 		for i, inputPath in spec.InputPaths do
 			out[i] = table.concat(inputPath, ".")
 		end
@@ -773,8 +760,8 @@ function DebugHook.Attach(Data: any, ctx: any)
 				Ok = false,
 				Error = `protocol mismatch: game hook speaks v{DebugHook.PROTOCOL_VERSION}, plugin speaks v{minSupported}-v{major}`
 					.. if major < DebugHook.PROTOCOL_VERSION
-						then " — update the Scribe Studio plugin"
-						else " — update the Scribe package in this game",
+						then "; update the Scribe Studio plugin"
+						else "; update the Scribe package in this game",
 				ProtocolVersion = DebugHook.PROTOCOL_VERSION,
 			}
 		end
@@ -782,7 +769,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 		everHandshaken = true
 		-- A handshake means a new plugin instance, so forget the previous one's
 		-- subscriptions: the next SetSubscriptions then sees a false->true Ops edge and
-		-- replays the boot ring into the fresh, empty Store.
+		-- replays the boot ring.
 		for stream in subscriptions do
 			subscriptions[stream] = false
 		end
@@ -834,8 +821,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 		end
 		-- On each stream's false->true edge, replay its ring and flush immediately so the
 		-- pending queue is free again for live records. Every record carries a per-stream
-		-- sequence number, which the plugin dedupes on, so a re-subscribe cannot
-		-- double-deliver.
+		-- sequence number the plugin dedupes on, so a re-subscribe cannot double-deliver.
 		local function replay(stream: string, ring: Ring, flagReplay: boolean?)
 			if subscriptions[stream] and not had[stream] and ring.Count > 0 then
 				pending[stream] = ringSnapshot(ring, flagReplay)
@@ -907,7 +893,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 
 	local function requireWrites(): string?
 		if not writesEnabled then
-			return "writes are disabled — enable the write toggle in Scribe Studio settings"
+			return "writes are disabled: enable the write toggle in Scribe Studio settings"
 		end
 		return nil
 	end
@@ -963,10 +949,10 @@ function DebugHook.Attach(Data: any, ctx: any)
 				end
 				accessorAt(entry, path).ExtendTimed(seconds)
 			elseif mode == "ClearTimed" then
-				-- Cancel the timer, leave the value. Goes through Timed's own raw-store
-				-- write rather than touching _Scribe.Timed here: a nested Timed field's
-				-- pathKey embeds \31, which the accessor tree rejects, and a save in
-				-- flight has the profile pointed at a converted copy.
+				-- Cancel the timer, leave the value. Through Timed's own raw-store write
+				-- rather than _Scribe.Timed here: a nested Timed field's pathKey embeds
+				-- \31, which the accessor tree rejects, and a save in flight has the
+				-- profile pointed at a converted copy.
 				accessorAt(entry, path).Active() -- errors early on non-Timed fields
 				ctx.Timed.ClearField(entry, Util.pathKey(path))
 			else
@@ -1138,7 +1124,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 		return {
 			Ok = true,
 			Note = if options.KickOnSessionEnd ~= false
-				then "session ended; with default KickOnSessionEnd the player is kicked — set KickOnSessionEnd=false to watch the reload loop"
+				then "session ended; with default KickOnSessionEnd the player is kicked; set KickOnSessionEnd=false to watch the reload loop"
 				else "session ended; reload will hit the armed failures",
 		}
 	end
@@ -1185,8 +1171,7 @@ function DebugHook.Attach(Data: any, ctx: any)
 			Mode = ctx.Persistence.Mode,
 			UseMock = ctx.Persistence.Mode == "Mock",
 			DontSave = ctx.Persistence.Mode == "Mock",
-			-- Where profiles live, so the plugin's Production panel can lock
-			-- its target to the real store instead of asking the user.
+			-- Where profiles live, so the plugin's Production panel locks onto the real store.
 			ProfileStoreIndex = options.ProfileStoreIndex or "Default",
 			ProfileKeyPrefix = options.ProfileKeyPrefix or "PLAYER_",
 			LoadFailurePolicy = options.LoadFailurePolicy or "Kick",

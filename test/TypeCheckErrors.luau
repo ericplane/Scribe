@@ -1,7 +1,7 @@
 --!strict
 -- Negative typecheck fixture: every marked line MUST produce a TypeError
 -- under the new solver. The verification gate asserts this file reports
--- exactly EXPECTED_ERRORS diagnostics — if a change silently loosens the
+-- exactly EXPECTED_ERRORS diagnostics: if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
 -- EXPECTED_ERRORS: 27
@@ -44,7 +44,7 @@ local badBoards: { [string]: Scribe.LeaderboardConfig<T> } = {
 	Top = { Stat = "Coinz" }, -- TypeError: not a template path
 }
 
--- 2) Nick is a string leaf, not numeric — not a valid stat.
+-- 2) Nick is a string leaf, not numeric, so not a valid stat.
 local badStat: { [string]: Scribe.LeaderboardConfig<T> } = {
 	Top = { Stat = "Nick" }, -- TypeError: string leaf excluded from the union
 }

@@ -9,6 +9,7 @@ local Node = require(Internal.Node)
 local Template = require(Internal.Template)
 local Log = require(Internal.Log)
 local Clock = require(Internal.Clock)
+local Profile = require(Internal.Profile)
 local Sched = require(Internal.Sched)
 local Rng = require(Internal.Rng)
 
@@ -20,12 +21,11 @@ local COOLDOWN_PREFIX = Template.COOLDOWN_PREFIX
 local ONLINE_PREFIX = Template.ONLINE_COOLDOWN_PREFIX
 local SWEEP_INTERVAL = 1
 
--- Keys under this prefix are Scribe's, not the game's. Scribe keeps its own
--- once-guards in the same flat cooldown dict a game's cooldowns live in, so the
--- namespace is reserved in both directions: the sweep does not announce a lapsed
--- claim through OnCooldownEnded, and the public entry points refuse the prefix
--- loudly, because Data.ClearCooldown on a purchase idempotency claim is exactly
--- what lets a retry apply the same purchase twice.
+-- Keys under this prefix are Scribe's, not the game's. Scribe's own once-guards share
+-- the flat cooldown dict a game's cooldowns live in, so the namespace is reserved in both
+-- directions: the sweep does not announce a lapsed claim through OnCooldownEnded, and the
+-- public entry points refuse the prefix loudly, because Data.ClearCooldown on a purchase
+-- idempotency claim is exactly what lets a retry apply the same purchase twice.
 local RESERVED_KEY_PREFIX = "@"
 
 --- Is `key` in Scribe's reserved claim namespace?
@@ -49,8 +49,8 @@ local function checkPublicKey(key: string, what: string)
 end
 
 -- Finite ceiling (~126 years) so SetTimed(value, math.huge) means "effectively
--- permanent": expiries are written raw into the persisted _Scribe.Timed store, and
--- an infinite expiry would break the DataStore JSON round trip.
+-- permanent": expiries are written raw into the persisted _Scribe.Timed store, and an
+-- infinite one would break the DataStore JSON round trip.
 local MAX_TIMED_SECONDS = 4e9
 
 -- Whole seconds, floored to at least 1 and capped finite.
@@ -63,9 +63,8 @@ function Timed.new(ctx: any)
 	local compiled: Template.Compiled = ctx.Compiled
 
 	local function timedStore(entry: any): { [string]: number }?
-		-- While a save is in flight the profile carries a converted copy (see
-		-- BeforeSave) and the live deadlines move here, so no reader or writer ever
-		-- observes the persisted form.
+		-- While a save is in flight the profile carries a converted copy (see BeforeSave)
+		-- and the live deadlines move here, so no reader ever sees the persisted form.
 		if entry.TimedLive then
 			return entry.TimedLive
 		end
@@ -80,12 +79,11 @@ function Timed.new(ctx: any)
 		return reserved.Timed
 	end
 
-	-- Write an internal expiry, or clear it with value == nil, straight into the
-	-- ServerOnly _Scribe.Timed dict. It bypasses the accessor tree on purpose: the
-	-- store is a flat dict keyed by full pathKey, and a nested Scribe.Timed field's
-	-- pathKey embeds the \31 separator, which Node's dictionary-key guard rejects. The
-	-- store lives in profile.Data, so a raw write persists on the next save; Dirty is
-	-- what makes that save prompt rather than the next autosave tick.
+	-- Write an internal expiry, or clear it with value == nil, straight into the ServerOnly
+	-- _Scribe.Timed dict. It bypasses the accessor tree on purpose: a nested Scribe.Timed
+	-- field's pathKey embeds the \31 separator, which Node's dictionary-key guard rejects.
+	-- The store lives in profile.Data, so a raw write persists on the next save; Dirty only
+	-- makes that save prompt rather than the next autosave tick.
 	local function setTimed(entry: any, pathKey: string, value: number?)
 		local store = timedStore(entry)
 		if not store then
@@ -93,11 +91,10 @@ function Timed.new(ctx: any)
 		end
 		local tree = entry.Tree
 		-- Cross-tree check first: refuse while a transaction is open on another player.
-		-- RecordRawWrite below can only roll a raw timed write back for the tree that
-		-- owns the transaction, so on any other tree it is a no-op and the write would
-		-- outlive the rollback. Through Node's own check rather than a copy of it, so
-		-- the rule has one home. Level 4: AssertSameTreeWrite (1) -> setTimed (2) ->
-		-- the Timed entry point (3) -> its public caller (4).
+		-- RecordRawWrite below can only roll back for the tree that owns the transaction,
+		-- so on any other tree it is a no-op and the write would outlive the rollback.
+		-- Level 4: AssertSameTreeWrite (1) -> setTimed (2) -> the Timed entry point (3) ->
+		-- its public caller (4).
 		Node.AssertSameTreeWrite(tree, `{Template.RESERVED_ROOT}.Timed.{pathKey}`, 4)
 		-- Record the pre-write expiry so a rollback reverts it in lockstep with the
 		-- field's value; without it the value reverts but the timer does not, and a
@@ -118,10 +115,9 @@ function Timed.new(ctx: any)
 			accessor = accessor[segment]
 		end
 		-- node.Default is only the field's default when Resolve fully consumed the path.
-		-- For a field a newer template removed, Resolve stops at a surviving ancestor
-		-- whose Default is that whole container, and writing it into the removed
-		-- field's path would fabricate a phantom sub-table.
-		local node, dynStart = Template.Resolve(compiled, segments)
+		-- For a field a newer template removed, Resolve stops at a surviving ancestor whose
+		-- Default is that whole container, which would fabricate a phantom sub-table.
+		local node, dynStart = Template.Resolve(compiled, segments :: { string | number })
 		if dynStart <= #segments then
 			return accessor, nil
 		end
@@ -166,9 +162,8 @@ function Timed.new(ctx: any)
 		}
 	end
 
-	-- A once-guard: has this key been claimed, and is the claim still live? Separate
-	-- from OnCooldown, which re-arms on every use, because a claim must not be
-	-- re-armed by the act of checking it.
+	-- A once-guard: has this key been claimed, and is the claim still live? Separate from
+	-- OnCooldown, which re-arms on every use, because checking a claim must not re-arm it.
 	function self.IsClaimed(entry: any, key: string): boolean
 		local store = timedStore(entry)
 		if not store then
@@ -178,15 +173,12 @@ function Timed.new(ctx: any)
 		return type(deadline) == "number" and deadline > Clock.Now()
 	end
 
-	--- Drop the nearest-to-expiring claims under `prefix` until at most `cap - 1`
-	--- remain, so the caller's own claim lands inside the cap. Returns how many were
-	--- dropped, and how many are live afterwards.
-	---
-	--- Claims expire, but nothing bounds how many are live at once: with a seven-day
-	--- TTL every keyed purchase a player makes in a week rides in every save and is
-	--- walked by the 1 Hz sweep. Nearest-to-expiring goes first, since claims share a
-	--- TTL and that one's retry window is closest to over. It is still an eviction, so
-	--- the caller logs it loudly: a retry under a dropped claim applies again.
+	--- Drop the nearest-to-expiring claims under `prefix` until at most `cap - 1` remain,
+	--- so the caller's own claim lands inside the cap. Returns how many were dropped and
+	--- how many are live afterwards. Nothing else bounds the count: with a seven-day TTL
+	--- every keyed purchase a player makes in a week rides in every save and is walked by
+	--- the 1 Hz sweep. Nearest-to-expiring goes first, its retry window being closest to
+	--- over. Still an eviction, so the caller logs it: a retry under a dropped claim applies.
 	function self.PruneClaims(entry: any, prefix: string, cap: number): (number, number)
 		local store = timedStore(entry)
 		if not store then
@@ -205,7 +197,7 @@ function Timed.new(ctx: any)
 		if #live <= target then
 			return 0, #live
 		end
-		table.sort(live, function(a, b)
+		table.sort(live, function(a: { Key: string, At: number }, b: { Key: string, At: number })
 			-- Ties broken on the key so eviction is deterministic: two claims taken in
 			-- the same second are otherwise ordered by table layout.
 			if a.At == b.At then
@@ -216,8 +208,8 @@ function Timed.new(ctx: any)
 		local dropped = #live - target
 		for i = 1, dropped do
 			-- Through setTimed, so an open transaction rolls the eviction back with the
-			-- claim it made room for; otherwise a rolled-back purchase would still have
-			-- thrown away another claim's protection.
+			-- claim it made room for; a rolled-back purchase must not still cost another
+			-- claim its protection.
 			setTimed(entry, live[i].Key, nil)
 		end
 		return dropped, target
@@ -239,18 +231,16 @@ function Timed.new(ctx: any)
 		if type(existing) == "number" and existing > now then
 			return
 		end
-		-- clampSeconds for the finite ceiling: math.floor(inf) is inf, so a
-		-- PurchaseClaimTTL of math.huge would write an unserializable expiry into the
-		-- persisted dict, which the profile's guards read as unpersistable and then
-		-- refuse offline receipts forever.
+		-- clampSeconds for the finite ceiling: math.floor(inf) is inf, so a PurchaseClaimTTL
+		-- of math.huge writes an unserializable expiry that the profile's guards read as
+		-- unpersistable, refusing offline receipts forever.
 		setTimed(entry, pathKey, now + clampSeconds(seconds))
 	end
 	-- Keyed cooldowns: checks and, when off cooldown, arms it. Call it at the grant
 	-- moment only; PeekCooldown is the read-only check.
 	function self.OnCooldown(entry: any, key: string, seconds: number, options: any?): (boolean, number)
-		-- Zero or negative seconds means "no cooldown": report off-cooldown without
-		-- arming, since clampSeconds floors to 1 and would turn a computed 0 into a
-		-- real one-second gate.
+		-- Zero or negative seconds means "no cooldown": clampSeconds floors to 1 and would
+		-- turn a computed 0 into a real one-second gate.
 		if type(seconds) ~= "number" or seconds <= 0 then
 			return false, 0
 		end
@@ -268,10 +258,9 @@ function Timed.new(ctx: any)
 			return false, 0
 		end
 		local now = Clock.Now()
-		-- Both slots hold an absolute deadline in memory; only the copy the DataStore
-		-- receives carries the online one as remaining seconds. Check both slots, not
-		-- just this call's mode: a key holds one cooldown, so a caller that flips
-		-- IncludeOfflineTime mid-cooldown must be told it is still on it.
+		-- Both slots hold an absolute deadline in memory; only the copy the DataStore gets
+		-- carries the online one as remaining seconds. Check both, not just this call's
+		-- mode: a key holds one cooldown, so flipping the flag mid-cooldown still reports it.
 		for _, prefix in { COOLDOWN_PREFIX, ONLINE_PREFIX } do
 			local running = store[prefix .. key]
 			if running and now < running then
@@ -306,8 +295,7 @@ function Timed.new(ctx: any)
 
 	-- Clear a cooldown (support/testing resets).
 	function self.ClearCooldown(entry: any, key: string)
-		-- The reserved check matters most here: clearing a purchase idempotency claim
-		-- is exactly what lets a retry apply the same purchase a second time.
+		-- The reserved check matters most here; see RESERVED_KEY_PREFIX.
 		checkPublicKey(key, "cooldown")
 		if timedStore(entry) then
 			setTimed(entry, COOLDOWN_PREFIX .. key, nil)
@@ -316,10 +304,9 @@ function Timed.new(ctx: any)
 	end
 
 	-- Clear lapsed entries. Timed fields reset to their template default, which fires
-	-- Changed and replicates, so a client Observe covers expiry with no separate
-	-- event. `notify` gates OnCooldownEnded; the load sweep passes false, because
-	-- those cooldowns lapsed while the player was away and listeners are not attached
-	-- yet.
+	-- Changed and replicates, so a client Observe covers expiry with no separate event.
+	-- `notify` gates OnCooldownEnded; the load sweep passes false, since those lapsed while
+	-- the player was away and no listener is attached yet.
 	local function sweepEntry(entry: any, notify: boolean?)
 		local store = timedStore(entry)
 		if not store or not entry.Tree or entry.Tree.Dead then
@@ -379,17 +366,14 @@ function Timed.new(ctx: any)
 		end
 	end
 
-	-- Online-only cooldowns are deadlines in memory and remaining seconds on disk, so
-	-- every read works as it does for a wall-clock one. Converting on every save
-	-- rather than only on leave makes a crash safe: whatever the DataStore caught is
-	-- already a remaining, so the worst case is a cooldown that resumes slightly long.
-	--
-	-- The conversion goes into a copy the profile carries for the save, while the live
-	-- deadlines move to entry.TimedLive. Converting the shared table in place would
-	-- leave every reader on remaining seconds for the whole round trip: a live
-	-- cooldown would read as a 1970 deadline, Peek and OnCooldown would report it
-	-- expired, and the sweep would delete it.
-	function self.BeforeSave(entry: any)
+	-- Online-only cooldowns are deadlines in memory and remaining seconds on disk, so every
+	-- read works as it does for a wall-clock one. Converting on every save rather than only
+	-- on leave makes a crash safe: whatever the DataStore caught is already a remaining, so
+	-- the worst case is a cooldown that resumes slightly long. The conversion goes into a
+	-- copy the profile carries for the save, while the live deadlines move to
+	-- entry.TimedLive; converting the shared table in place would make a live cooldown read
+	-- as a 1970 deadline for the whole round trip, and the sweep would delete it.
+	function self.BeforeSave(entry: any): { [string]: number }?
 		local store = timedStore(entry)
 		if not store then
 			return nil
@@ -406,9 +390,8 @@ function Timed.new(ctx: any)
 			end
 		end
 		entry.TimedLive = store
-		-- ProfileStore task.spawns every save and holds no per-profile lock, so an
-		-- autosave tick can start while a Data.Flush is still in flight; count the
-		-- open windows rather than assuming one.
+		-- ProfileStore task.spawns every save and holds no per-profile lock, so an autosave
+		-- tick can start while a Data.Flush is in flight; count the open windows.
 		entry.TimedSaves = (entry.TimedSaves or 0) + 1
 		local reserved = entry.LiveData and entry.LiveData[Template.RESERVED_ROOT]
 		if type(reserved) == "table" then
@@ -422,15 +405,12 @@ function Timed.new(ctx: any)
 			return
 		end
 		-- Only the last save out closes the window. Restoring while another is still in
-		-- flight would point the profile back at the live deadlines, and that save
-		-- would serialize them as remaining seconds: a rejoin then turns 1.78e9
-		-- "remaining" into a deadline decades away, re-minted by every later save.
+		-- flight would point the profile back at the live deadlines, and that save would
+		-- serialize them as remaining seconds: a rejoin then turns 1.78e9 "remaining" into
+		-- a deadline decades away, re-minted by every later save.
 		--
-		-- A failed save never fires OnAfterSave, so its count is never given back and
-		-- the window stays open for the session. That is inert: timedStore still hands
-		-- out the live table and BeforeSave rebuilds the persisted copy every save.
-		-- Closing it from the failure path is not possible, because ProfileStore cannot
-		-- say which call failed.
+		-- A failed save never fires OnAfterSave, so the window stays open for the session.
+		-- That is inert, and ProfileStore cannot say which call failed anyway.
 		local remaining = (entry.TimedSaves or 1) - 1
 		entry.TimedSaves = math.max(0, remaining)
 		if remaining > 0 then
@@ -485,9 +465,12 @@ function Timed.new(ctx: any)
 	-- against a half-constructed context.
 	function self.Start()
 		sweepThread = Sched.Spawn(function()
+			-- Its own long-lived thread, so what it allocates is attributable. Scribe's own
+			-- background work only: an accessor write runs on the game's calling thread and
+			-- stays under the game's category.
+			Profile.MemoryCategory("Scribe")
 			while not stopped do
-				-- Jittered so every server in the place does not sweep on one shared
-				-- metronome tick.
+				-- Jittered so every server in the place does not sweep on one tick.
 				Clock.Wait(Rng.Jitter(SWEEP_INTERVAL))
 				local persistence = ctx.Persistence
 				if persistence then
@@ -501,9 +484,9 @@ function Timed.new(ctx: any)
 		end)
 	end
 
-	-- Release the sweep so the bundle can be discarded. The flag alone would leave the
-	-- thread parked in task.wait for up to SWEEP_INTERVAL, so many bundles in one
-	-- process (a multi-server simulation, or the test harnesses) would pile up.
+	-- Release the sweep so the bundle can be discarded. The flag alone leaves the thread
+	-- parked in task.wait for up to SWEEP_INTERVAL, so many bundles in one process (a
+	-- multi-server simulation, or the test harnesses) would pile up.
 	function self.Stop()
 		if stopped then
 			return

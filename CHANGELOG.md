@@ -1,5 +1,306 @@
 # Changelog
 
+## 2.1.0
+
+Released 2026-08-28.
+
+This release adds exchanges: two players who are both loaded on the same server hand over two baskets
+of value, and one verdict decides both sides, so nothing is duplicated or destroyed. It also adds
+`Data.PromptPurchase`, confirms a finished game pass purchase before crediting it, and adds the
+measurements a game needs to tell what Scribe costs it in a running server. Scribe's reserved root
+gained two subkeys for the exchange ledger, which changes the schema hash the two realms compare
+during the handshake, so the server and the client must be deployed together, even by a game that
+declares nothing exchangeable. The largest fix is that a generalized `for` loop over an accessor used
+to empty the container it was reading.
+
+### Behaviour changes
+
+- Scribe's reserved `_Scribe` root gained two subkeys, `Exchange` for a trade while it is in flight
+  and `ExchangeInbox` for value that has settled to a player but has not been delivered onto a game
+  path yet. Both realms fold that root into the schema hash they compare during the handshake, so a
+  client built from 2.0.0 and a server built from 2.1.0 derive different hashes, the server logs
+  `SCHEMA_MISMATCH` and refuses to replicate to that client. Deploy the server and the client
+  together. The wire protocol version itself is unchanged, so on a mixed deploy the server loads and
+  saves normally while the player's client copy of the data never arrives and stays at template
+  defaults.
+
+- The `ResetData` option now refuses to wipe a profile that holds an in-flight or undelivered
+  exchange. The load reports `EXCHANGE_RESET_REFUSED` at Error, naming how many of each the profile
+  holds, and leaves the stored data as it was. Resolve or discard the exchange first, because the
+  wipe would take the reserved root with it, and with it the only record that the staked value ever
+  existed.
+
+- `Data.RestoreVersion` now returns false with a reason, and logs `PROFILE_RESTORE_FAIL`, while the
+  profile holds an in-flight or undelivered exchange, whatever `RollBackReserved` is set to. A
+  restore rolls game data back and deliberately keeps the live reserved root, which for an exchange
+  is wrong in both directions: it can leave a stake sitting in the inventory and in escrow at once,
+  or take an item back out from under a delivery that has already been cleared. The exchange has to
+  reach a terminal state first.
+
+- A finished game pass purchase is now confirmed with an ownership check before anything is credited.
+  `PromptGamePassPurchaseFinished` reports that the purchase dialog closed rather than that a
+  transaction completed, and a game pass has no `ProcessReceipt` to be authoritative, so an
+  unconfirmed close used to write a permanent Robux purchase-log entry for money that may never have
+  been spent. A check that does not confirm the purchase now credits nothing, writes no purchase-log
+  entry and logs `PASS_PURCHASE_UNCONFIRMED`, and a genuine purchase the ownership API has not caught
+  up with has the player's ownership restored on their next load, because the join scan re-resolves
+  every declared pass. The check yields, so ownership is credited once it returns rather than in the
+  same frame the purchase signal fires.
+
+- A name declared in both `Products` and `Passes` now fails to boot. A prompt resolves by name, so
+  the same name in two tables would leave table order deciding what the player is charged for. Rename
+  one of them.
+
+- An `OnPlayerInit` hook is handed the profile data directly, before the accessor tree that refuses
+  reserved writes exists, so that hook and a `Scribe.Dynamic` factory are the one place Scribe's
+  in-flight exchange ledger is reachable. A change either one makes to that ledger is now put back
+  and reported as `EXCHANGE_INIT_TAMPER` at Error, which is what a starter kit clearing `_Scribe` to
+  start clean looks like. Only the exchange ledger is put back: receipts, perks and the rest of that
+  root are not.
+
+### Added
+
+- `Data.Exchange.Attempt` moves value between two players who are both loaded on the same server.
+  Each side hands over a basket of legs naming what that player gives, both baskets are staked out of
+  the two profiles, and one verdict key decides the whole exchange, so every participant, on every
+  server and on every retry, reads the same answer. Nothing is duplicated or destroyed, but the
+  resolution is deliberately not time bounded: an exchange interrupted at the wrong moment finishes
+  on a later load or on the periodic sweep, and until then the staked value sits where the game can
+  still show it to the player. A profile may hold only one exchange at a time.
+
+- The new `Exchangeable` option is the allowlist of what a game may exchange, and nothing outside it
+  can be traded. Each entry names a `Path` and a `Kind`, and a path may name a field or a container
+  but may never reach through a container into one of its entries. The list says which kinds of thing
+  may move, never whether one particular item may, so ownership and any untradeable marker of your
+  own are still yours to check.
+
+- An exchange basket is a list of legs, and a leg is one of three kinds. A `Key` leg moves one whole
+  entry of a `DictOf`, `MapOf`, `SetOf` or `ArrayOf`. A `Qty` leg moves an `Amount` off a balance,
+  which must be a `Scribe.Int` field declaring a `Min`. A `Stack` leg moves part of one entry of a
+  `DictOf` or `MapOf`, splitting the count held on that entry and leaving the rest of it behind.
+
+- A `Stack` declaration names `Count`, the element field holding how many, and must then classify
+  every other field the element declares: `Identity` for a field that travels with both halves of a
+  split, `Ignore` for one that does not travel at all. A field in neither fails the game at boot and
+  is named. A split duplicates whatever it does not drop, and nothing at runtime can tell a
+  duplicated tag from a minted resource, because the count itself is exactly conserved either way. An
+  element that is a bare number is the one shape with nothing to declare, because the stored value is
+  the count.
+
+- A declaration Scribe cannot move safely fails the game at boot, naming the entry, and is logged as
+  `EXCHANGE_REGISTRATION_REFUSED`. Refused at startup: a misspelled path, which would otherwise
+  resolve to a parent and exchange a field nobody named; a path that reaches through a container,
+  because crediting a key the receiver does not hold would seed the whole element from its defaults;
+  a quantity on a container, on a `Scribe.Number`, on a `Scribe.Big`, on a `Scribe.Optional` or on a
+  field declaring no `Min`; a `Scribe.Flags` or a derived field; a non-persisted root; a
+  `Scribe.Timed` field or an `Evict` container anywhere in the subtree; and anything under Scribe's
+  reserved `_Scribe` root.
+
+- Every leg of both baskets is checked against the `Exchangeable` declarations, by path and by kind,
+  before a slot is claimed or any value moves. A basket may therefore be built straight from what a
+  client asked for: an undeclared path, an undeclared kind or a malformed leg produces a refusal that
+  costs the players nothing and leaves nothing behind.
+
+- `Data.Exchange.Open` reports what one player still has in flight: an entry per exchange carrying
+  `Id`, a `State` of `Claimed`, `Staked` or `Delivering`, the `Partner` UserId, `Staked` for what
+  they handed over, `Owed` for what they are owed, and `Since`. Staked value leaves the balance on
+  purpose and resolution is not time bounded, so this is what a game shows a player whose exchange
+  has stalled: without it their items simply look to them like they vanished. Every table it hands
+  back is freshly built and aliases nothing Scribe holds, so it is safe to keep or mutate.
+
+- `Data.Exchange.Discard`, `Data.Exchange.Settle` and `Data.Exchange.Redirect` are operator verbs for
+  an exchange the automatic machinery cannot finish, and all three act on profiles loaded on the
+  server they are called from. `Discard` drops an abandoned claim that never took value, and refuses
+  an exchange that already has a verdict or that holds escrowed value. `Settle` forces `Commit` or
+  `Abort` on one that cannot resolve itself, has no default verdict, and refuses a `Commit` when only
+  one side is loaded or when a side holds escrow with no take recorded. `Redirect` lands a parked
+  delivery on a different key of the same container, and refuses a set, where the key is the value,
+  and a parked delivery holding more than one key leg.
+
+- `Data.PromptPurchase` prompts a player to buy a declared product or pass for themselves, by the
+  name you gave it rather than its numeric Id. The name resolves against `Products` and `Passes`, and
+  Scribe makes the matching engine call, so a shop button does not have to know which table an item
+  lives in. It refuses something the player already owns, so a caller does not have to pair every
+  prompt with its own `Data.Owns` check; a product with no `Grants` is a consumable, has nothing to
+  own, and always prompts. An unknown name, a player whose data is not loaded, something the player
+  already owns and a prompt the engine refused all come back as `(false, reason)` rather than
+  raising. Prompting is all it does, and for a product the grant still happens on the receipt, so a
+  player who buys and then leaves is granted on their next load.
+
+- The new `LoadDuration` metric records how long a profile took to become ready, in seconds, and
+  reads through `Scribe.GetMetrics` and `Scribe.GetPercentiles` like any other distribution. It is
+  measured from the moment the player joined rather than from the DataStore call, so it covers the
+  queue, the retries and the migration chain, which is what the player actually waited through. A
+  load taking ten seconds or longer also warns as `SLOW_LOAD`, naming the player and how long it
+  took. That threshold is fixed and sits well below `LoadTimeout`, so it reports joins that are
+  merely slow rather than only the ones that end in a kick.
+
+- An attempt answers `Committed`, `Aborted`, or nil with a reason. An `Aborted` exchange is a
+  finished operation rather than a failure left to clean up: every basket has been returned to its
+  owner. A nil is one of two things, and the reason says which. Either the exchange was refused
+  before anything moved, which is by far the common case and costs the players nothing, or no verdict
+  could be established, in which case the value is in escrow and the exchange resolves itself on a
+  later load or on the sweep.
+
+- The refusals that cost nothing are a player exchanging with themselves, two empty baskets, a player
+  who already has an exchange in flight, a player who is not loaded on this server, and a player
+  already holding eight undelivered exchanges, which is the cap. An attempt also carries a deadline
+  of about twenty seconds: one that reaches it aborts rather than going on to commit, and every
+  basket comes back to its owner.
+
+- An exchange interrupted part way resolves itself the next time either profile loads, and a
+  background sweep does the same for sessions that never end. `EXCHANGE_RESOLVED` records each
+  exchange that reaches a terminal state, `EXCHANGE_UNRESOLVED` reports one that cannot, and
+  `EXCHANGE_PARKED` reports a settled exchange whose delivery has nowhere to land, which is the
+  condition `Data.Exchange.Redirect` exists for. The last two are announced once per exchange per
+  server rather than on every sweep.
+
+- A delivery that cannot be applied parks in the receiving player's inbox and is retried on every
+  load and on the sweep, rather than being clamped, evicted or dropped. That covers a container at
+  its cap, a destination key already occupied, and for a `Stack` leg a merge that would pass the
+  count's `Max` or land on an entry whose other fields do not match the one being delivered.
+
+- `Ignore` works on a `Key` leg as well, for a field that describes the owner's relationship to an
+  item rather than the item, such as a locked marker. The field is dropped where the item is staked,
+  the one point at which the giver's copy is still readable, and the receiver's copy starts from the
+  element's declared default. An ignored field is destroyed in transit rather than held, escrowed or
+  returned by an abort, so nothing that represents value belongs in it. Listing fields is optional on
+  a `Key` leg: one left unlisted simply travels, which is always conserving.
+
+- Moving a whole stack is the same `Stack` leg with `Amount` equal to what is held, and it removes
+  the key outright rather than leaving a zero count entry the player still appears to own, so a
+  container that stacks does not need a `Key` declaration as well. Where the count declares a `Min`,
+  a partial move that would leave either half below that floor is refused before anything moves, and
+  that includes the half being moved, not only the remainder.
+
+- `Scribe.ExchangeLeg`, `Scribe.OpenExchange` and `Scribe.OpenLeg` are exported types, so a basket
+  you build and the entries `Data.Exchange.Open` hands back both type-check. The `LogCode` union
+  gained eight exchange codes alongside `SLOW_LOAD` and `PASS_PURCHASE_UNCONFIRMED`, and
+  `LogCategory` gained `Exchanges`.
+
+- A bundle whose `Mode` is `Mock` or `NoSave` serves the exchange verdict from memory under the same
+  first writer wins contract, so an exchange resolves the same way in Studio as it does in
+  production. A server that cannot reach the verdict store logs `EXCHANGE_STORE_UNAVAILABLE` and
+  refuses attempts rather than falling back to a store no other server can see.
+
+- The new `FlushDuration` metric records what one frame of replication cost, in seconds, and reads
+  through `Scribe.GetMetrics` and `Scribe.GetPercentiles`. Nothing is recorded for a frame that
+  flushed nothing, so the distribution describes busy frames rather than the average frame, and the
+  existing `FlushEntriesPerFrame` and `FlushQueuedPerFrame` counts still say how much work there was.
+
+- A frame of replication now appears in the MicroProfiler under a single label, `Scribe.Flush`,
+  covering the flush across every player in that frame. It is the only label Scribe adds, because a
+  profiler annotation does not survive a yield: work that waits, such as a profile load or a
+  migration you wrote, is reported through a metric instead.
+
+- Scribe's own long-lived threads now report their allocations under a `Scribe` memory category in
+  the Developer Console, covering the profile load, the leaderboard refresh and write pacer loops,
+  the timed sweep and the exchange sweep. Roblox charges an allocation to the thread that is running,
+  so a write your own code makes stays under your own category: the tag shows what Scribe does on its
+  own rather than the total cost of the data layer.
+
+- The stack declarations are refused at boot on the same terms: a `Stack` on a `SetOf` or `ArrayOf`,
+  neither of which has a keyed stack to split; a `Count` naming a field that is not a `Scribe.Int`
+  declaring a `Min`; a `Count` that is also ignored; a name in `Count`, `Identity` or `Ignore` that
+  the element does not declare; a field listed in both `Identity` and `Ignore`; a container field
+  listed in `Identity`, where a split would duplicate the whole collection; `Ignore` on a quantity
+  leg; and `Count` or `Identity` on a leg that is not a `Stack`.
+
+- Each exchange writes one key to a DataStore named `ClaimExchangeVerdicts`. The first writer wins
+  and every later proposal reads that answer back rather than overwriting it, and Scribe never
+  deletes one, because deleting a verdict can only be justified by knowing both sides settled and a
+  settled side can still revert. Budget for one key per exchange.
+
+- An exchange in flight locks nothing. Neither profile is frozen and no write is refused, so both
+  players carry on playing throughout, and the only thing either of them can observe is that what
+  they staked has left their data until the exchange settles.
+
+- The new `PassPurchasesUnconfirmed` metric counts finished game pass purchases that the ownership
+  check would not confirm, and the new `PurchasePrompts` metric counts the prompts
+  `Data.PromptPurchase` opened. Both are reported by `Scribe.GetMetrics`.
+
+- `Scribe.Short` renders a quantity the way a player reads it, as `1.5K` or `100M`, and takes either
+  a plain number or a `Scribe.Big` value, so a balance label no longer has to branch on which numeric
+  type the field happens to be declared as. `Scribe.SetShortSuffixes` replaces the suffix table it
+  and a big value's `Short` method render with, for a game whose convention past `T` is not Scribe's
+  `Qa`, `Qi`, `Sx`. The list must be non-empty, every entry must be a string, and the first entry
+  must be the empty string, because that is the tier a plain number renders in. It applies to every
+  later render in the realm that calls it, so call it once at startup, and on the client too if the
+  client formats its own labels.
+
+### Fixed
+
+- A generalized `for` loop over an accessor, as in `for key, entry in data.Inventory do`, emptied the
+  container it was meant to read. An accessor carried no iterator, so Luau fell back to calling it,
+  and that call reached `Set` with a nil value and deleted the node. The loop body never ran, so the
+  whole statement read as a harmless no-op while the deletion replicated and saved. Iterating an
+  accessor now raises, and the error names `Get` for a read-only walk and `Clone` for a table you may
+  edit. Calling a node with two nil arguments is refused for the same reason, while a deliberate
+  `Set(nil)` with one argument still clears the value.
+
+- A save that handed its session to another server part way through was reported as having failed,
+  even though its bytes had already reached the key. When another server starts a session for a
+  profile this one still holds, which is what a teleport or a quick rejoin produces, it requests a
+  force load, and the save that noticed the request released the session without recording that its
+  own write had landed. `Data.Flush` returned false for data that was on disk, and the receipt path
+  reads that same answer before it decides whether to report `PurchaseGranted`.
+
+- In `DevMode`, `UNDECLARED_PERK` warned about a product whose `Grants` names a declared pass, and
+  about that same name passed to `Data.GrantPerk`. A game pass cannot be transferred, so granting a
+  perk of the pass's own name is how a gift confers it, and `Data.Owns` already answers across both
+  namespaces. A declared pass name is now accepted in both places without a warning.
+
+### Changed
+
+- The `PROFILE_LOADED` log entry now carries `LoadSeconds`, the time between the player joining and
+  their data being ready, so a sink added with `Scribe.AddLogSink` can attribute one slow join
+  without reading the metric.
+
+### Documentation
+
+- A new guide, Exchange, covers moving value between two players who are both loaded on the same
+  server: what an exchange promises and what it deliberately does not, the three leg kinds, declaring
+  `Count`, `Identity` and `Ignore` on a stack, why the allowlist answers whether a kind of thing may
+  move and never whether this particular item may, what a player sees while an exchange is in flight,
+  and the three operator verbs, including why `Settle` refuses to guess a verdict. It also gives the
+  rule that a listener on an exchangeable path must not yield, because container listeners fire
+  inside the transaction the exchange runs in and a yield rolls it back.
+
+- A new guide, What It Costs, covers measuring Scribe in a running game rather than guessing: the
+  `LoadDuration`, `SaveDuration`, `FlushDuration` and `ProfileSize` distributions and why the p99 is
+  the number to read, the `SLOW_LOAD` and `PROFILE_SIZE` warnings, `Scribe.GetStatus` and
+  `Scribe.GetBudgetSnapshot`, what the single `Scribe.Flush` MicroProfiler label and the `Scribe`
+  memory category do and do not cover, and what Scribe deliberately does not measure.
+
+- The configuration guide gained an Exchanging section covering the new `Exchangeable` option and
+  every field of a leg spec: `Path`, `Kind`, `Count`, `Identity` and `Ignore`. It states that an
+  ignored field is destroyed in transit rather than escrowed, and that a `Stack` element field named
+  in neither `Identity` nor `Ignore` refuses to start and names the field. It points at the Exchange
+  guide for the full list of shapes Scribe will not let you declare exchangeable, each with the
+  reason it cannot be moved safely.
+
+- The monetization guide no longer teaches prompting a sale with a numeric product id. It now teaches
+  `Data.PromptPurchase`, which takes the name you declared, resolves it across both `Products` and
+  `Passes`, refuses something the player already owns, and answers `(false, reason)` rather than
+  raising. A new section explains that a finished game pass purchase is confirmed with an ownership
+  check before anything is credited, that a genuine purchase the ownership API has not caught up with
+  is credited on the player's next load, and that a name declared in both tables fails at startup.
+  `PASS_PURCHASE_UNCONFIRMED` is written up alongside the other monetization log codes.
+
+- The cross key transactions decision table now sends a two sided trade to the Exchange guide for two
+  players on one server, where it previously said nothing covered that case. The log code reference
+  gained a matching Exchange section for the eight `EXCHANGE_` codes, which record where an in flight
+  exchange currently is rather than any loss of value, and gained rows for `SLOW_LOAD` and
+  `PASS_PURCHASE_UNCONFIRMED`.
+
+- The containers guide now warns that a container listener which yields closes the thread of any open
+  transaction and rolls that whole transaction back, including the write that fired the listener, and
+  that the error names the transaction body rather than the listener, so the file you go looking in
+  is the wrong one. A listener that raises instead is logged while the transaction still commits.
+
+- The documentation build now fails when a guide calls a `Scribe.` member the package does not
+  export, so a guide can no longer teach an entry point that does not exist.
+
 ## 2.0.0
 
 Released 2026-08-24.

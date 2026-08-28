@@ -1,17 +1,13 @@
 --!strict
--- Checks a stored profile against the compiled template. Read-only and free of
--- policy: it reports violations, and Persistence alone decides what one costs.
+-- Checks a stored profile against the compiled template. Read-only and free of policy:
+-- it reports violations, and Persistence alone decides what one costs. The walk is
+-- data-driven, not schema-driven: walking the schema would flag every field a profile
+-- predates, which Reconcile backfills moments later.
 --
--- The walk is data-driven, not schema-driven. Walking the schema would flag every
--- field a profile predates, which Reconcile backfills moments later; walking the
--- data finds values that are the wrong shape, which is what corruption looks like.
---
--- Stored form is not read form for three value types, and checking the read form
--- would reject every healthy profile:
+-- Stored form is not read form for three value types, and checking the read form would
+-- reject every healthy profile:
 --   datatype  a packed buffer, not a CFrame/Vector3/...
---   big       a {mantissa, exponent} pair, not a number. Its Min/Max are ordered
---             with Big.compare, not `<`, because a bound past the double range can
---             only be written as a numeric string.
+--   big       a {mantissa, exponent} pair, not a number
 --   flags     a sorted array of member-name strings, not a set
 
 local Big = require(script.Parent.Big)
@@ -39,15 +35,14 @@ export type Kind =
 --- Advisory: report it, but never end a session over it, not even under
 --- SchemaPolicy = "Reject". Set on the six container findings and nothing else.
 ---
---- A flag rather than a `Kind`, because `Kind` says what is wrong and this says
---- what policy applies: "OverMaxLength" covers both a string past `MaxLength`,
---- which rejects, and a container past `MaxItems`, which advises.
+--- A flag rather than a `Kind`, because `Kind` says what is wrong and this says what
+--- policy applies: "OverMaxLength" covers both a string past `MaxLength`, which
+--- rejects, and a container past `MaxItems`, which advises.
 ---
---- The mixed array/hash table is the one container finding that is not advisory:
---- it fails the DataStore save of the whole profile, so ending the session
---- preserves data that would otherwise be lost silently. The rest save fine (JSON
---- stores a sparse array as an object) and ordinary gameplay code can produce
---- them, so kicking over one strands the player on every rejoin.
+--- The mixed array/hash table is the one container finding that is not advisory: it
+--- fails the DataStore save of the whole profile, so ending the session preserves data
+--- that would otherwise be lost silently. The rest save fine and ordinary gameplay code
+--- can produce them, so kicking over one strands the player on every rejoin.
 export type Violation = {
 	Path: { string | number },
 	Kind: Kind,
@@ -206,11 +201,10 @@ end
 
 --- Does this table mix array indices with string keys?
 ---
---- Runs on every table the walk reaches, not just declared containers: JSON has no
---- encoding for the shape, so one mixed table fails the save of the whole profile,
---- opaquely and far from whatever wrote it. The write path refuses it, but data
---- from the datastore, a migration, an UpdateOffline draft or an OnPlayerInit hook
---- never passed through there.
+--- Runs on every table the walk reaches, not just declared containers: JSON cannot
+--- encode the shape, so one mixed table fails the save of the whole profile, opaquely
+--- and far from whatever wrote it. The write path refuses it, but datastore data,
+--- migrations, UpdateOffline drafts and OnPlayerInit hooks never passed through there.
 local function mixesKeyTypes(value: { [any]: any }): boolean
 	local hasNum, hasStr = false, false
 	for key in value do
@@ -226,15 +220,14 @@ end
 
 --- Container shape and caps, for a node that declares one.
 ---
---- The write path tolerates a container already over cap in storage and refuses
---- only growth past the stored size, since a rolling deploy can put a newer
---- server's larger container in front of an older server's lower cap. This check
---- has no stored size to compare against: it is the stored size. So it reports an
---- over-cap container even though a write to it would be allowed, and that is why
---- every finding here is advisory. See the note on Violation.Advisory.
+--- The write path tolerates a container already over cap in storage and refuses only
+--- growth past the stored size, since a rolling deploy can put a newer server's larger
+--- container in front of an older server's lower cap. This check has no stored size to
+--- compare against: it is the stored size. It therefore reports an over-cap container
+--- that a write would be allowed to make, so every finding here is advisory.
 ---
---- `Container` is nil on untyped bags: an undeclared `{}` has no key shape and no
---- caps, and measuring it would report every bag that happens to hold an array.
+--- `Container` is nil on untyped bags: an undeclared `{}` has no key shape and no caps,
+--- and measuring it would report every bag that happens to hold an array.
 local function checkContainer(walk: Walk, node: Template.SchemaNode, value: any, path: { string | number })
 	local container = node.Container
 	if container == nil then
@@ -332,12 +325,10 @@ local function walkNode(walk: Walk, node: Template.SchemaNode, value: any, path:
 
 	-- Dispatch on what the field is, not on what its default happened to be. `Kind`
 	-- records only whether the declared default was a table, and it disagrees with
-	-- `ValueType` in two places, both of which reported healthy profiles as corrupt:
-	--
+	-- `ValueType` in two places that reported healthy profiles as corrupt:
 	--   flags  defaults to `{}`, so Kind is "table", but the stored form is an array
 	--          of member names.
-	--   any    the child ChildSchema synthesises for an undeclared key carries no
-	--          schema, which is what makes untyped bags work.
+	--   any    the child ChildSchema synthesises for an undeclared key carries no schema.
 	if node.Kind == "leaf" or node.ValueType == "flags" or node.ValueType == "any" then
 		checkLeaf(walk, node, value, path)
 		return
@@ -369,9 +360,8 @@ local function walkNode(walk: Walk, node: Template.SchemaNode, value: any, path:
 		local childSchema = Template.ChildSchema(node, key)
 		table.insert(path, key)
 		if childSchema == nil then
-			-- Only reachable on a Closed record. Everywhere else ChildSchema
-			-- synthesises an `any` child, which is what makes untyped bags work, so
-			-- an unknown key is undetectable outside a closed shape.
+			-- Only reachable on a Closed record: everywhere else ChildSchema synthesises
+			-- an `any` child, so an unknown key is undetectable outside a closed shape.
 			record(walk, path, "UnknownKey", `"{tostring(key)}" is not declared on this record`)
 		else
 			walkNode(walk, childSchema, child, path, depth + 1)

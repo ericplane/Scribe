@@ -16,9 +16,9 @@ export type Op = {
 export type ScribeTransport = {
 	Name: string,
 	-- The largest buffer this channel wants handed to it in one call. Read once at
-	-- construction, and it wins over MaxOutboundBytes only when it is smaller, so
-	-- declaring one can never raise a game's configured budget. Declare it when the
-	-- adapter's own framing changes the arithmetic, such as base64 inflating by 4/3.
+	-- construction, and it wins over MaxOutboundBytes only when it is smaller, so it
+	-- can never raise a game's configured budget. Declare it when the adapter's own
+	-- framing changes the arithmetic, such as base64 inflating by 4/3.
 	MaxFrameBytes: number?,
 	-- Server
 	SendToClient: (self: any, player: Player, bytes: buffer) -> (),
@@ -41,6 +41,7 @@ export type LogCategory =
 	| "Integrity"
 	| "Lifecycle"
 	| "Derived"
+	| "Exchanges"
 
 export type LogCode =
 	-- Persistence
@@ -70,6 +71,7 @@ export type LogCode =
 	| "PROFILE_RESTORE_FAIL"
 	| "RESTORE_RESERVED_PRESERVED"
 	| "PROFILE_SIZE"
+	| "SLOW_LOAD"
 	| "SAVE_WAIT_TIMEOUT"
 	| "PROFILE_STORE_ERROR"
 	| "PROFILE_STORE_SIGNAL_MISSING"
@@ -142,6 +144,7 @@ export type LogCode =
 	| "GRANT_SEEDED_ELEMENT"
 	| "RECEIPT_IN_FLIGHT"
 	| "OWNERSHIP_CHECK_FAIL"
+	| "PASS_PURCHASE_UNCONFIRMED"
 	| "PERK_GRANTED"
 	| "PERK_REVOKED"
 	| "PURCHASE_DUPLICATE"
@@ -188,6 +191,15 @@ export type LogCode =
 	| "LB_WRITE_DROPPED"
 	| "LB_WRITE_FAIL"
 	| "SIM_LB_FLUSH"
+	-- Exchanges
+	| "EXCHANGE_INIT_TAMPER"
+	| "EXCHANGE_PARKED"
+	| "EXCHANGE_REGISTRATION_REFUSED"
+	| "EXCHANGE_RESET_REFUSED"
+	| "EXCHANGE_RESOLVED"
+	| "EXCHANGE_RESOLVE_ERROR"
+	| "EXCHANGE_STORE_UNAVAILABLE"
+	| "EXCHANGE_UNRESOLVED"
 	-- Derived
 	| "DERIVED_ERROR"
 	| "DERIVED_FEEDBACK"
@@ -235,14 +247,12 @@ export type LifecycleReason =
 	| "still-loading" -- the wait elapsed while the load was still in flight, and may yet succeed
 	| "timeout" -- the wait elapsed and Scribe has no session for this player at all
 
--- The fixed reasons Scribe itself answers a Client.Request with.
---
--- A command handler may return any (false, string) of its own, so a caller types
--- the second return as `string?` and treats a non-member as a handler message.
--- A member is not proof of a framework refusal though: a handler can return
--- `false, "timeout"` byte-identically. RequestFailed at the bottom of this file,
--- appended as a third value to every refusal here, is the attribution; this union
--- is only the vocabulary.
+-- The fixed reasons Scribe itself answers a Client.Request with. A handler may
+-- return any (false, string) of its own, so a caller types the second return as
+-- `string?` and treats a non-member as a handler message. Membership is not proof of
+-- a framework refusal either: a handler can return `false, "timeout"`
+-- byte-identically. RequestFailed at the bottom of this file, appended as a third
+-- value to every refusal here, is the attribution; this union is only the vocabulary.
 export type RequestReason =
 	"rate-limited" -- over CommandRateLimit; the handler never ran
 	| "not-ready" -- the caller's profile is not Ready
@@ -256,10 +266,8 @@ export type RequestReason =
 	| "edit-mode" -- client-side: not running, and no MockCommand is registered
 	| "mock-error" -- client-side: edit mode, and the MockCommand handler threw
 
--- The fixed refusals of Data.Purchase.
---
--- A Grant that throws passes the transaction's own error text through instead, so
--- this is not exhaustive over the second return either.
+-- The fixed refusals of Data.Purchase. A Grant that throws passes the transaction's
+-- own error text through instead, so this is not exhaustive over the second return.
 export type PurchaseReason =
 	"player data not loaded"
 	| "invalid Cost spec"
@@ -271,11 +279,11 @@ export type PurchaseReason =
 -- The fixed refusals of Data.PromptGift. Two more are interpolated (`unknown
 -- product "<name>"` and `purchase prompt failed: <err>`) and cannot be members.
 --
--- "could not deliver gift" and the unconfirmed one below it are not synonyms and
--- must not be collapsed in a UI. The first means the gift did not go out and the
--- buyer's credit is back. The second means the write may have committed with its
--- answer lost, so a retry would mint a fresh gift id the recipient's dedupe cannot
--- recognise and grant twice off one payment.
+-- "could not deliver gift" and "gift delivery could not be confirmed" must not be
+-- collapsed in a UI: the first means the gift did not go out and the buyer's credit
+-- is back, the second means the write may have committed with its answer lost, so a
+-- retry would mint a fresh gift id the recipient's dedupe cannot recognise and grant
+-- twice off one payment.
 export type GiftReason =
 	"buyer data not loaded"
 	| "invalid recipient"
@@ -405,17 +413,16 @@ export type EconomyConfig = {
 
 export type Disconnect = () -> ()
 
--- The marker Client.Request appends to every refusal that is Scribe's rather than
--- a handler's. Declared here so both realms share one identity: src/init.luau
--- re-exports it as Scribe.RequestFailed, and src/Client/init.luau returns this
--- exact table.
+-- The marker Client.Request appends to every refusal that is Scribe's rather than a
+-- handler's. Declared here so both realms share one identity: src/init.luau
+-- re-exports it as Scribe.RequestFailed, and src/Client/init.luau returns this exact
+-- table.
 --
--- Identity rather than a string is the whole mechanism: Wire.EncodeGeneric
--- serialises tables by value and has no representation for a reference, so nothing
--- a handler returns can decode to this table. A boolean or a string in the same
--- slot would be forgeable in one line of game code.
---
--- Frozen because it is a module singleton shared by every bundle in the process.
+-- Identity rather than a string is the mechanism: Wire.EncodeGeneric serialises
+-- tables by value and has no representation for a reference, so nothing a handler
+-- returns can decode to this table, where a boolean or a string in the same slot
+-- would be forgeable in one line of game code. Frozen because it is a module
+-- singleton shared by every bundle in the process.
 local RequestFailed = table.freeze({})
 
 -- This module is otherwise types only; RequestFailed is the one runtime value.

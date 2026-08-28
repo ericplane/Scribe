@@ -205,4 +205,49 @@ end
 ConformanceStore.STORE = "ScribeConformance"
 ConformanceStore.PREFIX = "CONF_"
 
+-- Roblox refuses repeated writes to the same key at roughly one per six seconds.
+-- Persistence.luau names the same number. Seven because the limit is approximate and a
+-- rejected write costs a retry with backoff.
+ConformanceStore.KEY_WRITE_WINDOW = 7
+
+--- Let the write window on a key clear before writing to it again.
+---
+--- Not the same limit as AwaitBudget. A 502 "Too many requests" is the BACKEND refusing;
+--- exhausting the client-side allowance makes a call queue and yield, never throw, so
+--- pacing on the request budget does not prevent one. The real-backend specs were making
+--- four writes to one key inside two seconds and died on it.
+---
+--- The logs do not cleanly separate a per-key limit from a place-wide one. Both want
+--- fewer writes and more space between them, which is what this and the shared round
+--- trips in ExchangeRealBackend do.
+function ConformanceStore.AwaitKeyWindow(seconds: number?)
+	task.wait(seconds or ConformanceStore.KEY_WRITE_WINDOW)
+end
+
+--- Wait until the engine has room for roughly `needed` more UpdateAsync requests.
+---
+--- The client-side allowance only, and the lesser limit here. It refills at about
+--- (60 + 10 * players) per minute for the whole server rather than per DataStore, so a
+--- Studio plugin polling its own store competes for it.
+---
+--- Returns the budget last seen, or -1 when the engine cannot be asked, which is every
+--- headless run. Never blocks then: treating "cannot ask" as "none left" would hang CI.
+function ConformanceStore.AwaitBudget(needed: number, timeout: number?): number
+	local Budget = require(Root.Scribe.Internal.Budget)
+	local deadline = os.clock() + (timeout or 90)
+	local seen = Budget.Remaining("UpdateAsync")
+	if seen == nil then
+		return -1
+	end
+	while seen < needed and os.clock() < deadline do
+		task.wait(1)
+		local now = Budget.Remaining("UpdateAsync")
+		if now == nil then
+			return -1
+		end
+		seen = now
+	end
+	return seen
+end
+
 return ConformanceStore

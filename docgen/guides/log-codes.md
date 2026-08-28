@@ -84,6 +84,7 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `PROFILE_RESTORED` | Warn | A profile was rolled back to an earlier version. The log records the restored version and the audit context. |
 | `PROFILE_RESTORE_FAIL` | Warn | A restore did not complete, so the stored profile is unchanged. The version was not found, a live session held the key, the live key no longer exists, or the commit failed. |
 | `RESTORE_RESERVED_PRESERVED` | Warn | A restore rolled the profile back, and the library-owned `_Scribe` root was kept as it was live rather than rolled back with it. That root records events that already happened in the real world, such as settled receipts and spent cooldowns. |
+| `SLOW_LOAD` | Warn | A profile took longer than ten seconds to load. Measured from the JOIN, not from the DataStore call, so it covers the queue, the retries and any migration: it is what the player waited through. Read the `LoadDuration` percentiles alongside it, because one slow join is weather and a moved p99 is a problem. |
 | `PROFILE_SIZE` | Warn | The profile passed the size-warning threshold and is approaching the 4 MB per-key ceiling. Measured before each save attempt, so it still fires when that save then fails. It stays latched until the size drops back. Also fires `OnAnomaly`. |
 | `PROFILE_STORE_ERROR` | Warn | ProfileStore reported a DataStore error against this bundle's store. `Context.Class` is `Throttled`, `Failed`, `Unresolved` or `Rejected`, and `Context.Code` is the numeric prefix Roblox sent. A nil code means the message did not carry one. |
 | `PROFILE_STORE_SIGNAL_MISSING` | Warn | ProfileStore's error or critical-state signal could not be connected, so save-failure observability for this bundle is off. |
@@ -208,6 +209,7 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `RECEIPT_IN_FLIGHT` | Warn | The same buyer and purchase id were already being processed on this server, so this delivery was refused and left for Roblox to retry. Seeing it occasionally is the guard working. Seeing it constantly means something is re-invoking `ProcessReceipt` concurrently. |
 | `RECEIPT_UNKNOWN_PRODUCT` | Error | A receipt arrived for a product id that is not in `Products`, so it cannot be granted and is deferred. Add the product to the registry. |
 | `OWNERSHIP_CHECK_FAIL` | Warn | A game-pass ownership call errored, so the check could not be resolved and is treated as not owned. Frequent hits point at a Roblox API problem. |
+| `PASS_PURCHASE_UNCONFIRMED` | Warn | A game-pass purchase reported success but the ownership check did not confirm it, so nothing was credited and no purchase-history entry was written. A genuine purchase the API had not caught up with is credited on the player's next load. Frequent hits point at API lag; a steady stream for one player is worth looking at. |
 | `RECEIPT_OFFLINE_RETRY` | Warn | An offline receipt could not read the buyer's saved profile, so the purchase is deferred for Roblox to retry. Repeated hits suggest DataStore read problems. |
 | `RECEIPT_RETRY` | Warn | A grant was applied in memory but the save did not confirm within the timeout, so the receipt returns `NotProcessedYet`. This is safe because the grant is idempotent. Persistent hits point at save latency. |
 | `PURCHASE_CLAIM_EVICTED` | Warn | A profile held `MaxPurchaseClaims` live `Data.Purchase` claims, so the one nearest to expiring was dropped. A retry under that key would apply the purchase a second time. |
@@ -277,6 +279,21 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
     `LB_SCORE_OUT_OF_RANGE` fires for two different reasons and the message says which. On a plain numeric stat, the score multiplied by the board's `Scale` passed the exact-integer range an ordered key can hold without losing its low digits. On a [`Scribe.Big`](./leaderboards) stat, the score was negative, because the packing has no sign bit, or its exponent passed the board's cap for its configured significant figures. `Scale` does not apply to a big board.
 
     A sustained `LB_BUDGET_DEFERRED` means the server produces score changes faster than its ordered-write allowance can carry them. Raise `RefreshInterval`, or write fewer distinct stats.
+
+## Exchange
+
+Every one of these is about an exchange in progress. None of them means value was lost: the design's whole claim is that an exchange conserves whatever happens to it, and these say WHERE it currently is. See [Exchange](./exchange).
+
+| Code | Level | Meaning |
+| --- | --- | --- |
+| `EXCHANGE_INIT_TAMPER` | Error | `OnPlayerInit` or a `Scribe.Dynamic` factory changed the in-flight exchange ledger. Those hooks receive the profile directly, before the tree exists, so the usual refusal has nothing to refuse through. The change is reverted; find the line that writes into `_Scribe`. |
+| `EXCHANGE_PARKED` | Warn | A delivery could not be applied, usually because the destination is full or the key is taken. The item is waiting in the player's inbox and is retried on every load and on the sweep. Nothing is lost. |
+| `EXCHANGE_REGISTRATION_REFUSED` | Error | A `Exchangeable` declaration names a path that cannot be moved safely. Raised at startup, by name; see [Exchange](./exchange). |
+| `EXCHANGE_RESET_REFUSED` | Error | `ResetData` was asked to wipe a profile holding an in-flight or undelivered exchange. Refused, because the wipe would take the escrow with it and leave nothing to return. Resolve or discard the exchange first. |
+| `EXCHANGE_RESOLVED` | Info | An interrupted exchange reached its terminal state on load or on the sweep. |
+| `EXCHANGE_RESOLVE_ERROR` | Error | Resolving one exchange raised. Other exchanges on the same profile are unaffected; this one keeps its value and is retried. |
+| `EXCHANGE_STORE_UNAVAILABLE` | Error | The verdict key could not be reached, so no exchange can be started or resolved on this server. Scribe deliberately does NOT fall back to a local store: a verdict nothing else can see is worse than no verdict. |
+| `EXCHANGE_UNRESOLVED` | Warn | An exchange could not be resolved this time, usually because no verdict could be established. The value stays where it is and the next load or sweep tries again. |
 
 ## Derived
 

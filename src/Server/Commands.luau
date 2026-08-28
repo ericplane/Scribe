@@ -17,9 +17,8 @@ local MAX_RETURNS = 8
 -- Nesting cap for an opt-in table-argument shape (see specMatches).
 local MAX_SHAPE_DEPTH = 8
 -- Declarator kinds meaningful for a command argument. The rest describe storage or
--- replication (Timed, ServerOnly, Shared, Session, Dynamic) or carry a value the
--- wire cannot represent (Datatype, Big), so accepting them would promise a check
--- that could never pass.
+-- replication (Timed, ServerOnly, Shared, Session, Dynamic) or carry a value the wire
+-- cannot represent (Datatype, Big), so accepting them would promise a check that fails.
 local ARG_MARKERS: { [string]: boolean } = {
 	Int = true,
 	Number = true,
@@ -32,14 +31,12 @@ local ARG_MARKERS: { [string]: boolean } = {
 	DictOf = true,
 	MapOf = true,
 }
--- Rate-limited frames still cost a log line and an outbound reply each, so a flood
--- is throttled: one log per interval per player, and past a sustained-flood cutoff
--- the reply is dropped too. The count decays after a quiet window so a legitimate
--- burst never accumulates toward the cutoff.
+-- Rate-limited frames still cost a log line and an outbound reply each, so a flood is
+-- throttled: one log per interval per player, and past a sustained-flood cutoff the
+-- reply is dropped too. The count decays after a quiet window.
 local RATE_LOG_INTERVAL = 1 -- seconds between COMMAND_RATE_LIMITED logs per player
 local RATE_RESET_WINDOW = 10 -- seconds of no rate-limiting that resets the counter
--- Seconds between COMMAND_ERROR lines: log the first, count the rest, say how many
--- were suppressed.
+-- Seconds between COMMAND_ERROR lines: log the first, count and report the rest.
 local COMMAND_ERROR_LOG_INTERVAL = 5
 local lastCommandErrorLog: number? = nil
 local commandErrorsSinceLog = 0
@@ -47,10 +44,10 @@ local commandErrorsSinceLog = 0
 local RATE_LIMIT_MAX = 256 -- sustained rate-limited frames before replies stop
 
 local MAX_IDEMPOTENCY_KEY_BYTES = Wire.MAX_IDEMPOTENCY_KEY_BYTES
--- Live idempotency records held per player. The cache is the protection, so evicting
--- an unexpired record means a retry under that key runs the handler a second time.
--- It is bounded anyway: unlike a Data.Purchase key this one is named by the client,
--- so without a ceiling a player at the full CommandRateLimit mints records forever.
+-- Live idempotency records held per player. The cache is the protection, so evicting an
+-- unexpired record means a retry under that key runs the handler again. Bounded anyway:
+-- unlike a Data.Purchase key this one is client-named, so without a ceiling a player at
+-- the full CommandRateLimit mints records forever.
 local MAX_IDEMPOTENT_RECORDS = 64
 -- Duplicates parked on one in-flight call. Client-driven, so bounded.
 local MAX_IDEMPOTENT_WAITERS = 32
@@ -77,15 +74,14 @@ function Commands.new(ctx: any)
 	local rateLimit: number = options.CommandRateLimit or 20
 	-- How long a settled idempotency record answers repeats. Derived rather than
 	-- configured: the window only has to outlast the client's own retry window, which
-	-- RequestTimeout defines. The floor keeps a short RequestTimeout from shortening
-	-- the protection to something a human reconnecting could outrun.
+	-- RequestTimeout defines. The floor keeps a short RequestTimeout from undercutting it.
 	local idempotencyTTL: number = math.max(120, (tonumber(options.RequestTimeout) or 10) * 4)
 
 	local registry: { [string]: Registered } = {}
-	-- The longest name any command is registered under, floored so an ordinary typo
-	-- still reaches the registry and gets an `unknown-command` reply rather than being
-	-- charged as malformed. It bounds the one attacker-sized read the rate limit does
-	-- not cover: the name is read above takeToken, so it runs at the raw frame rate.
+	-- The longest name any command is registered under, floored so an ordinary typo still
+	-- reaches the registry and answers `unknown-command` rather than being charged as
+	-- malformed. It bounds the one attacker-sized read the rate limit does not cover: the
+	-- name is read above takeToken, so it runs at the raw frame rate.
 	local COMMAND_NAME_FLOOR = 64
 	local maxNameBytes = COMMAND_NAME_FLOOR
 
@@ -107,9 +103,8 @@ function Commands.new(ctx: any)
 		if type(fn) ~= "function" then
 			error(`Scribe: command "{name}" handler must be a function`, 2)
 		end
-		-- Rejected at register time: a truthy-but-not-boolean value here would read as
-		-- opted in on one line and opted out on the `== true` comparison below, and the
-		-- difference only shows up as commands silently running twice.
+		-- Rejected at register time: a truthy-but-not-boolean value reads as opted in on
+		-- one line and out on the `== true` below, showing up as commands running twice.
 		local idempotent = if spec then spec.Idempotent else nil
 		if idempotent ~= nil and type(idempotent) ~= "boolean" then
 			error(`Scribe: command "{name}" Idempotent must be a boolean`, 2)
@@ -119,9 +114,8 @@ function Commands.new(ctx: any)
 			if type(args) ~= "table" then
 				error(`Scribe: command "{name}" Args must be an array of type strings or shapes`, 2)
 			end
-			-- Reject a malformed spec at register time, not on the first client call: a
-			-- spec that never matches turns every request into "bad-args", which reads
-			-- as a client bug.
+			-- Reject a malformed spec at register time: a spec that never matches turns
+			-- every request into "bad-args", which reads as a client bug.
 			local function checkSpec(entry: any, where: string, depth: number)
 				if type(entry) == "string" then
 					return
@@ -138,9 +132,8 @@ function Commands.new(ctx: any)
 				local kind, default, meta = Marker.inspect(entry)
 				if kind ~= nil then
 					if not ARG_MARKERS[kind] then
-						-- Name the kind: without it the recursion below walks the marker's
-						-- internals and reports something like "Args[1].Meta.Min", leaking
-						-- Scribe's own structure into the caller's error.
+						-- Name the kind: without it the recursion walks the marker's internals
+						-- and reports "Args[1].Meta.Min", leaking Scribe's own structure.
 						error(
 							`Scribe: command "{name}" {where} is a Scribe.{kind}, which describes stored data rather `
 								.. `than a wire argument. Command arguments accept `
@@ -200,9 +193,8 @@ function Commands.new(ctx: any)
 	end
 
 	-- Send one reply frame. `replayed` marks a reply reconstructed from the idempotency
-	-- cache and suppresses the truncation warning only: the handler ran once, and a
-	-- client may repeat a key indefinitely, which would be an unthrottled path into the
-	-- log ring.
+	-- cache and suppresses the truncation warning only: the handler ran once, and a client
+	-- may repeat a key indefinitely, which would be an unthrottled path into the log ring.
 	local function reply(entry: any, correlation: number, ok: boolean, results: { any }, replayed: boolean?)
 		-- encodeReply clamps to MAX_RETURNS, and the caller just sees trailing nils, so
 		-- say so. Only meaningful on success; failure replies are single-value.
@@ -217,9 +209,8 @@ function Commands.new(ctx: any)
 		end
 		local encoded, bytes = pcall(encodeReply, correlation, ok, results)
 		if not encoded then
-			-- The handler returned something the wire can't carry (Instance,
-			-- function, ...). Fail the request cleanly instead of stranding
-			-- the client until its timeout.
+			-- The handler returned something the wire can't carry. Fail cleanly instead
+			-- of stranding the client until its timeout.
 			Log.Warn("Commands", "COMMAND_REPLY_ENCODE_FAIL", tostring(bytes), { Player = entry.Player })
 			bytes = encodeReply(correlation, false, { "reply-encode-failed" })
 		end
@@ -229,13 +220,12 @@ function Commands.new(ctx: any)
 	-- Idempotency cache --------------------------------------------------------
 	--
 	-- Per entry, in memory, deliberately not the persisted claim Data.Purchase takes
-	-- through Timed.Claim: a command key is named by the client, so persisting it lets
-	-- a player at the full CommandRateLimit push their own profile past the DataStore
-	-- ceiling and fail every save. The cached reply has nowhere durable to go either,
-	-- since a handler may return values the wire carries and a DataStore refuses.
-	--
-	-- Session scope is also the honest scope: a request's correlation id, parked thread
-	-- and RequestTimeout are all session-lived, so the cache dies with the session.
+	-- through Timed.Claim: a command key is client-named, so persisting it lets a player
+	-- push their own profile past the DataStore ceiling and fail every save. Session scope
+	-- is honest anyway: the correlation id, parked thread and RequestTimeout are all
+	-- session-lived, so the cache dies with the session. The cached reply has nowhere
+	-- durable to go either: a handler may return values the wire carries and a DataStore
+	-- refuses.
 	local function idemStore(entry: any): { [string]: IdemRecord }
 		local store = entry.CommandIdem
 		if not store then
@@ -259,10 +249,9 @@ function Commands.new(ctx: any)
 		-- survives an embedded nil, so a replay is identical to the original reply.
 		record.Results = results
 		if not ok then
-			-- Dropped before the parked duplicates are answered. A handler that threw
-			-- did not happen, so the key stays retryable, and a reply can re-enter this
-			-- path through a synchronous transport: a failed record left in place even
-			-- for the length of these replies would answer that retry from the cache.
+			-- Dropped before the parked duplicates are answered. A handler that threw did
+			-- not happen, so the key stays retryable, and a synchronous transport can
+			-- re-enter this path mid-replies and answer that retry from the cache.
 			local store = entry.CommandIdem
 			if store then
 				store[record.CacheKey] = nil
@@ -285,9 +274,8 @@ function Commands.new(ctx: any)
 		return false
 	end
 
-	-- Warn at most once per interval per player per code. These fire on client input
-	-- that sits under the rate limit, so unthrottled an exploiter could drive them at
-	-- the full allowance and evict the whole diagnostic ring.
+	-- Warn at most once per interval per player per code. These fire on client input under
+	-- the rate limit, so unthrottled an exploiter could evict the whole diagnostic ring.
 	local function throttledWarn(entry: any, code: any, message: string, context: { [string]: any })
 		local now = Clock.Monotonic()
 		local seen = entry.LastCommandWarnAt
@@ -308,10 +296,9 @@ function Commands.new(ctx: any)
 	--   Scribe.Int(0, { Min = 0, Max = 99 })        a declarator, with its constraints
 	--   { Id = "string", Qty = "number?" }          a shape, nestable, mixable with both
 	--
-	-- Declarators are accepted so their constraints come along (Min/Max, MaxLength,
-	-- Enum members, MaxItems/MaxKeys); a type string can only say a number arrived.
-	-- All of it is opt-in: a bare "table" stays as permissive as `typeof`.
-	local markerMatches: (string, any, any, any, number) -> boolean
+	-- Declarators are accepted so their constraints come along (Min/Max, MaxLength, Enum
+	-- members, MaxItems/MaxKeys). All opt-in: a bare "table" stays as permissive as typeof.
+	local markerMatches: (string, any, Marker.Meta?, any, number) -> boolean
 	local function specMatches(expected: any, value: any, depth: number): boolean
 		if type(expected) == "string" then
 			local optional = string.sub(expected, -1) == "?"
@@ -351,8 +338,8 @@ function Commands.new(ctx: any)
 				return false
 			end
 		end
-		-- Reject unknown keys: passing an undeclared field through is how an
-		-- unvalidated value reaches game logic.
+		-- Reject unknown keys: an undeclared field is how an unvalidated value reaches
+		-- game logic.
 		for key in value do
 			if expected[key] == nil then
 				return false
@@ -364,8 +351,8 @@ function Commands.new(ctx: any)
 	-- Declarator constraints, checked against a value that arrived over the wire.
 	-- A rejection, never a clamp: a command argument is the client's claim about what
 	-- it wants, and clamping it to something legal turns "buy 999999" into "buy 99".
-	function markerMatches(kind, default, meta, value, depth)
-		meta = meta or {}
+	function markerMatches(kind: string, default: any, given: Marker.Meta?, value: any, depth: number): boolean
+		local meta: Marker.Meta = given or {}
 		if kind == "Optional" then
 			-- Scribe.Optional wraps its inner shape in the marker's Default, not Meta.
 			return value == nil or specMatches(default, value, depth)
@@ -460,9 +447,8 @@ function Commands.new(ctx: any)
 	-- dispatcher; decode errors propagate to its pcall).
 	function self.HandleFrame(entry: any, reader: Wire.Reader)
 		local correlation = Wire.RU32(reader)
-		-- Bounded from the length prefix, so an over-long name costs the varint rather
-		-- than the allocation. A name longer than every registered command could not
-		-- have matched one anyway.
+		-- Bounded from the length prefix, so an over-long name costs the varint rather than
+		-- the allocation; it could not have matched a registered command anyway.
 		local name = Wire.RStrBounded(reader, maxNameBytes)
 		local argc = Wire.RU8(reader)
 		if argc > MAX_ARGS then
@@ -471,23 +457,19 @@ function Commands.new(ctx: any)
 
 		Metrics.Add("CommandsReceived")
 
-		-- The token check has to stay above the argument decode. Arguments are
-		-- attacker-sized and the decode is where the CPU goes, so decoding first
-		-- protects the handlers but not the decoder, and these frames are valid so the
-		-- malformed-frame budget never catches them. The header read above is
-		-- fixed-cost and all the rejection reply needs.
+		-- The token check stays above the argument decode: arguments are attacker-sized and
+		-- the decode is where the CPU goes, and these frames are valid, so the
+		-- malformed-frame budget never catches them. The header alone answers the rejection.
 		if not takeToken(entry) then
 			Metrics.Add("CommandsRateLimited")
 			local now = Clock.Monotonic()
-			-- Decay first, so a player who stopped flooding starts fresh and a rare
-			-- legitimate burst never creeps toward the cutoff.
+			-- Decay first, so a rare legitimate burst never creeps toward the cutoff.
 			if now - (entry.LastRateLimitAt or -math.huge) > RATE_RESET_WINDOW then
 				entry.RateLimitedCount = 0
 			end
 			entry.LastRateLimitAt = now
 			entry.RateLimitedCount = (entry.RateLimitedCount or 0) + 1
-			-- Throttle the log: unthrottled this is the one command path an exploiter
-			-- can drive without bound, and it would evict the whole log ring.
+			-- Throttle the log: this is the one command path an exploiter drives unbounded.
 			if now - (entry.LastRateLimitLog or -math.huge) >= RATE_LOG_INTERVAL then
 				entry.LastRateLimitLog = now
 				Log.Warn("Commands", "COMMAND_RATE_LIMITED", `player exceeded {rateLimit}/s`, {
@@ -503,11 +485,10 @@ function Commands.new(ctx: any)
 			return
 		end
 
-		-- Above the registry lookup, so a session that is not Ready answers "not-ready"
-		-- for every name. Below it, an unauthenticated client could enumerate the whole
-		-- command surface by diffing "unknown-command" against "not-ready". Nothing
-		-- real is lost: Client.Request waits for Init, so a genuine Scribe client
-		-- cannot send a command in this window at all.
+		-- Above the registry lookup, so a not-Ready session answers "not-ready" for every
+		-- name. Below it, an unauthenticated client could enumerate the whole command
+		-- surface by diffing "unknown-command" against "not-ready". Nothing real is lost:
+		-- Client.Request waits for Init, so a genuine client cannot send in this window.
 		if entry.State ~= "Ready" then
 			reply(entry, correlation, false, { "not-ready" })
 			return
@@ -534,12 +515,10 @@ function Commands.new(ctx: any)
 		-- caller sent none, so Request and RequestOnce share one frame layout.
 		local idemKey = Wire.RStr(reader)
 		local hasKey = idemKey ~= ""
-		-- Refused rather than downgraded in both directions: a key sent to a command
-		-- that does not honour it would promise protection that does not exist, and a
-		-- keyless call to one that does is the same mistake from the other side.
-		--
-		-- The length is checked here rather than at the read, which MaxInboundBytes
-		-- already bounds; this cap is about what may become a retained table key.
+		-- Refused rather than downgraded in both directions: a key sent to a command that
+		-- does not honour it promises protection that does not exist, and a keyless call to
+		-- one that does is the same mistake reversed. The length is checked here rather
+		-- than at the read: this cap is about what may become a retained table key.
 		if
 			hasKey ~= registered.Idempotent
 			or (hasKey and (#idemKey > MAX_IDEMPOTENCY_KEY_BYTES or utf8.len(idemKey) == nil))
@@ -564,8 +543,7 @@ function Commands.new(ctx: any)
 			args[i] = Wire.DecodeGeneric(reader)
 		end
 
-		-- Optional argument schema: shape rejection before the handler runs;
-		-- semantic validation remains the handler's job.
+		-- Shape rejection before the handler runs; semantic validation is the handler's job.
 		if registered.Args then
 			for i, expected in registered.Args do
 				if not typeMatches(expected, args[i]) then
@@ -579,11 +557,9 @@ function Commands.new(ctx: any)
 			end
 		end
 
-		-- Idempotency is claimed before the handler runs, not after. A handler may
-		-- yield, so two identical requests can be in flight at once; a check after the
-		-- call would dedupe a sequential retry while letting concurrent duplicates both
-		-- execute. Parking the duplicate on the same record is what makes "at most
-		-- once" true for both shapes.
+		-- Claimed before the handler runs, not after. A handler may yield, so two identical
+		-- requests can be in flight at once, and a check after the call would let concurrent
+		-- duplicates both execute. Parking one on the record covers both shapes.
 		local record: IdemRecord? = nil
 		if registered.Idempotent then
 			local store = idemStore(entry)
@@ -602,9 +578,8 @@ function Commands.new(ctx: any)
 					Metrics.Add("CommandsDeduped")
 					reply(entry, correlation, existing.Ok, existing.Results :: { any }, true)
 				elseif #existing.Waiters < MAX_IDEMPOTENT_WAITERS then
-					-- Still running, so park this correlation on it: the first call's
-					-- outcome answers every duplicate. Nothing is replied here;
-					-- settleIdempotent does it when the handler returns.
+					-- Still running, so park this correlation on it; settleIdempotent
+					-- answers every duplicate when the handler returns.
 					Metrics.Add("CommandsDeduped")
 					table.insert(existing.Waiters, correlation)
 				else
@@ -632,9 +607,8 @@ function Commands.new(ctx: any)
 			end
 			if live >= MAX_IDEMPOTENT_RECORDS then
 				if oldestKey == nil then
-					-- Every record is in flight, so there is nothing safe to drop. It
-					-- takes a client deliberately holding that many handlers open, and it
-					-- already knows how to back off from "rate-limited".
+					-- Every record is in flight, so nothing is safe to drop. It takes a
+					-- client deliberately holding that many handlers open.
 					Metrics.Add("CommandsRejected")
 					throttledWarn(
 						entry,
@@ -645,9 +619,8 @@ function Commands.new(ctx: any)
 					reply(entry, correlation, false, { "rate-limited" })
 					return
 				end
-				-- Evicting an unexpired record means a retry under that key runs the
-				-- handler a second time, the one thing this cache exists to prevent, so
-				-- it is said out loud.
+				-- Evicting an unexpired record is the one thing this cache exists to
+				-- prevent, so it is said out loud.
 				store[oldestKey] = nil
 				Metrics.Add("CommandIdemEvicted")
 				throttledWarn(
@@ -659,7 +632,8 @@ function Commands.new(ctx: any)
 				)
 			end
 
-			record = { CacheKey = cacheKey, At = now, Done = false, Ok = false, Results = nil, Waiters = {} }
+			record =
+				{ CacheKey = cacheKey, At = now, Done = false, Ok = false, Results = nil, Waiters = {} } :: IdemRecord
 			store[cacheKey] = record
 		end
 
@@ -673,8 +647,7 @@ function Commands.new(ctx: any)
 			Metrics.Add("CommandErrors")
 			-- Throttled: a handler that throws on a given input is a bug the player can
 			-- replay at their full command rate, and each entry costs a JSONEncode, a
-			-- console write and a Sched.Spawn per sink. The suppressed count carries the
-			-- rest, and the metric above is unthrottled.
+			-- console write and a Sched.Spawn per sink. The metric above is unthrottled.
 			local nowMono = Clock.Monotonic()
 			commandErrorsSinceLog += 1
 			if lastCommandErrorLog == nil or nowMono - lastCommandErrorLog >= COMMAND_ERROR_LOG_INTERVAL then

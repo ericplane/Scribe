@@ -39,7 +39,7 @@ return function()
 
 		-- Server leaderboard reads see the flushed scores (in-memory store).
 		-- (The refresh cycle hasn't run; read the store through the public API
-		-- after a manual refresh is out of scope here — flushed writes suffice.)
+		-- after a manual refresh is out of scope here; flushed writes suffice.)
 
 		-- New sessions are refused while closing.
 		local latecomer = FakePlayer.new(7003)

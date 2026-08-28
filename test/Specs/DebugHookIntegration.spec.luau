@@ -1,7 +1,7 @@
 --!nonstrict
 -- DebugHook + replication integration: attaching the Studio hook at boot (as
 -- Server.new does since protocol v6) must not disturb the client handshake,
--- diff replication, or shared broadcasts — the hook wraps PushOp and the
+-- diff replication, or shared broadcasts: the hook wraps PushOp and the
 -- transport, and a regression here breaks the real game, not just the plugin.
 
 return function()

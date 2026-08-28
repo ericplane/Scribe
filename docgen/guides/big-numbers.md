@@ -27,9 +27,8 @@ print(data.Essence.Get():Short())    --> "9.775e99"
 
 `Set`, `Increment`, `Decrement`, `Multiply` and `Divide` all accept a plain number, a numeric string like `"1.5e100"`, or another big value. That is one operand rule for the whole surface, so you never have to remember which call takes which.
 
-:::caution This trades precision for range on purpose
-A big carries about 15 significant digits at any magnitude, so `1e20 + 1 == 1e20`. That is the right trade for a currency whose magnitude is the point, and the wrong one for anything audited. Emberfall's `Gems` stay a `Scribe.Int` for exactly that reason: they are bought with Robux, and a lost unit is a support ticket.
-:::
+!!! warning "This trades precision for range on purpose"
+    A big carries about 15 significant digits at any magnitude, so `1e20 + 1 == 1e20`. That is the right trade for a currency whose magnitude is the point, and the wrong one for anything audited. Emberfall's `Gems` stay a `Scribe.Int` for exactly that reason: they are bought with Robux, and a lost unit is a support ticket.
 
 ## The arithmetic methods
 
@@ -74,24 +73,30 @@ data.Essence.Set(data.Essence.Get():Pow(2))                -- square the balance
 local tier = math.floor(data.Essence.Get():Log10() / 3)    -- a prestige tier from the magnitude
 ```
 
-:::caution Comparisons need a big on both sides
-Luau picks `<` and `<=` by metatable identity, so mixing a big with a plain number throws *"attempt to compare table < number"*. `==` is worse: Luau only consults it when both sides are tables, so `Get() == 5` is silently `false` rather than an error.
+!!! warning "Comparisons need a big on both sides"
+    Luau picks `<` and `<=` by metatable identity, so mixing a big with a plain number throws *"attempt to compare table < number"*. `==` is worse: Luau only consults it when both sides are tables, so `Get() == 5` is silently `false` rather than an error.
 
-Two big fields compare directly. To test against a constant, convert first:
+    Two big fields compare directly. To test against a constant, convert first:
 
-```lua
-if data.Essence.Get() < data.Banked.Get() then end -- OK, both are bigs
-if data.Essence.Get() < 2000 then end              -- THROWS
-if data.Essence.Get():ToNumber() < 2000 then end   -- OK
-if data.Essence.Get() == 5 then end                -- always false, never fires
-if data.Essence.Get():ToNumber() == 5 then end     -- OK
-```
+    ```lua
+    if data.Essence.Get() < data.Banked.Get() then end -- OK, both are bigs
+    if data.Essence.Get() < 2000 then end              -- THROWS
+    if data.Essence.Get():ToNumber() < 2000 then end   -- OK
+    if data.Essence.Get() == 5 then end                -- always false, never fires
+    if data.Essence.Get():ToNumber() == 5 then end     -- OK
+    ```
 
-There is no public constructor for a standalone big, so a threshold comparison goes through `:ToNumber()`. That is exact while the threshold sits inside the double range, which covers any constant you can write as a literal.
-:::
+    There is no public constructor for a standalone big, so a threshold comparison goes through `:ToNumber()`. That is exact while the threshold sits inside the double range, which covers any constant you can write as a literal.
 
 ## Showing it to a player
 
+`Scribe.Short(value, decimals?)` is the same renderer as a free function, and it takes a plain number as well as a Big. A balance label should not have to know which numeric type the field was declared as:
+
+```lua
+local label = Scribe.Short(data.Coins.Get()) -- "1.50M", Int or Big alike
+```
+
+`Scribe.SetShortSuffixes({ "", "K", "M", "B", "T", "aa", "ab" })` replaces the suffix table, because the conventions past `T` diverge. Index 1 is the units tier and must stay empty.
 `:Short()` formats for UI, with an optional decimal count that defaults to 2. It uses letter suffixes while it can and falls back to scientific notation once it runs out:
 
 | Value | `:Short()` | `:Short(0)` | `:Short(3)` |

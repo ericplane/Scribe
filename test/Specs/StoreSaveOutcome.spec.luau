@@ -130,6 +130,81 @@ return function()
 			uni:Run(10)
 
 			expect(outcome).to.equal("NotOwned")
+
+			-- And the entry is GONE by now: a NotOwned settle always coincides with the
+			-- session ending, so teardown has already detached it. That is why nothing
+			-- in Scribe binds the outcome from the OnSettled fire; the value is consumed
+			-- through SaveAwait's return instead, where a live caller can still act on it.
+			expect(server.Bundle.Ctx.Persistence.EntryFor(player)).to.equal(nil)
+		end)
+
+		it("never reports Failed during a clean handover, because nothing failed", function()
+			-- The outcome contract's negative case, and the one that was wrong.
+			--
+			-- When another server force-loads this key, the in-progress save reaches
+			-- `force_load_pending == true and session_owns_profile == true`: its transform
+			-- HAS run and its bytes ARE on the key. The fork then hands the session over
+			-- and breaks out of the save loop. It used to break without assigning
+			-- `outcome`, and `settled = outcome or "Failed"` turned a save that persisted
+			-- into a reported failure.
+			--
+			-- That value is not cosmetic. It is what `SaveAwait` returns, which is what
+			-- `AwaitSave` answers, which is what `Data.Flush` reports and what the receipt
+			-- path consults before acknowledging a purchase. A false "Failed" there costs
+			-- a retried receipt every time a player is force-loaded mid-save.
+			--
+			-- No fault is armed anywhere in this case, which is the whole assertion: with
+			-- nothing injected, no save can legitimately report Failed.
+			local uni = Universe.new({
+				Seed = 6161,
+				Servers = 2,
+				Constants = {
+					AUTO_SAVE_PERIOD = 10,
+					SESSION_STEAL = 20,
+					FIRST_LOAD_REPEAT = 2,
+					LOAD_REPEAT_PERIOD = 4,
+					ASSUME_DEAD = 60,
+					START_SESSION_TIMEOUT = 120,
+				},
+				Transport = StubTransport.new({ AutoPump = false }),
+				LatencyProfile = "Nominal",
+				NoBudget = true,
+				StatusThresholds = { FailWindow = 60, FailCount = 1000, RecoverStreak = 1 },
+				Template = { Coins = Scribe.Int(0, { Min = 0 }) },
+				Options = {},
+			})
+			universe = uni
+			Guard.Install(uni)
+			local first, second = uni:Server(1), uni:Server(2)
+
+			local player = FakePlayer.new(61777)
+			first:Join(61777, player)
+			uni:Run(30)
+
+			local outcomes = {}
+			profileOf(first, player).OnSettled:Connect(function(_saveContext, settled)
+				table.insert(outcomes, tostring(settled))
+			end)
+
+			-- The steal. Real session-lock protocol, no faults.
+			second:Join(61777, FakePlayer.new(61777))
+			uni:Run(180)
+
+			local failed, saved = 0, 0
+			for _, outcome in outcomes do
+				if outcome == "Failed" then
+					failed += 1
+				elseif outcome == "Saved" then
+					saved += 1
+				end
+			end
+			-- "no Failed" is NOT enough on its own, and a surviving mutation proved it:
+			-- reporting NotOwned instead would also pass that, and NotOwned means "the
+			-- bytes did not land", which AwaitSave turns into the same false negative.
+			-- The handover's own write MUST be reported as Saved.
+			expect(`settles={#outcomes > 0} failed={failed} saved={saved >= 1}`).to.equal(
+				"settles=true failed=0 saved=true"
+			)
 		end)
 	end)
 end

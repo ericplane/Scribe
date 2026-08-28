@@ -239,6 +239,11 @@ ADM = {"note": "note", "tip": "tip", "info": "info", "caution": "warning",
 
 
 def convert_admonitions(text):
+    # Kept although nothing uses `:::` any more. Without it a `:::caution` block renders
+    # as literal text, with no build error to notice.
+    #
+    # Write `!!!`. `???` is the COLLAPSIBLE variant, not a style choice, so do not fold
+    # one into the other. Unknown types fall back to `note`.
     lines, out, i = text.split("\n"), [], 0
     while i < len(lines):
         m = re.match(r"^:::(\w+)\s*(.*)$", lines[i])
@@ -471,6 +476,34 @@ def render_types(types):
     return "\n".join(out)
 
 
+SCRIBE_MEMBER = re.compile(r"\bScribe\.(\w+)\s*(?=[(.])")
+
+
+def public_scribe_names():
+    src = (ROOT / "src" / "init.luau").read_text(encoding="utf-8")
+    return set(re.findall(r"^function Scribe\.(\w+)", src, re.M)) | set(
+        re.findall(r"^Scribe\.(\w+) = ", src, re.M)
+    )
+
+
+def check_scribe_members(text, source, public):
+    # The exchange guide shipped `Scribe.Server.new({...})` for a while and nothing
+    # caught it: GuideExamplesRun transcribes examples by hand rather than reading the
+    # Markdown, so a call to a non-existent member never reaches it.
+    #
+    # The lookahead limits this to names CALLED or used as a namespace.
+    # `Scribe.PlayerData<T>` is a type and `Scribe.Flush` in prose is a profiler label;
+    # both would be false positives otherwise.
+    for n, line in enumerate(text.split("\n"), 1):
+        for ref in SCRIBE_MEMBER.findall(line):
+            if ref not in public:
+                raise SystemExit(
+                    f"[docgen] {source}:{n}: `Scribe.{ref}` is not exported by src/init.luau.\n"
+                    f"          The entry point is `Scribe(options)`; see intro.md for the "
+                    f"canonical call.\n          {line.strip()[:90]}"
+                )
+
+
 def check_grid_cards(text, source):
     # A Material "grid cards" card is a list item, so every line of its body must
     # stay indented under it. Lose the indent on one line and that card ends
@@ -495,8 +528,15 @@ def check_grid_cards(text, source):
         )
 
 
+_PUBLIC_SCRIBE = None
+
+
 def convert_guide(text, source="guide"):
+    global _PUBLIC_SCRIBE
+    if _PUBLIC_SCRIBE is None:
+        _PUBLIC_SCRIBE = public_scribe_names()
     check_grid_cards(text, source)
+    check_scribe_members(text, source, _PUBLIC_SCRIBE)
     text = re.sub(r"^---\n.*?\n---\n", "", text, flags=re.S)  # strip frontmatter
     text = convert_admonitions(text)
     text = re.sub(r"\]\(\./([\w-]+)(#[\w-]+)?\)", lambda m: f"]({m.group(1)}.md{m.group(2) or ''})", text)

@@ -1,10 +1,9 @@
 --!strict
 -- Mantissa/exponent numbers for values past 2^53. Trades precision for range: a value
--- carries exactly 15 significant digits at any magnitude, so `1e20 + 1 == 1e20`.
--- Anything that must be exact belongs in Scribe.Int.
---
--- Stored as the two-element array { mantissa, exponent }, normalized to either
--- { 0, 0 } or 1 <= |mantissa| < 10 so there is one stored form per value.
+-- carries exactly 15 significant digits at any magnitude, so `1e20 + 1 == 1e20`, and
+-- anything that must be exact belongs in Scribe.Int. Stored as the two-element array
+-- { mantissa, exponent }, normalized to either { 0, 0 } or 1 <= |mantissa| < 10, so
+-- there is one stored form per value.
 
 local Big = {}
 
@@ -86,8 +85,8 @@ local function normalize(m: number, e: number): Big
 		e += shift
 	end
 	-- Snap to 15 digits, or 100 - 30 and the literal 70 store different mantissas and
-	-- everything that compares mantissas exactly splits on it. Must run before the
-	-- window fixup below, which catches the 9.99...8 -> 10 promotion this can produce.
+	-- everything comparing mantissas exactly splits on it. Must run before the window
+	-- fixup below, which catches the 9.99...8 -> 10 promotion this can produce.
 	m = tonumber(string.format("%.15g", m)) :: number
 	-- log10 rounding can leave the mantissa a hair outside the window.
 	if math.abs(m) >= 10 then
@@ -254,10 +253,8 @@ end
 -- The mantissa's 15 significant digits as text, with the decimal point's position
 -- returned rather than applied, so the renders below move the point by counting
 -- characters and never round a second time through a double. `%.14f` is exact because
--- normalize already snapped the mantissa to 15 digits.
---
--- Returns the sign, the digit string, and how many digits belong left of the point:
--- the value is sign .. "0." .. digits .. "e" .. point.
+-- normalize already snapped the mantissa to 15 digits. Returns the sign, the digits, and
+-- how many of them belong left of the point: sign .. "0." .. digits .. "e" .. point.
 local function significand(a: Big): (string, string, number)
 	local body = string.format("%.14f", math.abs(a.M))
 	local whole = string.match(body, "^%d+") :: string
@@ -307,8 +304,26 @@ function Big.toString(a: Big): string
 	return `{(mantissa:gsub("%.?0+$", ""))}e{exponent}`
 end
 
--- The display form an idle game actually shows: "1.72 Dtg". Falls back to
--- scientific once the suffix table runs out, rather than inventing names.
+--- Replace the suffix table `toShort` renders with.
+---
+--- Overridable because the conventions diverge past "T": plenty of idle games run
+--- aa, ab, ac rather than Qa, Qi, Sx. Index 1 is the units tier and must be empty,
+--- because it is what renders a plain number unchanged.
+function Big.SetSuffixes(suffixes: { string }): ()
+	if type(suffixes) ~= "table" or #suffixes == 0 then
+		error("Scribe: suffixes must be a non-empty list of strings", 3)
+	end
+	for index, suffix in suffixes do
+		if type(suffix) ~= "string" then
+			error(`Scribe: suffix {index} must be a string, got {typeof(suffix)}`, 3)
+		end
+	end
+	if suffixes[1] ~= "" then
+		error('Scribe: the first suffix is the units tier and must be ""', 3)
+	end
+	SUFFIXES = table.clone(suffixes)
+end
+
 function Big.toShort(a: Big, decimals: number?): string
 	if a.M == 0 then
 		return "0"
@@ -398,9 +413,9 @@ end
 -- runs once, at the end. Squaring over Big.mul instead compounds one rounding per pass and
 -- produces wrong leaderboard ranking keys well before n = 1000.
 --
--- The kernel is minimal on purpose: both operands stay in [1, 10) throughout this schedule,
--- so every product lands in [1, 100) and the window fixup is at most one divide by ten. A
--- general rescale loop would be dead code for the only caller.
+-- Both operands stay in [1, 10) throughout this schedule, so every product lands in
+-- [1, 100) and the window fixup is at most one divide by ten; a general rescale loop would
+-- be dead code for the only caller.
 local SPLIT = 134217729 -- 2^27 + 1, the Dekker splitter for a 53-bit significand
 
 -- The exact product of two doubles as an unevaluated sum (hi + lo).
@@ -473,12 +488,10 @@ function Big.pow(a: Big, n: number): Big?
 	return normalize(rh, re)
 end
 
--- Base-10 logarithm; the exponent is already the integer part. Total and unguarded on
--- purpose: 0 gives -inf and a negative value nan, matching what the same call on a plain
--- number does, so a fresh {0, 0} balance needs no nil check at every call site.
---
--- Precision decays as E grows, since the integer part and the fraction share one double's
--- 53 bits. Read `a.E` for the exact integer part; the fraction is what this adds.
+-- Base-10 logarithm; `a.E` is already the exact integer part and this adds the fraction.
+-- Total and unguarded on purpose: 0 gives -inf and a negative value nan, matching the
+-- same call on a plain number, so a fresh {0, 0} balance needs no nil check at the call
+-- site. Precision decays as E grows: the integer part and the fraction share 53 bits.
 function Big.log10(a: Big): number
 	return a.E + math.log10(a.M)
 end
@@ -486,11 +499,10 @@ end
 --[=[
 	@class BigValue
 
-	The object a [Scribe.Big] field hands back from `Get`. It is an object rather
-	than a number because the point of the field is a value that has outgrown one:
-	a mantissa and an exponent, carrying about 15 significant digits at any
-	magnitude. There is no public constructor, so you get one from a big field and
-	write one back through that field.
+	The object a [Scribe.Big] field hands back from `Get`: a mantissa and an
+	exponent, carrying about 15 significant digits at any magnitude. There is no
+	public constructor, so you get one from a big field and write one back through
+	that field.
 
 	It supports `+`, `-`, `*`, `/`, unary `-` and `tostring`. Each binary operator
 	takes a number, a numeric string like `"1.5e100"`, or another big value on
@@ -498,12 +510,11 @@ end
 	errors naming its type, and dividing by zero errors rather than handing back an
 	infinity that no save would survive.
 
-	:::caution Comparisons need a big on both sides
-	Luau picks `<` and `<=` by metatable identity, so `Get() < 2000` throws. `==` is
-	consulted only when both sides are tables, so `Get() == 5` is silently `false`
-	rather than an error. Compare two big values directly, or convert with
-	[`ToNumber`](#tonumber) first.
-	:::
+	!!! warning "Comparisons need a big on both sides"
+	    Luau picks `<` and `<=` by metatable identity, so `Get() < 2000` throws. `==` is
+	    consulted only when both sides are tables, so `Get() == 5` is silently `false`
+	    rather than an error. Compare two big values directly, or convert with
+	    [`ToNumber`](#tonumber) first.
 
 	Methods are called with a colon, `essence:Short()`, so the signatures below drop
 	the implicit `self`. The [Big Numbers](../big-numbers.md) guide covers the rest.

@@ -1,14 +1,8 @@
 --!strict
--- DataStore request budgets: what the engine says is left, and whether a
--- deferrable background request should wait for more.
---
--- Read-only, and inert unless asked for. It reports; the two leaderboard loops are
--- the only callers that act on it, and only when BudgetPolicy says so.
---
--- Stateless, including the service handle. A handle resolved through a pcall and
--- cached latches whatever it caught, so one unlucky moment at startup would break
--- the diagnostic for the rest of the process, and a module upvalue would outlive
--- the bundle that filled it in a library that builds many bundles per process.
+-- DataStore request budgets: what the engine says is left, and whether a deferrable
+-- background request should wait for more. Read-only and inert unless asked for; the
+-- two leaderboard loops are the only callers that act on it, and only when
+-- BudgetPolicy says so.
 
 local Clock = require(script.Parent.Clock)
 
@@ -26,9 +20,10 @@ export type Snapshot = {
 	At: number,
 }
 
--- Resolved per call, never stored. A module-load `game:GetService` cannot be
--- retried, and a simulated server without a disk has no DataStoreService at all,
--- so it would take the whole bundle down at require time.
+-- Resolved per call, never stored. A cached handle latches whatever one unlucky
+-- pcall caught, a module-load `game:GetService` cannot be retried, and a simulated
+-- server without a disk has no DataStoreService at all, so a stored handle would
+-- take the whole bundle down at require time.
 local function service(): (any?, string?)
 	local ok, resolved = pcall(function()
 		return game:GetService("DataStoreService")
@@ -39,10 +34,9 @@ local function service(): (any?, string?)
 	return resolved, nil
 end
 
---- Requests left for one type, or nil when the engine cannot answer.
----
---- nil and 0 are different: 0 means the allowance is spent, nil means the question
---- could not be asked. A gate that reads nil as 0 stalls forever in a headless or
+--- Requests left for one type, or nil when the engine cannot answer. nil and 0 are
+--- different: 0 means the allowance is spent, nil means the question could not be
+--- asked, and a gate that reads nil as 0 stalls forever in a headless or
 --- API-disabled environment.
 function Budget.Remaining(requestType: string): number?
 	local handle = service()

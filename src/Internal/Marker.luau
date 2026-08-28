@@ -1,7 +1,7 @@
 --!strict
--- Declarator markers. Declarators return marker tables at
--- runtime (cast to their base Luau type at the type level); the template
--- compiler strips them into (defaultValue, schemaMeta) and deep-freezes the rest.
+-- Declarator markers. Declarators return marker tables at runtime (cast to their
+-- base Luau type at the type level); the template compiler strips them into
+-- (defaultValue, schemaMeta) and deep-freezes the rest.
 
 local MARKER_KEY = "__scribeMarker"
 

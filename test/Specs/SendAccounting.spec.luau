@@ -50,6 +50,16 @@ return function()
 		return harness, players, datas
 	end
 
+	--- Step until the frame's sends have been counted.
+	--- A single Step is one frame in Studio and the engine decides whether the
+	--- resumption lands before or after that frame's flush, so reading the counter
+	--- straight after one reads it empty about half the time.
+	local function stepForSends(harness)
+		harness.StepUntil(function()
+			return Metrics.Get().FramesSent ~= nil
+		end)
+	end
+
 	describe("a transport that raises", function()
 		it("does not take down the flush loop, and the other clients still get theirs", function()
 			-- The guarantee the pcall exists for. Unwrapping the closure must not
@@ -170,7 +180,7 @@ return function()
 			for _, data in datas do
 				data.Pub.Title.Set("shared")
 			end
-			harness.Step()
+			stepForSends(harness)
 
 			local m = Metrics.Get()
 			-- 4 SharedDiff frames + 4 owner Diff frames.
@@ -186,7 +196,7 @@ return function()
 			for _, data in datas do
 				data.Pub.Title.Set("shared")
 			end
-			harness.Step()
+			stepForSends(harness)
 
 			expect(Metrics.Get().FramesSent).to.equal(16)
 			harness.Cleanup()
@@ -202,7 +212,7 @@ return function()
 				for _, data in datas do
 					data.Pub.Title.Set("shared")
 				end
-				harness.Step()
+				stepForSends(harness)
 				expect(`n={n} sent={Metrics.Get().FramesSent}`).to.equal(`n={n} sent={n * n}`)
 				harness.Cleanup()
 			end
