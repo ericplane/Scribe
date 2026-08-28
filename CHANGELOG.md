@@ -287,10 +287,13 @@ to empty the container it was reading.
   is credited on the player's next load, and that a name declared in both tables fails at startup.
   `PASS_PURCHASE_UNCONFIRMED` is written up alongside the other monetization log codes.
 
-- The cross key transactions decision table now sends a two sided trade to the Exchange guide for two
-  players on one server, where it previously said nothing covered that case. The log code reference
-  gained a matching Exchange section for the eight `EXCHANGE_` codes, which record where an in flight
-  exchange currently is rather than any loss of value, and gained rows for `SLOW_LOAD` and
+- The cross key transactions guide no longer says Scribe has no API for a two sided trade. The section that
+  frames the problem, the decision table and the closing links all send two players on one server to the
+  Exchange guide, and the costs listed below that section are now scoped to the cross server case, which is
+  still uncovered.
+
+- The log code reference gained an Exchange section for the eight `EXCHANGE_` codes, which record where an
+  in flight exchange currently is rather than any loss of value, and gained rows for `SLOW_LOAD` and
   `PASS_PURCHASE_UNCONFIRMED`.
 
 - The containers guide now warns that a container listener which yields closes the thread of any open

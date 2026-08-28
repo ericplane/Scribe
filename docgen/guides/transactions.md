@@ -196,7 +196,9 @@ Ordering is load bearing. Ava's flush must complete before Ben's tree is touched
 
 A trade is the shape where both sides give. Its rule is not conservation, because two independent one sided transfers conserve value perfectly well. Its rule is fairness: "I do not hand over my Ember Blade unless I get the Frost Shield." Fairness is exactly the property two independent transfers lack, and it is the thing the player is actually afraid of.
 
-Scribe has no API for this. What follows is the cost, so you can judge whether to build something above the library.
+[Exchange](./exchange) does this for two players who are both loaded on the same server: both baskets are staked out of the two profiles, one verdict decides both sides, and nothing is duplicated or destroyed. That is the shape a trade window is usually in.
+
+Two players on different servers still have no API. What follows is the cost of building one, so you can judge whether to.
 
 - **There is no cross key precondition.** The only write that reaches a key another server owns is an unconditional append to that key's message queue. It cannot say "commit only if Ben still has the shield". A precondition can only be checked where the data lives, so each side has to commit to giving before it can learn whether the other side did, and that commitment has to be durable.
 - **There is no safe unilateral reclaim.** Once your side's give is durable, taking it back needs proof the other side never took it. A write that errors on this platform may still have committed, so "my delivery failed" is not proof. Reading the other key gives you a snapshot that races a concurrent apply on some other server. Every timer based "give it back after five minutes" is unsound for the same reason. A clock may authorise a refusal. It may never authorise a transfer of value.
@@ -231,6 +233,7 @@ If you came here to find out whether you need a cross-key transaction, the most 
 
 ## Where to next
 
+- [Exchange](./exchange) for the two sided trade Scribe does automate, between two players loaded on one server.
 - [Session Lifecycle](./lifecycle) for when a profile loads, saves and shuts down, and where `Flush` fits in that timeline.
 - [Monetization](./monetization) for `Data.Purchase`, the one player transaction that is already written for you.
 - [Gifting](./gifting) for the outbox pattern as Scribe already ships it, escrowed on the buyer's profile.
