@@ -2,6 +2,12 @@
   "name": "ScribeTest",
   "tree": {
     "$className": "DataModel",
+    "Workspace": {
+      "$className": "Workspace",
+      "$properties": {
+        "UseNewLuauTypeSolver": "Enabled"
+      }
+    },
     "ReplicatedStorage": {
       "$className": "ReplicatedStorage",
       "ScribeDev": {

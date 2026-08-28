@@ -175,6 +175,27 @@ The range is 1 to 15. Above 15 the mantissa alone would pass 2^53, and a big car
 
 `SigFigs` is refused on a plain numeric stat. There the key **is** the value, and [`Scale`](#fractional-stats-scale) is the dial.
 
+## Roblox's built-in leaderboard UI
+
+Roblox can render a persistent leaderboard in your experience with no UI code, reading an
+OrderedDataStore directly. Scribe's boards are ordinary OrderedDataStores, so they work with it.
+Follow the
+[Creator Hub instructions](https://create.roblox.com/docs/players/leaderboards#configure-a-leaderboard-in-creator-hub)
+and give it two things:
+
+| It asks for | Give it |
+| --- | --- |
+| Data store name | `LB_<BoardName>`, using the name you gave the board in `Leaderboards` |
+| Key template | `{UserId}` |
+
+So a board declared as `TopLevel` lives in `LB_TopLevel`. If you set `StoreName` on the board
+yourself, use that name instead.
+
+!!! warning "A `Scribe.Big` board cannot be shown this way"
+    A big board stores a packed integer, not the score, so the built-in UI would rank players
+    correctly and then display a number that is not theirs. Use `Data.GetLeaderboard` and your own
+    UI for those, as in the section above.
+
 ## Typed configs
 
 Annotate the config as its own local and `Stat` autocompletes to your template's numeric leaf paths:

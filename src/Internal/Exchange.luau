@@ -38,7 +38,7 @@ export type OpenLeg = {
 --- What a profile still has in flight, and what it is holding while it does.
 export type OpenExchange = {
 	Id: string,
-	State: string, -- "Claimed", "Staked", or "Delivering"
+	State: "Claimed" | "Staked" | "Delivering",
 	Partner: number?,
 	Staked: { OpenLeg }, -- what this profile handed over
 	Owed: { OpenLeg }, -- what this profile is owed

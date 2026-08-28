@@ -200,6 +200,37 @@ local function serverUsage(player: Player)
 	local owns: boolean = Data.Owns(player, "VIP")
 	local ownsAsync: boolean = Data.OwnsAsync(player, "VIP")
 	local ok, err = Data.PromptGift(player, "GiftVIP", 12345)
+	-- These are on the returned Data type, not only on the runtime table.
+	local promptedOk: boolean, promptedWhy: string? = Data.PromptPurchase(player, "VIP")
+	local verdict: string?, exchangeWhy: string? = Data.Exchange.Attempt(player, {}, player, {})
+	local openExchanges = Data.Exchange.Open(player)
+	local openId: string? = if openExchanges[1] ~= nil then openExchanges[1].Id else nil
+	local openState = if openExchanges[1] ~= nil then openExchanges[1].State else nil
+	local openStaked: number? = if openExchanges[1] ~= nil then #openExchanges[1].Staked else nil
+	local discarded: boolean = Data.Exchange.Discard("exchange-id")
+	local settled: boolean = Data.Exchange.Settle("exchange-id", "Commit")
+	local redirected: boolean = Data.Exchange.Redirect("exchange-id", 1, "NewKey")
+	-- Returns nothing, so it is called only to pin that the type declares it.
+	Data.Stop()
+
+	-- Module level API and the exported exchange types, so a rename is not silent.
+	local shortLabel: string = Scribe.Short(1500)
+	local shortRounded: string = Scribe.Short(1500, 0)
+	Scribe.SetShortSuffixes({ "", "K", "M" })
+	local basket: { Scribe.ExchangeLeg } = {
+		{ Path = { "Inventory" }, Kind = "Key", Key = "Emberblade" },
+		{ Path = { "Coins" }, Kind = "Qty", Amount = 100 },
+	}
+	local openTyped: { Scribe.OpenExchange } = Data.Exchange.Open(player)
+	local legTyped: Scribe.OpenLeg? = if openTyped[1] ~= nil then openTyped[1].Staked[1] else nil
+	-- The allowlist entry as a named type, built outside the options literal.
+	local legSpec: Scribe.ExchangeableSpec = {
+		Path = { "Inventory" },
+		Kind = "Stack",
+		Count = "Qty",
+		Identity = { "ItemId" },
+		Ignore = { "TimesUsed" },
+	}
 	local onCooldown, cooldownRemaining = Data.OnCooldown(player, "DailyReward", 86400)
 
 	-- Purchase: Cost.Path is path-checked; Grant gets the typed accessor.
@@ -227,6 +258,22 @@ local function serverUsage(player: Player)
 		ownsAsync,
 		ok,
 		err,
+		promptedOk,
+		promptedWhy,
+		verdict,
+		exchangeWhy,
+		openId,
+		openState,
+		openStaked,
+		discarded,
+		settled,
+		redirected,
+		shortLabel,
+		shortRounded,
+		basket,
+		openTyped,
+		legTyped,
+		legSpec,
 		onCooldown,
 		cooldownRemaining,
 		blob,

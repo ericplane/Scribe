@@ -278,6 +278,11 @@ Putting a declarator inside a plain array literal is a template error for the sa
 
     A table that mixes array indices with string keys is rejected at the write site. One could never have been saved, because the DataStore's JSON encoder fails on it, so this used to surface as a lost profile save long after the write that caused it.
 
+!!! warning "A `Scribe.Big` element field costs you type checking"
+    A `Scribe.Big` declared as a field of an element shape puts the template past the Luau type
+    solver's budget, and the whole file stops being checked. The code still runs. See
+    [Big Numbers](./big-numbers) for the shapes that fit.
+
 ## Where to next
 
 - [Declaring Your Template](./templates) covers the scalar declarators that go inside an element shape.

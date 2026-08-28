@@ -33,6 +33,14 @@ export type BudgetSnapshot = Budget.Snapshot
 export type ExchangeLeg = ExchangeLegType.Leg
 export type OpenExchange = Exchange.OpenExchange
 export type OpenLeg = Exchange.OpenLeg
+--- One entry of the `Exchangeable` allowlist. See the Exchange guide for the rules.
+export type ExchangeableSpec = {
+	Path: { string },
+	Kind: "Key" | "Qty" | "Stack",
+	Count: string?,
+	Identity: { string }?,
+	Ignore: { string }?,
+}
 export type LifecycleReason = Types.LifecycleReason
 export type RequestReason = Types.RequestReason
 export type PurchaseReason = Types.PurchaseReason
@@ -210,7 +218,111 @@ export type function ValueType(T)
 		return memo(ts.newtable(props, spec, nil))
 	end
 
+	-- A canonical key for a subtree, so two identical subtrees are built once. A template
+	-- repeats declarators heavily and Luau interns none of them.
+	--
+	-- Returns nil for anything it cannot describe exactly, and nil means do not cache.
+	-- tostring() is not the key: it truncates past roughly 25 fields, so two records
+	-- sharing a long prefix would collide. Only `table` and `singleton` are probed,
+	-- because an unknown tag fails the whole type function.
+	local opaqueIds: { [type]: string } = {}
+	local opaqueCount = 0
+	local signatureOf: (type, number, { [type]: boolean }) -> string?
+	signatureOf = function(t: type, depth: number, seen: { [type]: boolean }): string?
+		-- A cut-short walk or a cycle cannot be keyed.
+		if depth > MAX_DEPTH + 2 or seen[t] then
+			return nil
+		end
+		if t:is("singleton") then
+			local value = t:value()
+			return `s<{type(value)}:{tostring(value)}>`
+		end
+		if t:is("table") then
+			seen[t] = true
+			local function sub(child: type?): string?
+				if child == nil then
+					return "-"
+				end
+				return signatureOf(child, depth + 1, seen)
+			end
+			local parts: { string } = {}
+			for key, prop in t:properties() do
+				-- Signed separately: a field can differ in only one.
+				local keySig, readSig, writeSig = sub(key), sub(prop.read), sub(prop.write)
+				if keySig == nil or readSig == nil or writeSig == nil then
+					seen[t] = nil
+					return nil
+				end
+				table.insert(parts, `{keySig}={readSig}|{writeSig}`)
+			end
+			-- Sorted, because property iteration order is not guaranteed.
+			table.sort(parts)
+			local indexerSig = "-"
+			local indexer = t:indexer()
+			if indexer ~= nil then
+				local i, r, w = sub(indexer.index), sub(indexer.readresult), sub(indexer.writeresult)
+				if i == nil or r == nil or w == nil then
+					seen[t] = nil
+					return nil
+				end
+				indexerSig = `{i}=>{r}|{w}`
+			end
+			-- The metatable carries the declarator brands, which pick the accessor.
+			local metaSig = "-"
+			local mt = t:metatable()
+			if mt ~= nil then
+				local m = sub(mt)
+				if m == nil then
+					seen[t] = nil
+					return nil
+				end
+				metaSig = m
+			end
+			seen[t] = nil
+			return `t<{table.concat(parts, ",")};i:{indexerSig};m:{metaSig}>`
+		end
+		-- Not a table, so its rendering is its structure and is short enough not to
+		-- truncate.
+		local rendered = tostring(t)
+		if #rendered <= 64 then
+			return `p<{rendered}>`
+		end
+		-- Anything longer falls back to identity: exact, but never shared.
+		local id = opaqueIds[t]
+		if id == nil then
+			opaqueCount += 1
+			id = `o<{opaqueCount}>`
+			opaqueIds[t] = id
+		end
+		return id
+	end
+
+	local buildUncached: (type, boolean, number) -> type
+	local buildCache: { [number]: { [string]: type } } = {}
 	local function build(rawType: type, isRoot: boolean, depth: number): type
+		-- Roots are never cached: isRoot changes what is emitted.
+		if isRoot then
+			return buildUncached(rawType, isRoot, depth)
+		end
+		local key = signatureOf(rawType, 0, {})
+		if key == nil then
+			return buildUncached(rawType, isRoot, depth)
+		end
+		-- Keyed by depth too, because MAX_DEPTH truncates.
+		local atDepth = buildCache[depth]
+		if atDepth == nil then
+			atDepth = {}
+			buildCache[depth] = atDepth
+		end
+		local hit = atDepth[key]
+		if hit ~= nil then
+			return hit
+		end
+		local built = buildUncached(rawType, isRoot, depth)
+		atDepth[key] = built
+		return built
+	end
+	buildUncached = function(rawType: type, isRoot: boolean, depth: number): type
 		if depth > MAX_DEPTH then
 			return anyType
 		end
@@ -843,6 +955,7 @@ export type function ServerDataType(T, P)
 	add("GetMyRank", fn({ P, ts.string }, { optional(ts.number) }))
 
 	add("PromptGift", fn({ P, ts.string, ts.number }, boolAndReason))
+	add("PromptPurchase", fn({ P, ts.string }, boolAndReason))
 	add("GetGiftCredits", fn({ P }, { stringToNumber }))
 	add("HandleReceipt", fn({ ts.any }, { ts.any }))
 	add("TryHandleReceipt", fn({ ts.any }, { optional(ts.any) }))
@@ -868,6 +981,40 @@ export type function ServerDataType(T, P)
 	purchaseProps[ts.singleton("Meta")] = optAnyTable
 	add("Purchase", fn({ P, ts.newtable(purchaseProps, nil, nil) }, boolAndReason))
 	add("RecordPurchase", fn({ P, anyTable }, {}))
+	-- OpenLeg and OpenExchange are rebuilt here: a type function cannot reach an alias.
+	local openLegProps: { [type]: type } = {}
+	local pathSegment = ts.unionof(ts.string, ts.number)
+	openLegProps[ts.singleton("Path")] =
+		ts.newtable(nil, { index = ts.number, readresult = pathSegment, writeresult = pathSegment }, nil)
+	openLegProps[ts.singleton("Kind")] = ts.string
+	openLegProps[ts.singleton("Key")] = optional(ts.any)
+	openLegProps[ts.singleton("Amount")] = optional(ts.number)
+	local openLeg = ts.newtable(openLegProps, nil, nil)
+	local openLegArray = ts.newtable(nil, { index = ts.number, readresult = openLeg, writeresult = openLeg }, nil)
+	local openProps: { [type]: type } = {}
+	openProps[ts.singleton("Id")] = ts.string
+	openProps[ts.singleton("State")] =
+		ts.unionof(ts.singleton("Claimed"), ts.unionof(ts.singleton("Staked"), ts.singleton("Delivering")))
+	openProps[ts.singleton("Partner")] = optional(ts.number)
+	openProps[ts.singleton("Staked")] = openLegArray
+	openProps[ts.singleton("Owed")] = openLegArray
+	openProps[ts.singleton("Since")] = optional(ts.number)
+	local openExchange = ts.newtable(openProps, nil, nil)
+	local openArray =
+		ts.newtable(nil, { index = ts.number, readresult = openExchange, writeresult = openExchange }, nil)
+	local exchangeProps: { [type]: type } = {}
+	exchangeProps[ts.singleton("Attempt")] = fn(
+		{ P, anyArray, P, anyArray },
+		{ optional(ts.string), optional(ts.string) }
+	)
+	exchangeProps[ts.singleton("Open")] = fn({ P }, { openArray })
+	exchangeProps[ts.singleton("Discard")] = fn({ ts.string }, boolAndReason)
+	exchangeProps[ts.singleton("Settle")] = fn({ ts.string, ts.string }, boolAndReason)
+	exchangeProps[ts.singleton("Redirect")] = fn({ ts.string, ts.number, ts.string }, boolAndReason)
+	add("Exchange", ts.newtable(exchangeProps, nil, nil))
+
+	-- Returned by Scribe.Server.
+	add("Stop", fn({}, {}))
 	local purchaseFilterProps: { [type]: type } = {}
 	purchaseFilterProps[ts.singleton("Kind")] = optional(ts.unionof(ts.singleton("Robux"), ts.singleton("InGame")))
 	purchaseFilterProps[ts.singleton("Category")] = optional(ts.string)
@@ -1077,6 +1224,9 @@ export type ScribeOptions<T> = {
 	Passes: { [string]: PassConfig }?,
 	Perks: { string }?,
 	OwnReceipts: boolean?,
+
+	-- exchanging
+	Exchangeable: { [string]: ExchangeableSpec }?,
 	PurchaseLog: {
 		RobuxCap: number?,
 		InGameCap: number?,

@@ -117,7 +117,9 @@ jobs:
             --settings=.vscode/settings.json \
             --ignore="**/DevPackages/**" \
             --ignore="**/ServerPackages/**" \
-            test/TypeCheck.luau
+            test/TypeCheck.luau \
+            test/TypeCheckSignatureA.luau \
+            test/TypeCheckSignatureB.luau
       # Negative gate: TypeCheckErrors.luau is a fixture of deliberate type
       # errors. It must report EXACTLY the number of diagnostics declared in its
       # own `EXPECTED_ERRORS:` header. If a change silently loosens the

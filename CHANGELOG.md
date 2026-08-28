@@ -1,5 +1,56 @@
 # Changelog
 
+## 2.1.1
+
+Released 2026-08-28.
+
+A types and tooling release. Three members of the server API were missing from the type
+`Scribe.Server` hands back, so calling them from a strict-mode script was a type error even though
+they worked at runtime. It also raises the template size at which Luau gives up type-checking your
+game entirely.
+
+### Added
+
+- `Scribe.ExchangeableSpec` is exported, and the `Exchangeable` option is now declared on
+  `ScribeOptions`. The option always worked, and Luau never rejected it because it does not check
+  extra keys in an options literal, but naming the type means a game can build the allowlist as a
+  typed table separately from the options table and get completion on `Path`, `Kind`, `Count`,
+  `Identity` and `Ignore`.
+
+### Fixed
+
+- `Data.PromptPurchase`, `Data.Exchange` and `Data.Stop` were missing from the type `Scribe.Server`
+  returns, so a strict-mode script calling any of them reported the key as not found in the Data
+  table while the call itself worked at runtime. `Data.Exchange` is now typed in full, including
+  what `Open` hands back. `Data.PromptPurchase` and `Data.Exchange` were new in 2.1.0; `Data.Stop`
+  had been missing since before 2.0.0.
+
+### Changed
+
+- A template can now be roughly three times larger before Luau reports "Code is too complex to
+  typecheck" at the `Scribe(...)` call and silently stops checking the file. The accessor type is
+  built once per distinct shape instead of once per field, which matters because a template repeats
+  declarators heavily and Luau treats each one as a separate type. Measured on a template of mixed
+  records and containers, the limit moved from 12 roots to over 32; a template whose roots are all
+  structurally different still gains about half again. Nothing about the types changes: every
+  diagnostic is identical, across every declarator.
+
+- `Scribe.OpenExchange` declares `State` as `"Claimed" | "Staked" | "Delivering"` rather than
+  `string`, so a game can narrow on it. Assigning what `Data.Exchange.Open` returns to a
+  `{ Scribe.OpenExchange }` did not type-check before this.
+
+### Documentation
+
+- The leaderboards guide covers Roblox's built-in leaderboard UI, which renders a persistent
+  leaderboard with no UI code by reading an OrderedDataStore directly. It needs a store name of
+  `LB_<BoardName>` and a key template of `{UserId}`. A `Scribe.Big` board cannot be shown that
+  way, because it stores a packed integer rather than the score, and the guide says so.
+
+- The big numbers and containers guides record that a `Scribe.Big` declared as a field of a
+  container's element shape puts a template past the Luau type solver's budget, so the file stops
+  being type-checked. It is a type-checking limit only and the code runs correctly either way. The
+  guides give the shapes that do fit, including a container whose element is the big itself.
+
 ## 2.1.0
 
 Released 2026-08-28.
@@ -287,13 +338,10 @@ to empty the container it was reading.
   is credited on the player's next load, and that a name declared in both tables fails at startup.
   `PASS_PURCHASE_UNCONFIRMED` is written up alongside the other monetization log codes.
 
-- The cross key transactions guide no longer says Scribe has no API for a two sided trade. The section that
-  frames the problem, the decision table and the closing links all send two players on one server to the
-  Exchange guide, and the costs listed below that section are now scoped to the cross server case, which is
-  still uncovered.
-
-- The log code reference gained an Exchange section for the eight `EXCHANGE_` codes, which record where an
-  in flight exchange currently is rather than any loss of value, and gained rows for `SLOW_LOAD` and
+- The cross key transactions decision table now sends a two sided trade to the Exchange guide for two
+  players on one server, where it previously said nothing covered that case. The log code reference
+  gained a matching Exchange section for the eight `EXCHANGE_` codes, which record where an in flight
+  exchange currently is rather than any loss of value, and gained rows for `SLOW_LOAD` and
   `PASS_PURCHASE_UNCONFIRMED`.
 
 - The containers guide now warns that a container listener which yields closes the thread of any open
