@@ -294,10 +294,12 @@ end
 
 --- Reject a Stack amount before anything reads a balance against it.
 local function assertStackAmount(leg: Leg): number
-	local amount = leg.Amount
-	if type(amount) ~= "number" or amount ~= amount or amount == math.huge or amount == -math.huge then
+	local raw = leg.Amount
+	if type(raw) ~= "number" or raw ~= raw or raw == math.huge or raw == -math.huge then
 		fail(`stack leg at "{Util.pathString(leg.Path)}" has no finite Amount`)
 	end
+	-- Cast for the same reason `present` exists: the guard above does not narrow.
+	local amount = raw :: number
 	if amount <= 0 then
 		fail(`stack leg at "{Util.pathString(leg.Path)}" must move a positive amount, got {amount}`)
 	end
@@ -707,10 +709,10 @@ function ExchangeLeg.Escrow(ctx: any, exchangeId: string, legs: { Leg }): (boole
 			local node = resolveStrict(ctx.Compiled, leg.Path)
 			local entry: Leg = { Path = leg.Path, Kind = leg.Kind, Key = leg.Key, Amount = leg.Amount }
 			if leg.Kind == "Stack" then
-				local plan = planFor(ctx, leg)
-				if plan == nil then
-					fail(`stack leg at "{Util.pathString(leg.Path)}" has no declared Stack rules on this bundle`)
-				end
+				local plan = present(
+					planFor(ctx, leg),
+					`stack leg at "{Util.pathString(leg.Path)}" has no declared Stack rules on this bundle`
+				)
 				local kind = containerKindOf(node)
 				if kind ~= "Dict" and kind ~= "Map" then
 					fail(`stack leg at "{Util.pathString(leg.Path)}" is a {kind}, which has no keyed stack to split`)
