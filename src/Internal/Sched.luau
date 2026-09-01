@@ -1,21 +1,14 @@
 --!strict
--- The scheduling seam: starting a thread goes through here, so a simulation can
--- decide the interleaving instead of the engine. Separate from Clock, which answers
--- what time it is rather than who runs next. A replacement must keep the engine's
--- semantics, or it finds bugs that cannot happen and hides ones that can:
---
---   Spawn(fn, ...)   runs `fn` immediately on the caller's stack, exactly like
---                    task.spawn. Code all over Scribe relies on a spawned load that
---                    never yields having finished by the time Spawn returns.
---   Defer(fn, ...)   queues `fn` to run after the current resumption point.
---   Resume(thr, ...) resumes an already existing suspended coroutine. Distinct from
---                    Spawn because nothing is created, and because these are the
---                    moments a request completes, which is what an interleaving
---                    search most wants to move around.
---
--- Signal's dispatch and the DebugHook pair are deliberately not routed: the signal
--- runner is never blocked, so simulating it buys no new orderings on Scribe's
--- hottest path, and the hooks are Studio tooling.
+-- The scheduling seam: starting a thread goes through here, so a simulation can decide
+-- the interleaving. A replacement must keep the engine's semantics, or it finds bugs
+-- that cannot happen and hides ones that can:
+--   Spawn(fn, ...)   runs `fn` immediately on the caller's stack, like task.spawn. Code
+--                    relies on a spawned load that never yields being done on return.
+--   Defer(fn, ...)   queues `fn` after the current resumption point.
+--   Resume(thr, ...) resumes an existing suspended coroutine: the moments a request
+--                    completes, which an interleaving search most wants to move.
+-- Signal dispatch and the DebugHook pair are not routed: the signal runner is never
+-- blocked, so simulating it buys no orderings, and the hooks are Studio tooling.
 
 local Sched = {}
 

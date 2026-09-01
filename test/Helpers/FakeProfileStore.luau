@@ -46,6 +46,10 @@ function FakeProfileStore.new()
 	fake.DataStoreState = "Access"
 
 	fake.FailNextLoad = false
+	-- What OnError carries when FailNextLoad fires. The text matters: Failure.Classify
+	-- reads the numeric prefix, so "301: ..." is the only way a spec can reach the
+	-- throttled branch of the load-failure kick.
+	fake.LoadFailMessage = "mock load failure"
 	-- Opt-in yield inside StartSessionAsync. Real ProfileStore's StartSessionAsync
 	-- yields (WaitForStoreReady, then UpdateAsync), so a game's own PlayerAdded
 	-- handler genuinely parks in Data.WaitForData while the load runs. The fake is
@@ -495,7 +499,7 @@ function FakeProfileStore.new()
 			end
 			if fake.FailNextLoad then
 				fake.FailNextLoad = false
-				fake.OnError:Fire("mock load failure", storeName, profileKey)
+				fake.OnError:Fire(fake.LoadFailMessage, storeName, profileKey)
 				return nil
 			end
 			if params and type(params.Cancel) == "function" and params.Cancel() then

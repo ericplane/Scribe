@@ -1,16 +1,11 @@
 --!strict
--- Studio debug hook: the game-side half of the Scribe Studio companion plugin. Server.new
--- gates the require on RunService:IsStudio(), so outside Studio nothing here exists.
---
--- Transport is one BindableFunction (request/response) and one BindableEvent (stream
--- digests) under ServerStorage._ScribeDebugHook. The plugin runs in a different Luau VM,
--- so payloads cross as Codec-encoded strings: plain-table reflection between VMs rejects
--- mixed keys and mangles sparse arrays.
---
--- Writes need a per-session opt-in and go through the public server Value API, so the
--- hook can never do what game code could not; receipt injection also needs the resolved
--- Mode to be "Mock". Interception installs at Attach, so ops from before the plugin
--- window opened replay from a capped ring when a plugin subscribes.
+-- Studio debug hook: the game-side half of the Scribe Studio plugin. Server.new gates
+-- the require on RunService:IsStudio(), so outside Studio nothing here exists.
+-- Transport is one BindableFunction and one BindableEvent under
+-- ServerStorage._ScribeDebugHook; payloads cross VMs as Codec-encoded strings, since
+-- plain-table reflection rejects mixed keys and mangles sparse arrays. Writes need a
+-- per-session opt-in and go through the public Value API, so the hook can never do
+-- what game code could not; receipt injection also needs Mode = "Mock".
 
 local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")

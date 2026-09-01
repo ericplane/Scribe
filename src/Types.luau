@@ -27,6 +27,8 @@ export type ScribeTransport = {
 	-- Client
 	SendToServer: (self: any, bytes: buffer) -> (),
 	ListenClient: (self: any, callback: (bytes: buffer) -> ()) -> (),
+	-- Optional. Client.Stop calls it to disconnect what ListenClient connected.
+	Release: ((self: any) -> ())?,
 }
 
 export type LogLevel = "Debug" | "Info" | "Warn" | "Error" | "Fatal"
@@ -72,6 +74,7 @@ export type LogCode =
 	| "RESTORE_RESERVED_PRESERVED"
 	| "PROFILE_SIZE"
 	| "SLOW_LOAD"
+	| "SLOW_IMPORT"
 	| "SAVE_WAIT_TIMEOUT"
 	| "PROFILE_STORE_ERROR"
 	| "PROFILE_STORE_SIGNAL_MISSING"
@@ -147,6 +150,8 @@ export type LogCode =
 	| "PASS_PURCHASE_UNCONFIRMED"
 	| "PERK_GRANTED"
 	| "PERK_REVOKED"
+	| "PRODUCT_INFO_FAIL"
+	| "PRODUCT_INFO_THROTTLED"
 	| "PURCHASE_DUPLICATE"
 	| "PURCHASE_CLAIM_EVICTED"
 	| "PURCHASE_ID_EVICTED"

@@ -1,14 +1,11 @@
 --!strict
 -- Checks a stored profile against the compiled template. Read-only and free of policy:
--- it reports violations, and Persistence alone decides what one costs. The walk is
--- data-driven, not schema-driven: walking the schema would flag every field a profile
--- predates, which Reconcile backfills moments later.
---
--- Stored form is not read form for three value types, and checking the read form would
--- reject every healthy profile:
---   datatype  a packed buffer, not a CFrame/Vector3/...
---   big       a {mantissa, exponent} pair, not a number
---   flags     a sorted array of member-name strings, not a set
+-- it reports violations, and Persistence decides what one costs. Data-driven, not
+-- schema-driven: walking the schema would flag every field a profile predates, which
+-- Reconcile backfills moments later.
+-- Stored form is not read form for three types, and checking the read form would reject
+-- every healthy profile: datatype (a packed buffer), big ({mantissa, exponent}), flags
+-- (a sorted array of member names).
 
 local Big = require(script.Parent.Big)
 local Template = require(script.Parent.Template)
@@ -32,17 +29,11 @@ export type Kind =
 	| "BadEncoding" -- a string that is not valid UTF-8; would fail the save
 	| "UnknownKey" -- a key a closed record does not declare
 
---- Advisory: report it, but never end a session over it, not even under
---- SchemaPolicy = "Reject". Set on the six container findings and nothing else.
----
---- A flag rather than a `Kind`, because `Kind` says what is wrong and this says what
---- policy applies: "OverMaxLength" covers both a string past `MaxLength`, which
---- rejects, and a container past `MaxItems`, which advises.
----
---- The mixed array/hash table is the one container finding that is not advisory: it
---- fails the DataStore save of the whole profile, so ending the session preserves data
---- that would otherwise be lost silently. The rest save fine and ordinary gameplay code
---- can produce them, so kicking over one strands the player on every rejoin.
+--- Advisory: report it, but never end a session over it, even under SchemaPolicy =
+--- "Reject". Set on the six container findings only. A flag rather than a `Kind`,
+--- because `Kind` says what is wrong and this says what policy applies. The mixed
+--- array/hash table is the one container finding that is not advisory: it fails the
+--- whole profile's save, so ending the session preserves data that would be lost.
 export type Violation = {
 	Path: { string | number },
 	Kind: Kind,

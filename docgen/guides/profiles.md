@@ -183,7 +183,7 @@ Each profile stores the version its last successful run stamped, so **never renu
 ??? note "Two things a migration deploy will surprise you with"
     **A near-empty account is not a test.** A returning profile whose stored data is still nothing but current-template defaults is loaded un-migrated and left **unstamped** rather than kicked, because it has no stored progress to protect. Its chain retries on every join and lands as soon as the migration is fixed. It still logs `MIGRATION_FAIL` at Error, plus a warning explaining the carve-out. So a broken deploy kicks players with real progress while a barely-touched test account loads normally, and "my account loaded fine" is not evidence the step ran.
 
-    **A rolling deploy bounces players.** A player whose data a new server already migrated can land on a still-running old server. By default (`VersionAheadPolicy = "Kick"`) Scribe fails closed there too, refusing to run old code against newer-shaped data. When you ship a migration, shut old servers down so players do not bounce between kicking instances.
+    **A rolling deploy bounces players.** A player whose data a new server already migrated can land on a still-running old server. By default (`VersionAheadPolicy = "Kick"`) Scribe fails closed there too, refusing to run old code against newer-shaped data. When you ship a migration, shut old servers down so players do not bounce between kicking instances. Those players are kicked with `VersionAheadMessage`, which says their data is newer than the server rather than blaming a migration.
 
 ## Cross-server messages
 

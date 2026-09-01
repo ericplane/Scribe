@@ -9,6 +9,7 @@ local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Marker = require(Internal.Marker)
 local Clock = require(Internal.Clock)
+local Util = require(Internal.Util)
 
 local Commands = {}
 
@@ -165,6 +166,16 @@ function Commands.new(ctx: any)
 					checkSpec(field, `{where}.{tostring(key)}`, depth + 1)
 				end
 			end
+			-- A gap leaves that position decoded but never type-checked: the arity check reads
+			-- `#` while the loops below skip what is missing. "any" accepts anything instead.
+			local gap = Util.firstGap(args)
+			if gap ~= nil then
+				error(
+					`Scribe: command "{name}" Args[{gap}] is nil, which would leave that argument `
+						.. `unvalidated; use "any" to accept anything at that position`,
+					2
+				)
+			end
 			for i, entry in args do
 				checkSpec(entry, `Args[{i}]`, 0)
 			end
@@ -305,6 +316,14 @@ function Commands.new(ctx: any)
 			local base = if optional then string.sub(expected, 1, -2) else expected
 			if value == nil then
 				return optional
+			end
+			-- No number Scribe can store is non-finite: every write refuses NaN and
+			-- infinity, and markerMatches already refuses them for Int and Number. A bare
+			-- "number" would otherwise hand one to the handler, where typeof says number
+			-- and every comparison against NaN is false, so both arms of a guard are
+			-- skipped. Refused whatever the spec says, "any" included.
+			if type(value) == "number" and (value ~= value or value == math.huge or value == -math.huge) then
+				return false
 			end
 			if base == "any" then
 				return true

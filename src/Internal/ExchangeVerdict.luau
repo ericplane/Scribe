@@ -1,21 +1,13 @@
 --!strict
--- The verdict key: the single point of no return for an exchange's ownership.
+-- The verdict key: the single point of no return for an exchange. Two players are two
+-- DataStore keys with no multi-key transaction, so ONE key decides and everything after
+-- it is infallible or infinitely retryable. The only property owed: every participant,
+-- on every server, on every retry, reads the SAME answer.
 --
--- Two players are two DataStore keys and Roblox has no multi-key transaction. This
--- module makes ONE key the decision point and everything after that decision either
--- infallible or infinitely retryable, so the only property it owes is that every
--- participant, on every server, on every retry, reads the SAME answer.
---
--- First writer wins, and the loser learns from the return value. The transform NEVER
--- returns nil, tempting as that is for "someone else already decided": a nil return
--- aborts the write and yields `(nil, nil)` to the caller, who then cannot tell "another
--- server won, here is their answer" from "nothing happened, try again". Returning `old`
--- unchanged costs one commit and puts the winner's verdict where the loser reads it.
---
--- Indeterminate is not a special case. A write can land and then fail, so a proposer may
--- never learn its own proposal won. Nobody has settled at that point, because a settle
--- requires reading a verdict back. The next proposal reads the committed answer if it
--- landed, or lands its own if it did not, with no reconciliation and no timer.
+-- First writer wins and the loser learns from the return value. The transform never
+-- returns nil: that aborts the write and yields (nil, nil), which the caller cannot tell
+-- from "nothing happened". Indeterminate is not special: a proposer that never learned
+-- its proposal won has not settled, and the next proposal reads the committed answer.
 local Clock = require(script.Parent.Clock)
 
 local ExchangeVerdict = {}

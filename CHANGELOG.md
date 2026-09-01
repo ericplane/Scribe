@@ -1,5 +1,217 @@
 # Changelog
 
+## 2.2.0
+
+Released 2026-09-01.
+
+A server-owned store, so state that belongs to nobody stops having to live on a player. A template
+can also now hold a `Scribe.Big` anywhere, including inside a container's element shape, which used
+to put the whole file past the Luau type solver's budget and silently stop it being checked. The
+change that buys it also makes assigning to an accessor a type error, which is the one thing to
+read before upgrading.
+
+### Added
+
+- `ServerStore` declares a second tree owned by the server rather than by any player. One table for
+  the whole server, reached as `Data.ServerStore.Wave` with no player argument on either realm,
+  written on the server and replicated to every client as ordinary diffs. It exists from the moment
+  the bundle is built, so the server can write it with nobody in the game, and a joiner receives it
+  in the same Init snapshot that carries their own profile.
+
+  Nothing in it is saved. A store root is in no profile payload and no session store, it does not
+  mark a profile dirty, and it is gone when the server closes. It compiles through the same pass as
+  the template, so store fields share one id space and one schema hash with the rest of the bundle
+  and store drift fails the Hello handshake like any other drift.
+
+  `Scribe.ServerOnly` keeps a store root off the wire. `Scribe.Session`, `Scribe.Shared`,
+  `Scribe.Timed`, `Scribe.Dynamic`, a name the template already declares, a `_Scribe` prefix, and a
+  `Scribe.Derived` reading across the boundary are all refused at startup with a message naming the
+  field. Containers, records, bounds, `Scribe.Big` and same-side derived fields work normally.
+
+  A bundle that declares no `ServerStore` builds no store tree, exposes no `Data.ServerStore` on
+  either realm, and does not pay so much as a function call per frame for the feature.
+
+- `ImportLegacyData` can pace itself on the DataStore request budget. A game adopting Scribe may read
+  several legacy stores for one joining player, a main store plus a sharded copy plus a board per
+  OrderedDataStore, and twenty players joining at once throttle each other and everything else on the
+  server. The hook now receives a third argument carrying
+  `AwaitBudget(requestType, count?, timeout?)`, which yields until that many requests are spare.
+
+  Waiting callers are served first come, first served, per request type, so a player who has been
+  waiting is never overtaken by one who just joined and a hook wanting five requests is never passed
+  by one wanting one. A grant is debited against a short-lived ledger, because the engine's budget
+  reading has not moved between granting a caller and that caller issuing its request, and granting
+  the next one off the same reading would put the stampede back. When the engine cannot be asked at
+  all the call grants rather than parking, which is the difference between a headless server working
+  and hanging.
+
+  `Data.GetState` gained a second return: `"Importing"` while the hook runs and `"ImportThrottled"`
+  while it is queued, nil at every other time. It is additive, so single-value callers are unchanged.
+  Relay it to your loading screen yourself; Scribe cannot replicate to a client with no data yet.
+  `OnPlayerInit` receives the same context as a fourth argument, because `ImportLegacyData` only fires
+  for a player who has never saved and a game already on Scribe has nowhere else to finish moving.
+
+  Migrations are held off the allowance Scribe needs for itself: `UpdateAsync` is reserved at the
+  online session count, since its worst case is the shutdown drain saving every session at once. The
+  new `MigrationConcurrency` option (default 2) bounds how many imports run at once, which is the only
+  hard limit available, because a hook that never calls `AwaitBudget` cannot be paced. A hook running
+  past thirty seconds now warns `SLOW_IMPORT`, so one patiently waiting on budget and one that has
+  hung stop looking identical.
+
+- Copy-in UI framework adapters for Vide, React and Fusion, in `adapters/`. Not part of the
+  package: wally publishes `src` only, so these are files you copy into your game rather than
+  something installed with Scribe. Each takes your framework as an argument, since it sits at a
+  path in your project Scribe cannot know.
+
+  They are short because the client mirror already has the right shape, and three properties that
+  make them safe are now pinned by specs rather than assumed: `Get()` returns a referentially
+  stable value (a fresh table per call would make a React memo or a Vide derived recompute
+  forever), that stability survives a resync rebuilding the mirror, and one frame of writes
+  arrives as one notification, so no adapter debounces.
+
+  The React adapter targets jsdotlua React 17.2.1 and uses `useState`, `useEffect` and
+  `useBinding`. It avoids `useSyncExternalStore`, the React 18 hook for exactly this, because that
+  port does not export it. `useScribeBinding` updates a property without re-rendering the
+  component. Fusion covers both calling conventions: pass a scope on 0.3, omit it on 0.2.
+
+- A kick after a failed load now says WHICH failure it was. One sentence covered five different
+  outcomes, so "we couldn't load your data" read the same whether the DataStore was rate limiting
+  the server for a few seconds or the profile was never going to load at all. A throttled load, a
+  migration that could not complete, a `SchemaPolicy = "Reject"` rejection and an
+  `ImportLegacyData` hook that threw each have their own wording now, and each has its own option:
+  `RateLimitedMessage`, `MigrationFailureMessage`, `SchemaFailureMessage` and
+  `LegacyImportFailureMessage`.
+
+  `VersionAheadPolicy = "Kick"` is split out too, as `VersionAheadMessage`. It used to wear the
+  migration wording, which is the wrong way round: no migration ran and nothing is broken, the
+  profile was written by a newer deploy and this server is the old one. During a staged rollout
+  that is the message players actually see.
+
+  The rate-limited case is read from the store rather than guessed. `StartSessionAsync` answers nil
+  and carries no reason of its own, so Scribe uses the class of the last DataStore error reported
+  for that key, and only a 3xx throttling code gets the "busy, rejoin in a moment" wording. A 5xx is
+  the service failing rather than throttling and keeps the ordinary load message.
+
+  `LoadFailureMessage` still overrides all five, so a game that set it keeps one voice and nothing
+  about its configuration changes. Games that read kick text in support tooling should note the
+  four new defaults.
+
+- The session-end kick says which kind of ending it was. `KickOnSessionEnd` had one sentence,
+  "your data session has ended", which hid the cause it nearly always is: another server holds
+  the profile now, because the player opened the experience somewhere else. That is
+  `SessionStolenMessage`, decided by the same `LocalSessionEnd` flag Scribe already uses to tell
+  a local release from a steal. A session that went away mid-load gets
+  `SessionInterruptedMessage`, because a player kicked before their data ever arrived never had
+  a session to lose.
+
+  The two families stay separate: load causes fall back to `LoadFailureMessage`, session-end
+  causes to `SessionEndMessage`. Wording your load failures does not silently reword your
+  session ends.
+
+- `migration.AwaitBudget` now returns a release alongside its verdict. Calling it once the
+  reads have been issued hands the allowance straight to the next waiting player, instead of
+  leaving a timer to presume the grant spent. It is optional, safe to call twice and safe to
+  call when nothing was granted, so hooks written against the old single return keep working.
+
+- The `GetSortedAsync` allowance held back from a migrating `ImportLegacyData` hook now
+  follows the leaderboards a game actually declares, one read per board and capped, instead
+  of a flat four. A game with no leaderboards reserves nothing, so its migration gets the
+  whole ordered-read pool.
+
+- `Data.Stop()` on the client, the counterpart of the server's. It releases the transport
+  listener, the Hello retry loop, the subscription watch and the mirror's listeners. A
+  storybook that remounts a bundle per story, or a test suite that builds many, no longer
+  stacks a listener per build. Custom transports can implement an optional `Release` for it.
+
+- The budget pacer reports itself: `BudgetWaiters`, `BudgetQueued`, `BudgetGranted`,
+  `BudgetTimedOut` and a `BudgetWaitSeconds` distribution, so a migrating server's queue is
+  visible as a whole rather than one player's phase at a time.
+
+- Per-player prices on the client. `Data.GetPrice("VIP")` answers what **this** player is charged,
+  after any Roblox Plus discount (10% for two months, then 20%) and any regional pricing (30% to
+  100% of the listed price). `Data.GetProductInfo` returns the whole Marketplace table, so
+  `UserBasePriceInRobux` and `PriceDiscountDetails` are there for a "was 100, now 80" button, and
+  `Data.ObserveProductInfo` is the reactive form for a shop that should repaint when the value
+  lands. `Data.PrefetchProductInfo` warms a list, or everything declared, as one batch.
+
+  Client-only on purpose. A live server's `GetProductInfoAsync` has no player in context and answers
+  the base catalog price, while a Studio server answers the personalized one, so the obvious
+  server-side cache is correct in Play Solo and wrong in production for everyone holding a discount.
+  Reads are named by the pass or product you declared, Scribe picks the InfoType, and reads asked
+  for in one frame are batched into a single burst. A read that fails leaves the price `nil` rather
+  than falling back to the catalog number, and logs `PRODUCT_INFO_FAIL`. Prices are re-read once,
+  the first time the local player's `HasRobloxSubscription` flips.
+
+### Behaviour changes
+
+- A write to the server store from inside `Data.Transaction` is refused, and the transaction that
+  contained it aborts. A rollback restores one player's tree, and the store is neither that tree nor
+  saved to any key, so a store write made inside a transaction would outlive an abort. The refusal
+  names the store and says to write it before the transaction or after it returns `true`; the
+  cross-player refusal, which points at the durable outbox instead, is unchanged.
+
+- Assigning to an accessor is now a type error. `data.Coins = 5` and `data.Coins.Set = f` report
+  that the property is read-only, where before they type-checked and did something worse than
+  nothing: the accessor metatable has no `__newindex`, so the assignment wrote over the accessor
+  and permanently shadowed the real one for that instance. Nothing that works today stops working;
+  `data.Coins.Set(5)` and every other method are unchanged. If a script does assign to an accessor,
+  it was already broken and the error is telling you where.
+
+### Fixed
+
+- A non-finite number is refused as a command argument. `typeof(0/0)` is `"number"`, so a bare
+  `"number"` in `Args` accepted NaN and handed it to the handler, where every comparison against it is
+  false: a guard written as `if amount > 0` takes neither branch, so both arms of a check can be
+  skipped. Infinity passed the same way, and NaN survives the wire intact, so a client could genuinely
+  send one. Declarators were never affected, since `Scribe.Int` and `Scribe.Number` already refused
+  non-finite values. Now refused whatever the spec says, `"any"` included, because no number Scribe can
+  store is non-finite. `Scribe.Derived` was already covered at both ends: a compute returning NaN fails
+  at startup, and one that goes non-finite at runtime raises rather than storing it.
+
+- A gap in a developer-declared list is refused where it used to pass silently, in command `Args`
+  and in `Scribe.Derived` inputs. Both read the list two ways that disagree: `#` counts past a gap
+  written in a constructor (`{ "number", nil, "string" }` is 3) and stops short of one written by
+  assignment (`t[1]`, `t[3]` is 1), while every loop over the list iterates the array part and
+  skips whatever is missing.
+
+  For `Args` that left the middle argument decoded and handed to the handler without a type check,
+  because the arity check read `#` and admitted it. For `Scribe.Derived` it silently narrowed the
+  field: `{ "A", nil, "B" }` became a two-input derived, the "inputs must be strings" check never
+  saw the gap, and `Compute` took nil for that parameter forever. Neither is remotely reachable,
+  since a developer has to declare the gap, but in both cases the declaration quietly meant
+  something other than what it read as. Use `"any"` for a command argument you do not want
+  checked. The `Args` half was reported by a community member against 2.1.1; the `Scribe.Derived`
+  half was found by sweeping for the same shape.
+
+- `Owns`, `OwnsAsync` and `ObserveOwned` raise a named error when the key is not a string,
+  instead of failing two different ways depending on where they ran. In Studio a nil key hit
+  `warnedOwnsKeys[key] = true` inside the unknown-key warning and raised "table index is nil"
+  from inside Scribe, naming neither the caller nor the argument. In production that warning sits
+  behind `DevMode` and never ran, so the same call answered `false` and an ownership gate quietly
+  denied a player who had paid, with nothing logged anywhere. Both realms now say which API was
+  called and what type arrived, so `Owns(player, passId)` and a missing config field name
+  themselves. Reported against 2.1.1.
+
+- A `Scribe.Big` inside a container's element shape, as in
+  `Scribe.DictOf({ Id = Scribe.String(""), Amount = Scribe.Big(0) })`, put a two root template past
+  the type solver's budget. The file reported "Code is too complex to typecheck" at the
+  `Scribe(...)` call and lost autocomplete and every other diagnostic. The same wall caught a plain
+  record holding two bigs, and a big nested three levels deep with no container involved at all.
+  All of them compile now.
+
+  The cause was not the size of the big type, which is why every attempt to trim it failed. An
+  accessor property carried both a read and a write type, so comparing two instantiations of the
+  accessor tree had to prove each side exactly the other, in both directions, at every property and
+  every level, with the self-referential big expanded at each mention. Accessor properties are now
+  read-only, which makes that comparison covariant. Diagnostics for ordinary mistakes are
+  unchanged.
+
+### Documentation
+
+- A new guide, The Server Store, covers declaring one, reading it on both realms, what it refuses
+  and why, and what a store write costs in memory, bytes on the wire and time in a flush. The
+  configuration guide lists `ServerStore` under Core.
+
 ## 2.1.1
 
 Released 2026-08-28.

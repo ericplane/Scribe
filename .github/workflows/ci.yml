@@ -60,7 +60,7 @@ jobs:
       # std on first run. If a runner ever flakes on that fetch, add a
       # `selene generate-roblox-std` step before this one.
       - name: Lint
-        run: selene src test lune
+        run: selene src test lune adapters
 
   format:
     runs-on: ubuntu-latest
@@ -73,7 +73,7 @@ jobs:
           path: ~/.rokit
           key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
       - name: Check formatting
-        run: stylua --check src test lune
+        run: stylua --check src test lune adapters
 
   analyze:
     runs-on: ubuntu-latest
@@ -123,7 +123,7 @@ jobs:
       # Negative gate: TypeCheckErrors.luau is a fixture of deliberate type
       # errors. It must report EXACTLY the number of diagnostics declared in its
       # own `EXPECTED_ERRORS:` header. If a change silently loosens the
-      # template-aware config types, the count drops and this fails — catching a
+      # template-aware config types, the count drops and this fails, catching a
       # regression the positive fixture cannot.
       - name: Type-check (negative fixture must report the expected count)
         run: |
@@ -280,9 +280,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Same guard the release workflows run — moved left to PR time so version
-      # drift is caught on the branch that introduced it, not at (immutable)
-      # publish time.
+      # Same guard the release workflows run, at PR time so version drift is
+      # caught on the branch that introduced it, not at (immutable) publish time.
       - name: wally.toml must match src/Internal/Version.luau
         run: |
           WALLY_VER="$(grep -m1 '^version' wally.toml | sed 's/.*"\(.*\)".*/\1/')"

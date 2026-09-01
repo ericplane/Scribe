@@ -23,6 +23,7 @@ local Timed = require(script.Timed)
 local Analytics = require(script.Analytics)
 local Leaderboards = require(script.Leaderboards)
 local Exchanges = require(script.Exchanges)
+local ServerStore = require(script.ServerStore)
 local Monetization = require(script.Monetization)
 
 local Server = {}
@@ -83,6 +84,8 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		ctx.Timed = Timed.new(ctx)
 		ctx.Persistence = Persistence.new(ctx)
 		ctx.Replication = Replication.new(ctx)
+		-- After Replication: its OnOp pushes onto Replication's store queue.
+		ctx.ServerStore = ServerStore.new(ctx)
 		ctx.Commands = Commands.new(ctx)
 		ctx.Leaderboards = Leaderboards.new(ctx)
 		ctx.Monetization = Monetization.new(ctx)
@@ -92,7 +95,15 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	end)
 	if not constructed then
 		for _, subsystem in
-			{ ctx.Exchanges, ctx.Leaderboards, ctx.Timed, ctx.Monetization, ctx.Replication, ctx.Persistence }
+			{
+				ctx.Exchanges,
+				ctx.Leaderboards,
+				ctx.Timed,
+				ctx.Monetization,
+				ctx.ServerStore,
+				ctx.Replication,
+				ctx.Persistence,
+			}
 		do
 			if subsystem ~= nil and type(subsystem.Stop) == "function" then
 				pcall(subsystem.Stop)
@@ -209,7 +220,13 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@server
 		@param player Player
 		@return "Loading" | "Ready" | "SessionEnded"
+		@return ("Importing" | "ImportThrottled")?
 		The player's session state, without yielding.
+
+		The second return says where a **Loading** player actually is, and is nil at every
+		other time. `"Importing"` means `ImportLegacyData` is running; `"ImportThrottled"`
+		means it is queued on the DataStore request budget. Relay it to your loading screen
+		over your own remote: Scribe cannot replicate to a client that has no data yet.
 	]=]
 	function Data.GetState(player: Player)
 		return ctx.Persistence.GetState(player)
@@ -1339,7 +1356,15 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		stopped = true
 		-- Reverse of the Start order: stop producing work before releasing what consumes it.
 		for _, subsystem in
-			{ ctx.Exchanges, ctx.Leaderboards, ctx.Timed, ctx.Monetization, ctx.Replication, ctx.Persistence }
+			{
+				ctx.Exchanges,
+				ctx.Leaderboards,
+				ctx.Timed,
+				ctx.Monetization,
+				ctx.ServerStore,
+				ctx.Replication,
+				ctx.Persistence,
+			}
 		do
 			if subsystem ~= nil and type(subsystem.Stop) == "function" then
 				local ok, err = pcall(subsystem.Stop)
@@ -1354,6 +1379,28 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		if ownsDefaultChannel then
 			pcall(TransportModule.ReleaseChannel, options.TransportChannel)
 		end
+	end
+
+	-- Per store root, not the store's root accessor: the client holds one tree over both
+	-- halves, so this keeps the surface identical on both realms.
+	--[=[
+		@within Server
+		@tag Reads
+		@server
+		@prop ServerStore table
+		The server-owned tree, one per server rather than per player, present only
+		when the bundle declares `ServerStore`. Each declared root is an accessor
+		reached with no player argument, as in `Data.ServerStore.Wave.Set(3)`.
+		
+		Nothing in it is saved, and the same shape appears on the client, where it
+		is read-only. See [Server-owned state](../server-store.md).
+	]=]
+	if ctx.ServerStore ~= nil then
+		local proxy = {}
+		for _, key in compiled.Views.Store.RootOrder do
+			proxy[key] = ctx.ServerStore.Accessor[key]
+		end
+		Data.ServerStore = table.freeze(proxy)
 	end
 
 	-- A root field named like a Data API name is silently shadowed by that real key (a

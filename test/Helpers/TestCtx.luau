@@ -11,7 +11,9 @@ local Scribe = require(ScribeRoot) :: any
 local Template = require(ScribeRoot.Internal.Template)
 local Wire = require(ScribeRoot.Internal.Wire)
 local Health = require(ScribeRoot.Internal.Health)
+local Budget = require(ScribeRoot.Internal.Budget)
 local Server = require(ScribeRoot.Server) :: any
+local Client = require(ScribeRoot.Client) :: any
 
 local FakeProfileStore = require(script.Parent.FakeProfileStore)
 local StubTransport = require(script.Parent.StubTransport)
@@ -121,6 +123,7 @@ function TestCtx.make(
 	local compiled = Template.Compile(options.Template, {
 		ReplicateRobuxLog = purchaseLog.ReplicateRobux == true,
 		ReplicateInGameLog = purchaseLog.ReplicateInGame == true,
+		ServerStore = options.ServerStore,
 	})
 	local Data, ctx = Server.build(options, compiled)
 
@@ -322,6 +325,10 @@ function TestCtx.make(
 		pcall(Data.Stop)
 		-- The Health singleton is shared across harnesses: walk it back to
 		-- Healthy so failure-injection tests don't poison later specs.
+		-- Budget pacing is module-global, since the allowance is per process rather than
+		-- per bundle. A spec that queued must not hand its queue to the next one.
+		Budget.Reset()
+		Client.SetLocalPlayerProbe(nil)
 		Health.SetCritical(false)
 		for _ = 1, 40 do
 			if Health.GetStatus() == "Healthy" then

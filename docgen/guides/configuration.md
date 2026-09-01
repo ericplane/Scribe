@@ -82,9 +82,11 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | `Transport` | `(ScribeTransport \| "Default")?` | `"Default"` | Picks the server-to-client replication channel. Supply an adapter table only to route replication through your own networking layer. See [Custom Transports](./transports). |
 | `Migrations` | `{ [number]: (data) -> () }?` | `{}` | Maps each data version from 2 upward to a function that upgrades stored data to it. See [Offline Profiles](./profiles#migrations). |
 | `MigrationShadow` | `boolean?` | off | Re-runs your migration chain a second time against the raw pre-reconcile data and warns where the two disagree. |
+| `ServerStore` | `{ [string]: any }?` | none | Declares a second tree owned by the server rather than by any player: one table for the whole server, never saved, replicated to everyone. See [The Server Store](./server-store). |
 | `Economy` | `EconomyConfig?` | none | Per-currency labels, custom field declarations, and resolvers for Roblox's economy dashboard. See [Economy Analytics](./economy). |
-| `ImportLegacyData` | `((player, userId) -> table?)?` | none | Adopts data from another library, once, before reconcile and before migrations. See [Migrating to Scribe](./migrating). |
-| `OnPlayerInit` | `((player, rawData, isNewProfile) -> ())?` | none | Runs once per player right after their profile loads, against the raw data table. See [Session Lifecycle](./lifecycle#onplayerinit). |
+| `ImportLegacyData` | `((player, userId, migration) -> table?)?` | none | Adopts data from another library, once, before reconcile and before migrations. The third argument is a [`MigrationContext`](/api/types#migrationcontext): `migration.AwaitBudget(requestType, count?, timeout?)` paces reads on the DataStore budget and returns `(granted, release)`. See [Migrating to Scribe](./migrating). |
+| `OnPlayerInit` | `((player, rawData, isNewProfile, migration) -> ())?` | none | Runs once per player right after their profile loads, against the raw data table. The fourth argument is the same [`MigrationContext`](/api/types#migrationcontext), so `AwaitBudget` is available here too, for a game already on Scribe with stores left to move. See [Session Lifecycle](./lifecycle#onplayerinit). |
+| `MigrationConcurrency` | `number?` | 2 | How many `ImportLegacyData` hooks may run at once. The only hard bound on what a migrating server spends, because `AwaitBudget` is cooperative. |
 | `OnPlayerLeaving` | `((player, data, reason) -> ())?` | none | Runs once per player as they leave, **before** the final save, so anything it writes persists. |
 
 ??? note "What `MigrationShadow` is actually catching"
@@ -105,9 +107,39 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | `LoadFailurePolicy` | `("Kick" \| "Wait")?` | `"Kick"` | What to do when a load keeps failing. `"Kick"` removes the player. `"Wait"` retries with backoff and never serves template data. |
 | `VersionAheadPolicy` | `("Kick" \| "Allow")?` | `"Kick"` | What to do with a profile written by a newer deploy. `"Kick"` fails closed. `"Allow"` runs older code against newer data and warns. |
 | `KickOnSessionEnd` | `boolean?` | `true` | Kicks a player whose session ends unexpectedly, so they can rejoin with a working one. |
-| `LoadFailureMessage` | `string?` | "We couldn't load your data. Please rejoin!" | The kick message under the `"Kick"` load policy, and after a failed migration. |
-| `SessionEndMessage` | `string?` | "Your data session has ended. Please rejoin!" | The kick message when `KickOnSessionEnd` fires. |
+| `LoadFailureMessage` | `string?` | "We couldn't load your data. Please rejoin!" | The kick message under the `"Kick"` load policy. Setting it overrides the four **load** causes below, so an existing config keeps one voice; it does not reach the session-end rows. |
+| `LegacyImportFailureMessage` | `string?` | "We couldn't check your existing data…" | Shown when `ImportLegacyData` threw, so the load fails closed rather than starting the player empty. |
+| `MigrationFailureMessage` | `string?` | "We couldn't update your data to this version of the game…" | Shown when the migration chain could not complete. |
+| `VersionAheadMessage` | `string?` | "Your data is from a newer version of the game than this server…" | Shown when `VersionAheadPolicy = "Kick"` fails closed on a profile a newer deploy already migrated. Their data is fine; this server is the old one. |
+| `SchemaFailureMessage` | `string?` | "Your saved data doesn't match this version of the game…" | Shown when `SchemaPolicy = "Reject"` rejects the stored profile. |
+| `RateLimitedMessage` | `string?` | "Roblox's data service is busy right now…" | Shown when the load failed and the DataStore's last error for that key was a throttle (a 3xx code). The one load failure worth rejoining for. |
+| `SessionEndMessage` | `string?` | "Your data session has ended. Please rejoin!" | The kick message when `KickOnSessionEnd` fires. Setting it overrides both causes below. |
+| `SessionStolenMessage` | `string?` | "Your data was opened on another server…" | Shown when another server took the profile, which is what almost every unexpected session end actually is. |
+| `SessionInterruptedMessage` | `string?` | "Your data session ended before it finished loading…" | Shown when the session went away mid-load, so the player never had a session to lose. |
 | `UseMock`, `DontSave`, `ViewedUserId`, `OverriddenUserId` | | | Superseded by [`Mode`](#persistence-mode). |
+
+??? note "Why the kick messages are split by cause"
+    A player who is told "we couldn't load your data" cannot tell a throttle that clears in
+    ten seconds from a profile that will never load again, and neither can whoever reads
+    their support report. Each cause names itself instead.
+
+    The rate-limited wording is earned, not guessed. `StartSessionAsync` answers `nil` and
+    carries no reason of its own, so Scribe reads the DataStore error the store reported for
+    that key and uses the throttle wording only for a 3xx code. A 5xx is the service failing,
+    not throttling, and gets the ordinary load message; see [Diagnostics](./diagnostics) for
+    the same classification behind the counters.
+
+    The session-end kick splits the same way. "Your data session has ended" hid the one cause
+    it nearly always is: another server holds the profile now, because the player opened the
+    experience somewhere else. That is `SessionStolenMessage`, and it is decided by the same
+    `LocalSessionEnd` flag Scribe already uses to tell "we ended this" from "someone took it".
+
+    The two families do not leak into each other. Load causes fall back to
+    `LoadFailureMessage`, session-end causes to `SessionEndMessage`, so wording your load
+    failures has not thereby worded your session ends.
+
+    Every one of them still defers to `LoadFailureMessage` when you set it, so nothing about
+    an existing config changes. Name a specific one to override just that cause.
 
 ??? note "Why `LoadTimeout` has a 60 second floor"
     ProfileStore's own `START_SESSION_TIMEOUT` only applies when no `Cancel` hook is passed, and Scribe always passes one. Without `LoadTimeout`, a DataStore outage would park a joining player in `Loading` forever and `LoadFailurePolicy` would never be reached.
@@ -127,6 +159,7 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | `OwnReceipts` | `boolean?` | `true` | Whether this bundle installs the single global `ProcessReceipt` callback. Set false on a secondary bundle and route its receipts through `Data.HandleReceipt`. |
 | `PurchaseLog` | table | caps of 100, server-only | Tunes the per-player purchase history rings. |
 | `UserOwnsGamePassAsync` | `((userId, passId) -> boolean)?` | the real service call | A test seam for pass ownership. Leave it unset in production. |
+| `GetProductInfoAsync` | `((assetId, infoType) -> table?)?` | the real service call | A test seam for the client's price reads. Leave it unset in production. |
 
 Emberfall's money config is two products and one pass:
 
@@ -340,6 +373,7 @@ Absent, the policy follows [`DevMode`](#diagnostics): `"Warn"` while you develop
 | Option | Type | Default | What it does |
 | --- | --- | --- | --- |
 | `DevMode` | `boolean?` | `true` in Studio | Turns on the developer guards: the warnings that catch a typo instead of letting it fail quietly later. |
+| `IsRunning` | `boolean?` | `RunService:IsRunning()` | A test seam. `false` builds only the edit-mode client half, which is how a storybook or the command bar gets a tree with no server. Leave it unset in a real place. |
 | `LogLevel` | `("Debug" \| "Info" \| "Warn" \| "Error" \| "Fatal")?` | `"Warn"` live, `"Debug"` in Studio | The minimum severity printed to the console. Everything still enters the ring. |
 | `LogRingSize` | `number?` | 512 | How many entries [`Scribe.GetRecentLogs`](/api/Scribe#GetRecentLogs) retains. |
 | `StatusThresholds` | `{ FailWindow, FailCount, RecoverStreak }?` | `{ 60, 3, 5 }` | Tunes the health machine that moves the service between Healthy, Degraded and Outage. |

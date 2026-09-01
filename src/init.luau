@@ -402,13 +402,16 @@ export type function ValueType(T)
 			end
 		end
 
-		local props: { [type]: type } = {}
+		-- Insertion ordered, because the properties are applied one at a time below and a
+		-- later entry must overwrite an earlier one of the same name. A map keyed by type
+		-- cannot do that: two ts.singleton("Remove") calls are distinct objects.
+		local props: { { key: type, ty: type } } = {}
 		local indexerSpec: { index: type, readresult: type, writeresult: type }? = nil
 
 		-- Strips a nested Timed / ServerOnly label, the one thing a read should not show.
 		local valueType = unwrapWrappers(t, depth)
 		local function add(name: string, ty: type)
-			props[ts.singleton(name)] = ty
+			table.insert(props, { key = ts.singleton(name), ty = ty })
 		end
 
 		-- Static children and container methods first, so the common node methods below win
@@ -419,7 +422,7 @@ export type function ValueType(T)
 			for key, prop in t:properties() do
 				local childType = prop.read or prop.write
 				if childType ~= nil then
-					props[key] = build(childType, false, depth + 1)
+					table.insert(props, { key = key, ty = build(childType, false, depth + 1) })
 				end
 			end
 
@@ -578,7 +581,14 @@ export type function ValueType(T)
 			add("Active", fn({}, { ts.boolean, optNumber }))
 		end
 
-		return ts.newtable(props, indexerSpec, nil)
+		-- Read-only, not read/write. An accessor is never assigned to, and a read/write
+		-- property makes comparing two accessor trees invariant: the solver has to prove
+		-- each side is exactly the other, which is what exceeds its budget at Scribe().
+		local out = ts.newtable(nil, indexerSpec, nil)
+		for _, entry in props do
+			out:setreadproperty(entry.key, entry.ty)
+		end
+		return out
 	end
 
 	return build(T, true, 0)
@@ -801,6 +811,7 @@ export type function ClientDataType(T)
 	end
 
 	add("IsReady", fn({}, { ts.boolean }))
+	add("Stop", fn({}, {}))
 	add("WaitForData", fn({ optional(ts.number) }, { ts.boolean }))
 	add("Request", ts.newfunction({ head = { ts.string }, tail = ts.any }, { tail = ts.any }))
 	-- RequestOnce(name, key, ...): the key is a required second string, so a plain
@@ -827,12 +838,21 @@ export type function ClientDataType(T)
 	purchaseFilterProps[ts.singleton("Limit")] = optional(ts.number)
 	local purchaseFilter = optional(ts.newtable(purchaseFilterProps, nil, nil))
 	add("GetPurchases", fn({ purchaseFilter }, { anyArray }))
+	local stringArray = ts.newtable(nil, { index = ts.number, readresult = ts.string, writeresult = ts.string }, nil)
+	add("GetProductInfo", fn({ ts.string }, { optional(anyTable) }))
+	add("GetPrice", fn({ ts.string }, { optional(ts.number) }))
+	add("GetProductInfoAsync", fn({ ts.string, optional(ts.number) }, { optional(anyTable) }))
+	add("GetPriceAsync", fn({ ts.string, optional(ts.number) }, { optional(ts.number) }))
+	add("ObserveProductInfo", fn({ ts.string, fn({ optional(anyTable) }, {}) }, { fn({}, {}) }))
+	add("PrefetchProductInfo", fn({ optional(stringArray) }, {}))
+	add("RefreshProductInfo", fn({ optional(ts.string) }, {}))
 	add("Mock", fn({ optional(anyTable), optional(anyTable) }, {}))
 	add(
 		"MockCommand",
 		ts.newfunction({ head = { ts.string, ts.newfunction({ tail = ts.any }, { tail = ts.any }) } }, { head = {} })
 	)
 	add("Raw", ts.any)
+	add("ServerStore", ts.any)
 
 	return out
 end
@@ -1045,6 +1065,10 @@ export type function ServerDataType(T, P)
 	add("SendMessage", fn({ ts.number, ts.any }, { ts.boolean }))
 	add("ProfileStore", ts.any)
 	add("Raw", ts.any)
+	-- Typed `any` for now, like Raw: the store template is not a parameter of this type
+	-- function, so its accessors cannot be spelled here. Declared so a strict script can
+	-- reach it at all.
+	add("ServerStore", ts.any)
 
 	return ts.newtable(props, { index = P, readresult = node, writeresult = node }, nil)
 end
@@ -1184,17 +1208,38 @@ type EconomyConfigLoose = {
 	read LogEconomyEvent: Types.EconomyLogFn?,
 }
 
+--- Passed to ImportLegacyData and OnPlayerInit for pacing legacy-store reads.
+export type MigrationContext = {
+	--- Yields until `count` requests are spare, or `timeout` passes. Returns whether
+	--- they were granted, and an optional release to call once they have been issued.
+	AwaitBudget: (requestType: string, count: number?, timeout: number?) -> (boolean, () -> ()),
+}
+
 export type ScribeOptions<T> = {
 	Template: T,
+	-- Roots owned by the server rather than a player: match state, wave number, boss
+	-- health. Never persisted, replicated to everyone, one per server.
+	ServerStore: { [string]: any }?,
 	Transport: (Types.ScribeTransport | "Default")?,
 
 	Migrations: { [number]: (data: { [string]: any }) -> () }?,
 	UserOwnsGamePassAsync: ((userId: number, passId: number) -> boolean)?, -- advanced/test seam
+	GetProductInfoAsync: ((assetId: number, infoType: any) -> { [string]: any }?)?, -- advanced/test seam
 	DevMode: boolean?, -- advanced/test seam: overrides the RunService:IsStudio() default
 	IsRunning: boolean?, -- advanced/test seam: overrides the RunService:IsRunning() default (false builds the edit-mode client half)
 	MigrationShadow: boolean?, -- audit aid: re-runs migrations against raw pre-Reconcile data and warns on divergence (re-executes your migration bodies)
-	ImportLegacyData: ((player: Player, userId: number) -> { [string]: any }?)?, -- adopt data from another library, once, before Scribe has ever saved for this player
-	OnPlayerInit: ((player: Player, rawData: { [string]: any }, isNewProfile: boolean) -> ())?,
+	-- Adopt data from another library, once, before Scribe has ever saved for this player.
+	-- The third argument paces reads on the DataStore budget.
+	ImportLegacyData: ((player: Player, userId: number, migration: MigrationContext) -> { [string]: any }?)?,
+	MigrationConcurrency: number?, -- imports allowed to run at once; defaults to 2
+	-- The fourth argument is the same MigrationContext: ImportLegacyData only fires for a
+	-- player who has never saved, so a game already on Scribe finishes moving here.
+	OnPlayerInit: ((
+		player: Player,
+		rawData: { [string]: any },
+		isNewProfile: boolean,
+		migration: MigrationContext
+	) -> ())?,
 	OnPlayerLeaving: ((player: Player, data: any, reason: LifecycleReason) -> ())?,
 
 	-- persistence
@@ -1216,7 +1261,17 @@ export type ScribeOptions<T> = {
 	VersionAheadPolicy: ("Kick" | "Allow")?, -- default "Kick": fail closed when data is from a newer deploy
 	KickOnSessionEnd: boolean?,
 	LoadFailureMessage: string?,
+	-- Per-cause overrides for the kick text. Each falls back to LoadFailureMessage when
+	-- that is set, and to its own wording otherwise, so naming one never flattens the rest.
+	LegacyImportFailureMessage: string?,
+	MigrationFailureMessage: string?,
+	VersionAheadMessage: string?,
+	SchemaFailureMessage: string?,
+	RateLimitedMessage: string?,
 	SessionEndMessage: string?,
+	-- Per-cause overrides for the session-end kick, falling back to SessionEndMessage.
+	SessionStolenMessage: string?,
+	SessionInterruptedMessage: string?,
 
 	-- services
 	Leaderboards: { read [string]: LeaderboardConfigLoose }?,
@@ -1689,6 +1744,184 @@ export type Bundle<T> = {
 	them as different outcomes.
 ]=]
 
+--[=[
+	@interface MigrationContext
+	@tag Setup
+	.AwaitBudget (requestType: string, count: number?, timeout: number?) -> (boolean, () -> ()) -- pace a legacy read on the DataStore request budget
+	The third argument to `ImportLegacyData` and the fourth to `OnPlayerInit`, for
+	pacing reads of the stores you are migrating away from.
+
+	`AwaitBudget` yields until `count` requests of that type are spare or `timeout`
+	passes (default 120 seconds), then returns whether they were granted plus a
+	release. Waiters are served first come, first served, per request type, and a
+	queued one shows as `"ImportThrottled"` on [Server.GetState].
+
+	Release once you stop asking, not when a read succeeds: the request counts either
+	way. Retry on a fresh grant, never release before the call returns, and when in
+	doubt do nothing. See [Migrating to Scribe](../migrating.md).
+]=]
+
+--[=[
+	@interface ProductConfig
+	@tag Monetization
+	.Id number -- the developer product id
+	.Category string? -- purchase-log category, for [Server.GetPurchases]
+	.Grant ((data) -> ())? -- applies the purchase; runs inside a transaction, so it must not yield
+	.Grants string? -- name of a perk to set instead of, or as well as, running Grant
+	One entry in the `Products` table. See [Monetization](../monetization.md).
+]=]
+
+--[=[
+	@interface PassConfig
+	@tag Monetization
+	.Id number -- the game pass id
+	.Category string? -- purchase-log category, for [Server.GetPurchases]
+	One entry in the `Passes` table. The pass name is its own ownership key, so
+	[Server.Owns] answers for it with no extra declaration.
+]=]
+
+--[=[
+	@interface LeaderboardConfig
+	@tag Leaderboards
+	.Stat string -- dotted path to the field being ranked
+	.Limit number? -- entries to keep (default 100)
+	.Scale number? -- multiplier applied before the score is stored as an integer
+	.SigFigs number? -- Scribe.Big stats only: ranking-key significant figures, 1 to 15 (default 12)
+	.Replicate boolean? -- default false (server-only); true streams the board to clients
+	.RefreshInterval number? -- approximate seconds between reads (default 60, floor 60, jittered)
+	.StoreName string? -- override the OrderedDataStore name (default "LB_<board>")
+	One entry in the `Leaderboards` table. See [Leaderboards](../leaderboards.md).
+]=]
+
+--[=[
+	@interface ExchangeableSpec
+	@tag Exchange
+	.Path { string } -- the container or balance a leg may move
+	.Kind "Key" | "Qty" | "Stack" -- whole entry, an amount off a balance, or part of a stack
+	.Count string? -- Stack only: the field holding the count
+	.Identity { string }? -- fields that decide whether two stack entries are the same item
+	.Ignore { string }? -- fields excluded from that identity check
+	One entry in the `Exchangeable` allowlist. Nothing moves through
+	[Server.Exchange] unless a spec permits it. See [Exchange](../exchange.md).
+]=]
+
+--[=[
+	@interface ScribeTransport
+	@tag Setup
+	.Name string -- shown in transport diagnostics
+	.MaxFrameBytes number? -- largest buffer this channel wants in one call; only ever lowers the budget
+	.SendToClient (self, player: Player, bytes: buffer) -> () -- server to one client
+	.SendToAllClients ((self, bytes: buffer) -> ())? -- optional broadcast fast path
+	.ListenServer (self, callback: (player: Player, bytes: buffer) -> ()) -> () -- server inbound
+	.SendToServer (self, bytes: buffer) -> () -- client to server
+	.ListenClient (self, callback: (bytes: buffer) -> ()) -> () -- client inbound
+	.Release ((self) -> ())? -- optional; Client.Stop calls it to disconnect what ListenClient connected
+	A replacement for Scribe's built-in RemoteEvent channel, passed as `Transport`.
+	See [Custom transports](../transports.md).
+]=]
+
+--[=[
+	@interface EconomyConfig
+	@tag Diagnostics
+	.Resolve ((player: Player) -> { [string]: any })? -- ambient values shared across every currency
+	.Prefix boolean? -- format custom-field values as "Team - Red" (default true)
+	.Currencies { [string]: EconomyCurrencyConfig }? -- per-currency overrides
+	.LogEconomyEvent EconomyLogFn? -- advanced/test seam; defaults to AnalyticsService
+	The `Economy` option. Declares how a tagged [Value.Increment] reaches Roblox's
+	economy dashboard. See [Economy Analytics](../economy.md).
+]=]
+
+--[=[
+	@interface EconomyCurrencyConfig
+	@tag Diagnostics
+	.Label string? -- logged currency name (default: the field's name)
+	.Fields { EconomyFieldSpec }? -- up to three dimensions, mapped to CustomField01/02/03 in order
+	.Resolve ((player: Player) -> { [string]: any })? -- ambient values for this currency, merged over the global Resolve
+	One entry in [EconomyConfig]'s `Currencies` table.
+]=]
+
+--[=[
+	@type EconomyFieldSpec string | { Name: string, Prefix: boolean? }
+	@tag Diagnostics
+	One custom-field dimension in [EconomyCurrencyConfig]. A bare string names the
+	field; the table form also turns the "Label - Value" prefix off for that field.
+]=]
+
+--[=[
+	@type EconomyLogFn (userId: number, flowType, currency: string, amount: number, endBalance: number, transactionType: string, itemSku: string?, fields: { [string]: any }?) -> ()
+	@tag Diagnostics
+	The seam [EconomyConfig] uses to reach `AnalyticsService:LogEconomyEvent`.
+	Replace it in tests; leave it alone in a live game.
+]=]
+
+--[=[
+	@type Status "Healthy" | "Degraded" | "Outage"
+	@tag Diagnostics
+	Scribe's view of whether DataStores are answering, from [Scribe.GetStatus],
+	[Client.GetServiceStatus] and [Scribe.OnStatusChanged].
+]=]
+
+--[=[
+	@type CooldownOptions { IncludeOfflineTime: boolean? }
+	@tag Declarator options
+	The optional second argument to [Server.OnCooldown]. Set
+	`IncludeOfflineTime = false` for a cooldown that only ticks while the player is
+	in the server.
+]=]
+
+--[=[
+	@type NumberMeta { Min: number?, Max: number? }
+	@tag Declarator options
+	The bounds table accepted by [Scribe.Int] and read back from a field as
+	`Value.Min` and `Value.Max`.
+]=]
+
+--[=[
+	@type StringMeta { MaxLength: number? }
+	@tag Declarator options
+	The options table accepted by [Scribe.String].
+]=]
+
+--[=[
+	@type PlayerData<T> ValueType<T>
+	@tag Setup
+	One player's typed accessor tree: the type of `Data[player]`, `Data.Get(player)`
+	and the client's `Data.Get()`. Name it when you pass a player's data into your
+	own function, since a type function cannot be invoked across a module boundary.
+]=]
+
+--[=[
+	@type ServerData<T> ServerDataType<T, Player>
+	@tag Setup
+	The type of the `.Server` half of [Bundle], for annotating a variable that holds
+	it.
+]=]
+
+--[=[
+	@type ClientData<T> ClientDataType<T>
+	@tag Setup
+	The type of the `.Client` half of [Bundle]. `Scribe.ServerOnly` roots are absent
+	from it, so reading one on the client is a type error rather than a nil.
+]=]
+
+--[=[
+	@interface Op
+	@tag Diagnostics
+	.Kind "Init" | "Set" | "Insert" | "Remove" | "Clear" -- what the change did
+	.Path { string | number } -- the field it landed on, from the root
+	.Value unknown? -- the new value, absent for Remove and Clear
+	.Index number? -- array position, for Insert and Remove
+	One replicated change, as the debug hook and the Studio plugin's change feed
+	see it. You never build one; it is the shape handed to a stream digest.
+]=]
+
+--[=[
+	@type ScribeModule typeof(Scribe) & <T>(options: ScribeOptions<T>) -> Bundle<T>
+	@tag Setup
+	The module itself: every `Scribe.*` declarator and helper, plus the call
+	signature that builds a [Bundle]. Name it when you pass the module around.
+]=]
+
 --------------------------------------------------------------------------------
 -- Runtime
 --------------------------------------------------------------------------------
@@ -1700,10 +1933,12 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	TransportChannel = true,
 	Migrations = true,
 	UserOwnsGamePassAsync = true,
+	GetProductInfoAsync = true,
 	DevMode = true,
 	IsRunning = true,
 	MigrationShadow = true,
 	ImportLegacyData = true,
+	MigrationConcurrency = true,
 	OnPlayerInit = true,
 	OnPlayerLeaving = true,
 	ProfileStoreIndex = true,
@@ -1722,7 +1957,14 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	VersionAheadPolicy = true,
 	KickOnSessionEnd = true,
 	LoadFailureMessage = true,
+	LegacyImportFailureMessage = true,
+	MigrationFailureMessage = true,
+	VersionAheadMessage = true,
+	SchemaFailureMessage = true,
+	RateLimitedMessage = true,
 	SessionEndMessage = true,
+	SessionStolenMessage = true,
+	SessionInterruptedMessage = true,
 	Leaderboards = true,
 	Products = true,
 	Passes = true,

@@ -180,6 +180,7 @@ You never wire up a RemoteEvent. The `"Default"` transport uses two RemoteEvents
 ## Where to next
 
 - [Commands & Requests](./commands) is how a client asks the server to change something it can only read.
+- [The Server Store](./server-store) replicates state that belongs to the server rather than to a player.
 - [Derived Fields](./derived) shows how visibility decides whether a computed value is sent or recomputed.
 - [Containers](./containers) covers the caps that keep a `Session` root from growing without limit.
 - [Security](./security) explains what a `ServerOnly` field does and does not protect.

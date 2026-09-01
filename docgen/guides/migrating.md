@@ -199,6 +199,62 @@ Forget the `Pack` and the raw `CFrame` is flagged `PROFILE_UNPERSISTABLE` at loa
 ??? note "Adding a field to a container element later"
     Add a field to an existing `Scribe.ArrayOf` or `Scribe.DictOf` element shape and Scribe fills it into every stored entry on load, just as it fills a new top-level field. This runs **after** your `Migrations`, so a rename migration still sees the old entry before any default lands. `Scribe.Optional` fields have no default, so they stay absent.
 
+## Reading several stores without throttling
+
+A real migration rarely reads one key. A main store, a sharded copy and three OrderedDataStores is five requests per joining player, and twenty players joining at once is a hundred. Roblox throttles that, and the reads start failing.
+
+The hook receives a third argument for exactly this:
+
+```lua
+ImportLegacyData = function(player, userId, migration)
+    local ok, done = migration.AwaitBudget("GetSortedAsync", 3)
+    local boards = if ok then readThreeOrderedStores(userId) else {}
+    done()
+
+    local mainOk, mainDone = migration.AwaitBudget("GetAsync")
+    local main = if mainOk then readMainStore(userId) else nil
+    mainDone()
+
+    return merge(main, boards)
+end
+```
+
+`AwaitBudget(requestType, count?, timeout?)` yields until that many requests are spare, or until `timeout` passes (default 120 seconds). It returns whether they were granted, and a **release** to call once you have issued them. Waiting hooks are served **first come, first served**, so a player who has been waiting is never overtaken by one who just joined, and a hook wanting five requests is never passed by one wanting one.
+
+The release is optional, safe to call twice, and safe to call when nothing was granted. Skipping it is not a correctness problem: the grant is then retired by a timer that has to assume the worst, so the next waiter simply waits longer than it needed to. Calling it replaces that guess with the fact, which matters most when many players are migrating at once.
+
+**Release when you stop asking, not when the read succeeds.** A DataStore call yields until it is done, so by the time your hook runs again the request has been counted against the allowance whether it returned data or threw. Releasing after a failure is correct, and so is releasing when you decided not to read at all.
+
+!!! warning "Two ways to get it wrong"
+    **Retrying on a released grant.** The reservation covered the attempt you already made. Take a fresh `AwaitBudget`, so the queue paces the retry instead of letting a failing hook spin through the allowance.
+
+    **Releasing before you read.** That hands the allowance to the next player and then spends it anyway, which is the double-spend the ledger exists to prevent.
+
+    Unsure? Do nothing. Not releasing is always the safe side: the timer retires the grant a few seconds later, and nothing is ever spent twice.
+
+Budgets are per request type, so the ordered-store reads above draw on a different allowance than the main-store read. Pass the type you are about to spend.
+
+!!! tip "Nothing kicks a player for a slow import"
+    The hook runs after the session is already held, so neither `LoadTimeout` nor `LoadFailurePolicy` applies to it and it may yield for as long as it needs. What times out is `Data.WaitForData`, whose default is 60 seconds and whose second return is then `"still-loading"` rather than a failure. Branch on that instead of treating every `nil` as fatal, or your own code will kick a player whose migration was going to succeed.
+
+### Telling the player
+
+[`Data.GetState`](/api/Server#GetState) returns a second value while a player is still loading: `"Importing"` while the hook runs, and `"ImportThrottled"` while it is queued on the budget.
+
+```lua
+local state, phase = Data.GetState(player)
+if phase == "ImportThrottled" then
+    -- "Moving your data across. This can take a moment."
+end
+```
+
+Relay it to your loading screen over your own remote. Scribe cannot replicate to a client that has no data yet, so there is no client-side equivalent.
+
+??? note "Already on Scribe, with stores still to move"
+    `ImportLegacyData` only fires for a player who has never saved through Scribe, so a game that has already adopted it never sees the hook again. Leftover migration work belongs in `OnPlayerInit`, which receives the same `migration` context as its fourth argument.
+
+    One difference: `OnPlayerInit` is not behind `MigrationConcurrency`. It runs on every join, and serialising all of them would throttle ordinary logins, which is worse than an unpaced migration. The budget queue still paces whatever calls `AwaitBudget`.
+
 ## Backfilling offline players
 
 Most migrations never need this. With the import hook above, every player is carried over automatically the next time they log in, so you can leave the old store in place and let it drain on its own.

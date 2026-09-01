@@ -425,24 +425,14 @@ end
 -- Schema-typed value codec -------------------------------------------------------
 
 -- The value header byte, in front of every encoded value.
---
---   bits 0-1 mode, an enumeration rather than independent flags:
---              GENERIC  the schema cannot describe this value, so it degrades to
---                       the self-describing generic codec.
---              DENSE    keys are exactly 1..n; the body writes values positionally,
---                       with no key at all.
---              STATIC   keys are all declared children; the body is one presence
---                       bitmask over ChildOrder, then the present values in order.
---              TAGGED   the fallback, and the only mode that can carry a key the
---                       schema does not know.
---   bits 2-3 key tag, present only for an entry of a tagged table. A static
---            table's children need none; the bitmask is their key.
---   bits 4-7 reserved, and refused rather than ignored: a set bit is a drifted
---            encoder or a crafted frame.
---
--- A standalone header is 0..3 and a table entry's 0..15, each checked against its
--- own range. DENSE and STATIC are also refused on a non-table node, which the
--- scalar readers would otherwise accept in silence.
+--   bits 0-1 mode: GENERIC (the schema cannot describe it; self-describing codec),
+--            DENSE (keys exactly 1..n; values positional, no key), STATIC (all declared
+--            children; a presence bitmask over ChildOrder, then values in order), or
+--            TAGGED (the fallback, and the only mode that can carry an unknown key).
+--   bits 2-3 key tag, present only for an entry of a tagged table.
+--   bits 4-7 reserved and refused: a set bit is a drifted encoder or a crafted frame.
+-- A standalone header is 0..3 and a table entry's 0..15. DENSE and STATIC are refused on
+-- a non-table node, which the scalar readers would otherwise accept in silence.
 local VH_TAGGED = 0x00
 local VH_GENERIC = 0x01
 local VH_DENSE = 0x02
@@ -1230,18 +1220,12 @@ end
 
 -- Frame fragmentation ------------------------------------------------------------
 --
--- Framing, not replication. An Init snapshot is one op per root, so no op-level
--- chunking can divide it; splitting the encoded buffer always works.
---
+-- Framing, not replication: an Init snapshot is one op per root, so the encoded buffer
+-- is split rather than the ops.
 --   u8 Frames.Fragment | u16 seq | u32 total | u16 index | <payload slice>
---
--- `total` is the reassembled length, repeated in every fragment so the receiver can
--- size its destination from the first one. `index` makes a lost middle fragment
--- detectable, where a gap would otherwise write later bytes at the wrong offset and
--- still reach `total`. Without `seq`, index 0 is the only reset trigger, so two
--- interleaved logical frames splice into a buffer whose indices ascend and whose
--- length matches, and decode cleanly into values that existed in neither snapshot.
--- Scribe never interleaves today, but only by transport contract.
+-- `total` repeats in every fragment so the receiver can size from the first. `index`
+-- makes a lost middle fragment detectable. `seq` stops two interleaved frames splicing
+-- into one that decodes cleanly to values from neither; Scribe never interleaves today.
 Wire.FRAGMENT_HEADER = 9
 
 --- Splits `bytes` into fragments no larger than `maxBytes`, handing each to `emit`

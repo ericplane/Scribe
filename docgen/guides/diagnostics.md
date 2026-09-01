@@ -208,6 +208,9 @@ These describe what Scribe is putting on the wire. Reach for them when the Ember
     | `EconomyEvents`, `EconomyEventFailures` | Analytics events emitted, and analytics events dropped |
     | `LegacyImports`, `LegacyImportFailures` | `ImportLegacyData` outcomes |
     | `MigrationsFailed` | Migration steps that threw or produced unpersistable data |
+    | `BudgetWaiters` | Migration hooks currently parked on `AwaitBudget`, across every request type. A gauge, so it reads the moment rather than a total |
+    | `BudgetQueued`, `BudgetGranted`, `BudgetTimedOut` | `AwaitBudget` outcomes. `Granted` includes grants that never queued, so `Queued` over `Granted` is the share of hooks that had to wait |
+    | `BudgetWaitSeconds` | How long queued grants waited. Only queued ones, so an instant grant does not drag the distribution to zero. `Scribe.GetPercentiles()` carries its P50/P90/P99 |
     | `LeavingHooksSkipped`, `LeavingHooksTimedOut` | Exit hooks the shutdown drain could not afford. Both are zero on a server whose hooks return promptly |
     | `SnapshotRootDropped` | A top-level root that could not be serialized into a client's initial snapshot |
 

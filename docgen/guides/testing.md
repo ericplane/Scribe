@@ -76,6 +76,8 @@ The second argument takes four keys, each feeding one client API: `Perks` feeds 
 
 Both [`Mock`](/api/Client#Mock) and [`MockCommand`](/api/Client#MockCommand) error outside edit mode, so neither can leak into a real session.
 
+A story that builds a bundle on mount should call [`Data.Stop()`](/api/Client#Stop) on unmount. In edit mode there is no transport or handshake to release, but the mirror tree still holds every `Observe` and `Changed` listener the story registered, and a remount otherwise builds a second bundle beside the first with the old listeners still alive.
+
 ??? note "Mock seeds go through the same validation as a live write"
     `Data.Mock` writes each root field with a normal accessor `Set`, so a seed for Emberfall's `Inventory` is checked against the element shape. An undeclared field is rejected, dictionary keys must be strings, array entries must run contiguously from 1, and the `MaxKeys = 200` cap still applies. A `Rarity` that is not one of the four declared members is refused exactly as it would be in a real session.
 
@@ -124,6 +126,8 @@ ctx.Persistence.OnPlayerRemoving(player)
 ```
 
 The difference from `Server.new` is exactly that wiring. `build` connects no `PlayerAdded` or `PlayerRemoving` and binds no shutdown handler, so nothing happens until you call those yourself. Accessors are torn down with the entry, so read what you need before `OnPlayerRemoving`.
+
+End each test with [`Data.Stop()`](/api/Server#Stop) on the server half and [`Data.Stop()`](/api/Client#Stop) on any client half you built. The server call is what releases the transport channel claim, so the next test can bind the same `TransportChannel`; the client call releases its listener and the Hello retry loop. Neither saves, so flush first if a test checks persisted state.
 
 ??? note "The knobs build gives you"
     `Template.Compile` takes an optional second argument that only matters if you test replicated purchase logs: `{ ReplicateRobuxLog = true, ReplicateInGameLog = true }`, which `Scribe({})` derives from the `PurchaseLog` option.

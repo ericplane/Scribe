@@ -1,34 +1,21 @@
 --!strict
--- The total-apply primitive for ClaimExchange. Moves value off a declared path into the
--- owner's reserved root, and later back onto a declared path, proving every step.
+-- The total-apply primitive for ClaimExchange: moves value off a declared path into the
+-- owner's reserved root and later back onto a declared path, proving every step from a
+-- return value AND a post-mutation re-read. Never Increment, Decrement or a bare Insert:
+-- those can no-op or clamp and still report success.
 --
--- Every leg proves its effect from a return value AND a post-mutation re-read. Never
--- Increment, never Decrement, never a bare Insert: applySet no-ops and returns the OLD
--- value when the new one is equal, SetOf Add and Remove return a literal derived from a
--- pre-read, and a bounded field clamps rather than refusing.
---
--- Three invariants close the ways both proofs pass on a write that did nothing. They are
--- named I1/I2/I3 at the checks that enforce them.
---
+-- Three invariants close the ways both proofs pass on a write that did nothing:
 --   I1 NO-OP INTERLOCK. An intended post-state equal to the current state is refused.
 --   I2 VACANCY. A credit lands only on a destination proved absent.
 --   I3 SOLVENCY. A quantity leg never drives a balance below its declared floor, and a
---      path with no floor is not exchangeable. Scribe.Int(0) compiles Min = nil, so
---      validateWrite skips its bounds clause and a debit past zero stores a negative.
+--      path with no floor is not exchangeable.
 --
--- Escrow and Deliver return RunTransaction's (ok, err), but a raise can still escape:
---   pcall false           INDETERMINATE. A failed rollback leaves the tree partly
---                         restored, and a throw from OnOp/OnEconomy means the writes
---                         committed. Reconcile; never retry blind.
---   pcall true, ok false  Reverted, if the rollback completed. Listener writes made
---                         during the rollback drain are not.
---   pcall true, ok true   Committed.
+-- Escrow and Deliver return RunTransaction's (ok, err). pcall false is INDETERMINATE:
+-- reconcile, never retry blind. pcall true with ok false is reverted; ok true committed.
 --
--- PRECONDITION. No listener on this tree may write or yield from a Changed,
--- OnChildChanged, OnKeyAdded, OnKeyRemoved, OnInsert or OnRemove handler. fireAncestors
--- runs to depth 0, so a write under `_Scribe` reaches listeners bound on the profile
--- root, and OnChildChanged is never deferred, so it fires inside the settle transaction
--- where a yield becomes a rollback. A listener write during the drain lands and stays.
+-- PRECONDITION: no listener on this tree may write or yield from a change handler.
+-- OnChildChanged is not deferred, so it fires inside the settle transaction, where a
+-- yield becomes a rollback and a write during the drain lands and stays.
 
 local Clock = require(script.Parent.Clock)
 local Template = require(script.Parent.Template)

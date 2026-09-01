@@ -224,7 +224,15 @@ function Monetization.new(ctx: any)
 		end
 	end
 	local warnedOwnsKeys: { [string]: boolean } = {}
-	local function checkOwnsKey(key: string)
+	-- Every public ownership API calls this first. The type check is load-bearing: without
+	-- it a nil key reaches `warnedOwnsKeys[key] = true` below, which raises, and only in
+	-- Studio since DevMode gates that branch. Everywhere else it falls through and answers
+	-- false, silently denying a player who has paid.
+	local function checkOwnsKey(key: string, what: string)
+		if type(key) ~= "string" then
+			-- 4: checkOwnsKey -> self.<Api> -> Data.<Api> -> the game code that got it wrong.
+			error(`Scribe: {what}: key must be a string, got {typeof(key)}`, 4)
+		end
 		if ctx.DevMode and not knownOwnsKeys[key] and not warnedOwnsKeys[key] then
 			warnedOwnsKeys[key] = true
 			Log.Warn(
@@ -574,7 +582,7 @@ function Monetization.new(ctx: any)
 	-- genuinely-owned gamepass can still read false just after join. Use OwnsAsync when
 	-- the answer has to be authoritative immediately.
 	function self.Owns(player: Player, key: string): boolean
-		checkOwnsKey(key)
+		checkOwnsKey(key, "Owns")
 		local entry = ctx.Persistence.EntryFor(player)
 		if not entry or entry.State ~= "Ready" or not entry.LiveData then
 			return false
@@ -666,7 +674,7 @@ function Monetization.new(ctx: any)
 	-- Data.ObserveOwned (Server/init.luau); keep this a plain comment so docgen does not
 	-- emit a duplicate entry.
 	function self.ObserveOwned(player: Player, key: string, callback: (owned: boolean) -> ()): () -> ()
-		checkOwnsKey(key)
+		checkOwnsKey(key, "ObserveOwned")
 		local entry = ctx.Persistence.EntryFor(player)
 		if not entry or entry.State ~= "Ready" or not entry.Tree or entry.Tree.Dead then
 			error("Scribe: ObserveOwned requires a Ready player (use Data.WaitForData)", 3)
@@ -761,7 +769,7 @@ function Monetization.new(ctx: any)
 	-- public doc-comment lives on Data.OwnsAsync (Server/init.luau); keep this a plain
 	-- comment so docgen does not emit a duplicate entry.
 	function self.OwnsAsync(player: Player, key: string, _timeout: number?): boolean
-		checkOwnsKey(key)
+		checkOwnsKey(key, "OwnsAsync")
 		local entry = ctx.Persistence.EntryFor(player)
 		if not entry or entry.State ~= "Ready" or not entry.LiveData then
 			return false
@@ -1286,19 +1294,12 @@ function Monetization.new(ctx: any)
 		end
 
 		-- NO LIVE INTENT. Two questions before the no-intent policy may grant this to the
-		-- buyer.
-		--
-		-- (1) PROOF: has THIS PurchaseId already been delivered to the recipient the record
-		--     names? A self-purchase's PurchaseId can never appear in someone else's dedupe
-		--     ring, so a hit means one payment and two grants. Carries no clock.
-		-- (2) PRESUMPTION: a record says a gift of this product was aimed somewhere and
-		--     never settled. A guess, so it is bounded twice: only from an ARCHIVED aim,
-		--     and only inside giftAimTTL. A stale slot still holding its intent means the
-		--     buyer sat out the whole intent TTL online, which is an abandoned prompt.
-		--
-		-- Past giftAimTTL the presumption lapses and this falls through to the no-intent
-		-- policy: value to the wrong player rather than a receipt refused forever. The proof
-		-- leg still works past the horizon, so the double grant does not come back with it.
+		-- buyer. (1) PROOF: was THIS PurchaseId already delivered to the named recipient? A
+		-- self-purchase's id never appears in another ring, so a hit is one payment and two
+		-- grants. (2) PRESUMPTION: a record says a gift of this product was aimed and never
+		-- settled. A guess, bounded to an ARCHIVED aim inside giftAimTTL. Past the horizon
+		-- it falls through to the no-intent policy: value to the wrong player rather than a
+		-- receipt refused forever. The proof leg still works past it.
 		local record, fromAim = staleIntent, false
 		if record == nil then
 			record = readGiftRecord(reservedRaw(entry.LiveData), true, product)
@@ -1515,17 +1516,11 @@ function Monetization.new(ctx: any)
 
 		local _, durable = deliverGift(product, recipientId, purchaseId, giftId, userId)
 		if not durable then
-			-- Mirror of the online failure arm's guarded Ts refresh, and needed here too: the
-			-- record's age is wall time, which keeps running while Roblox retries. Without it
-			-- an offline buyer's retries outlive giftIntentTTL, the next attempt falls into
-			-- the no-intent policy, grants the perk to the BUYER and answers PurchaseGranted,
-			-- so the paid gift is gone for good.
-			--
-			-- Through an UpdateOffline transform, never a bare write on the GetOffline
-			-- snapshot: that snapshot is a dead copy, and deliverGift YIELDED, so the slot
-			-- may have been cleared or taken over by a second gift that is not ours to
-			-- extend, with no accessor tree out here to raise on either mistake. Best effort;
-			-- the answer stays NotProcessedYet whatever the write does.
+			-- The record's age is wall time and keeps running while Roblox retries, so without
+			-- this refresh an offline buyer's retries outlive giftIntentTTL and the next attempt
+			-- grants the perk to the BUYER. Through an UpdateOffline transform, never a bare
+			-- write on the GetOffline snapshot: deliverGift YIELDED, so the slot may now belong
+			-- to a second gift. Best effort; the answer stays NotProcessedYet.
 			ctx.Persistence.UpdateOffline(userId, function(offlineData)
 				local offlineReserved = reservedRaw(offlineData)
 				local live = offlineReserved[giftRecordKey(fromAim)][productIdStr]
@@ -2028,19 +2023,12 @@ function Monetization.new(ctx: any)
 				return false, "could not reserve gift credit; try again later"
 			end
 			-- ONE RULE AT TWO GATES: prefer a bounded value loss over a double grant. This
-			-- spend has no id a retry could reuse (`giftId` is a fresh guid persisted
-			-- nowhere), so every credit handed back can buy a SECOND grant under a purchaseId
-			-- the recipient's dedupe ring has never seen.
-			--
-			-- FIRST GATE, on `applied` rather than `durable`: a same-server recipient's grant
-			-- is marked processed under this giftId and persists on their next save, so
-			-- refunding on a merely non-durable save would reopen the re-spend.
-			--
-			-- SECOND GATE, on `refundable`: MessageAsync's write can commit and then lose its
-			-- answer, which deliverGift cannot tell from a write that never landed. The
-			-- paid-purchase path is immune only because it makes its GiftId durable before
-			-- the money moves. A raise out of deliverGift would unwind past both gates,
-			-- leaving the credit spent with no refund, so it is caught and read as AMBIGUOUS.
+			-- spend has no id a retry could reuse, so a credit handed back can buy a SECOND
+			-- grant under a purchaseId the recipient's dedupe ring has never seen.
+			-- First gate, on `applied` not `durable`: a same-server grant is marked processed
+			-- under this giftId and persists on the next save. Second gate, on `refundable`:
+			-- MessageAsync can commit and lose its answer. A raise out of deliverGift would
+			-- unwind past both gates, so it is caught and read as AMBIGUOUS.
 			local deliveryOk, applied, _, refundable =
 				pcall(deliverGift, product, recipientUserId, `credit:{giftId}`, giftId, entry.UserId)
 			local deliveryError = if deliveryOk then nil else tostring(applied)

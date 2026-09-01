@@ -15,25 +15,15 @@ runs:
       env:
         VER: ${{ inputs.version }}
       run: |
-        # No `wally install`, no dependency copy, and no link redaction any more.
-        # Scribe vendors its store at src/Internal/Store, so the bundle is just
-        # src plus a README. What used to happen here, and why it is gone:
+        # Scribe vendors its store at src/Internal/Store, so the bundle is just src
+        # plus a README: no `wally install`, no dependency copy, no ServerPackages
+        # folder. A game that wants ProfileStore for its own purposes brings its own.
         #
-        #   * ProfileStore was copied out of ServerPackages/_Index into
-        #     bundle/deps and mounted at ServerPackages.ProfileStore, because
-        #     Scribe looked it up by name at runtime. It now requires
-        #     Internal.Store directly, so the bundle has no ServerPackages folder
-        #     at all. NOTE for release notes: a game that was using the bundled
-        #     ProfileStore for its OWN purposes no longer gets one.
-        #   * A sed redacted an off-platform gist URL out of that copy. Every
-        #     off-platform link has since been removed from src/ at the source,
-        #     so there is nothing left to redact -- attribution is by name.
-        #
-        # The backstop below stays, and is the reason this is safe: it fails the
-        # build if any non-roblox.com URL is present in what gets packed, so a
-        # future edit that reintroduces one is caught here rather than shipping
-        # inside the model. The licence texts live outside src/ precisely so they
-        # do not trip it, and are shipped with the source package instead.
+        # The backstop below is why that is safe: it fails the build if any
+        # non-roblox.com URL is present in what gets packed, so an edit that
+        # reintroduces one is caught here rather than shipping inside the model.
+        # The licence texts live outside src/ precisely so they do not trip it, and
+        # are shipped with the source package instead.
         if grep -rnoE 'https?://[^ "*]+' src bundle/README.luau | grep -viE 'roblox\.com'; then
           echo "::error::off-platform URL in bundle inputs; remove it at the source in src/"
           exit 1

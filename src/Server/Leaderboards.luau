@@ -419,6 +419,9 @@ function Leaderboards.new(ctx: any)
 		end
 	end
 
+	-- Sizes the GetSortedAsync reserve in Persistence. Zero boards must reserve nothing.
+	self.BoardCount = Util.count(boards)
+
 	local function orderedStore(name: string): any
 		if useMock then
 			local mock = mockStores[name]

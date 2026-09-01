@@ -40,10 +40,9 @@ local function buildDefault(channel: string?): ScribeTransport
 	local name = folderName(channel)
 	local down: RemoteEvent
 	local up: RemoteEvent
-	-- Everything this channel connects, so ReleaseChannel can undo it. Declared out
-	-- here because ListenServer closes over it; stays nil on the client, which has no
-	-- claim to release.
+	-- The server list backs ReleaseChannel and the claim; the client list backs Release.
 	local serverConnections: { RBXScriptConnection }? = nil
+	local clientConnections: { RBXScriptConnection } = {}
 
 	if RunService:IsServer() then
 		if boundServerChannels[name] then
@@ -115,11 +114,20 @@ local function buildDefault(channel: string?): ScribeTransport
 			up:FireServer(bytes)
 		end,
 		ListenClient = function(_, callback: (bytes: buffer) -> ())
-			down.OnClientEvent:Connect(function(bytes: any)
+			local connection = down.OnClientEvent:Connect(function(bytes: any)
 				if typeof(bytes) == "buffer" then
 					callback(bytes)
 				end
 			end)
+			table.insert(clientConnections, connection)
+		end,
+		Release = function()
+			for _, connection in clientConnections do
+				pcall(function()
+					connection:Disconnect()
+				end)
+			end
+			table.clear(clientConnections)
 		end,
 	}
 end

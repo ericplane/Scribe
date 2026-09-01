@@ -230,6 +230,7 @@ function Bundle.new(config: Config)
 	local compiled = Template.Compile(options.Template, {
 		ReplicateRobuxLog = purchaseLog.ReplicateRobux == true,
 		ReplicateInGameLog = purchaseLog.ReplicateInGame == true,
+		ServerStore = options.ServerStore,
 	})
 
 	-- build, not new: `new` also wires PlayerAdded/BindToClose to the real engine

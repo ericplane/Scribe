@@ -68,6 +68,60 @@ The meta table on `Increment` is optional. It makes the grant show up in Roblox'
 
     Do the async work before you show the prompt, or afterwards from a signal.
 
+## Showing the price
+
+A shop button with `100 R$` baked into it is wrong for a large share of your players, and wrong in the direction that confuses them: they are charged less than the number on the button and cannot tell why. Two discounts move it, independently of each other.
+
+- **Roblox Plus** takes 10% off for a subscriber's first two months and 20% from the third. Roblox covers it, so your earnings per sale do not change.
+- **Regional pricing** puts a player anywhere between 30% and 100% of your listed price, based on their economic location.
+
+Ask on the client, by the name you declared:
+
+```lua
+-- In a LocalScript
+local price = Data.GetPrice("VIP")
+```
+
+The first call starts the read and returns `nil`; the value lands a moment later. [`Data.GetPriceAsync`](/api/Client#GetPriceAsync) is the yielding form when you would rather wait than poll. For UI, observe it rather than polling:
+
+```lua
+local disconnect = Data.ObserveProductInfo("VIP", function(info)
+    if info == nil then
+        label.Text = "..."
+        return
+    end
+    label.Text = `{info.PriceInRobux} R$`
+    was.Visible = info.PriceInRobux < info.UserBasePriceInRobux
+    was.Text = `{info.UserBasePriceInRobux} R$`
+end)
+```
+
+`PriceInRobux` is what this player pays. `UserBasePriceInRobux` is the undiscounted price, and `PriceDiscountDetails` lists each discount as `{ Type, Percent, AmountInRobux }`, which is enough to say **why** an item is cheaper instead of just showing a smaller number.
+
+None of this waits for the profile to load, so a shop can price itself during your loading screen.
+
+!!! danger "The server cannot answer this"
+    `MarketplaceService:GetProductInfoAsync` takes no player. On a live server it returns the **base catalog price**, which is the one number a discounted player never pays.
+
+    In Studio a server script does get the personalized price, and Roblox has confirmed that as a divergence between Studio and live. So a server-side price cache looks right in Play Solo and is wrong for every discounted player in production. That is why these calls are client-only.
+
+### Warming a shop
+
+Every read fetches on demand, so nothing here is required. If you are about to open a shop with many items, warm them together:
+
+```lua
+Data.PrefetchProductInfo()                     -- every declared pass and product
+Data.PrefetchProductInfo({ "VIP", "Coins100" })
+```
+
+Reads asked for in the same frame are deferred and leave as one burst. The engine's transparent batching only coalesces calls that are in flight together, so twelve buttons mounting at once cost one request rather than twelve. Roblox rate-limits this API without publishing the limit, which is what makes the batching worth having.
+
+### When a read fails
+
+A refused read retries with backoff and then leaves the price `nil`, logging `PRODUCT_INFO_FAIL`. It never falls back to the catalog price: `nil` means "show a placeholder", a number means "this is what they pay". Guessing would reintroduce the mismatch this whole API exists to prevent.
+
+Scribe re-reads on its own the first time the local player's `HasRobloxSubscription` flips, since that moves a Plus discount. It watches once, and the 10% to 20% step at month three does not flip that flag at all, so [`Data.RefreshProductInfo`](/api/Client#RefreshProductInfo) is there for every later move.
+
 ## Checking what a player owns
 
 Perks, passes and Roblox Premium all answer to the same key. In Emberfall, `"VIP"` is the pass name, so `Owns(player, "VIP")` is true whether the player bought the pass or was handed the perk by staff.
@@ -104,6 +158,20 @@ end)
 ```
 
 For a single key with the current value delivered up front, use [`ObserveOwned`](/api/Server#ObserveOwned). It needs a Ready profile on the server, so put it behind [`WaitForData`](/api/Server#WaitForData). Both signals exist on the client too, and the client versions are the easy way to hide a "buy VIP" button the instant the sale completes.
+
+??? note "The key is the NAME you registered, and it has to be a string"
+    `Owns`, `OwnsAsync` and `ObserveOwned` take the name a pass, perk or product grant was
+    registered under, not a game-pass id. `Owns(player, 12345)` is a mistake, and so is
+    `Owns(player, config.PassName)` when that field is missing.
+
+    Both raise now, naming the API and the type they got. They used to be silent in the
+    worst way: a non-string key answered `false`, so an ownership gate denied a player who
+    had paid and nothing was logged anywhere.
+
+    Only owned keys are stored. The ownership cache holds a key when the player owns it and
+    holds nothing when they do not, rather than writing `false` for every declared pass, so
+    what crosses the wire is proportional to what a player actually owns. Every reader tests
+    for `true`, so an absent key and a `false` one are the same answer.
 
 ??? note "Why `Owns` can say false right after a player joins"
     Perks and gift deliveries resolve the moment a profile is Ready, but real game-pass ownership is filled in by an asynchronous refresh that starts at load. `Owns` reads that cache, so a genuinely-owned pass can read `false` for a moment right after join. `OwnsAsync` closes that gap by verifying live.

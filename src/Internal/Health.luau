@@ -97,17 +97,12 @@ local function pruneFailures(now: number)
 	end
 end
 
--- Lifting Outage once the failures stop -------------------------------------
---
--- evaluate() only ever escalates, and a quiet server never calls it, so without this a
--- burst that ends leaves the status at Outage forever, with no traffic to feed the
--- success streak that would lift it.
---
--- The step condition is that the window is genuinely empty, not that the count dipped
--- below the Outage threshold: with a sparse failure stream, which the retry cooldown
--- guarantees for a few keys, the count dips constantly between retries and the status
--- would flap, opening the money gate mid-outage. It stops at Degraded, because "nobody
--- reported a failure" is not evidence anything worked; reaching Healthy costs a streak.
+-- Lifting Outage once the failures stop --------------------------------------
+-- evaluate() only escalates and a quiet server never calls it, so a burst that ends
+-- would leave Outage forever. The step condition is an empty window, not a count under
+-- the threshold: with the sparse stream the retry cooldown guarantees, the count dips
+-- between retries and the status would flap, opening the money gate mid-outage. It
+-- stops at Degraded, because no reports is not evidence anything worked.
 local DECAY_MIN_DELAY = 1 -- seconds; the horizon can land on the prune boundary, where an entry survives
 local decayPending = false
 local armDecay: () -> ()
@@ -228,17 +223,11 @@ function Health.ResetThresholds()
 	table.clear(conflictWarned)
 end
 
---- Report a failed DataStore/OrderedDataStore/MessageAsync operation.
----
---- `key` identifies the subject of the operation (a profile key, a user id) so repeated
---- failures of the same thing collapse into one problem; omit it only where there is no
---- subject. Of the `class` verdicts only "Throttled" changes anything: see
---- THROTTLE_SUBJECT.
----
---- Returns `(counted, folded)`. `counted` is whether the report became a distinct
---- problem rather than being absorbed into a live one. `folded` is how many reports were
---- absorbed: on a counted call the previous problem's tally, now flushed; on an absorbed
---- call the running tally including this one.
+--- Report a failed DataStore/OrderedDataStore/MessageAsync operation. `key` names the
+--- subject so repeated failures of one thing collapse into one problem; omit it only
+--- where there is no subject. Of the `class` verdicts only "Throttled" changes anything.
+--- Returns `(counted, folded)`: whether this became a distinct problem rather than being
+--- absorbed into a live one, and how many reports that problem has absorbed.
 function Health.ReportFailure(subsystem: string, key: string?, class: string?): (boolean, number)
 	successStreak = 0
 	-- The metric still counts every report; only the state machine below dedupes.

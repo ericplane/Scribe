@@ -189,7 +189,7 @@ local POOL_FOR_REQUEST_TYPE: { [string]: { string } } = {
 --- ProfileStore ever calls this. Every save, receipt await, gift check, version
 --- query and offline update is issued unbudgeted and scales linearly with CCU.
 --- The budget model is what makes that visible.
-function Disk.GetRequestBudgetForRequestType(self, kind: any): number
+function Disk.GetRequestBudgetForRequestType(self, kind: any, jobId: string?): number
 	self.BudgetQueries += 1
 	if self.Config.NoBudget then
 		return math.huge
@@ -208,7 +208,7 @@ function Disk.GetRequestBudgetForRequestType(self, kind: any): number
 	-- is scarcer. Reporting only one would promise headroom the other cannot honour.
 	local least = math.huge
 	for _, pool in pools do
-		least = math.min(least, self.Budget:Peek(self._defaultJob, pool))
+		least = math.min(least, self.Budget:Peek(jobId or self._defaultJob, pool))
 	end
 	return math.floor(least)
 end
@@ -264,7 +264,10 @@ function Disk.ServiceFor(self, jobId: string)
 			return setmetatable({ _jobId = jobId }, { __index = store, __metatable = false })
 		end,
 		GetRequestBudgetForRequestType = function(_self, kind: any)
-			return disk:GetRequestBudgetForRequestType(kind)
+			-- Threaded like _jobId on the stores above: without it the query peeked the
+			-- default job while charges went to the caller's, so a server never saw its
+			-- own drain.
+			return disk:GetRequestBudgetForRequestType(kind, jobId)
 		end,
 	}
 end

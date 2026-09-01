@@ -19,10 +19,25 @@ local Signal = require(Internal.Signal)
 local Clock = require(script.Parent.Internal.Clock)
 local Rng = require(script.Parent.Internal.Rng)
 local Sched = require(Internal.Sched)
+local Defaults = require(Internal.Defaults)
 -- For RequestFailed only: the identity Request appends to its own refusals.
 local Types = require(script.Parent.Types)
 
 local Client = {}
+
+-- Test seam: Players.LocalPlayer is read-only in Studio.
+local localPlayerProbe: (() -> any)? = nil
+
+function Client.SetLocalPlayerProbe(fn: (() -> any)?)
+	localPlayerProbe = fn
+end
+
+local function readLocalPlayer(): any
+	if localPlayerProbe ~= nil then
+		return localPlayerProbe()
+	end
+	return (game:GetService("Players") :: any).LocalPlayer
+end
 
 local ID_TO_STATUS: { [number]: string } = { [0] = "Healthy", [1] = "Degraded", [2] = "Outage" }
 
@@ -91,6 +106,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 
 	local mirror: { [string]: any } = Template.BuildDefaults(compiled, "Client")
 	local loaded = editMode
+	local stopped = false
 	local loadedSignal = Signal.new()
 
 	local tree = Node.NewTree({
@@ -142,22 +158,16 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	local OnLeaderboard = Signal.new()
 
 	local transport: any = nil
-	-- One in-flight Client.Request. The slot carries the answer; the resumption carries
-	-- nothing. Sched.Resume is task.spawn, so a synchronous loopback can settle the slot
-	-- from inside the send while the requester is still running, and resuming a running
-	-- thread is a hard error: the answer is recorded here and collected without a yield.
-	--
-	--   Parked   written only by the requester, on the statements either side of
-	--            coroutine.yield(), so it is never true while the requester runs.
-	--            coroutine.status is not a substitute: a transport that yields inside
-	--            SendToServer suspends the requester somewhere that is not its reply
-	--            yield, and a status-keyed resume would misdeliver the reply.
-	--   Settled  an answer has been claimed. Written only by settleRequest, with
-	--            Results/Count, which are meaningless until then. The reply, the
-	--            timeout and a throwing send race for it; the first one wins.
-	--
-	-- Results carries an explicit Count because a handler may return nils and `#` on
-	-- a table with a hole is undefined, while RPC arity is part of the contract.
+	-- One in-flight Client.Request. The slot carries the answer, not the resumption:
+	-- Sched.Resume is task.spawn, so a synchronous loopback can settle the slot from
+	-- inside the send while the requester is still running, and resuming a running
+	-- thread raises.
+	--   Parked   written only by the requester either side of its yield, so never true
+	--            while it runs. coroutine.status is no substitute: a transport that
+	--            yields inside SendToServer would misdeliver the reply.
+	--   Settled  an answer has been claimed. The reply, the timeout and a throwing send
+	--            race for it; first wins. Results carries an explicit Count because a
+	--            handler may return nils and `#` on a table with a hole is undefined.
 	type RequestSlot = {
 		Correlation: number,
 		Thread: thread,
@@ -454,7 +464,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				-- The retry delay only. The first sendHello stays immediate: delaying it
 				-- would slow every ordinary join to fix a problem only a mass rejoin has.
 				Clock.Wait(Rng.Jitter(delaySeconds))
-				if loaded then
+				if loaded or stopped then
 					break
 				end
 				if fragProgress then
@@ -533,7 +543,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		local conn = loadedSignal:Connect(function()
 			resume(true)
 		end)
-		Clock.Delay(timeout or 30, function()
+		Clock.Delay(timeout or Defaults.ClientWaitForData, function()
 			resume(false)
 		end)
 		local result = coroutine.yield()
@@ -593,7 +603,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		-- Armed before the send so the deadline covers the send itself, which matters if
 		-- the spawn below ever goes. Clock.Delay cannot be cancelled, so the callback
 		-- always fires and settleRequest is what makes a late one a no-op.
-		Clock.Delay(options.RequestTimeout or 10, function()
+		Clock.Delay(options.RequestTimeout or Defaults.Request, function()
 			settleRequest(slot, { false, "timeout", Types.RequestFailed }, 3)
 		end)
 		-- Spawned, not deferred. Sched.Spawn runs the send immediately on this stack, so
@@ -802,6 +812,15 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	Data.OnOwnershipChanged = OnOwnershipChanged
 
 	-- Ownership: reads the replicated mirror.
+	-- Client twin of the server's check. Without it a non-string key reads as "not owned"
+	-- off a nil table index, so a typo is indistinguishable from a player who owns nothing.
+	local function assertOwnsKey(key: any, what: string)
+		if type(key) ~= "string" then
+			-- 3: assertOwnsKey -> Data.<Api> -> the game code that got it wrong.
+			error(`Scribe: {what}: key must be a string, got {typeof(key)}`, 3)
+		end
+	end
+
 	local function ownsFromMirror(key: string): boolean
 		local reserved = mirror[Template.RESERVED_ROOT]
 		if type(reserved) == "table" and type(reserved.Perks) == "table" and reserved.Perks[key] == true then
@@ -825,6 +844,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Yields until data has loaded.
 	]=]
 	function Data.Owns(key: string): boolean
+		assertOwnsKey(key, "Owns")
 		if not editMode then
 			waitForLoaded()
 		end
@@ -851,6 +871,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		back to the current mirror value after `timeout` seconds (default 10).
 	]=]
 	function Data.OwnsAsync(key: string, timeout: number?): boolean
+		assertOwnsKey(key, "OwnsAsync")
 		if editMode then
 			return ownsFromMirror(key)
 		end
@@ -873,7 +894,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 					wake()
 				end
 			end) :: () -> ()
-			Clock.Delay(timeout or 10, wake)
+			Clock.Delay(timeout or Defaults.OwnsAsync, wake)
 			-- If the flag arrived between the check and the connect, clean up and skip
 			-- the yield: never task.spawn a thread that has not yielded.
 			if ownsSyncedFromMirror() then
@@ -950,6 +971,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Returns a disconnect function. Ideal for reactively toggling "buy" buttons.
 	]=]
 	function Data.ObserveOwned(key: string, callback: (owned: boolean) -> ()): () -> ()
+		assertOwnsKey(key, "ObserveOwned")
 		if not editMode then
 			waitForLoaded()
 		end
@@ -970,6 +992,373 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			disconnectPerk()
 			disconnectCache()
 		end
+	end
+
+	-- Product info --------------------------------------------------------------
+	--
+	-- Client-side by necessity: a live server has no player in context, so its
+	-- GetProductInfoAsync answers the base catalog price, which is the one number a
+	-- discounted player never pays. Studio servers DO answer personalized, so the
+	-- server version tests clean and ships broken.
+	--
+	-- Lazy throughout: a bundle that never asks for a price pays nothing.
+
+	-- Overridable because patching a real service Instance is illegal, the same seam
+	-- as the server's UserOwnsGamePassAsync.
+	local getProductInfoAsync: (assetId: number, infoType: any) -> any = options.GetProductInfoAsync
+		or function(assetId: number, infoType: any): any
+			local marketplace: any = game:GetService("MarketplaceService")
+			return marketplace:GetProductInfoAsync(assetId, infoType)
+		end
+
+	-- Distinct from nil, so an observer's first push fires while nothing is resolved.
+	local UNRESOLVED: any = table.freeze({})
+	local PRODUCT_ATTEMPTS = 4
+	local PRODUCT_RETRY_BASE = 2
+
+	local productAssets: { [string]: { Id: number, InfoType: any } }? = nil
+	local productInfo: { [string]: any } = {}
+	local productWaiters: { [string]: { { Thread: thread, Settled: boolean } } } = {}
+	local productObservers: { [string]: { () -> () } } = {}
+	local productQueue: { string } = {}
+	local productQueued: { [string]: boolean } = {}
+	local productFlushScheduled = false
+	local membershipWatched = false
+	local membershipConnection: any = nil
+
+	-- Every declared pass and product, built on first use.
+	local function ensureProductAssets(): { [string]: { Id: number, InfoType: any } }
+		if productAssets == nil then
+			local built: { [string]: { Id: number, InfoType: any } } = {}
+			for passName, config in (options.Passes or {}) :: { [string]: any } do
+				built[passName] = { Id = config.Id, InfoType = Enum.InfoType.GamePass }
+			end
+			-- The server refuses a product named like a pass, so one namespace is enough.
+			for productName, config in (options.Products or {}) :: { [string]: any } do
+				built[productName] = { Id = config.Id, InfoType = Enum.InfoType.Product }
+			end
+			productAssets = built
+		end
+		return productAssets :: any
+	end
+
+	-- The declared pass or product, or a raise naming the key.
+	local function productAsset(name: string, api: string): { Id: number, InfoType: any }
+		local asset = ensureProductAssets()[name]
+		if asset == nil then
+			-- 3: productAsset -> Data.<Api> -> the game code that got it wrong.
+			error(`Scribe.{api}: "{tostring(name)}" is not a declared pass or product`, 3)
+		end
+		return asset
+	end
+
+	local function notifyProduct(name: string)
+		local observers = productObservers[name]
+		if observers == nil then
+			return
+		end
+		-- Cloned: a callback may disconnect itself, which mutates the list.
+		for _, push in table.clone(observers) do
+			push()
+		end
+	end
+
+	local function settleProduct(name: string, info: any)
+		productQueued[name] = nil
+		if info ~= nil then
+			productInfo[name] = info
+		end
+		local waiters = productWaiters[name]
+		productWaiters[name] = nil
+		if waiters ~= nil then
+			for _, waiter in waiters do
+				-- Settled is the discriminator, not coroutine status: a caller that timed
+				-- out and then parked on something else is also "suspended", and resuming
+				-- it here wakes it out of an unrelated wait.
+				if not waiter.Settled then
+					waiter.Settled = true
+					-- Directly: a wake must never travel the defer queue.
+					Sched.Resume(waiter.Thread, info)
+				end
+			end
+		end
+		notifyProduct(name)
+	end
+
+	local function fetchProduct(name: string)
+		local asset = if productAssets ~= nil then (productAssets :: any)[name] else nil
+		if asset == nil then
+			return
+		end
+		for attempt = 1, PRODUCT_ATTEMPTS do
+			local ok, result = pcall(getProductInfoAsync, asset.Id, asset.InfoType)
+			if ok and type(result) == "table" then
+				settleProduct(name, result)
+				return
+			end
+			if attempt == PRODUCT_ATTEMPTS then
+				Log.Warn(
+					"Monetization",
+					"PRODUCT_INFO_FAIL",
+					`could not read product info for "{name}": {tostring(result)}`,
+					{ Product = name }
+				)
+				-- Never the base price: nil means "show a placeholder".
+				settleProduct(name, nil)
+				return
+			end
+			Log.Warn(
+				"Monetization",
+				"PRODUCT_INFO_THROTTLED",
+				`product info for "{name}" failed, retrying ({attempt}/{PRODUCT_ATTEMPTS})`,
+				{ Product = name }
+			)
+			Clock.Wait(Rng.Jitter(PRODUCT_RETRY_BASE * 2 ^ (attempt - 1)))
+		end
+	end
+
+	local function flushProductQueue()
+		productFlushScheduled = false
+		local batch = productQueue
+		productQueue = {}
+		-- Together on purpose: the engine only coalesces calls in flight at the same
+		-- time, so one burst costs one request where N singles cost N.
+		for _, name in batch do
+			Sched.Spawn(fetchProduct, name)
+		end
+	end
+
+	local function enqueueProduct(name: string)
+		if productInfo[name] ~= nil or productQueued[name] then
+			return
+		end
+		productQueued[name] = true
+		table.insert(productQueue, name)
+		if not productFlushScheduled then
+			productFlushScheduled = true
+			Sched.Defer(flushProductQueue)
+		end
+	end
+
+	-- Observers hear about the new value landing, not the old one being dropped, so a
+	-- successful refresh does not blink the price to nil.
+	local function refreshProduct(name: string?)
+		local names: { string } = {}
+		if name ~= nil then
+			names[1] = name
+		else
+			for cached in productInfo do
+				table.insert(names, cached)
+			end
+		end
+		for _, each in names do
+			productInfo[each] = nil
+			enqueueProduct(each)
+		end
+	end
+
+	-- A Roblox Plus discount moves the price, leaving the cached one wrong for the rest
+	-- of the session. Armed on first use, and one-shot: the flag flips at most once in a
+	-- session. The 10% to 20% step at month three does not move it at all, which is what
+	-- RefreshProductInfo is for.
+	--
+	-- The signal is on the PLAYER. Asking the Players service for it raises, and the
+	-- pcall would swallow that into a watch that silently never fires.
+	local function watchMembership()
+		if membershipWatched then
+			return
+		end
+		-- Left unarmed while there is no LocalPlayer, so the next read retries.
+		membershipWatched = pcall(function()
+			local localPlayer: any = readLocalPlayer()
+			membershipConnection = localPlayer:GetPropertyChangedSignal("HasRobloxSubscription"):Once(function()
+				refreshProduct(nil)
+			end)
+		end)
+	end
+
+	--[=[
+		@within Client
+		@tag Monetization
+		@client
+		@param name string
+		@return { [string]: any }?
+		Marketplace info for a declared pass or product, as **this** player sees it.
+		`PriceInRobux` is what they are charged, after any Roblox Plus or regional
+		discount; `UserBasePriceInRobux` and `PriceDiscountDetails` are there for a
+		"was 100, now 80" button.
+
+		Returns nil until the first read lands, and starts that read. Poll it, or use
+		[Client.ObserveProductInfo]. Never waits for the profile to load.
+
+		Client-only by necessity: a live server has no player in context and reads the
+		base catalog price, which is not what a discounted player pays.
+	]=]
+	function Data.GetProductInfo(name: string): { [string]: any }?
+		productAsset(name, "GetProductInfo")
+		watchMembership()
+		enqueueProduct(name)
+		return productInfo[name]
+	end
+
+	--[=[
+		@within Client
+		@tag Monetization
+		@client
+		@param name string
+		@return number?
+		Shorthand for the `PriceInRobux` of [Client.GetProductInfo]: the Robux this
+		player pays. nil until the first read lands, and starts that read.
+	]=]
+	function Data.GetPrice(name: string): number?
+		local info = Data.GetProductInfo(name)
+		local price = if info ~= nil then info.PriceInRobux else nil
+		return if type(price) == "number" then price else nil
+	end
+
+	--[=[
+		@within Client
+		@tag Monetization
+		@client
+		@param name string
+		@param timeout number?
+		@return { [string]: any }?
+		Like [Client.GetProductInfo], but yields until the read lands. Returns nil if it
+		times out (default 10s), or if Marketplace refused every attempt.
+	]=]
+	function Data.GetProductInfoAsync(name: string, timeout: number?): { [string]: any }?
+		productAsset(name, "GetProductInfoAsync")
+		watchMembership()
+		local cached = productInfo[name]
+		if cached ~= nil then
+			return cached
+		end
+		enqueueProduct(name)
+		-- Re-checked before parking: a queue that ever resolved synchronously would
+		-- leave this thread in the waiter list with nobody left to wake it.
+		local resolved = productInfo[name]
+		if resolved ~= nil then
+			return resolved
+		end
+		local waiters = productWaiters[name]
+		if waiters == nil then
+			waiters = {}
+			productWaiters[name] = waiters
+		end
+		local waiter = { Thread = coroutine.running(), Settled = false }
+		table.insert(waiters :: { any }, waiter)
+		Clock.Delay(timeout or Defaults.ProductInfo, function()
+			if not waiter.Settled then
+				waiter.Settled = true
+				Sched.Resume(waiter.Thread, nil)
+			end
+		end)
+		return coroutine.yield()
+	end
+
+	--[=[
+		@within Client
+		@tag Monetization
+		@client
+		@param name string
+		@param timeout number?
+		@return number?
+		Shorthand for the `PriceInRobux` of [Client.GetProductInfoAsync]: the Robux this
+		player pays. nil if the read times out (default 10s) or was refused.
+	]=]
+	function Data.GetPriceAsync(name: string, timeout: number?): number?
+		local info = Data.GetProductInfoAsync(name, timeout)
+		local price = if info ~= nil then info.PriceInRobux else nil
+		return if type(price) == "number" then price else nil
+	end
+
+	--[=[
+		@within Client
+		@tag Monetization
+		@client
+		@param name string
+		@param callback ({ [string]: any }?) -> ()
+		@return () -> ()
+		Calls `callback` with the info now (nil if it has not landed), again when it
+		does, and again if the price changes. Returns a disconnect function. The
+		reactive way to price a shop button.
+	]=]
+	function Data.ObserveProductInfo(name: string, callback: ({ [string]: any }?) -> ()): () -> ()
+		productAsset(name, "ObserveProductInfo")
+		watchMembership()
+		local last: any = UNRESOLVED
+		local alive = true
+		local function push()
+			if not alive then
+				return
+			end
+			local info = productInfo[name]
+			if info ~= last then
+				last = info
+				Sched.Spawn(callback, info)
+			end
+		end
+		local list = productObservers[name]
+		if list == nil then
+			list = {}
+			productObservers[name] = list
+		end
+		table.insert(list :: { () -> () }, push)
+		enqueueProduct(name)
+		push()
+		return function()
+			alive = false
+			local current = productObservers[name]
+			if current ~= nil then
+				local index = table.find(current, push)
+				if index ~= nil then
+					table.remove(current, index)
+				end
+			end
+		end
+	end
+
+	--[=[
+		@within Client
+		@tag Monetization
+		@client
+		@param names { string }?
+		Warms `names`, or every declared pass and product when omitted, as one batch.
+		Optional: every read path fetches on demand anyway. Worth calling before opening
+		a shop with many items, because one burst costs one request where the same reads
+		trickling in frame by frame cost one each.
+	]=]
+	function Data.PrefetchProductInfo(names: { string }?)
+		watchMembership()
+		if names == nil then
+			for name in ensureProductAssets() do
+				enqueueProduct(name)
+			end
+			return
+		end
+		-- Validated in full first, so a typo raises instead of half-warming.
+		for _, name in names do
+			productAsset(name, "PrefetchProductInfo")
+		end
+		for _, name in names do
+			enqueueProduct(name)
+		end
+	end
+
+	--[=[
+		@within Client
+		@tag Monetization
+		@client
+		@param name string?
+		Drops the cached info for `name`, or for everything when omitted, and reads it
+		again. Scribe already does this the first time the local player's
+		`HasRobloxSubscription` flips; use this for any later move.
+	]=]
+	function Data.RefreshProductInfo(name: string?)
+		if name ~= nil then
+			productAsset(name, "RefreshProductInfo")
+		end
+		refreshProduct(name)
 	end
 
 	--[=[
@@ -1173,6 +1562,55 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		The same `Data` object without the typed accessor tree: the untyped
 		escape hatch if the type solver ever trips on your template.
 	]=]
+	-- Server store roots are in this mirror like any other root; they simply are never
+	-- written from here. Same per-root shape as the server exposes.
+	--[=[
+		@within Client
+		@tag Reads
+		@client
+		@prop ServerStore table
+		The server-owned tree as this client mirrors it, present only when the
+		bundle declares `ServerStore`. Read and observe it like any other root,
+		with no player argument; writes belong on the server.
+		
+		See [Server-owned state](../server-store.md).
+	]=]
+	if compiled.Views.Store ~= nil then
+		local proxy = {}
+		for _, key in compiled.Views.Store.RootOrder do
+			proxy[key] = tree.Accessor[key]
+		end
+		Data.ServerStore = table.freeze(proxy)
+	end
+
+	--[=[
+		@within Client
+		@tag Lifecycle
+		@client
+		Releases what this client bundle holds on the process: the transport listener,
+		the Hello retry loop, the subscription watch behind [Client.GetProductInfo], and
+		the mirror tree's listeners. The counterpart of [Server.Stop].
+
+		A game never needs it. A storybook that remounts a bundle per story, or a test
+		suite that builds many, otherwise stacks a listener per build. Idempotent.
+	]=]
+	function Data.Stop()
+		if stopped then
+			return
+		end
+		stopped = true
+		if transport ~= nil and type((transport :: any).Release) == "function" then
+			pcall((transport :: any).Release, transport)
+		end
+		if membershipConnection ~= nil then
+			pcall(function()
+				membershipConnection:Disconnect()
+			end)
+			membershipConnection = nil
+		end
+		tree:Destroy()
+	end
+
 	Data.Raw = Data
 
 	-- One line confirming the bundle initialized (Banner = false to silence).

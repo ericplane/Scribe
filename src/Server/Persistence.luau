@@ -10,6 +10,7 @@ local Internal = script.Parent.Parent.Internal
 local Util = require(Internal.Util)
 local Node = require(Internal.Node)
 local Template = require(Internal.Template)
+local Defaults = require(Internal.Defaults)
 local Conform = require(Internal.Conform)
 local DerivedModule = require(Internal.Derived)
 local Log = require(Internal.Log)
@@ -21,6 +22,7 @@ local Clock = require(Internal.Clock)
 local Sched = require(Internal.Sched)
 local Profile = require(Internal.Profile)
 local Failure = require(Internal.Failure)
+local Budget = require(Internal.Budget)
 local Rng = require(Internal.Rng)
 
 local Persistence = {}
@@ -104,6 +106,13 @@ export type Entry = {
 	RateLimitedCount: number?, -- consecutive rate-limited frames (decays when quiet)
 	LastRateLimitAt: number?, -- os.clock of the last rate-limited frame
 	LastRateLimitLog: number?, -- os.clock of the last emitted COMMAND_RATE_LIMITED
+	-- Why the store last failed for this key. StartSessionAsync answers nil with no reason
+	-- of its own, so this is the only way a load failure can tell a throttle apart.
+	LastStoreErrorClass: Failure.Class?,
+	LastStoreErrorAt: number?, -- monotonic
+	-- A parallel field, not a fourth State, so nothing switching on State changes
+	-- meaning. nil once Ready.
+	LoadPhase: ("Importing" | "ImportThrottled")?,
 	-- Monetization state
 	GiftLastAt: number,
 	OwnsLast: { [string]: boolean }?, -- last reported effective ownership, for change detection
@@ -114,6 +123,20 @@ local SIZE_WARN_BYTES = 3.5 * 1024 * 1024 -- warn approaching the ~4 MB DataStor
 -- Past this a join is something the player notices. Well under LoadTimeout, where they
 -- are kicked: a warn firing only at the timeout would only ever report failures.
 local SLOW_LOAD_SECONDS = 10
+-- An import is unbounded by design and holds the session lock throughout. Well past
+-- SLOW_LOAD, because waiting on budget is the point.
+local SLOW_IMPORT_SECONDS = 30
+local IMPORT_SLOT_POLL = 0.25
+local DEFAULT_MIGRATION_CONCURRENCY = 2
+-- Held back from migrations. Nothing in a join CALLS GetAsync (ProfileStore loads
+-- through UpdateAsync), but an UpdateAsync charges the read pool too, so a join spends
+-- this anyway: one read and one write per join, measured in SimBudget. That dual charge
+-- is undocumented (Uncertain.luau U12), so a join-rate derivation would rest on it.
+local GET_RESERVE = 2
+-- Ceiling on the GetSortedAsync reserve, which follows the declared board count: one
+-- read per board lets a refresh tick through while a migration drains the pool. Capped
+-- because boards come due on their own intervals, not together.
+local SORTED_RESERVE_CAP = 4
 local MIN_SAVE_INTERVAL = 15 -- seconds; below this, per-key DataStore throttling causes save failures
 local WIPE_GUARD_RATIO_DEFAULT = 0.6 -- a profile shrinking past 60% looks like a wipe, not like spending
 
@@ -220,6 +243,87 @@ function Persistence.new(ctx: any)
 	local self = {} :: any
 	local options = ctx.Options
 
+	-- Player-facing kick text, by cause. Two families, each with its own catch-all:
+	-- Fallback is the family option, so setting LoadFailureMessage or SessionEndMessage
+	-- still covers everything in that family, and naming one cause overrides only it.
+	local KICK_TEXT: { [string]: { Option: string, Fallback: string?, Default: string } } = {
+		-- Load family.
+		LegacyImport = {
+			Option = "LegacyImportFailureMessage",
+			Fallback = "LoadFailureMessage",
+			Default = "We couldn't check your existing data, and we didn't want to start you from scratch. Please rejoin!",
+		},
+		Migration = {
+			Option = "MigrationFailureMessage",
+			Fallback = "LoadFailureMessage",
+			Default = "We couldn't update your data to this version of the game. Please rejoin!",
+		},
+		VersionAhead = {
+			Option = "VersionAheadMessage",
+			Fallback = "LoadFailureMessage",
+			Default = "Your data is from a newer version of the game than this server. Please rejoin!",
+		},
+		Schema = {
+			Option = "SchemaFailureMessage",
+			Fallback = "LoadFailureMessage",
+			Default = "Your saved data doesn't match this version of the game. Please rejoin!",
+		},
+		RateLimited = {
+			Option = "RateLimitedMessage",
+			Fallback = "LoadFailureMessage",
+			Default = "Roblox's data service is busy right now. Please rejoin in a moment!",
+		},
+		Load = {
+			Option = "LoadFailureMessage",
+			Default = "We couldn't load your data. Please rejoin!",
+		},
+		-- Session-end family.
+		SessionStolen = {
+			Option = "SessionStolenMessage",
+			Fallback = "SessionEndMessage",
+			Default = "Your data was opened on another server, so this session ended. Please rejoin!",
+		},
+		SessionInterrupted = {
+			Option = "SessionInterruptedMessage",
+			Fallback = "SessionEndMessage",
+			Default = "Your data session ended before it finished loading. Please rejoin!",
+		},
+		SessionEnd = {
+			Option = "SessionEndMessage",
+			Default = "Your data session has ended. Please rejoin!",
+		},
+	}
+
+	local function kickText(reason: string): string
+		local spec = KICK_TEXT[reason]
+		local specific = options[spec.Option]
+		if type(specific) == "string" then
+			return specific
+		end
+		if spec.Fallback ~= nil then
+			local family = options[spec.Fallback]
+			if type(family) == "string" then
+				return family
+			end
+		end
+		return spec.Default
+	end
+
+	-- Windowed: the class is stamped whenever the store errors on this key, and an error
+	-- from minutes ago says nothing about the attempt that just failed.
+	local THROTTLE_ATTRIBUTION_WINDOW = 15
+	local function loadKickText(entry: Entry): string
+		local at = entry.LastStoreErrorAt
+		if
+			entry.LastStoreErrorClass == "Throttled"
+			and at ~= nil
+			and (Clock.Monotonic() - at) <= THROTTLE_ATTRIBUTION_WINDOW
+		then
+			return kickText("RateLimited")
+		end
+		return kickText("Load")
+	end
+
 	-- Bound on ONE StartSessionAsync attempt. ProfileStore's own START_SESSION_TIMEOUT
 	-- applies only `if params.Cancel == nil` and Scribe always passes a Cancel, so
 	-- without this the load never returns during a DataStore outage and everything below
@@ -252,7 +356,10 @@ function Persistence.new(ctx: any)
 	if type(ProfileStore) == "table" and ProfileStore.ExternalShutdown ~= nil then
 		ProfileStore.ExternalShutdown = true
 	end
-	local persistentDefaults = Template.BuildDefaults(compiled, "Persistent")
+	-- The PLAYER view throughout: a store root must never reach a profile payload, a
+	-- per-player session store, or the per-player snapshot.
+	local playerCompiled = compiled.Views.Player
+	local persistentDefaults = Template.BuildDefaults(playerCompiled, "Persistent")
 	local baseStore = ProfileStore.New(storeIndex, persistentDefaults)
 	-- Persistence mode: which store to read, whether to hold a session, whether anything
 	-- saves.
@@ -442,6 +549,12 @@ function Persistence.new(ctx: any)
 					},
 				})
 				for _, entry in self.Entries :: { [Player]: Entry } do
+					if entry.Key == profileKey then
+						-- Outside the in-flight guard: a load has no save on the wire, and
+						-- the load path is what needs the distinction. Dies with the entry.
+						entry.LastStoreErrorClass = class
+						entry.LastStoreErrorAt = Clock.Monotonic()
+					end
 					if entry.Key == profileKey and entry.SavesInFlight > 0 then
 						-- Attribute this failure to a save genuinely on the wire. A
 						-- single-slot SaveT0 let an overlapping success clear it first, so
@@ -562,6 +675,68 @@ function Persistence.new(ctx: any)
 		entry.State = state
 		entry.FailReason = reason
 		entry.StateChanged:Fire(state, reason)
+	end
+
+	--- Fires StateChanged so a WaitForData caller wakes on the transition.
+	local function setPhase(entry: Entry, phase: ("Importing" | "ImportThrottled")?)
+		if entry.LoadPhase == phase then
+			return
+		end
+		entry.LoadPhase = phase
+		entry.StateChanged:Fire(entry.State, entry.FailReason)
+	end
+
+	-- AwaitBudget is cooperative (a hook that never calls it is unpaced), so the cap is
+	-- the only hard bound on what a migrating server spends.
+	local importsRunning = 0
+
+	--- Wait for a slot, then hand back a release. The caller must run it on every exit
+	--- or the cap leaks a slot per import.
+	local function takeImportSlot(entry: Entry): () -> ()
+		local cap = math.max(1, tonumber(options.MigrationConcurrency) or DEFAULT_MIGRATION_CONCURRENCY)
+		while importsRunning >= cap and not entry.TornDown do
+			setPhase(entry, "ImportThrottled")
+			Clock.Wait(IMPORT_SLOT_POLL)
+		end
+		importsRunning += 1
+		setPhase(entry, "Importing")
+		local released = false
+		return function()
+			if not released then
+				released = true
+				importsRunning -= 1
+			end
+		end
+	end
+
+	--- What ImportLegacyData and OnPlayerInit receive. The wait reports itself, so a
+	--- throttled migration is visible without the hook doing anything beyond calling it.
+	local function migrationContext(entry: Entry)
+		return {
+			AwaitBudget = function(requestType: string, count: number?, timeout: number?): (boolean, () -> ())
+				if type(requestType) ~= "string" then
+					error(
+						`Scribe: migration.AwaitBudget(requestType, count?, timeout?): requestType must be a `
+							.. `string, got {typeof(requestType)}`,
+						2
+					)
+				end
+				return Budget.Await(requestType, count, timeout, function(waiting)
+					setPhase(entry, if waiting then "ImportThrottled" else "Importing")
+				end, function()
+					return entry.TornDown
+				end)
+			end,
+		}
+	end
+
+	--- UpdateAsync tracks the session count because its worst case is the shutdown
+	--- drain: every online session saving at once.
+	local function syncBudgetReserves()
+		Budget.SetReserve("UpdateAsync", self.EntryCount)
+		Budget.SetReserve("GetAsync", GET_RESERVE)
+		local boards = if ctx.Leaderboards ~= nil then ctx.Leaderboards.BoardCount or 0 else 0
+		Budget.SetReserve("GetSortedAsync", math.min(boards, SORTED_RESERVE_CAP))
 	end
 
 	function self.UpdateSaveInfoMirror(entry: Entry)
@@ -994,7 +1169,7 @@ function Persistence.new(ctx: any)
 		return true
 	end
 
-	local function runMigrationsInner(entry: Entry, data: { [string]: any }): boolean
+	local function runMigrationsInner(entry: Entry, data: { [string]: any }): (boolean, string?)
 		local reserved = data[Template.RESERVED_ROOT]
 		local stored = if type(reserved) == "table" and type(reserved.Version) == "number" then reserved.Version else 1
 		if stored > currentVersion then
@@ -1014,7 +1189,8 @@ function Persistence.new(ctx: any)
 						Current = currentVersion,
 					}
 				)
-				return false
+				-- Not a migration failure: nothing ran, this server is just older than the data.
+				return false, "version-ahead"
 			end
 			Log.Warn(
 				"Persistence",
@@ -1122,17 +1298,17 @@ function Persistence.new(ctx: any)
 
 	--- Not spanned, deliberately: a migration is developer code that may yield, and an
 	--- annotation does not survive a yield. LoadDuration already covers what it costs.
-	local function runMigrations(entry: Entry, data: { [string]: any }): boolean
+	local function runMigrations(entry: Entry, data: { [string]: any }): (boolean, string?)
 		return runMigrationsInner(entry, data)
 	end
 
 	local function buildTree(entry: Entry)
 		local profile = entry.Profile
 		entry.LiveData = profile.Data
-		entry.SessionStore = Template.BuildDefaults(compiled, "Session")
+		entry.SessionStore = Template.BuildDefaults(playerCompiled, "Session")
 
 		entry.Tree = Node.NewTree({
-			Compiled = compiled,
+			Compiled = playerCompiled,
 			Stores = { Persist = profile.Data, Session = entry.SessionStore },
 			IsServer = true,
 			Label = entry.Player.Name,
@@ -1215,6 +1391,8 @@ function Persistence.new(ctx: any)
 		-- One canonical reason reaches every consumer: the SessionEnded signal, the stored
 		-- end reason, and WaitForData's second return (see Types.LifecycleReason).
 		local canonical: string = reason or "session-ended"
+		-- Before setState overwrites it: a mid-load kick never had a session to lose.
+		local wasLoading = entry.State == "Loading"
 		self.EndReasons[entry.Player] = canonical
 
 		-- A Data.OnMessage handler that never returns holds its FireTracked open forever,
@@ -1256,7 +1434,12 @@ function Persistence.new(ctx: any)
 			and canonical ~= "player-left"
 			and entry.Player.Parent == Players
 		then
-			entry.Player:Kick(options.SessionEndMessage or "Your data session has ended. Please rejoin!")
+			-- Nearly always another server holding the profile now.
+			local why = if entry.SessionStolen
+				then "SessionStolen"
+				elseif wasLoading then "SessionInterrupted"
+				else "SessionEnd"
+			entry.Player:Kick(kickText(why))
 		end
 
 		-- Only adjust the maintained counters if this entry was still the live one
@@ -1265,6 +1448,7 @@ function Persistence.new(ctx: any)
 		if self.Entries[entry.Player] == entry then
 			self.Entries[entry.Player] = nil
 			self.EntryCount -= 1
+			syncBudgetReserves()
 		end
 		if self.EntriesByUserId[entry.UserId] == entry then
 			self.EntriesByUserId[entry.UserId] = nil
@@ -1316,9 +1500,30 @@ function Persistence.new(ctx: any)
 		then
 			-- YIELDS: the hook reads another library's key and everything below assumes a
 			-- live session, so the liveness re-check moves up here.
+			local importStarted = Clock.Monotonic()
+			local releaseSlot = takeImportSlot(entry)
+			if entry.TornDown then
+				-- Waiting for a slot is a window the outer guard could not see, and teardown
+				-- has already run.
+				releaseSlot()
+				setPhase(entry, nil)
+				return
+			end
 			local ok, legacy = xpcall(options.ImportLegacyData, function(e)
 				return debug.traceback(tostring(e), 2)
-			end, player, entry.UserId)
+			end, player, entry.UserId, migrationContext(entry))
+			releaseSlot()
+			setPhase(entry, nil)
+			local importSeconds = Clock.Monotonic() - importStarted
+			if importSeconds >= SLOW_IMPORT_SECONDS then
+				-- Without this, "waiting on budget" and "hung" look identical in the log.
+				Log.Warn(
+					"Persistence",
+					"SLOW_IMPORT",
+					`ImportLegacyData took {string.format("%.1f", importSeconds)}s, past the {SLOW_IMPORT_SECONDS}s mark`,
+					{ Player = player }
+				)
+			end
 
 			if not ok then
 				-- Fail closed, the same shape as a failed migration: a hook that threw
@@ -1339,7 +1544,7 @@ function Persistence.new(ctx: any)
 				entry.LocalSessionEnd = true
 				releaseWithoutWriting(profile)
 				if player.Parent == Players then
-					player:Kick(options.LoadFailureMessage or "We couldn't load your data. Please rejoin!")
+					player:Kick(kickText("LegacyImport"))
 				end
 				teardown(entry, "load-failed")
 				return
@@ -1509,7 +1714,8 @@ function Persistence.new(ctx: any)
 			end
 		end
 
-		if not runMigrations(entry, profile.Data) then
+		local migrated, refusal = runMigrations(entry, profile.Data)
+		if not migrated then
 			-- Carve-out for a returning player whose stored data is still nothing but
 			-- current-template defaults. Fail-closed protects real stored bytes and this
 			-- profile has none, so kicking would manufacture a permanent outage for
@@ -1534,7 +1740,8 @@ function Persistence.new(ctx: any)
 				entry.LocalSessionEnd = true
 				releaseWithoutWriting(profile)
 				if player.Parent == Players then
-					player:Kick(options.LoadFailureMessage or "We couldn't load your data. Please rejoin!")
+					-- Their data is newer, not broken: the migration wording is backwards here.
+					player:Kick(kickText(if refusal == "version-ahead" then "VersionAhead" else "Migration"))
 				end
 				teardown(entry, "migration-failed")
 				return
@@ -1648,7 +1855,7 @@ function Persistence.new(ctx: any)
 					entry.LocalSessionEnd = true
 					releaseWithoutWriting(profile)
 					if player.Parent == Players then
-						player:Kick(options.LoadFailureMessage or "We couldn't load your data. Please rejoin!")
+						player:Kick(kickText("Schema"))
 					end
 					teardown(entry, "load-failed")
 					return
@@ -1708,9 +1915,12 @@ function Persistence.new(ctx: any)
 			-- profile does not: they arrive carrying a full inventory, and the starter kit
 			-- on top is the exact double-grant this flag prevents elsewhere.
 			local isNewProfile = (isNew or options.ResetData == true or freshAsTemplate) and not imported
+			-- ImportLegacyData only fires for a player who has never saved, so a game
+			-- already on Scribe finishes moving stores here instead. NOT behind the import
+			-- cap: this runs on every join, and serialising those throttles ordinary logins.
 			Util.safeCall(function(err)
 				Log.Error("Lifecycle", "ON_PLAYER_INIT_ERROR", err, { Player = player })
-			end, options.OnPlayerInit, player, profile.Data, isNewProfile)
+			end, options.OnPlayerInit, player, profile.Data, isNewProfile, migrationContext(entry))
 		end
 
 		-- REVERTED rather than merely reported: a half-edited exchange record is worse than
@@ -2046,7 +2256,7 @@ function Persistence.new(ctx: any)
 			})
 
 			if (options.LoadFailurePolicy or "Kick") == "Kick" then
-				player:Kick(options.LoadFailureMessage or "We couldn't load your data. Please rejoin!")
+				player:Kick(loadKickText(entry))
 				teardown(entry, "load-failed")
 				return
 			end
@@ -2111,6 +2321,7 @@ function Persistence.new(ctx: any)
 		}
 		self.Entries[player] = entry
 		self.EntryCount += 1
+		syncBudgetReserves()
 		self.EntriesByUserId[entry.UserId] = entry
 		Sched.Spawn(function()
 			-- Its OWN thread, so everything the load allocates, the profile copy and the
@@ -2176,7 +2387,7 @@ function Persistence.new(ctx: any)
 	end
 
 	function self.WaitForData(player: Player, timeout: number?): (any?, string?)
-		local deadline = Clock.Monotonic() + (timeout or 60)
+		local deadline = Clock.Monotonic() + (timeout or Defaults.ServerWaitForData)
 		while true do
 			local entry = self.Entries[player]
 			if entry then
@@ -2212,9 +2423,14 @@ function Persistence.new(ctx: any)
 		end
 	end
 
-	function self.GetState(player: Player): string
+	--- The phase is a SECOND return, not a fourth state: every existing single-value
+	--- caller keeps working and nothing switching on the state changes meaning.
+	function self.GetState(player: Player): (string, string?)
 		local entry = self.Entries[player]
-		return if entry then entry.State else "SessionEnded"
+		if entry == nil then
+			return "SessionEnded", nil
+		end
+		return entry.State, entry.LoadPhase
 	end
 
 	--- Did THIS save write something other than the live tree?

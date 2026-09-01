@@ -84,6 +84,7 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `PROFILE_RESTORED` | Warn | A profile was rolled back to an earlier version. The log records the restored version and the audit context. |
 | `PROFILE_RESTORE_FAIL` | Warn | A restore did not complete, so the stored profile is unchanged. The version was not found, a live session held the key, the live key no longer exists, or the commit failed. |
 | `RESTORE_RESERVED_PRESERVED` | Warn | A restore rolled the profile back, and the library-owned `_Scribe` root was kept as it was live rather than rolled back with it. That root records events that already happened in the real world, such as settled receipts and spent cooldowns. |
+| `SLOW_IMPORT` | Warn | An `ImportLegacyData` hook ran for longer than thirty seconds. The hook is unbounded on purpose and holds the session lock throughout, so this separates one patiently waiting on the DataStore budget from one that has hung. |
 | `SLOW_LOAD` | Warn | A profile took longer than ten seconds to load. Measured from the JOIN, not from the DataStore call, so it covers the queue, the retries and any migration: it is what the player waited through. Read the `LoadDuration` percentiles alongside it, because one slow join is weather and a moved p99 is a problem. |
 | `PROFILE_SIZE` | Warn | The profile passed the size-warning threshold and is approaching the 4 MB per-key ceiling. Measured before each save attempt, so it still fires when that save then fails. It stays latched until the size drops back. Also fires `OnAnomaly`. |
 | `PROFILE_STORE_ERROR` | Warn | ProfileStore reported a DataStore error against this bundle's store. `Context.Class` is `Throttled`, `Failed`, `Unresolved` or `Rejected`, and `Context.Code` is the numeric prefix Roblox sent. A nil code means the message did not carry one. |
@@ -217,6 +218,8 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `UNDECLARED_CATEGORY` | Warn | In DevMode, a purchase-log entry used a category string that is not in the declared set. Usually a typo. |
 | `UNDECLARED_PERK` | Warn | In DevMode, a perk key was granted or referenced that is not in the `Perks` registry. Usually a typo. |
 | `UNKNOWN_OWNS_KEY` | Warn | In DevMode, `Owns` or `OwnsAsync` was called with a key that is not a registered pass, a declared perk, a product grant, or `RobloxPlus`, so it will always return false. Warned once per key. |
+| `PRODUCT_INFO_FAIL` | Warn | _(Client.)_ Marketplace refused every attempt to read a pass or product's info, so its price stays `nil` rather than falling back to the undiscounted catalog price. Usually rate limiting. The read is retried by the next `GetProductInfo` call. |
+| `PRODUCT_INFO_THROTTLED` | Warn | _(Client.)_ A product info read failed and will be retried with backoff. Roblox rate-limits `GetProductInfoAsync` and does not publish the limit. |
 | `SIM_RECEIPT` | Warn | _(Studio only.)_ The Studio plugin injected a mock receipt. Injection requires the resolved `Mode = "Mock"`, so no real store is ever touched. |
 | `PERK_GRANTED` | Info | A perk flag was set on a ready player. |
 | `PERK_REVOKED` | Info | A perk flag was cleared on a ready player. |

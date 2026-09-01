@@ -516,6 +516,56 @@ function Replication.new(ctx: any)
 	-- superlinear path is the Shared fanout, which a budget does not touch.
 	--- One frame's flush. Extracted so the profiler has something to name and so the
 	--- frame cost can be timed around it.
+	-- One queue for the whole server: a single writer, one frame to every ready client.
+	local storeQueue: { Wire.Op } = {}
+	-- Lets flushFrame skip the drain entirely. Read from the compiled, not from
+	-- ctx.ServerStore, which is assigned after this constructor returns.
+	local hasStore = compiled.Views.Store ~= nil
+
+	--- Queue a store op. Same visibility rule as a player op: ServerOnly never leaves.
+	function self.PushStoreOp(op: Wire.Op, schema: Template.SchemaNode?)
+		local visibility = if schema then schema.Visibility else Template.VisibilityOf(compiled, op.Path)
+		if visibility == "ServerOnly" then
+			return
+		end
+		stripServerOnly(op, schema)
+		Metrics.Add("OpsQueued")
+		-- compactOps reads _pk unconditionally. The semicolon is load-bearing: a line opening
+		-- with `(` after a call is ambiguous to Luau.
+		local pathKey = Util.pathKey(op.Path);
+		(op :: any)._pk = pathKey
+		storeQueue[#storeQueue + 1] = op
+	end
+
+	--- Encode whatever the store queued and broadcast it to every ready client.
+	function self.FlushStoreQueue()
+		if #storeQueue == 0 then
+			return
+		end
+		local queue = compactOps(storeQueue)
+		storeQueue = {}
+		local offset = 1
+		while offset <= #queue do
+			local chunk = table.move(queue, offset, math.min(offset + MAX_OPS_PER_FRAME - 1, #queue), 1, {})
+			local ok, bytesOrErr = pcall(Wire.EncodeOpsFrame, Wire.Frames.Diff, compiled, chunk)
+			if ok then
+				-- An ordinary Diff against the full compiled: no new frame kind needed.
+				local missed = broadcastBuffer(bytesOrErr)
+				Metrics.Add("OpsSent", #chunk)
+				if missed ~= nil then
+					-- Nothing else repairs a missed store diff, so force a re-Init.
+					for _, entry in missed do
+						markResync(entry, "StoreDiff")
+					end
+				end
+			else
+				Log.Error("Replication", "SERIALIZE_FAIL", tostring(bytesOrErr), {})
+				Metrics.Add("SerializeFailed")
+			end
+			offset += MAX_OPS_PER_FRAME
+		end
+	end
+
 	local function flushFrame(): (number, number)
 		local flushed = 0
 		local queued = 0
@@ -548,6 +598,10 @@ function Replication.new(ctx: any)
 				self.FlushEntry(entry)
 			end
 		end
+		-- The store drains once per frame, not per entry: one queue, one broadcast.
+		if hasStore then
+			self.FlushStoreQueue()
+		end
 		return flushed, queued
 	end
 
@@ -573,9 +627,19 @@ function Replication.new(ctx: any)
 	local function ownerSnapshotOps(entry: any): { Wire.Op }
 		local ops: { Wire.Op } = {}
 		local rootChildren = compiled.Root.Children :: { [string]: Template.SchemaNode }
+		-- Store roots come from the server's tree, not this player's. They ride the Init
+		-- because applyInit clears and refills from defaults. Nil when no store is declared.
+		local storeData = if ctx.ServerStore ~= nil then ctx.ServerStore.Data else nil
 		for _, rootKey in compiled.RootOrder do
 			local rootSchema = rootChildren[rootKey]
-			local store = if not rootSchema.Persist then entry.SessionStore else entry.LiveData
+			local store
+			if storeData ~= nil and storeData[rootKey] ~= nil then
+				store = storeData
+			elseif not rootSchema.Persist then
+				store = entry.SessionStore
+			else
+				store = entry.LiveData
+			end
 			local value = if store then store[rootKey] else nil
 			if value ~= nil then
 				-- CloneVisible strips ServerOnly subtrees and returns nil for roots with

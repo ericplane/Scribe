@@ -87,7 +87,7 @@ end
 
 ## OnPlayerInit
 
-`OnPlayerInit` runs once per player, right after their profile finishes loading and before they are Ready. It receives the Player, their **raw** data table, and whether this is a brand-new profile:
+`OnPlayerInit` runs once per player, right after their profile finishes loading and before they are Ready. It receives the Player, their **raw** data table, whether this is a brand-new profile, and a migration context covered [below](#reading-legacy-stores-here):
 
 ```lua
 Scribe({
@@ -104,6 +104,29 @@ Scribe({
 ```
 
 `isNewProfile` is true for a genuinely new profile, a `ResetData` wipe, and a first-session crash recovery, so you can run starter kits and welcome flows without keeping your own sentinel field. An error thrown here is caught and logged rather than blocking the load.
+
+### Reading legacy stores here
+
+The fourth argument is the same context [`ImportLegacyData`](./migrating) receives, and it exists for a game that has **already** adopted Scribe but still has stores to move across. `ImportLegacyData` only fires for a player who has never saved through Scribe, so once you have shipped it never runs again; leftover migration work belongs here.
+
+```lua
+OnPlayerInit = function(player, rawData, isNewProfile, migration)
+    if rawData.PetsMigrated then
+        return
+    end
+    local ok, done = migration.AwaitBudget("GetAsync")
+    if ok then
+        rawData.Pets = readOldPetStore(player.UserId)
+        rawData.PetsMigrated = true
+    end
+    done()
+end,
+```
+
+`AwaitBudget(requestType, count?, timeout?)` yields until that many DataStore requests are spare, so a backfill across many joining players paces itself instead of throttling. It returns whether they were granted and a release to call once the reads have gone out, which hands the allowance to the next waiter immediately instead of leaving a timer to presume the grant spent. Release whether the read worked or not, since the request was counted either way, and take a fresh grant for a retry. See [Migrating to Scribe](./migrating) for the two ways to get that wrong. Waiting callers are served first come, first served. While one is queued, [`Data.GetState`](/api/Server#GetState) reports `"ImportThrottled"` as its second return.
+
+!!! warning "This hook is not behind `MigrationConcurrency`"
+    `ImportLegacyData` runs at most `MigrationConcurrency` at a time (default 2). `OnPlayerInit` is deliberately exempt, because it runs on **every** join and serialising all of them would throttle ordinary logins. Only the budget queue paces it, so keep the work here conditional: guard on a field you set once, as above, rather than reading the old store on every join forever.
 
 The table you get is the raw profile data, not the accessor tree, so writes here bypass the usual validation. Scribe scans the result afterwards and reports anything unstorable as `PROFILE_UNPERSISTABLE`. For a value that depends only on the profile itself, such as a creation timestamp, prefer [`Scribe.Dynamic`](./templates), which is declared in the template and runs per profile automatically.
 
@@ -242,6 +265,8 @@ Doing this from your own `Players.PlayerRemoving` handler instead is a race agai
     ```
 
     It is idempotent, and it deliberately does **not** save, so flush first if the data matters. Loaded sessions are left alone: drop the bundle and they go with it. See [Testing & Edit Mode](./testing).
+
+    The client has the same call. [`Data.Stop()`](/api/Client#Stop) releases the transport listener, the Hello retry loop and the mirror's listeners, which is what a storybook that remounts a bundle per story needs so each story does not leave a listener behind.
 
 ## Where to next
 

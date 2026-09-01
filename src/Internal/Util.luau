@@ -33,16 +33,11 @@ export type Unpersistable = {
 }
 
 -- Depth-first scan for the first value or key a DataStore cannot store: invalid UTF-8
--- (error 104), or an unserializable leaf. Used by the raw-table save boundaries that
--- bypass Node.validateWrite (OnPlayerInit, UpdateOffline, migrations, Dynamic seeds),
--- where the alternative is the entire profile save failing opaquely. The offender's
--- ancestor keys are all valid UTF-8, because a bad key is reported before recursing
--- under it. `stats`, when supplied, collects the deepest nesting reached, which reports
--- data stored deeper than a write can reach at load rather than at the first Set.
---
--- The path rides a scratch stack rather than a fresh array per child. `n` is the count
--- of live entries and is passed by value, so a frame only reads `stack[1..n]`; stale
--- entries past it are unreachable, hence no pop.
+-- (error 104) or an unserializable leaf. Used by the raw-table save boundaries that
+-- bypass Node.validateWrite, where the alternative is the whole save failing opaquely.
+-- A bad key is reported before recursing under it, so the offender's ancestors are all
+-- valid. The path rides a scratch stack: `n` is the live count, passed by value, so a
+-- frame only reads `stack[1..n]` and nothing is popped.
 local function snapshotPath(stack: { string | number }, n: number, extra: (string | number)?): { string | number }
 	local out: { string | number } = {}
 	table.move(stack, 1, n, 1, out)
@@ -280,7 +275,6 @@ local function decimalDigits(n: number): number
 	return #string.format("%.0f", n)
 end
 
--- Bytes JSON spends on a number.
 local function jsonNumberBytes(v: number): number
 	if v ~= v or v == math.huge or v == -math.huge then
 		-- Not encodable at all; findUnpersistable rejects these separately, so
@@ -496,6 +490,29 @@ function Util.sanitizeContext(context: any, depth: number?): any
 		return context
 	end
 	return tostring(context)
+end
+
+--- The first missing index in what is meant to be a dense array, or nil. `#` cannot
+--- answer this alone: it counts past a constructor hole (`{ "a", nil, "b" }` is 3) and
+--- stops short of an assigned one (t[1], t[3] is 1), and iteration skips either. Named
+--- keys are not gaps.
+function Util.firstGap(list: { any }): number?
+	local count, highest = 0, 0
+	for key in list do
+		count += 1
+		if type(key) == "number" and key > highest then
+			highest = key
+		end
+	end
+	if count == highest then
+		return nil
+	end
+	for i = 1, highest do
+		if list[i] == nil then
+			return i
+		end
+	end
+	return nil
 end
 
 return Util

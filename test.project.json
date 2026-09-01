@@ -18,6 +18,9 @@
         "Test": {
           "$path": "test"
         },
+        "Adapters": {
+          "$path": "adapters"
+        },
         "DevPackages": {
           "$path": "DevPackages"
         }

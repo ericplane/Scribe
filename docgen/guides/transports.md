@@ -57,10 +57,11 @@ export type ScribeTransport = {
     -- Client
     SendToServer: (self: any, bytes: buffer) -> (),
     ListenClient: (self: any, callback: (bytes: buffer) -> ()) -> (),
+    Release: ((self: any) -> ())?, -- optional: disconnect what ListenClient connected
 }
 ```
 
-Scribe checks the members it needs for the current realm at startup, so a missing one fails loudly with `Scribe: custom transport is missing "..."` rather than going quiet. On the server that is `SendToClient` and `ListenServer`. On the client it is `SendToServer` and `ListenClient`.
+Scribe checks the members it needs for the current realm at startup, so a missing one fails loudly with `Scribe: custom transport is missing "..."` rather than going quiet. On the server that is `SendToClient` and `ListenServer`. On the client it is `SendToServer` and `ListenClient`. `Release` is optional: [`Data.Stop`](/api/Client#Stop) on the client calls it if present, so an adapter that implements it is torn down cleanly by a storybook or a test.
 
 `SendToAllClients` is an optional fast path for frames that go to every connected client, which today means the service-status broadcast. `Scribe.Shared` frames are not among them, because [they deliberately skip the owner's own client](./visibility), so those always go out through `SendToClient`. Omit the method and Scribe loops `SendToClient` for everything.
 

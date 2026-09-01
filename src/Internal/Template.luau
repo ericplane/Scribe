@@ -131,12 +131,18 @@ export type Compiled = {
 	-- pathKey of an input (or any ancestor of one) -> the fields to recompute. A
 	-- write looks up its own pathKey and finds every dependent in one hop.
 	DerivedByWrite: { [string]: { SchemaNode } },
+	-- Root views. Player is the compiled itself when no store is declared; views share
+	-- everything but Root, RootOrder and HasShared by reference.
+	Views: { Player: Compiled, Store: Compiled? },
 	Config: CompileConfig,
 }
 
 export type CompileConfig = {
 	ReplicateRobuxLog: boolean?,
 	ReplicateInGameLog: boolean?,
+	-- Roots owned by the server, not a player. Same compile state as the player roots,
+	-- so one id space and one hash.
+	ServerStore: { [string]: any }?,
 }
 
 local RESERVED_ROOT = "_Scribe"
@@ -1223,11 +1229,92 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		children[key] = buildNode(state, key, userTemplate[key], { key }, "Replicated", true, root)
 	end
 
+	-- persist = false is what keeps these out of every save.
+	local storeTemplate = cfg.ServerStore
+	local storeOrder: { string } = {}
+	if storeTemplate ~= nil then
+		if type(storeTemplate) ~= "table" then
+			error("Scribe: ServerStore must be a table", 0)
+		end
+		storeOrder = Util.sortedKeys(storeTemplate)
+		for _, key in storeOrder do
+			if type(key) ~= "string" then
+				error("Scribe: ServerStore root keys must be strings", 0)
+			end
+			if string.sub(key, 1, 3) == "@cd" or string.sub(key, 1, #RESERVED_ROOT) == RESERVED_ROOT then
+				error(`Scribe: ServerStore may not declare a "{key}" key: that prefix is library-owned`, 0)
+			end
+			if children[key] ~= nil then
+				error(
+					`Scribe: ServerStore declares "{key}", which the Template already declares. The two share `
+						.. "one field-id space and one schema, so one would silently shadow the other. Rename one.",
+					0
+				)
+			end
+			-- Caught on the declarator: it cannot be told apart after building.
+			local markerKind = Marker.inspect(storeTemplate[key])
+			if markerKind == "Session" then
+				error(
+					`Scribe: ServerStore root "{key}" is Scribe.Session. A server store is never saved, so the `
+						.. "marker sets nothing that is not already true. Drop the wrapper.",
+					0
+				)
+			end
+			local node = buildNode(state, key, storeTemplate[key], { key }, "Replicated", false, root)
+			children[key] = node
+
+			-- Load-bearing, not tidiness: hasShared scans every child of the root, so one
+			-- Shared store root switches on the whole per-player fanout.
+			if node.Visibility == "Shared" then
+				error(
+					`Scribe: ServerStore root "{key}" is Scribe.Shared. Every store root already reaches every `
+						.. "client, and a store has no owning player for Shared to name. Drop the wrapper, or use "
+						.. "Scribe.ServerOnly to keep it off the wire.",
+					0
+				)
+			end
+
+			-- A deadline is swept per profile entry and a Dynamic factory is sampled per profile
+			-- load. A store has neither, and both would fail silently.
+			local function refuseSubtree(n: SchemaNode)
+				local where = if n.Name then `"{Util.pathString(n.Path :: any)}"` else `root "{key}"`
+				if n.Timed then
+					error(
+						`Scribe: ServerStore field {where} is Scribe.Timed. A deadline lives in a player's `
+							.. "_Scribe.Timed dict and is swept per profile, so a server store has nowhere to "
+							.. "hold one and nothing to expire it.",
+						0
+					)
+				end
+				if n.Factory ~= nil then
+					error(
+						`Scribe: ServerStore field {where} is Scribe.Dynamic. The factory is sampled once when `
+							.. "a brand-new profile is created, and a store has no profile. Set the value from "
+							.. "your own code after the bundle is built.",
+						0
+					)
+				end
+				if n.Children then
+					for _, child in n.Children do
+						refuseSubtree(child)
+					end
+				end
+				if n.AnyChild then
+					refuseSubtree(n.AnyChild)
+				end
+			end
+			refuseSubtree(node)
+		end
+	end
+
 	local scribeNode, sessionNode = buildInternalRoots(state, root, cfg)
 	children[RESERVED_ROOT] = scribeNode
 	children[SESSION_ROOT] = sessionNode
 
 	local order = table.clone(userOrder)
+	for _, key in storeOrder do
+		table.insert(order, key)
+	end
 	table.insert(order, RESERVED_ROOT)
 	table.insert(order, SESSION_ROOT)
 	table.sort(order)
@@ -1270,6 +1357,31 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		derivedNodes, derivedByWrite =
 			DerivedModule.Resolve(root, pendingDerived :: any, reservedRoots, compileError :: any)
 		DerivedModule.SeedDefaults(derivedNodes :: any, compileError :: any)
+
+		-- A derived field recomputes on whichever tree took the write, so an input on the
+		-- far side would settle into the wrong one.
+		if storeTemplate ~= nil then
+			local function isStoreRoot(path: { any }): boolean
+				return #path > 0 and storeTemplate[path[1]] ~= nil
+			end
+			for _, node in derivedNodes do
+				local spec = (node :: any).Derived
+				if spec ~= nil and spec.Inputs ~= nil then
+					local outputInStore = isStoreRoot(node.Path)
+					for _, input in spec.Inputs do
+						if isStoreRoot(input.Path) ~= outputInStore then
+							error(
+								`Scribe: derived field "{Util.pathString(node.Path)}" reads `
+									.. `"{Util.pathString(input.Path)}", which is on the other side of the `
+									.. "ServerStore boundary. A derived field recomputes on whichever tree took "
+									.. "the write, and the two trees hold different data.",
+								0
+							)
+						end
+					end
+				end
+			end
+		end
 		-- A record's Default table was composed from its children while they were
 		-- built, so a nested derived field's freshly seeded default has to be written
 		-- back up: anything reading a record's Default directly would otherwise see
@@ -1424,7 +1536,7 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		end
 	end
 
-	return {
+	local compiled: Compiled = {
 		Root = root,
 		ById = state.ById,
 		NodeCount = state.NextId,
@@ -1434,8 +1546,53 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		DynamicNodes = dynamicNodes,
 		DerivedNodes = derivedNodes,
 		DerivedByWrite = derivedByWrite,
+		Views = nil :: any,
 		Config = cfg,
 	}
+
+	-- A view is the compiled with its root scoped to a subset of the children. Node reads
+	-- only Root, DerivedByWrite, DerivedNodes and Template.Resolve, so this costs nothing
+	-- in Node itself.
+	local function makeView(keys: { string }): Compiled
+		local viewChildren: { [string]: SchemaNode } = {}
+		local viewOrdinal: { [string]: number } = {}
+		local viewShared = false
+		for index, key in keys do
+			local child = children[key]
+			viewChildren[key] = child
+			viewOrdinal[key] = index
+			if child.Visibility == "Shared" then
+				viewShared = true
+			end
+		end
+		local viewRoot: SchemaNode = table.clone(root)
+		-- No Id: a view must never reach an encoder. EncodePath would write id 0 and decode
+		-- to a valid but schemaless path instead of raising.
+		viewRoot.Id = nil
+		viewRoot.Children = viewChildren
+		viewRoot.ChildOrder = keys
+		viewRoot.ChildOrdinal = viewOrdinal
+		local view: Compiled = table.clone(compiled)
+		view.Root = viewRoot
+		view.RootOrder = keys
+		view.HasShared = viewShared
+		return view
+	end
+
+	if #storeOrder == 0 then
+		-- No store, so the player view IS the compiled and nothing else changes shape.
+		compiled.Views = { Player = compiled, Store = nil }
+	else
+		local declared = storeTemplate :: { [string]: any }
+		local playerKeys: { string } = {}
+		for _, key in order do
+			if declared[key] == nil then
+				table.insert(playerKeys, key)
+			end
+		end
+		compiled.Views = { Player = makeView(playerKeys), Store = makeView(table.clone(storeOrder)) }
+	end
+	return compiled
 end
 
 -- Shared with Node, whose read paths all have to agree on which nodes need an unpack.

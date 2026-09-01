@@ -616,6 +616,15 @@ local function clientUsage()
 	-- RequestOnce takes the idempotency key as a required second string, then the
 	-- command's own arguments.
 	local requestOnceOk = ClientData.RequestOnce("EquipItem", "click-1", "Sword_001")
+	local price: number? = ClientData.GetPrice("VIP")
+	local priceAsync: number? = ClientData.GetPriceAsync("VIP", 5)
+	local info: { [string]: any }? = ClientData.GetProductInfo("VIP")
+	local infoAsync: { [string]: any }? = ClientData.GetProductInfoAsync("VIP", 5)
+	local stopObserving: () -> () = ClientData.ObserveProductInfo("VIP", function(_info) end)
+	ClientData.PrefetchProductInfo({ "VIP" })
+	ClientData.RefreshProductInfo("VIP")
+	ClientData.Stop()
+	local _pricing = { price, priceAsync, info, infoAsync, stopObserving }
 	return rank, owns, ownsAsync, requestOk, requestOnceOk, ready, music, inCombat
 end
 

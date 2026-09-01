@@ -1,17 +1,12 @@
 --!strict
--- The clock seam: every reading of time and every timed wait goes through here, so
--- a test or a simulation can replace them and fast-forward. Two clocks, because
--- conflating them is a real bug:
---
---   Now()       wall time in unix seconds (os.time). For anything persisted or
---               compared across sessions and servers; it can jump when the
---               machine's clock is corrected, so never measure an interval with it.
---   Monotonic() a steadily-increasing process timer (os.clock). For intervals
---               inside one session; never persist it, it means nothing elsewhere.
---
--- ProfileStore measures its own deadlines with its own os.clock but reaches the
--- outside world only through globals, so loading it under a per-server environment
--- (test/Sim/Env.luau) virtualises its clock without a fork.
+-- The clock seam: every time reading and timed wait goes through here, so a test can
+-- replace them and fast-forward. Two clocks, because conflating them is a real bug:
+--   Now()       wall time (os.time). For anything persisted or compared across servers;
+--               it can jump when corrected, so never measure an interval with it.
+--   Monotonic() a steady process timer (os.clock). For intervals in one session; never
+--               persist it.
+-- ProfileStore reaches the clock only through globals, so loading it under a per-server
+-- environment (test/Sim/Env.luau) virtualises it without a fork.
 
 local Clock = {}
 

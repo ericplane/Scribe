@@ -115,6 +115,14 @@ Uncertain.REGISTER = {
 		Where = "test/Sim/Link.luau -> Link.new(MaxFrameBytes)",
 		Direction = "MEASURED, not invented, and it corrected this model rather than justifying it: a FireClient of 32 MiB of incompressible data was delivered IN FULL on a live server with a real client -- no raise, no drop, no disconnect, at roughly 30 MiB/s. Platform remotes do not refuse, so a raising channel is a HOSTILE transport, not a faithful one. Boundary: one client on an otherwise idle connection. The aggregate case -- a server pushing large frames to fifty players at once -- is UNMEASURED, and is the case where a real ceiling would most plausibly exist. Do not quote this as evidence that size does not matter at scale.",
 	},
+	{
+		Id = "U12",
+		Quantity = "Whether UpdateAsync spends the read request budget as well as the write one",
+		Documented = "Limits are listed per request type. Whether one UpdateAsync draws on both allowances is never stated.",
+		Default = "It draws on both: one StandardRead and one StandardWrite per call",
+		Where = "test/Sim/Disk/init.luau -> POOL_FOR_REQUEST_TYPE",
+		Direction = "Sizes GET_RESERVE in src/Server/Persistence.luau. If UpdateAsync does NOT charge reads, a join spends no read allowance, the reserve protects only the sessionless paths, and it is merely oversized. If it DOES, a filling server draws on the same pool a migration is pacing against and the reserve is load-bearing. Measured in this model at one read and one write per join (SimBudget). UNVERIFIED against the engine.",
+	},
 } :: { Entry }
 
 --- The sweep matrix: settings a headline result must be reproduced across.

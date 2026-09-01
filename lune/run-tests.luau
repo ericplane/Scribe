@@ -922,6 +922,9 @@ end
 local root = newInstance("ScribeDev", "Folder")
 addChild(root, buildTree("Scribe", "src"))
 addChild(root, buildTree("Test", "test"))
+-- Mirrors test.project.json: the UI-framework adapters are not part of the package
+-- (wally publishes src only), but their specs drive them, so they have to be reachable.
+addChild(root, buildTree("Adapters", "adapters"))
 
 -- The escape hatch a simulation needs, and the ONLY one.
 --

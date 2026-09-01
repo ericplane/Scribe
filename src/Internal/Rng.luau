@@ -1,14 +1,10 @@
 --!strict
--- The randomness seam: every draw goes through here, so a simulation can replay a
--- run exactly. Next() returns a float in [0, 1) and nothing else. Not math.random,
--- whose state is shared with the game, and not Random.new, which does not exist
--- outside Roblox.
---
--- Seeded from JobId mixed with Clock.Now(): a fleet booted by one deploy reads
--- nearly the same wall clock, and a herd left synchronised by neighbouring seeds
--- is the failure that jitter exists to prevent. Clock.Now() covers Studio, where
--- JobId is empty. Seeded lazily, on the first draw, so a module that draws while
--- loading does not sample the clock before Clock.Install has run.
+-- The randomness seam: every draw goes through here, so a simulation can replay a run.
+-- Next() returns a float in [0, 1). Not math.random, whose state the game shares, and
+-- not Random.new, which does not exist outside Roblox.
+-- Seeded from JobId mixed with Clock.Now(), because a fleet booted by one deploy reads
+-- nearly the same clock and a synchronised herd is what jitter exists to prevent.
+-- Seeded lazily, so a module drawing at load does not beat Clock.Install.
 
 local Clock = require(script.Parent.Clock)
 

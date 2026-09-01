@@ -200,3 +200,4 @@ Use `Scribe.ServerData<T>` and `Scribe.ClientData<T>` when you need to name the 
 - [Big Numbers](./big-numbers) is for a currency that runs past `2^53`.
 - [Timers & Cooldowns](./time) covers `Scribe.Timed` and the cooldown API beside it.
 - [Replication and Visibility](./visibility) decides which of these fields the client ever sees.
+- [The Server Store](./server-store) declares the round state that belongs to nobody.

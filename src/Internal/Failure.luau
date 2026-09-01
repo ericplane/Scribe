@@ -1,17 +1,12 @@
 --!strict
--- Classifies a DataStore failure into one of four outcomes and reports it. Failure.Report
--- at the bottom is the single entry point every failure site uses.
---
+-- Classifies a DataStore failure and reports it. Failure.Report is the single entry
+-- point every failure site uses.
 --   Throttled   dropped; back off, retrying makes it worse
---   Failed      a transient service-side failure; a retry may well work
---   Unresolved  timed out and the write may have landed, so it cannot be retried blindly
---   Rejected    permanently invalid (oversize payload, bad key, metadata cap); every
---               retry fails identically forever
---
--- Only the numeric prefix of the error string is read ("504: Datastore request timed
--- out."); the prose after the colon is not a contract. An unrecognised code classifies as
--- Failed, with the parsed code in the log context so a family that starts showing up
--- unclassified is visible rather than silent.
+--   Failed      transient service-side; a retry may work
+--   Unresolved  timed out and the write may have landed; never retry blindly
+--   Rejected    permanently invalid; every retry fails identically
+-- Only the numeric prefix of the error string is read; the prose is not a contract.
+-- An unrecognised code classifies as Failed, with the code in the log context.
 
 local Health = require(script.Parent.Health)
 local Log = require(script.Parent.Log)

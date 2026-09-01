@@ -90,6 +90,79 @@ return function()
 		Guard.Reset()
 	end)
 
+	describe("which pools a join actually spends", function()
+		--- Count budget takes by modelled pool. Set on the INSTANCE for the same reason
+		--- stubBudget is: it dies with the universe and restores nothing.
+		local function countCharges(disk)
+			local charges = {}
+			local real = disk.Budget.TryTake
+			disk.Budget.TryTake = function(selfBudget, jobId, kind)
+				charges[kind] = (charges[kind] or 0) + 1
+				return real(selfBudget, jobId, kind)
+			end
+			return charges
+		end
+
+		it("charges a join to the READ pool as well as the write pool", function()
+			-- A join does not CALL GetAsync, but ProfileStore loads with UpdateAsync and
+			-- that charges both pools, so GET_RESERVE rests on an undocumented engine
+			-- behaviour (register U12). Equal counts are the tell that every standard op
+			-- in a join is an UpdateAsync rather than a bare read.
+			local uni = newUniverse({ NoBudget = false })
+			local charges = countCharges(uni.Disk)
+			local server = uni:Server(1)
+			local player = FakePlayer.new(8821)
+			server:Join(8821, player)
+			uni:Run(5)
+
+			local read = charges.StandardRead or 0
+			local write = charges.StandardWrite or 0
+			local ordered = (charges.OrderedRead or 0) + (charges.OrderedWrite or 0)
+			expect(`read={read} write={write} equal={read == write} ordered={ordered}`).to.equal(
+				"read=1 write=1 equal=true ordered=0"
+			)
+		end)
+
+		it("answers the GetAsync query from the pool an UpdateAsync actually drains", function()
+			-- POOL_FOR_REQUEST_TYPE mirrors where Store.luau charges and nothing else holds
+			-- the two together; drift leaves the query reporting a pool the ops never
+			-- spend. One raw UpdateAsync, no players: the ceiling scales with player
+			-- count, so a join raises the allowance faster than it spends it.
+			local uni = newUniverse({ NoBudget = false })
+			local service = uni.Disk:ServiceFor("probe-job")
+			local before, after
+			uni.Sched:Spawn(function()
+				before = service:GetRequestBudgetForRequestType({ Name = "GetAsync" })
+				service:GetDataStore("BudgetProbe"):UpdateAsync("k", function(old)
+					return (old or 0) + 1
+				end)
+				after = service:GetRequestBudgetForRequestType({ Name = "GetAsync" })
+			end)
+			uni:Run(1)
+			expect(`before={before} spent={(before or 0) - (after or -1)}`).to.equal("before=60 spent=1")
+		end)
+
+		it("reports the SCARCER pool for UpdateAsync, not just the write side", function()
+			-- Answering from the roomier pool promises headroom the other cannot honour.
+			local uni = newUniverse({ NoBudget = false })
+			local service = uni.Disk:ServiceFor("probe-job")
+			local read, write, update
+			uni.Sched:Spawn(function()
+				local store = service:GetDataStore("BudgetProbe")
+				for i = 1, 20 do
+					store:GetAsync(`k{i}`)
+				end
+				read = service:GetRequestBudgetForRequestType({ Name = "GetAsync" })
+				write = service:GetRequestBudgetForRequestType({ Name = "SetIncrementAsync" })
+				update = service:GetRequestBudgetForRequestType({ Name = "UpdateAsync" })
+			end)
+			uni:Run(2)
+			expect(`follows={update == read} readIsScarcer={(read or 0) < (write or 0)}`).to.equal(
+				"follows=true readIsScarcer=true"
+			)
+		end)
+	end)
+
 	describe("the budget is never consulted unless asked for", function()
 		it("issues zero budget queries with no BudgetPolicy", function()
 			-- The audit's measured baseline, pinned. Every save, receipt await, gift

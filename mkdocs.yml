@@ -96,7 +96,9 @@ nav:
           - Timers & Cooldowns: time.md
           - Derived Fields: derived.md
           - Replication & Visibility: visibility.md
+          - The Server Store: server-store.md
           - Commands & Requests: commands.md
+          - UI Frameworks: ui-frameworks.md
           - Monetization: monetization.md
           - Economy Analytics: economy.md
           - Leaderboards: leaderboards.md

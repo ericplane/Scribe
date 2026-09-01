@@ -1,20 +1,15 @@
 --!strict
 -- ClaimExchange orchestration: one same-server exchange, start to finish.
 --
--- Everything fallible happens BEFORE the verdict. After it there are exactly two kinds
--- of operation: SETTLE, which writes only under the reserved root and so cannot be
--- refused by any declared shape, cap, bound or seed; and DELIVER, which can fail but
--- rolls back leaving the inbox entry intact and is retried for ever. There is no third
--- kind, and adding one reintroduces the class that killed five earlier designs.
+-- Everything fallible happens BEFORE the verdict. After it there are two kinds of step:
+-- SETTLE, which writes only under the reserved root and cannot be refused by any shape,
+-- cap or bound; and DELIVER, which can fail but rolls back and is retried for ever.
+-- Never decide what happened from a pcall boundary: every step re-reads the record out
+-- of the tree, and the pcall result only picks which question to ask.
 --
--- Never decide what happened from a pcall boundary. Every step below decides by
--- RE-READING the record out of the tree, and the pcall result only picks which question
--- to ask. `stepped` carries the five causes.
---
--- The taker's copy of the payload is durable on the taker's own key BEFORE any verdict
--- record can exist, because the verdict is proposed only after both forced flushes have
--- returned true. A Commit that authorises a giver to drop its escrow therefore cannot
--- destroy the only copy. The flushes are not an optimisation.
+-- The taker's payload is durable on its own key BEFORE any verdict exists (both forced
+-- flushes return true first), so a Commit that drops the giver's escrow cannot destroy
+-- the only copy. The flushes are not an optimisation.
 local Clock = require(script.Parent.Clock)
 local Util = require(script.Parent.Util)
 local ExchangeLeg = require(script.Parent.ExchangeLeg)
@@ -389,19 +384,12 @@ local function participantsOf(record: any, ownerId: number): (number, number)
 	return ownerId, partner
 end
 
---- Carry ONE profile's side of an exchange to its terminal state, without the counterparty.
----
---- What a load or a cadence tick runs. Safe alone because settle and delivery are both
---- per-profile and idempotent: the verdict key is first-writer-wins and nobody can settle
---- without reading it back, so the other side reaches the identical verdict whenever it
---- next looks.
----
---- Proposes ABORT when no verdict exists yet, the conserving default: an attempt that
---- never reached its verdict has both baskets sitting in escrow, and an Abort returns
---- each to its owner. If the counterparty already committed, this proposal loses and
---- reads Commit back.
----
---- Yields. Never call it with a transaction open.
+--- Carry ONE profile's side of an exchange to its terminal state, without the
+--- counterparty. What a load or a cadence tick runs. Safe alone because settle and
+--- delivery are per-profile and idempotent: the verdict key is first-writer-wins, so
+--- the other side reaches the identical verdict whenever it next looks. Proposes ABORT
+--- when no verdict exists, the conserving default. Yields; never call it with a
+--- transaction open.
 function Exchange.ResolveOne(deps: any, side: Side, exchangeId: string): (string?, string?)
 	if type(deps) ~= "table" or deps.VerdictStore == nil then
 		fail("ResolveOne needs a VerdictStore")

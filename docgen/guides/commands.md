@@ -57,6 +57,13 @@ The spec table reads exactly two keys: `Args`, covered next, and `Idempotent`, c
 
 `Args` is a list of specs, one per positional argument. The leading `player` is not counted, so `{ "string" }` describes `function(player, itemId)`. The check runs before your handler does, and it checks **shape** only. Semantic validation, such as whether this player really owns that item, stays your job.
 
+A `nil` in that list is refused at registration. `{ "number", nil, "string" }` counts as three arguments to the arity check but only two to the validation loop, so the middle one would reach your handler unchecked. Write `"any"` when you mean "anything goes here".
+
+A **non-finite** number argument is refused too, whatever the spec says, `"any"` included. `typeof(0/0)`
+is `"number"`, so a bare `"number"` would otherwise hand NaN straight to your handler, where every
+comparison against it is false: a guard written as `if amount > 0 then ... else ... end` takes neither
+branch you expect. No number Scribe can store is non-finite, so one is never a legitimate argument.
+
 | Spec entry | Accepts |
 | --- | --- |
 | `"string"`, `"number"`, `"boolean"`, `"table"`, `"buffer"` | a value whose `typeof()` is exactly that |

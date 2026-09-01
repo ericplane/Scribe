@@ -1,7 +1,7 @@
 name: Dependency freshness
 
 # Dependabot understands neither wally.toml nor rokit.toml, and wally.lock is
-# gitignored — so the Wally deps (ProfileStore/TestEZ) and the rokit toolchain
+# gitignored, so the Wally deps (ProfileStore/TestEZ) and the rokit toolchain
 # can silently fall behind with nothing signalling it. This weekly job compares
 # the pinned versions against the latest published ones and opens (or refreshes)
 # a single tracking issue when anything is behind. Best-effort: a lookup that
@@ -91,7 +91,7 @@ jobs:
           existing="$(gh issue list --state open --search "in:title \"${ISSUE_TITLE}\"" --json number --jq '.[0].number' || true)"
           if [ -n "$existing" ] && [ "$existing" != "null" ]; then
             gh issue edit "$existing" --body-file body.md
-            gh issue comment "$existing" --body "Refreshed $(date -u +%Y-%m-%d) — see the updated issue body."
+            gh issue comment "$existing" --body "Refreshed $(date -u +%Y-%m-%d), see the updated issue body."
             echo "Updated issue #${existing}."
           else
             gh issue create --title "$ISSUE_TITLE" --body-file body.md --label dependencies || \

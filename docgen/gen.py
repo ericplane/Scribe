@@ -542,7 +542,7 @@ def convert_guide(text, source="guide"):
     text = re.sub(r"\]\(\./([\w-]+)(#[\w-]+)?\)", lambda m: f"]({m.group(1)}.md{m.group(2) or ''})", text)
     text = re.sub(r"\]\(/api/(\w+)(#[\w-]+)?\)",
                   lambda m: f"](api/{m.group(1).lower()}.md{(m.group(2) or '').lower()})", text)
-    text = text.replace("](intro.md", "](getting-started.md")  # intro is now the Getting Started guide
+    text = text.replace("](intro.md", "](getting-started.md")  # the intro page is published as getting-started
     text = text.replace("{{version}}", VERSION)       # stamp the wally.toml version
     text = unescape_code_pipes(text)                  # `\|` in table cells -> `|`
     return text

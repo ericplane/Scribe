@@ -2,7 +2,7 @@ name: Docs check
 
 # Builds the MkDocs site with --strict on PRs that touch docs sources, so a
 # broken doc-comment tag (@function/@within/...) or dead internal link is caught
-# on the PR. Build only, no GitHub Pages deploy — that stays in docs.yml on main.
+# on the PR. Build only, no GitHub Pages deploy; that stays in docs.yml on main.
 
 on:
   pull_request:

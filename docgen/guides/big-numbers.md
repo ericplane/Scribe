@@ -151,30 +151,6 @@ end
 ??? note "Ranking a big field on a leaderboard"
     A `Scribe.Big` field can be a leaderboard stat, ranked exactly rather than through a lossy `number`. That comes with its own rules: values must be non-negative, `SigFigs` decides how many digits the ranking key keeps, and `Scale` is refused. [Leaderboards](./leaderboards) has the details.
 
-## A Big inside a container element
-
-A `Scribe.Big` declared as a field of a container's element shape puts the template past the Luau
-type solver's budget. The module reports `Code is too complex to typecheck` at the `Scribe(...)`
-call and stops type-checking, which costs you autocomplete and every other diagnostic in that file.
-
-```lua
--- Over budget: a Big inside a record element.
-Bees = Scribe.DictOf({ Id = Scribe.String(""), Amount = Scribe.Big(0, { Min = 0 }) }),
-
--- Fine: the element IS the big.
-Bees = Scribe.DictOf(Scribe.Big(0, { Min = 0 })),
-
--- Fine: a big at a root, or in a plain record.
-Essence = Scribe.Big(0, { Min = 0 }),
-Wallet = { Essence = Scribe.Big(0, { Min = 0 }) },
-```
-
-This is a type-checking limit only. The code runs correctly either way, and nothing about storage
-or replication changes.
-
-If you need other fields beside the amount, either use `Scribe.Int` when the values fit under
-`2^53`, or keep the amounts in their own `DictOf(Scribe.Big(...))` under the same keys.
-
 ## Where to next
 
 - [Declaring Your Template](./templates) covers `Scribe.Int` and `Scribe.Number`, which are the right choice for everything that is not a runaway counter.

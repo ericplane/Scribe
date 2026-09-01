@@ -131,6 +131,12 @@ function Derived.Resolve(
 		if #entry.InputPaths == 0 then
 			fail(path, "Scribe.Derived requires at least one input path")
 		end
+		-- A gap silently narrows the field: the loop below skips it, so the string check
+		-- never sees it and Compute takes nil for that parameter forever.
+		local gap = Util.firstGap(entry.InputPaths)
+		if gap ~= nil then
+			fail(path, `Scribe.Derived input {gap} is nil; the input list cannot have a gap`)
+		end
 
 		local inputs: { any } = {}
 		local inputPaths: { { string } } = {}

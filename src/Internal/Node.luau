@@ -43,6 +43,8 @@ export type TreeParams = {
 	-- Scribe.Derived diagnostics, so each realm logs with its own context and this
 	-- module stays free of the logger.
 	OnDerivedIssue: ((code: string, field: string, detail: string) -> ())?,
+	-- The server store: no player, no key. Read only by the cross-tree refusal.
+	IsServerStore: boolean?,
 }
 
 -- Cast once: Big.from is optional because parsing can fail, which a literal cannot,
@@ -151,14 +153,26 @@ local CROSS_TREE_TXN_WHY = "a transaction can only roll back its OWN player, bec
 -- written, `level` is the caller's own blame depth. Callers gate on OPEN_TXN_TREE
 -- before building `subject`, which is not worth allocating on every write.
 local function assertSameTreeWrite(tree: Tree?, subject: string, level: number)
-	if OPEN_TXN_TREE ~= nil and tree ~= OPEN_TXN_TREE then
+	if OPEN_TXN_TREE == nil or tree == OPEN_TXN_TREE then
+		return
+	end
+	-- Not another player, so the outbox route is wrong advice: it has no key at all.
+	if tree ~= nil and tree.Params.IsServerStore then
 		error(
-			`Scribe: "{subject}" belongs to a different player than the one `
-				.. `whose transaction is open, so it cannot be written from inside that transaction: `
-				.. CROSS_TREE_TXN_WHY,
+			`Scribe: "{subject}" is on the ServerStore, not on the player whose transaction is `
+				.. `open, so it cannot be written from inside that transaction: a rollback restores one `
+				.. `player's own tree, and the store is not saved to any key, so a store write would `
+				.. `outlive an aborted transaction. Write the store before Data.Transaction, or after it `
+				.. `returns true.`,
 			level
 		)
 	end
+	error(
+		`Scribe: "{subject}" belongs to a different player than the one `
+			.. `whose transaction is open, so it cannot be written from inside that transaction: `
+			.. CROSS_TREE_TXN_WHY,
+		level
+	)
 end
 
 local function newAccessor(tree: Tree, path: { string | number }, schema: SchemaNode?, privileged: boolean?): any
