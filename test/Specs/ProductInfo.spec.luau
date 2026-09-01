@@ -347,15 +347,16 @@ return function()
 
 		it("returns nil on timeout, and the late arrival still settles cleanly", function()
 			-- Resuming a thread the timeout already woke raises, inside the spawned read
-			-- where nothing catches it. The proof it did not: the value is still there.
+			-- where nothing catches it. The proof it did not: the read still settles a
+			-- second waiter, which is also the wait; a frame count is 15ms a frame on
+			-- Windows and far less on Linux.
 			local fake = function(assetId: number)
 				task.wait(0.2)
 				return { Name = "Item", PriceInRobux = 80, UserBasePriceInRobux = 100, Asset = assetId }
 			end
 			local harness, client = makeClient(fake)
 			local timedOut = client.GetProductInfoAsync("VIP", 0)
-			settle(20)
-			local afterwards = client.GetPrice("VIP")
+			local afterwards = client.GetPriceAsync("VIP", 5)
 			harness.Cleanup()
 			expect(`timedOut={tostring(timedOut)} afterwards={tostring(afterwards)}`).to.equal(
 				"timedOut=nil afterwards=80"
@@ -377,12 +378,12 @@ return function()
 			local started = os.clock()
 			local timedOut = slowClient.GetPriceAsync("VIP", 0)
 			local waited = os.clock() - started
-			settle(20)
+			local late = slowClient.GetPriceAsync("VIP", 5)
 
 			harness.Cleanup()
 			slowHarness.Cleanup()
-			expect(`price={price} timedOut={tostring(timedOut)} quick={waited < 0.15}`).to.equal(
-				"price=80 timedOut=nil quick=true"
+			expect(`price={price} timedOut={tostring(timedOut)} quick={waited < 0.15} late={tostring(late)}`).to.equal(
+				"price=80 timedOut=nil quick=true late=80"
 			)
 		end)
 
@@ -403,9 +404,10 @@ return function()
 				table.insert(reached, "WOKEN BY THE LATE READ")
 			end)
 			coroutine.resume(worker)
-			settle(20)
+			-- Joins the read in flight, so the assertion runs once it has landed.
+			local late = client.GetPriceAsync("VIP", 5)
 			harness.Cleanup()
-			expect(table.concat(reached, ",")).to.equal("timeout=nil")
+			expect(`{table.concat(reached, ",")} late={tostring(late)}`).to.equal("timeout=nil late=80")
 		end)
 	end)
 
