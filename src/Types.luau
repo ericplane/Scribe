@@ -151,6 +151,8 @@ export type LogCode =
 	| "PERK_GRANTED"
 	| "PERK_REVOKED"
 	| "PRODUCT_INFO_FAIL"
+	| "POLICY_READ_FAIL"
+	| "PAID_RANDOM_RECEIPT"
 	| "PRODUCT_INFO_THROTTLED"
 	| "PURCHASE_DUPLICATE"
 	| "PURCHASE_CLAIM_EVICTED"
@@ -271,6 +273,9 @@ export type RequestReason =
 	| "edit-mode" -- client-side: not running, and no MockCommand is registered
 	| "mock-error" -- client-side: edit mode, and the MockCommand handler threw
 
+-- What PromptPurchase refuses with, or "purchasable".
+export type ProductState = "purchasable" | "owned" | "paid-random-restricted" | "policy-pending" | "not-loaded"
+
 -- The fixed refusals of Data.Purchase. A Grant that throws passes the transaction's
 -- own error text through instead, so this is not exhaustive over the second return.
 export type PurchaseReason =
@@ -280,6 +285,8 @@ export type PurchaseReason =
 	| "invalid cost path"
 	| "cost path is not a spendable number"
 	| "insufficient funds"
+	| "paid-random-restricted"
+	| "policy-pending"
 
 -- The fixed refusals of Data.PromptGift. Two more are interpolated (`unknown
 -- product "<name>"` and `purchase prompt failed: <err>`) and cannot be members.
@@ -302,6 +309,8 @@ export type GiftReason =
 	| "gift delivery could not be confirmed; do not send it again"
 	| "a gift of this item is already pending; try again shortly"
 	| "could not record gift intent; try again later"
+	| "paid-random-restricted"
+	| "policy-pending"
 
 export type SaveInfo = {
 	LastSaveAt: number?,
@@ -344,6 +353,7 @@ export type ProductConfig = {
 	Category: string?,
 	Grant: ((data: any) -> ())?,
 	Grants: string?,
+	PaidRandom: boolean?,
 }
 
 export type PassConfig = {
@@ -361,6 +371,8 @@ export type PurchaseSpec = {
 	-- original outcome without debiting or granting again. A FAILED purchase claims
 	-- nothing, so retrying after a refusal still works. Max 64 bytes, valid UTF-8.
 	IdempotencyKey: string?,
+	-- A paid random item: refused for a player whose policy restricts them.
+	PaidRandom: boolean?,
 }
 
 export type PurchaseFilter = {

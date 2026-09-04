@@ -1010,6 +1010,10 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			local marketplace: any = game:GetService("MarketplaceService")
 			return marketplace:GetProductInfoAsync(assetId, infoType)
 		end
+	local getPolicyInfoAsync: (player: any) -> any = options.GetPolicyInfoAsync
+		or function(player: any): any
+			return (game:GetService("PolicyService") :: any):GetPolicyInfoForPlayerAsync(player)
+		end
 
 	-- Distinct from nil, so an observer's first push fires while nothing is resolved.
 	local UNRESOLVED: any = table.freeze({})
@@ -1177,6 +1181,106 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		end)
 	end
 
+	-- Paid random items. The server enforces; this greys the button, so unknown
+	-- reads as pending.
+	local POLICY_ATTEMPTS = 3
+	local POLICY_RETRY_BASE = 2
+	local POLICY_REARM_AFTER = 30
+	local policy: any = nil
+	local policyObservers: { () -> () } = {}
+
+	local function anyPaidRandom(): boolean
+		for _, config in (options.Products or {}) :: { [string]: any } do
+			if config.PaidRandom == true then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function notifyPolicy()
+		for _, push in table.clone(policyObservers) do
+			push()
+		end
+	end
+
+	local function readPolicy(attempts: number)
+		local mine = policy
+		for attempt = 1, attempts do
+			if policy ~= mine or stopped then
+				return
+			end
+			mine.LastAttempt = Clock.Monotonic()
+			local ok, info = pcall(function()
+				return getPolicyInfoAsync(readLocalPlayer())
+			end)
+			if policy ~= mine or stopped then
+				return
+			end
+			if ok and type(info) == "table" then
+				mine.Restricted = info.ArePaidRandomItemsRestricted == true
+				mine.Phase = "known"
+				notifyPolicy()
+				return
+			end
+			if attempt == attempts then
+				mine.Phase = "failed"
+				if not mine.Logged then
+					mine.Logged = true
+					Log.Warn(
+						"Monetization",
+						"POLICY_READ_FAIL",
+						`could not read the local player's policy: {tostring(info)}; paid random items stay pending`,
+						{}
+					)
+				end
+				return
+			end
+			Clock.Wait(Rng.Jitter(POLICY_RETRY_BASE * 2 ^ (attempt - 1)))
+		end
+	end
+
+	local function ensurePolicy(): any
+		if policy == nil then
+			policy = { Phase = "pending", Restricted = false, LastAttempt = 0, Logged = false }
+			Sched.Spawn(readPolicy, POLICY_ATTEMPTS)
+		elseif policy.Phase == "failed" and Clock.Monotonic() - policy.LastAttempt >= POLICY_REARM_AFTER then
+			policy.Phase = "pending"
+			Sched.Spawn(readPolicy, 1)
+		end
+		return policy
+	end
+
+	-- nil when the local player may buy paid random items.
+	local function paidRandomState(): string?
+		local current = ensurePolicy()
+		if current.Phase == "known" then
+			return if current.Restricted then "paid-random-restricted" else nil
+		end
+		return "policy-pending"
+	end
+
+	-- The same answer the server gives, from the mirror and the local policy.
+	local function productStateFor(name: string): string
+		if not loaded then
+			return "not-loaded"
+		end
+		local products: any = options.Products or {}
+		local passes: any = options.Passes or {}
+		local config: any = products[name] or passes[name]
+		if products[name] ~= nil and config.PaidRandom == true then
+			local refused = paidRandomState()
+			if refused ~= nil then
+				return refused
+			end
+		end
+		local ownedKey = if products[name] ~= nil then config.Grants else name
+		if ownedKey ~= nil and ownsFromMirror(ownedKey) then
+			return "owned"
+		end
+		return "purchasable"
+	end
+
 	--[=[
 		@within Client
 		@tag Monetization
@@ -1330,6 +1434,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	]=]
 	function Data.PrefetchProductInfo(names: { string }?)
 		watchMembership()
+		if anyPaidRandom() then
+			ensurePolicy()
+		end
 		if names == nil then
 			for name in ensureProductAssets() do
 				enqueueProduct(name)
@@ -1359,6 +1466,63 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			productAsset(name, "RefreshProductInfo")
 		end
 		refreshProduct(name)
+	end
+
+	--[=[
+		@within Client
+		@tag Monetization
+		@client
+		@param name string
+		@return ProductState
+		The state of a declared pass or product for the local player, as one
+		[Scribe.ProductState] string: `"purchasable"`, `"owned"`, `"paid-random-restricted"`,
+		`"policy-pending"` or `"not-loaded"`. The same answer the server's
+		[Server.GetProductState] gives, computed here from the mirror and the local
+		player's own policy, so a shop can grey a button without a round trip. Raises
+		for a name that is not declared.
+	]=]
+	function Data.GetProductState(name: string): string
+		productAsset(name, "GetProductState")
+		return productStateFor(name)
+	end
+
+	--[=[
+		@within Client
+		@tag Monetization
+		@client
+		@param name string
+		@param callback (state: ProductState) -> ()
+		@return () -> ()
+		Calls `callback` with the current [Client.GetProductState] and again whenever
+		it changes: the profile loading, the policy landing, ownership changing.
+		Returns a disconnect.
+	]=]
+	function Data.ObserveProductState(name: string, callback: (state: string) -> ()): () -> ()
+		productAsset(name, "ObserveProductState")
+		local last: string? = nil
+		local function push()
+			local state = productStateFor(name)
+			if state ~= last then
+				last = state
+				Sched.Spawn(callback, state)
+			end
+		end
+		local loadedConn = if loaded then nil else loadedSignal:Connect(push)
+		table.insert(policyObservers, push)
+		local disconnectPerk = tree.Reserved.Perks.Changed(push)
+		local disconnectCache = tree.Accessor[Template.SESSION_ROOT].OwnsCache.Changed(push)
+		push()
+		return function()
+			if loadedConn ~= nil then
+				loadedConn:Disconnect()
+			end
+			local index = table.find(policyObservers, push)
+			if index ~= nil then
+				table.remove(policyObservers, index)
+			end
+			disconnectPerk()
+			disconnectCache()
+		end
 	end
 
 	--[=[

@@ -211,7 +211,7 @@ local boards: { [string]: Scribe.LeaderboardConfig<T> } = {
 return Scribe({ Template = template, Leaderboards = boards, --[[ ...required fields... ]] })
 ```
 
-The annotation is what enables the strict check. Inside a single `Scribe({ ... })` literal, Luau widens the string before the template type is known, so the annotated-local pattern is how you get autocomplete for `Stat` and for `Cost.Path`.
+The annotation is what enables the strict check. Inside a single `Scribe({ ... })` literal, Luau widens the string before the template type is known, so the annotated-local pattern is how you get autocomplete for `Stat` and for `Cost.Path`. Past 32 numeric leaf paths both fall back to plain `string`: the union of every path is what would push a template that size past the type solver's budget, and startup still refuses a path that is not in the template.
 
 ## Where to next
 

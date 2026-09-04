@@ -218,6 +218,8 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `UNDECLARED_CATEGORY` | Warn | In DevMode, a purchase-log entry used a category string that is not in the declared set. Usually a typo. |
 | `UNDECLARED_PERK` | Warn | In DevMode, a perk key was granted or referenced that is not in the `Perks` registry. Usually a typo. |
 | `UNKNOWN_OWNS_KEY` | Warn | In DevMode, `Owns` or `OwnsAsync` was called with a key that is not a registered pass, a declared perk, a product grant, or `RobloxPlus`, so it will always return false. Warned once per key. |
+| `POLICY_READ_FAIL` | Warn | The player's policy could not be read after three attempts, so a `PaidRandom` entry stays `policy-pending` for them and every prompt for it refuses. Logged once per player; the next check re-arms one read at most every 30 seconds. |
+| `PAID_RANDOM_RECEIPT` | Warn | A receipt for a `PaidRandom` product arrived from a player whose policy restricts paid random items. It was granted, because the money has already moved; only a prompt made outside `Data.PromptPurchase` can produce it, so the fix is that call site. |
 | `PRODUCT_INFO_FAIL` | Warn | _(Client.)_ Marketplace refused every attempt to read a pass or product's info, so its price stays `nil` rather than falling back to the undiscounted catalog price. Usually rate limiting. The read is retried by the next `GetProductInfo` call. |
 | `PRODUCT_INFO_THROTTLED` | Warn | _(Client.)_ A product info read failed and will be retried with backoff. Roblox rate-limits `GetProductInfoAsync` and does not publish the limit. |
 | `SIM_RECEIPT` | Warn | _(Studio only.)_ The Studio plugin injected a mock receipt. Injection requires the resolved `Mode = "Mock"`, so no real store is ever touched. |

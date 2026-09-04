@@ -1,4 +1,4 @@
 --!strict
 -- Single source of truth for the release version. Keep wally.toml in sync.
 
-return "2.2.0"
+return "2.3.0"

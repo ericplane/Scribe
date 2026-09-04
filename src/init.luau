@@ -45,6 +45,7 @@ export type LifecycleReason = Types.LifecycleReason
 export type RequestReason = Types.RequestReason
 export type PurchaseReason = Types.PurchaseReason
 export type GiftReason = Types.GiftReason
+export type ProductState = Types.ProductState
 export type LeaderboardEntry = Types.LeaderboardEntry
 export type PassConfig = Types.PassConfig
 export type PurchaseFilter = Types.PurchaseFilter
@@ -98,6 +99,7 @@ export type function ValueType(T)
 	-- Util.MAX_VALUE_DEPTH, so it can never bind before the runtime does and only a
 	-- cyclic type is cut off. Matches StatPathsType's cap below.
 	local MAX_DEPTH = 25
+	local MAX_CHILD_UNION = 12
 
 	-- One shared Scribe.Big type for the whole template. Luau resolves `<` and `<=`
 	-- by metatable identity rather than by shape, so a fresh type per field leaves
@@ -483,8 +485,11 @@ export type function ValueType(T)
 				-- optional: an added key has no old, a removed key has no new. On a
 				-- heterogeneous static table they widen to a union Luau will not narrow from
 				-- the key, which is accepted; that node kind has exact per-field listeners.
-				local childKey = ts.unionof(table.unpack(childKeys))
-				local childValue = optional(ts.unionof(table.unpack(childValues)))
+				-- Past MAX_CHILD_UNION the pair is widened; a growing union is what exceeds the budget.
+				local childKey = if #childKeys > MAX_CHILD_UNION then ts.string else ts.unionof(table.unpack(childKeys))
+				local childValue = if #childValues > MAX_CHILD_UNION
+					then optional(anyType)
+					else optional(ts.unionof(table.unpack(childValues)))
 				add("OnChildChanged", fn({ fn({ childKey, childValue, childValue }, {}) }, { disconnectType }))
 			end
 		end
@@ -602,6 +607,7 @@ end
 -- selene: allow(undefined_variable)
 export type function StatPathsType(T, IncludeBig)
 	local ts = types
+	local MAX_STAT_PATHS = 32
 	local includeBig = IncludeBig ~= nil and IncludeBig:is("singleton") and IncludeBig:value() == true
 
 	local function hasMarker(t: type, name: string): boolean
@@ -700,6 +706,10 @@ export type function StatPathsType(T, IncludeBig)
 	end
 	if #paths == 1 then
 		return paths[1]
+	end
+	if #paths > MAX_STAT_PATHS then
+		-- A union this size is what the solver cannot afford.
+		return ts.string
 	end
 	return ts.unionof(table.unpack(paths))
 end
@@ -844,6 +854,8 @@ export type function ClientDataType(T)
 	add("GetProductInfoAsync", fn({ ts.string, optional(ts.number) }, { optional(anyTable) }))
 	add("GetPriceAsync", fn({ ts.string, optional(ts.number) }, { optional(ts.number) }))
 	add("ObserveProductInfo", fn({ ts.string, fn({ optional(anyTable) }, {}) }, { fn({}, {}) }))
+	add("GetProductState", fn({ ts.string }, { ts.string }))
+	add("ObserveProductState", fn({ ts.string, fn({ ts.string }, {}) }, { fn({}, {}) }))
 	add("PrefetchProductInfo", fn({ optional(stringArray) }, {}))
 	add("RefreshProductInfo", fn({ optional(ts.string) }, {}))
 	add("Mock", fn({ optional(anyTable), optional(anyTable) }, {}))
@@ -976,6 +988,7 @@ export type function ServerDataType(T, P)
 
 	add("PromptGift", fn({ P, ts.string, ts.number }, boolAndReason))
 	add("PromptPurchase", fn({ P, ts.string }, boolAndReason))
+	add("GetProductState", fn({ P, ts.string }, { ts.string }))
 	add("GetGiftCredits", fn({ P }, { stringToNumber }))
 	add("HandleReceipt", fn({ ts.any }, { ts.any }))
 	add("TryHandleReceipt", fn({ ts.any }, { optional(ts.any) }))
@@ -1225,6 +1238,7 @@ export type ScribeOptions<T> = {
 	Migrations: { [number]: (data: { [string]: any }) -> () }?,
 	UserOwnsGamePassAsync: ((userId: number, passId: number) -> boolean)?, -- advanced/test seam
 	GetProductInfoAsync: ((assetId: number, infoType: any) -> { [string]: any }?)?, -- advanced/test seam
+	GetPolicyInfoAsync: ((player: Player) -> { [string]: any }?)?, -- advanced/test seam
 	DevMode: boolean?, -- advanced/test seam: overrides the RunService:IsStudio() default
 	IsRunning: boolean?, -- advanced/test seam: overrides the RunService:IsRunning() default (false builds the edit-mode client half)
 	MigrationShadow: boolean?, -- audit aid: re-runs migrations against raw pre-Reconcile data and warns on divergence (re-executes your migration bodies)
@@ -1712,7 +1726,7 @@ export type Bundle<T> = {
 ]=]
 
 --[=[
-	@type PurchaseReason "player data not loaded" | "invalid Cost spec" | "invalid Cost amount" | "invalid cost path" | "cost path is not a spendable number" | "insufficient funds"
+	@type PurchaseReason "player data not loaded" | "invalid Cost spec" | "invalid Cost amount" | "invalid cost path" | "cost path is not a spendable number" | "insufficient funds" | "paid-random-restricted" | "policy-pending"
 	@tag Reasons
 	The fixed refusals of [Server.Purchase]. They are not exhaustive over the
 	second return: a Grant that throws passes its own error text through instead.
@@ -1731,8 +1745,9 @@ export type Bundle<T> = {
 	`"could not reserve gift credit; try again later"`,
 	`"could not deliver gift; try again later"`,
 	`"gift delivery could not be confirmed; do not send it again"`,
-	`"could not record gift intent; try again later"`, and
-	`"a gift of this item is already pending; try again shortly"`. Two further
+	`"could not record gift intent; try again later"`,
+	`"a gift of this item is already pending; try again shortly"`,
+	`"paid-random-restricted"` and `"policy-pending"`. Two further
 	refusals interpolate a value and so cannot be members. The names are also on
 	[Scribe.GiftReason]. See [Gifting](../gifting.md).
 
@@ -1768,6 +1783,7 @@ export type Bundle<T> = {
 	.Category string? -- purchase-log category, for [Server.GetPurchases]
 	.Grant ((data) -> ())? -- applies the purchase; runs inside a transaction, so it must not yield
 	.Grants string? -- name of a perk to set instead of, or as well as, running Grant
+	.PaidRandom boolean? -- a paid random item, refused on every purchase path for a player whose policy restricts them
 	One entry in the `Products` table. See [Monetization](../monetization.md).
 ]=]
 
@@ -1934,6 +1950,7 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	Migrations = true,
 	UserOwnsGamePassAsync = true,
 	GetProductInfoAsync = true,
+	GetPolicyInfoAsync = true,
 	DevMode = true,
 	IsRunning = true,
 	MigrationShadow = true,
@@ -2961,8 +2978,9 @@ Scribe.RequestFailed = Types.RequestFailed
 	The fixed refusals of [Server.Purchase]. A `Grant` that throws passes its own
 	error text through instead, so a non-member reason is a failed grant.
 
-	The six members are `DataNotLoaded`, `InvalidCostSpec`, `InvalidCostAmount`,
-	`InvalidCostPath`, `CostPathNotSpendable` and `InsufficientFunds`. Each one's
+	The eight members are `DataNotLoaded`, `InvalidCostSpec`, `InvalidCostAmount`,
+	`InvalidCostPath`, `CostPathNotSpendable`, `InsufficientFunds`,
+	`PaidRandomRestricted` and `PolicyPending`. Each one's
 	string is in the [Monetization](../monetization.md#reading-the-refusal) guide.
 ]=]
 Scribe.PurchaseReason = table.freeze({
@@ -2972,6 +2990,8 @@ Scribe.PurchaseReason = table.freeze({
 	InvalidCostPath = "invalid cost path" :: Types.PurchaseReason,
 	CostPathNotSpendable = "cost path is not a spendable number" :: Types.PurchaseReason,
 	InsufficientFunds = "insufficient funds" :: Types.PurchaseReason,
+	PaidRandomRestricted = "paid-random-restricted" :: Types.PurchaseReason,
+	PolicyPending = "policy-pending" :: Types.PurchaseReason,
 })
 
 --[=[
@@ -2982,10 +3002,11 @@ Scribe.PurchaseReason = table.freeze({
 	with the offending value and so cannot be constants: an unknown product name, and
 	a failed purchase prompt.
 
-	The twelve members are `BuyerDataNotLoaded`, `InvalidRecipient`,
+	The fourteen members are `BuyerDataNotLoaded`, `InvalidRecipient`,
 	`CannotGiftYourself`, `GiftCooldown`, `TooManyPending`, `DataServicesDown`,
 	`RecipientAlreadyOwns`, `CreditReserveFailed`, `DeliveryFailed`,
-	`DeliveryUnconfirmed`, `AlreadyPending` and `IntentRecordFailed`. Each one's
+	`DeliveryUnconfirmed`, `AlreadyPending`, `IntentRecordFailed`,
+	`PaidRandomRestricted` and `PolicyPending`. Each one's
 	string is in the [Gifting](../gifting.md#reading-the-refusal) guide.
 ]=]
 Scribe.GiftReason = table.freeze({
@@ -3001,6 +3022,33 @@ Scribe.GiftReason = table.freeze({
 	DeliveryUnconfirmed = "gift delivery could not be confirmed; do not send it again" :: Types.GiftReason,
 	AlreadyPending = "a gift of this item is already pending; try again shortly" :: Types.GiftReason,
 	IntentRecordFailed = "could not record gift intent; try again later" :: Types.GiftReason,
+	PaidRandomRestricted = "paid-random-restricted" :: Types.GiftReason,
+	PolicyPending = "policy-pending" :: Types.GiftReason,
+})
+
+--[=[
+	@type ProductState "purchasable" | "owned" | "paid-random-restricted" | "policy-pending" | "not-loaded"
+	@tag Reasons
+	The state of a declared pass or product for one player, from
+	[Server.GetProductState] and [Client.GetProductState]. Every value but
+	`"purchasable"` is also the reason [Server.PromptPurchase] refuses with, so a
+	shop and the prompt cannot disagree. The names are also on [Scribe.ProductState].
+]=]
+
+--[=[
+	@within Scribe
+	@tag Monetization
+	@prop ProductState { [string]: ProductState }
+	The members are `Purchasable`, `Owned`, `PaidRandomRestricted`, `PolicyPending`
+	and `NotLoaded`. Each one's string is in the
+	[Monetization](../monetization.md#paid-random-items) guide.
+]=]
+Scribe.ProductState = table.freeze({
+	Purchasable = "purchasable" :: Types.ProductState,
+	Owned = "owned" :: Types.ProductState,
+	PaidRandomRestricted = "paid-random-restricted" :: Types.ProductState,
+	PolicyPending = "policy-pending" :: Types.ProductState,
+	NotLoaded = "not-loaded" :: Types.ProductState,
 })
 
 --[=[

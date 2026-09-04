@@ -375,9 +375,14 @@ local function checkContainerKey(
 	containerSchema: SchemaNode?,
 	container: any,
 	key: any,
-	where: string,
+	path: { any },
+	upto: number,
 	removing: boolean?
 )
+	-- Rendered only when refusing; this runs on every container write.
+	local function where(): string
+		return Util.pathString(table.move(path, 1, upto, 1, {}))
+	end
 	local kind = if containerSchema then containerSchema.Container else nil
 	if kind == nil then
 		-- No declared key type, but an undeclared container still may not become a mixed
@@ -389,7 +394,7 @@ local function checkContainerKey(
 			if blocker ~= nil then
 				-- A write on the profile root has an empty path prefix, and `"" already
 				-- holds ...` reads like a bug in the message. Name the root instead.
-				local label = if where == "" then "the profile root" else `"{where}"`
+				local label = if where() == "" then "the profile root" else `"{where()}"`
 				error(
 					`Scribe: {label} already holds {blocker}, so adding the key {tostring(key)} would make it `
 						.. "a mixed array/hash table -- the DataStore drops half of one on save, and Set on the "
@@ -404,7 +409,7 @@ local function checkContainerKey(
 	if kind == "Array" then
 		if type(key) ~= "number" then
 			error(
-				`Scribe: "{where}" is a Scribe.ArrayOf and takes array indices, but the key "{tostring(key)}" `
+				`Scribe: "{where()}" is a Scribe.ArrayOf and takes array indices, but the key "{tostring(key)}" `
 					.. `is a {type(key)}`,
 				0
 			)
@@ -415,7 +420,7 @@ local function checkContainerKey(
 			-- a key that is not there stays a no-op.
 			if container[key] ~= nil and key ~= len then
 				error(
-					`Scribe: "{where}" is a Scribe.ArrayOf and must stay contiguous; use Remove({key}) `
+					`Scribe: "{where()}" is a Scribe.ArrayOf and must stay contiguous; use Remove({key}) `
 						.. `instead of setting index {key} to nil`,
 					0
 				)
@@ -424,7 +429,7 @@ local function checkContainerKey(
 		end
 		if key % 1 ~= 0 or key < 1 or key > len + 1 then
 			error(
-				`Scribe: index {key} is out of range for "{where}" (length {len}); `
+				`Scribe: index {key} is out of range for "{where()}" (length {len}); `
 					.. "array elements are created with Insert",
 				0
 			)
@@ -433,7 +438,7 @@ local function checkContainerKey(
 		-- because a newer-template server may have stored it before this server's
 		-- lower cap deployed, and stranding it turns a rolling deploy into lost writes.
 		if schema.MaxItems and key > schema.MaxItems and container[key] == nil then
-			error(`Scribe: "{where}" is capped at MaxItems {schema.MaxItems}`, 0)
+			error(`Scribe: "{where()}" is capped at MaxItems {schema.MaxItems}`, 0)
 		end
 	else
 		-- Scribe.MapOf declares its key type; a plain Scribe.DictOf is string-keyed.
@@ -441,7 +446,7 @@ local function checkContainerKey(
 		if keyType == "integer" then
 			if type(key) ~= "number" then
 				error(
-					`Scribe: "{where}" is a Scribe.MapOf("integer") and takes integer keys, but the key `
+					`Scribe: "{where()}" is a Scribe.MapOf("integer") and takes integer keys, but the key `
 						.. `{tostring(key)} is a {type(key)}`,
 					0
 				)
@@ -449,12 +454,12 @@ local function checkContainerKey(
 			-- A DataStore serializes object keys to JSON strings, and only a finite
 			-- integer survives that round trip unambiguously.
 			if key ~= key or key == math.huge or key == -math.huge or key % 1 ~= 0 then
-				error(`Scribe: "{where}" takes finite integer keys, got {tostring(key)}`, 0)
+				error(`Scribe: "{where()}" takes finite integer keys, got {tostring(key)}`, 0)
 			end
 		elseif type(key) ~= "string" then
 			local declarator = if schema.KeyType then `Scribe.MapOf("string")` else "Scribe.DictOf"
 			error(
-				`Scribe: "{where}" is a {declarator} and takes string keys, but the key {tostring(key)} `
+				`Scribe: "{where()}" is a {declarator} and takes string keys, but the key {tostring(key)} `
 					.. `is a {type(key)}`,
 				0
 			)
@@ -470,7 +475,7 @@ local function checkContainerKey(
 			local blocking = blockingStringKey(container)
 			if blocking ~= nil then
 				error(
-					`Scribe: "{where}" is a Scribe.MapOf("integer") but still holds the string key `
+					`Scribe: "{where()}" is a Scribe.MapOf("integer") but still holds the string key `
 						.. `"{blocking}", which load-time coercion could not convert. Writing an integer `
 						.. "key now would leave both key types in one table, which fails the whole "
 						.. "profile save. Remove or migrate that key first",
@@ -481,7 +486,7 @@ local function checkContainerKey(
 		local maxKeyLength = if keyType == "string" then schema.MaxKeyLength else nil
 		if maxKeyLength and #(key :: string) > maxKeyLength then
 			-- Reject rather than truncate: a truncated key writes to the wrong slot.
-			error(`Scribe: key "{key}" at "{where}" is {#(key :: string)} bytes, over MaxKeyLength {maxKeyLength}`, 0)
+			error(`Scribe: key "{key}" at "{where()}" is {#(key :: string)} bytes, over MaxKeyLength {maxKeyLength}`, 0)
 		end
 		local maxKeys = schema.MaxKeys
 		if maxKeys and container[key] == nil then
@@ -493,7 +498,7 @@ local function checkContainerKey(
 				count = countKeysExact(container)
 			end
 			if count >= maxKeys then
-				error(`Scribe: "{where}" already holds {count} keys, at its MaxKeys {maxKeys}`, 0)
+				error(`Scribe: "{where()}" already holds {count} keys, at its MaxKeys {maxKeys}`, 0)
 			end
 		end
 	end
@@ -539,7 +544,7 @@ local function resolveContainer(
 			-- container. Validated writes only: a remote apply must never throw here,
 			-- because one throw drops the rest of the frame and desyncs the mirror.
 			if validating and chain and i > 1 then
-				checkContainerKey(chain[i - 1], container, seg, Util.pathString(table.move(path, 1, i - 1, 1, {})))
+				checkContainerKey(chain[i - 1], container, seg, path, i - 1)
 			end
 			-- Same alias hazard applySet guards for the leaf key: a nested write like
 			-- Dict[7].Sub must not create a numeric 7 next to an existing string "7".
@@ -1673,12 +1678,7 @@ local function seedMissingElements(tree: Tree, path: { string | number }, schema
 					-- The element's own key must satisfy its container's rules before the
 					-- seed write lands, which runs NoValidate on an already-stored form.
 					if validating and i > 1 then
-						checkContainerKey(
-							chain[i - 1],
-							container,
-							seg,
-							Util.pathString(table.move(path, 1, i - 1, 1, {}))
-						)
+						checkContainerKey(chain[i - 1], container, seg, path, i - 1)
 						-- The same alias guard resolveContainer applies. Seeding reaches the
 						-- container first, so resolveContainer's own check would see a key
 						-- that already exists and never run. Unreachable today only because
@@ -1804,13 +1804,7 @@ function applySet(tree: Tree, path: { string | number }, schema: SchemaNode?, va
 		-- to it too; resolveContainer only saw the intermediate ones. Removals are
 		-- checked because a nil write to a middle array index punches a hole.
 		if schema and schema.Parent then
-			checkContainerKey(
-				schema.Parent,
-				container,
-				key,
-				Util.pathString(table.move(path, 1, #path - 1, 1, {})),
-				newValue == nil
-			)
+			checkContainerKey(schema.Parent, container, key, path, #path - 1, newValue == nil)
 		end
 		-- Deleting a declared, non-Optional field of a closed element record stores the
 		-- partial element that shape exists to prevent. Removing the WHOLE element stays

@@ -67,7 +67,7 @@ return function()
 			local player = harness.Join(9002)
 			harness.Data.GrantPerk(player, "VIP")
 			local outcome = attempt(harness, player, "EmberPack")
-			expect(`{outcome} prompts={#prompted}`).to.equal('false why=player already owns "VIP" prompts=0')
+			expect(`{outcome} prompts={#prompted}`).to.equal("false why=owned prompts=0")
 		end)
 	end)
 
@@ -95,7 +95,7 @@ return function()
 			local FakePlayer = require(Root.Test.Helpers.FakePlayer)
 			local stranger = FakePlayer.new(9005)
 			local outcome = attempt(harness, stranger, "EmberPack")
-			expect(`{outcome} prompts={#prompted}`).to.equal("false why=player data not loaded prompts=0")
+			expect(`{outcome} prompts={#prompted}`).to.equal("false why=not-loaded prompts=0")
 		end)
 	end)
 
@@ -159,7 +159,7 @@ return function()
 		if not ran then
 			error(err, 0)
 		end
-		expect(answer).to.equal('false why=player already owns "VIPPass" prompts=0')
+		expect(answer).to.equal("false why=owned prompts=0")
 	end)
 
 	it("REFUSES TO START when one name is both a product and a pass", function()

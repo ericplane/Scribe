@@ -1,5 +1,60 @@
 # Changelog
 
+## 2.3.0
+
+Released 2026-09-04.
+
+Paid random items, gated on every purchase path, and one query that tells a shop what the prompt
+would say before it prompts.
+
+### Added
+
+- `PaidRandom = true` on a product declares a paid random item (a pass grants a fixed perk and
+  refuses the flag at startup). `PromptPurchase` refuses it
+  for a player whose policy restricts paid random items, and while that policy is not yet known.
+  `Purchase` refuses a spec carrying the flag, which is the in-experience currency half of Roblox's
+  rule. `PromptGift` refuses a restricted buyer, and a recipient who is not on this server, whose
+  policy cannot be read. A receipt for a flagged product from a restricted player, which only a
+  prompt made outside Scribe can produce, is granted and logged `PAID_RANDOM_RECEIPT`.
+
+  The policy is read once per player, off the join path, and only when a flagged entry is
+  declared. Unknown refuses: a read in flight or failed answers `policy-pending`. Three attempts
+  with backoff, `POLICY_READ_FAIL` once, one re-arm at most every 30 seconds. Unflagged entries
+  never consult it. Nothing on the wire and nothing in the profile.
+
+- `Data.GetProductState(player, name)` on the server and `Data.GetProductState(name)` on the
+  client answer one of `Scribe.ProductState`: `purchasable`, `owned`, `paid-random-restricted`,
+  `policy-pending` or `not-loaded`. Every value but the first is exactly the reason
+  `PromptPurchase` refuses with, so a greyed button and the prompt behind it cannot disagree. The
+  client computes it from the mirror and the local player's own policy read, so a shop needs no
+  round trip; `Data.ObserveProductState(name, callback)` is the reactive form. `GetPolicyInfoAsync`
+  is the test seam, on both realms. Proposed by a community member.
+
+### Changed
+
+- A template can be much larger before Luau reports "Code is too complex to typecheck" at the
+  `Scribe(...)` call. What scaled with the template was not the accessor nodes, which were already
+  built once per shape, but two unions built from them: a record's `OnChildChanged` key and value
+  unions over every child, and the union of every numeric leaf path behind `Stat` and `Cost.Path`.
+  Past twelve children the pair is typed `string` and `any?`; past 32 numeric paths the path type is
+  plain `string`. Measured with the same analyzer CI runs: a template of identical leaves stopped
+  checking at 48 roots and now passes 256; one of structurally distinct records moved from 8 to 32,
+  containers from 8 to 16. Every diagnostic inside those limits is unchanged, and nothing at runtime
+  is touched. A template that still reaches the wall has an escape hatch, in the templates guide: name
+  the options, cast the call and annotate the half you use, which checks past 256 roots of either
+  shape.
+
+- A write into a container no longer renders its path into a string on the way in. The string
+  existed for the error message, and is now built only when the key is refused.
+
+### Behaviour changes
+
+- `PromptPurchase`'s refusal reasons are now the `Scribe.ProductState` strings: `player data not
+  loaded` became `not-loaded` and `player already owns "VIP"` became `owned`. The two interpolated
+  reasons, an unknown name and an engine-refused prompt, are unchanged. No export ever promised
+  the old text, but a caller comparing it should read `Scribe.ProductState` instead.
+  `Scribe.PurchaseReason` and `Scribe.GiftReason` gain `PaidRandomRestricted` and `PolicyPending`.
+
 ## 2.2.0
 
 Released 2026-09-01.

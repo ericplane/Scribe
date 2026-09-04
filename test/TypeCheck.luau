@@ -202,6 +202,8 @@ local function serverUsage(player: Player)
 	local ok, err = Data.PromptGift(player, "GiftVIP", 12345)
 	-- These are on the returned Data type, not only on the runtime table.
 	local promptedOk: boolean, promptedWhy: string? = Data.PromptPurchase(player, "VIP")
+	local productState: string = Data.GetProductState(player, "VIP")
+	local _purchasable: boolean = productState == Scribe.ProductState.Purchasable
 	local verdict: string?, exchangeWhy: string? = Data.Exchange.Attempt(player, {}, player, {})
 	local openExchanges = Data.Exchange.Open(player)
 	local openId: string? = if openExchanges[1] ~= nil then openExchanges[1].Id else nil
@@ -622,6 +624,8 @@ local function clientUsage()
 	local infoAsync: { [string]: any }? = ClientData.GetProductInfoAsync("VIP", 5)
 	local stopObserving: () -> () = ClientData.ObserveProductInfo("VIP", function(_info) end)
 	ClientData.PrefetchProductInfo({ "VIP" })
+	local _clientState: string = ClientData.GetProductState("VIP")
+	local _stopObservingState: () -> () = ClientData.ObserveProductState("VIP", function(_state) end)
 	ClientData.RefreshProductInfo("VIP")
 	ClientData.Stop()
 	local _pricing = { price, priceAsync, info, infoAsync, stopObserving }

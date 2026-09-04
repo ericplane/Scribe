@@ -152,7 +152,7 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 
 | Option | Type | Default | What it does |
 | --- | --- | --- | --- |
-| `Products` | `{ [string]: ProductConfig }?` | none | Declares developer products by name, each with an `Id` and an optional `Category`, `Grant` and `Grants`. See [Monetization](./monetization). |
+| `Products` | `{ [string]: ProductConfig }?` | none | Declares developer products by name, each with an `Id` and an optional `Category`, `Grant`, `Grants` and `PaidRandom`. See [Monetization](./monetization). |
 | `Passes` | `{ [string]: PassConfig }?` | none | Declares game passes by name, each with an `Id` and an optional `Category`. |
 | `Perks` | `{ string }?` | none | A list of valid perk names, used only as a typo guard. Without it any perk name is accepted silently. |
 | `Leaderboards` | `{ [string]: LeaderboardConfig }?` | none | Registers all-time OrderedDataStore boards. See [Leaderboards](./leaderboards). |
@@ -160,6 +160,7 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | `PurchaseLog` | table | caps of 100, server-only | Tunes the per-player purchase history rings. |
 | `UserOwnsGamePassAsync` | `((userId, passId) -> boolean)?` | the real service call | A test seam for pass ownership. Leave it unset in production. |
 | `GetProductInfoAsync` | `((assetId, infoType) -> table?)?` | the real service call | A test seam for the client's price reads. Leave it unset in production. |
+| `GetPolicyInfoAsync` | `((player) -> table?)?` | the real service call | A test seam for the paid random policy read, on both realms. Leave it unset in production. |
 
 Emberfall's money config is two products and one pass:
 

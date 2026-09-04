@@ -199,6 +199,8 @@ end)
 
 `Changed` is coalesced, so a [`Data.Batch`](/api/Server#Batch) writing four entries fires it once, and on the client one replication frame fires it once however many children it carried. `OnChildChanged` is never coalesced: three writes fire it three times, and every ancestor receives its own immediate child.
 
+On a record with more than twelve declared children, `OnChildChanged` types its `key` as `string` and both values as `any?` rather than the exact union. A union that grows with the template is what pushes a large one past the type solver's budget, and losing that narrowing on one listener is the cheaper trade. Smaller records keep the exact types.
+
 All of a container's `OnChildChanged` fires arrive before its `Changed`, so you can accumulate keys and act once at the end. `OnKeyAdded` and `OnKeyRemoved` report a key appearing or disappearing and never one changing, so `OnChildChanged` is the only way to learn that an existing entry's value moved.
 
 !!! warning "Never yield inside a container listener"

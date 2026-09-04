@@ -191,6 +191,21 @@ end
 
 Use `Scribe.ServerData<T>` and `Scribe.ClientData<T>` when you need to name the whole `Data` object rather than one player's tree.
 
+### If Luau says the code is too complex
+
+On a large template the `Scribe({ ... })` call can report "Code is too complex to typecheck", and Luau then silently stops checking the whole file. The accessor trees are not the cost. What the solver cannot afford is instantiating both halves of the bundle inside one call, so name the options, cast the call, and annotate the half you use:
+
+```lua
+local options: Scribe.ScribeOptions<typeof(template)> = {
+    Template = template,
+    ProfileStoreIndex = "MyGameData",
+    ProfileKeyPrefix = "PLAYER_",
+}
+local Data = (Scribe :: any)(options).Server :: Scribe.ServerData<typeof(template)>
+```
+
+The options literal is still checked against your template, `Data` is the same type the bundle would have given you, and every diagnostic inside is unchanged. Measured with the analyzer CI runs, a template of distinct five-field records checks to 32 roots through the plain call and past 256 this way; one of `DictOf` containers moves from 16 to past 256.
+
 ## Where to next
 
 - [Reading and Writing Values](./values) covers what you can call on a field once you have declared it.

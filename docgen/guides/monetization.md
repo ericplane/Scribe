@@ -42,7 +42,7 @@ A name declared in **both** tables is a startup error. Resolution is by name, so
 
 **It refuses something the player already owns.** A pass is its own ownership key. A product is checked against its `Grants` perk, and one with no `Grants` is a consumable, has nothing to own, and always prompts. So you do not have to pair every prompt with its own [`Owns`](/api/Server#Owns) check.
 
-You also get `(false, reason)` for an unknown name, a player whose data is not loaded, and a prompt the engine itself refused, which is what an unpublished product looks like. None of those raise, so a shop handler needs no `pcall` of its own.
+The reason is one of the `Scribe.ProductState` strings (`"not-loaded"`, `"owned"`, `"paid-random-restricted"`, `"policy-pending"`), plus two outside that set: an unknown name, and a prompt the engine itself refused, which is what an unpublished product looks like. None of those raise, so a shop handler needs no `pcall` of its own. [Paid random items](#paid-random-items) covers the query that answers the same thing before you prompt.
 
 Prompting is all it does. The grant happens on the receipt through the same path every purchase takes, so a player who buys and then leaves is still granted on their next load.
 
@@ -67,6 +67,54 @@ The meta table on `Increment` is optional. It makes the grant show up in Roblox'
     A soft-currency [`Purchase`](/api/Server#Purchase) `Grant` that yields is refused outright. Nothing is debited and nothing is granted.
 
     Do the async work before you show the prompt, or afterwards from a signal.
+
+## Paid random items
+
+Roblox restricts paid random items for some players and leaves the check to the game. The engine reports the answer per player as `PolicyService:GetPolicyInfoForPlayerAsync(player).ArePaidRandomItemsRestricted`, and the rule covers an item bought with Robux **or with an in-experience currency that Robux can buy**. Declare the entry, and Scribe enforces it on every path:
+
+```lua
+Products = {
+    LootBox = {
+        Id = 1234567890,
+        PaidRandom = true,
+        Grant = function(data)
+            data.Boxes.Increment(1)
+        end,
+    },
+},
+```
+
+A pass cannot carry the flag: it grants a fixed perk, so declaring `PaidRandom` on one is a startup error.
+
+`Data.PromptPurchase` refuses a flagged entry for a restricted player, and while the player's policy is not yet known. `Data.Purchase` does the same for a spec carrying `PaidRandom = true`, which is the in-experience currency half of the rule. `Data.PromptGift` refuses a restricted buyer, and a recipient who is not on this server, because a policy can only be read for a Player who is here; an unflagged gift needs nobody present, as before. A receipt for a flagged product from a restricted player, which only a prompt made outside Scribe can produce, is still granted and logged `PAID_RANDOM_RECEIPT`, because the money has moved and a refused receipt would sit in a retry loop granting nothing.
+
+**The policy is read once per player**, off the join path, and only when the bundle declares a flagged entry. Until it lands the entry reads `policy-pending` and the prompt refuses: selling a loot box to a player whose restriction could not be read is the failure the rule exists to prevent. A read that fails is retried three times with backoff, logged `POLICY_READ_FAIL` once, and re-armed at most every 30 seconds by the next check. Unflagged entries never consult it, so an outage cannot refuse an ordinary coin pack.
+
+### Asking before you prompt
+
+`Data.GetProductState(player, name)` answers with one of five strings, and every string but `"purchasable"` is exactly the reason `PromptPurchase` refuses with, so a button greyed on the state and the prompt behind it cannot disagree. The names are on `Scribe.ProductState`.
+
+| `Scribe.ProductState` member | The string | When |
+| --- | --- | --- |
+| `Purchasable` | `"purchasable"` | none of the below |
+| `Owned` | `"owned"` | a pass the player holds, or a product whose `Grants` perk they hold; a consumable is never owned |
+| `PaidRandomRestricted` | `"paid-random-restricted"` | flagged, and the player's policy restricts it |
+| `PolicyPending` | `"policy-pending"` | flagged, and the policy is not known yet |
+| `NotLoaded` | `"not-loaded"` | the player's data is not loaded |
+
+The client has the same call, `Data.GetProductState(name)`, computed from the mirror and the local player's own policy read, and `Data.ObserveProductState(name, callback)` for a button that should repaint when the policy lands or ownership changes:
+
+```lua
+Data.ObserveProductState("LootBox", function(state)
+    buyButton.Active = state == Scribe.ProductState.Purchasable
+    buyButton.Text = if state == "paid-random-restricted" then "Not available" else "Buy"
+end)
+```
+
+The client is the hint and the server is the gate: if the client's read fails it shows `policy-pending`, and the server still refuses. Two reasons sit outside the table. An unknown name raises from `GetProductState` and is refused without raising by `PromptPurchase`, and a prompt the engine refused, which is what an unpublished product looks like, is something no query can predict.
+
+??? note "Testing it"
+    `GetPolicyInfoAsync` in the options is a seam for the policy read on both realms, in the shape of `GetProductInfoAsync`. Hand it a function returning `{ ArePaidRandomItemsRestricted = true }` to render the restricted button in a storybook or a headless test.
 
 ## Showing the price
 
@@ -288,7 +336,7 @@ The claim is persisted, so it survives a rejoin, and it is taken inside the tran
 
 ### Reading the refusal
 
-`Purchase` returns `(false, reason)` for six fixed refusals, and Scribe exports them as a frozen table so you can branch on them without pasting strings:
+`Purchase` returns `(false, reason)` for eight fixed refusals, and Scribe exports them as a frozen table so you can branch on them without pasting strings:
 
 | `Scribe.PurchaseReason` member | The string |
 | --- | --- |
@@ -298,6 +346,8 @@ The claim is persisted, so it survives a rejoin, and it is taken inside the tran
 | `InvalidCostPath` | `"invalid cost path"` |
 | `CostPathNotSpendable` | `"cost path is not a spendable number"` |
 | `InsufficientFunds` | `"insufficient funds"` |
+| `PaidRandomRestricted` | `"paid-random-restricted"` |
+| `PolicyPending` | `"policy-pending"` |
 
 ```lua
 local ok, reason = Data.Purchase(player, spec)

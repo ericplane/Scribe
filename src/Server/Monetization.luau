@@ -15,6 +15,7 @@ local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
 local Clock = require(Internal.Clock)
 local Sched = require(Internal.Sched)
+local Rng = require(Internal.Rng)
 local Failure = require(Internal.Failure)
 -- For MAX_IDEMPOTENCY_KEY_BYTES only. Wire's own requires are Internal leaves, so
 -- this adds no module to the bundle and no cycle.
@@ -106,10 +107,21 @@ function Monetization.new(ctx: any)
 		or function(userId: number, passId: number): boolean
 			return MarketplaceService:UserOwnsGamePassAsync(userId, passId)
 		end
+	local getPolicyInfo: (player: Player) -> any = options.GetPolicyInfoAsync
+		or function(player: Player): any
+			return (game:GetService("PolicyService") :: any):GetPolicyInfoForPlayerAsync(player)
+		end
 
 	-- Registry ----------------------------------------------------------------
 
-	type Product = { Name: string, Id: number, Category: string?, Grant: ((data: any) -> ())?, Grants: string? }
+	type Product = {
+		Name: string,
+		Id: number,
+		Category: string?,
+		Grant: ((data: any) -> ())?,
+		Grants: string?,
+		PaidRandom: boolean,
+	}
 	local productsByName: { [string]: Product } = {}
 	local productsById: { [number]: Product } = {}
 	for name, config in (options.Products or {}) :: { [string]: any } do
@@ -134,12 +146,16 @@ function Monetization.new(ctx: any)
 		if config.Category ~= nil and not Util.isUtf8(config.Category) then
 			error(`Scribe: product "{name}" Category contains invalid UTF-8 bytes`, 0)
 		end
+		if config.PaidRandom ~= nil and type(config.PaidRandom) ~= "boolean" then
+			error(`Scribe: product "{name}" PaidRandom must be a boolean`, 0)
+		end
 		local product: Product = {
 			Name = name,
 			Id = config.Id,
 			Category = config.Category,
 			Grant = config.Grant,
 			Grants = config.Grants,
+			PaidRandom = config.PaidRandom == true,
 		}
 		productsByName[name] = product
 		if productsById[config.Id] then
@@ -161,6 +177,12 @@ function Monetization.new(ctx: any)
 		if config.Category ~= nil and not Util.isUtf8(config.Category) then
 			error(`Scribe: pass "{name}" Category contains invalid UTF-8 bytes`, 0)
 		end
+		if config.PaidRandom ~= nil then
+			error(
+				`Scribe: pass "{name}" cannot be PaidRandom; a pass grants a fixed perk, so only a product can be a paid random item`,
+				0
+			)
+		end
 		-- One name, one thing. PromptPurchase resolves a name against both registries, so a
 		-- name in both would leave resolution order deciding what the player is charged for.
 		if productsByName[name] then
@@ -181,6 +203,11 @@ function Monetization.new(ctx: any)
 			)
 		end
 		passNamesById[config.Id] = name
+	end
+
+	local anyPaidRandom = false
+	for _, product in productsByName do
+		anyPaidRandom = anyPaidRandom or product.PaidRandom
 	end
 
 	local declaredPerks: { [string]: boolean }? = nil
@@ -578,6 +605,61 @@ function Monetization.new(ctx: any)
 		return false
 	end
 
+	-- Paid random items. The policy is per session, read once off the join path;
+	-- unknown refuses.
+	local POLICY_ATTEMPTS = 3
+	local POLICY_RETRY_BASE = 2
+	local POLICY_REARM_AFTER = 30
+
+	local function readPolicy(entry: any, attempts: number)
+		local policy = entry.Policy
+		for attempt = 1, attempts do
+			policy.LastAttempt = Clock.Monotonic()
+			local ok, info = pcall(getPolicyInfo, entry.Player)
+			if ok and type(info) == "table" then
+				policy.Restricted = info.ArePaidRandomItemsRestricted == true
+				policy.Phase = "known"
+				return
+			end
+			if attempt == attempts then
+				policy.Phase = "failed"
+				if not policy.Logged then
+					policy.Logged = true
+					Log.Warn(
+						"Monetization",
+						"POLICY_READ_FAIL",
+						`could not read the player's policy: {tostring(info)}; paid random items stay refused`,
+						{ Player = entry.Player }
+					)
+				end
+				return
+			end
+			Clock.Wait(Rng.Jitter(POLICY_RETRY_BASE * 2 ^ (attempt - 1)))
+		end
+	end
+
+	local function ensurePolicy(entry: any)
+		local policy = entry.Policy
+		if policy == nil then
+			policy = { Phase = "pending", Restricted = false, LastAttempt = 0, Logged = false }
+			entry.Policy = policy
+			Sched.Spawn(readPolicy, entry, POLICY_ATTEMPTS)
+		elseif policy.Phase == "failed" and Clock.Monotonic() - policy.LastAttempt >= POLICY_REARM_AFTER then
+			policy.Phase = "pending"
+			Sched.Spawn(readPolicy, entry, 1)
+		end
+		return policy
+	end
+
+	-- nil when the player may buy paid random items.
+	local function paidRandomState(entry: any): string?
+		local policy = ensurePolicy(entry)
+		if policy.Phase == "known" then
+			return if policy.Restricted then "paid-random-restricted" else nil
+		end
+		return "policy-pending"
+	end
+
 	-- NON-YIELDING: reads the cache refreshOwnership fills asynchronously, so a
 	-- genuinely-owned gamepass can still read false just after join. Use OwnsAsync when
 	-- the answer has to be authoritative immediately.
@@ -588,6 +670,33 @@ function Monetization.new(ctx: any)
 			return false
 		end
 		return ownsInternal(player, entry, key)
+	end
+
+	-- One function behind both the query and the prompt, so they cannot disagree.
+	local function productState(entry: any, name: string, product: any, pass: any): string
+		if not entry or entry.State ~= "Ready" then
+			return "not-loaded"
+		end
+		if product and product.PaidRandom then
+			local refused = paidRandomState(entry)
+			if refused ~= nil then
+				return refused
+			end
+		end
+		local ownedKey = if pass then name else product.Grants
+		if ownedKey ~= nil and self.Owns(entry.Player, ownedKey) then
+			return "owned"
+		end
+		return "purchasable"
+	end
+
+	function self.GetProductState(player: Player, name: string): string
+		local product, pass = productsByName[name], passesByName[name]
+		if not product and not pass then
+			-- 3: here -> Data.GetProductState -> the caller.
+			error(`Scribe.GetProductState: "{tostring(name)}" is not a declared pass or product`, 3)
+		end
+		return productState(ctx.Persistence.EntryFor(player), name, product, pass)
 	end
 
 	local function setOwnsCache(entry: any, key: string, owned: boolean)
@@ -1730,6 +1839,22 @@ function Monetization.new(ctx: any)
 		Metrics.Add("ReceiptsReceived")
 
 		local entry: { [string]: any }? = ctx.Persistence.EntryForUserId(userId)
+		if
+			product.PaidRandom
+			and entry
+			and entry.Policy
+			and entry.Policy.Phase == "known"
+			and entry.Policy.Restricted
+			and not isProcessed(entry, tostring(receiptInfo.PurchaseId))
+		then
+			-- Only a prompt made outside Scribe reaches here. The money has moved, so grant.
+			Log.Warn(
+				"Monetization",
+				"PAID_RANDOM_RECEIPT",
+				`receipt for paid random product "{product.Name}" from a player whose policy restricts it; granted`,
+				{ Player = entry.Player, ProductId = productId }
+			)
+		end
 		if entry and entry.State == "Ready" and isProcessed(entry, tostring(receiptInfo.PurchaseId)) then
 			Metrics.Add("ReceiptsDuplicate")
 			-- Logged as well as counted: the metric alone leaves an operator with no
@@ -1857,27 +1982,19 @@ function Monetization.new(ctx: any)
 		if not product and not pass then
 			return false, `unknown product or pass "{name}"`
 		end
-		local entry = ctx.Persistence.EntryFor(player)
-		if not entry or entry.State ~= "Ready" then
-			return false, "player data not loaded"
+		local state = productState(ctx.Persistence.EntryFor(player), name, product, pass)
+		if state ~= "purchasable" then
+			if state == "paid-random-restricted" or state == "policy-pending" then
+				Metrics.Add("PaidRandomRefused")
+			end
+			return false, state
 		end
 
 		local promptId: number
 		local prompt: (player: Player, id: number) -> ()
 		if pass then
-			-- A pass IS its own ownership key, and the join scan warms the cache for every
-			-- declared pass.
-			if self.Owns(player, name) then
-				return false, `player already owns "{name}"`
-			end
 			promptId, prompt = pass.Id, promptGamePassPurchase
 		else
-			-- A product owns nothing unless it Grants a perk. Without one it is a
-			-- consumable and is always promptable.
-			local grants = (product :: any).Grants
-			if grants ~= nil and self.Owns(player, grants) then
-				return false, `player already owns "{grants}"`
-			end
 			promptId, prompt = (product :: any).Id, promptProductPurchase
 		end
 
@@ -1905,6 +2022,22 @@ function Monetization.new(ctx: any)
 		end
 		if recipientUserId == entry.UserId then
 			return false, "cannot gift yourself"
+		end
+		if product.PaidRandom then
+			local refused = paidRandomState(entry)
+			if refused == nil then
+				-- Readable only for a Player on this server; anyone else stays unknown.
+				local recipientEntry = ctx.Persistence.EntryForUserId(recipientUserId)
+				if recipientEntry and recipientEntry.State == "Ready" then
+					refused = paidRandomState(recipientEntry)
+				else
+					refused = "policy-pending"
+				end
+			end
+			if refused ~= nil then
+				Metrics.Add("PaidRandomRefused")
+				return false, refused
+			end
 		end
 
 		-- Anti-abuse: per-sender cooldown + max pending gifts.
@@ -2192,6 +2325,13 @@ function Monetization.new(ctx: any)
 		if not entry or entry.State ~= "Ready" then
 			return false, "player data not loaded"
 		end
+		if spec.PaidRandom == true then
+			local refused = paidRandomState(entry)
+			if refused ~= nil then
+				Metrics.Add("PaidRandomRefused")
+				return false, refused
+			end
+		end
 		-- Optional caller-supplied idempotency key. Deliberately NOT stored in
 		-- _Scribe.ProcessedPurchaseIds: pushing ordinary shop traffic through that capped
 		-- ring would flush real receipt ids.
@@ -2388,6 +2528,10 @@ function Monetization.new(ctx: any)
 		end
 		Sched.Spawn(refreshOwnership, entry)
 		watchOwnership(entry)
+		-- Last and spawned: the hooks after this one end with the first snapshot.
+		if anyPaidRandom then
+			ensurePolicy(entry)
+		end
 	end
 
 	function self.OnUnload(entry: any)

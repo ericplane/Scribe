@@ -83,6 +83,10 @@ Ownership is checked twice, at prompt time and again at receipt time, so a race 
 | `DeliveryUnconfirmed` | `"gift delivery could not be confirmed; do not send it again"` |
 | `AlreadyPending` | `"a gift of this item is already pending; try again shortly"` |
 | `IntentRecordFailed` | `"could not record gift intent; try again later"` |
+| `PaidRandomRestricted` | `"paid-random-restricted"` |
+| `PolicyPending` | `"policy-pending"` |
+
+The last two belong to a product declared `PaidRandom = true`: the buyer is restricted, or the buyer's or recipient's policy is not known, which for a recipient who is not on this server it never is. [Paid random items](./monetization.md#paid-random-items) has the rule.
 
 ```lua
 local ok, reason = Data.PromptGift(ava, "GemPack100", benUserId)

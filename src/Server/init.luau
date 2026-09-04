@@ -711,9 +711,15 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		this is a UI gate: for a product the receipt path is what actually prevents a
 		double grant, and Roblox itself refuses a pass the player holds.
 
-		Returns `(false, reason)` for an unknown name, a player whose data is not loaded,
-		something they already own, or a prompt the engine refused, which is what an
-		unpublished product looks like. None of those raise.
+		A `PaidRandom` product is refused for a player whose policy restricts paid random
+		items, and while that policy is not yet known.
+
+		Returns `(false, reason)`, where `reason` is the [Scribe.ProductState] the prompt
+		refused on: `"not-loaded"`, `"owned"`, `"paid-random-restricted"` or
+		`"policy-pending"`. [Server.GetProductState] answers the same state without
+		prompting. Two reasons sit outside that set: an unknown name, and a prompt the
+		engine refused, which is what an unpublished product looks like. None of those
+		raise.
 
 		Prompting is all it does. The grant happens on the receipt, through the same path
 		every purchase takes, so a player who buys and then leaves is still granted on
@@ -723,6 +729,27 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	]=]
 	function Data.PromptPurchase(player: Player, name: string)
 		return ctx.Monetization.PromptPurchase(player, name)
+	end
+	--[=[
+		@within Server
+		@tag Monetization
+		@server
+		@param player Player
+		@param name string
+		@return ProductState
+		The state of a declared product or pass for `player`, as one
+		[Scribe.ProductState] string: what [Server.PromptPurchase] would refuse with, or
+		`"purchasable"`. A shop that greys a button on this and the prompt behind it
+		cannot disagree. Raises for a name that is not declared.
+
+		```lua
+		if Data.GetProductState(player, "LootBox") == Scribe.ProductState.Purchasable then
+		    showBuyButton(player)
+		end
+		```
+	]=]
+	function Data.GetProductState(player: Player, name: string): string
+		return ctx.Monetization.GetProductState(player, name)
 	end
 	--[=[
 		@within Server
