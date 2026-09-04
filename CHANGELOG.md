@@ -7,6 +7,14 @@ Released 2026-09-04.
 Paid random items, gated on every purchase path, and one query that tells a shop what the prompt
 would say before it prompts.
 
+### Behaviour changes
+
+- `PromptPurchase`'s refusal reasons are now the `Scribe.ProductState` strings: `player data not
+  loaded` became `not-loaded` and `player already owns "VIP"` became `owned`. The two interpolated
+  reasons, an unknown name and an engine-refused prompt, are unchanged. No export ever promised
+  the old text, but a caller comparing it should read `Scribe.ProductState` instead.
+  `Scribe.PurchaseReason` and `Scribe.GiftReason` gain `PaidRandomRestricted` and `PolicyPending`.
+
 ### Added
 
 - `PaidRandom = true` on a product declares a paid random item (a pass grants a fixed perk and
@@ -47,14 +55,6 @@ would say before it prompts.
 - A write into a container no longer renders its path into a string on the way in. The string
   existed for the error message, and is now built only when the key is refused.
 
-### Behaviour changes
-
-- `PromptPurchase`'s refusal reasons are now the `Scribe.ProductState` strings: `player data not
-  loaded` became `not-loaded` and `player already owns "VIP"` became `owned`. The two interpolated
-  reasons, an unknown name and an engine-refused prompt, are unchanged. No export ever promised
-  the old text, but a caller comparing it should read `Scribe.ProductState` instead.
-  `Scribe.PurchaseReason` and `Scribe.GiftReason` gain `PaidRandomRestricted` and `PolicyPending`.
-
 ## 2.2.0
 
 Released 2026-09-01.
@@ -64,6 +64,21 @@ can also now hold a `Scribe.Big` anywhere, including inside a container's elemen
 to put the whole file past the Luau type solver's budget and silently stop it being checked. The
 change that buys it also makes assigning to an accessor a type error, which is the one thing to
 read before upgrading.
+
+### Behaviour changes
+
+- A write to the server store from inside `Data.Transaction` is refused, and the transaction that
+  contained it aborts. A rollback restores one player's tree, and the store is neither that tree nor
+  saved to any key, so a store write made inside a transaction would outlive an abort. The refusal
+  names the store and says to write it before the transaction or after it returns `true`; the
+  cross-player refusal, which points at the durable outbox instead, is unchanged.
+
+- Assigning to an accessor is now a type error. `data.Coins = 5` and `data.Coins.Set = f` report
+  that the property is read-only, where before they type-checked and did something worse than
+  nothing: the accessor metatable has no `__newindex`, so the assignment wrote over the accessor
+  and permanently shadowed the real one for that instance. Nothing that works today stops working;
+  `data.Coins.Set(5)` and every other method are unchanged. If a script does assign to an accessor,
+  it was already broken and the error is telling you where.
 
 ### Added
 
@@ -196,21 +211,6 @@ read before upgrading.
   for in one frame are batched into a single burst. A read that fails leaves the price `nil` rather
   than falling back to the catalog number, and logs `PRODUCT_INFO_FAIL`. Prices are re-read once,
   the first time the local player's `HasRobloxSubscription` flips.
-
-### Behaviour changes
-
-- A write to the server store from inside `Data.Transaction` is refused, and the transaction that
-  contained it aborts. A rollback restores one player's tree, and the store is neither that tree nor
-  saved to any key, so a store write made inside a transaction would outlive an abort. The refusal
-  names the store and says to write it before the transaction or after it returns `true`; the
-  cross-player refusal, which points at the durable outbox instead, is unchanged.
-
-- Assigning to an accessor is now a type error. `data.Coins = 5` and `data.Coins.Set = f` report
-  that the property is read-only, where before they type-checked and did something worse than
-  nothing: the accessor metatable has no `__newindex`, so the assignment wrote over the accessor
-  and permanently shadowed the real one for that instance. Nothing that works today stops working;
-  `data.Coins.Set(5)` and every other method are unchanged. If a script does assign to an accessor,
-  it was already broken and the error is telling you where.
 
 ### Fixed
 
