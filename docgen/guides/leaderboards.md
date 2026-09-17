@@ -1,6 +1,15 @@
 # Leaderboards
 
-A leaderboard in Scribe is an all-time global ranking of one field in your template. You name the field, Scribe keeps every player's score in an OrderedDataStore for you, and you read back the top few whenever you want to draw them. Reach for one when the ranking should span every server and outlive the session, such as the highest-level adventurer in all of Emberfall.
+A leaderboard ranks a numeric field in your template. By default it is an all-time ranking shared across every server, stored in an OrderedDataStore. You can also rank daily or weekly progress, or only the players on the current server.
+
+| You want to rank... | Start here |
+| --- | --- |
+| Every player's all-time score | [Your first board](#your-first-board) |
+| Progress earned today or this week | [Daily and weekly boards](#daily-and-weekly-boards) |
+| Players currently in this server | [A board for this server](#a-board-for-this-server) |
+| Very large `Scribe.Big` values | [Ranking a Scribe.Big](#ranking-a-scribebig) |
+
+The examples use `Level` from the [Emberfall template](./emberfall). Replace it with any supported numeric field in your own template.
 
 ## Your first board
 
@@ -83,12 +92,106 @@ Leaderboards = {
 
 A top-100 all-time board rarely needs minute-freshness, and every refresh spends from a `GetSortedAsync` budget that scales with player count. Values below 60 seconds are clamped up and reported as `LB_INTERVAL_CLAMPED`.
 
+`Data.GetLeaderboardRefreshIn(name)` is the seconds until a board next reads, for a "refreshes in" label. It is `0` while a due refresh waits on the request budget, and `nil` until the loop has scheduled its first cycle a few seconds after boot. It is server-side; a client label reads it through a `Scribe.Shared` field or a Command.
+
 Scribe also refuses at startup if your boards would collectively read too often. The ceiling is **12 reads per minute**, summed as `60 / RefreshInterval` across every board, so twelve boards at the default exactly fit and the thirteenth will not boot. `TopCoins` above costs 0.1 reads per minute instead of 1, which is how you buy room for more boards.
 
-??? tip "If you wanted a live in-server scoreboard, this is the wrong tool"
-    Going faster than a minute is nearly always a sign that what you want is an in-server live scoreboard, not a global all-time board. That belongs in a [`Scribe.Shared`](./visibility) root, which updates instantly and costs no DataStore requests at all.
+??? tip "If you wanted a live in-server scoreboard, declare `Scope = \"Server\"`"
+    Going faster than a minute is nearly always a sign that what you want is the players on *this* server, not a global board. That is [a server-scoped board](#a-board-for-this-server), which reads nothing from a store and refreshes every five seconds by default.
 
-    Be deliberate about it, though. `Shared` broadcasts to every client in the server, so a currency published that way is visible to everyone, live. The balance is the smaller half of what leaks: because the value updates the moment it changes, other players can see *when* someone spends or gifts, and infer *what they did* from the size of the movement. Publish a rank, a tier, or a bucketed figure instead, and leave the real `Coins` balance on the owner-only default.
+    Be deliberate about what you rank. A replicated board shows every player's score to everyone here, and a stat that moves the moment a player spends or gifts lets others infer what they did from the size of the movement. Rank a score, a tier, or a bucketed figure, and leave the real balance on the owner-only default.
+
+## Daily and weekly boards
+
+A board resets on a period by declaring one. It is otherwise an ordinary board: same store cost, same refresh, same `Replicate`, same reads.
+
+```lua
+Leaderboards = {
+    Wins       = { Stat = "Wins", Replicate = true },
+    WinsDaily  = { Stat = "Wins", Period = "Daily", Replicate = true },
+    WinsWeekly = { Stat = "Wins", Period = "Weekly" },
+    BestCombo  = { Stat = "Combo", Period = "Daily", Mode = "Peak" },
+},
+```
+
+**What goes on the board is not the stat.** A player with 5,000 lifetime wins who won twice today ranks at 2. Scribe keeps a small baseline per periodic board in the profile and writes the difference:
+
+| `Mode` | writes | for |
+| --- | --- | --- |
+| `Gain` (default) | the stat now minus the stat when the period began, floored at 0 | cumulative stats: wins, XP, coins earned |
+| `Peak` | the highest value seen this period | high-score stats: best combo, longest streak |
+
+The baseline is saved in the profile. Rejoining within the same period keeps it; rejoining after a rollover starts the new period at zero. A stat that falls below its period start ranks at 0.
+
+**A reset starts a new store; it does not delete the old period.** That lets Scribe read previous winners and keeps servers on the same schedule.
+
+??? note "Period store names and retained history"
+    `WinsDaily` writes to names such as `LB_WinsDaily_d20708`; `WinsWeekly` uses names such as `LB_WinsWeekly_w2958`. The reset clock determines the index, so no cross-server reset message is needed.
+
+    Old period stores remain. They use storage and add work to a user's [erasure](#erasure). If you need to remove old stores in bulk, use the Creator Hub's Data Stores Manager rather than expecting a rollover to clean them up.
+
+### The reset clock
+
+One clock per bundle, because a game has one audience:
+
+```lua
+PeriodReset = { UtcOffset = -8, WeekStart = "Monday" },
+```
+
+`UtcOffset` is in hours from UTC, fractional allowed for the half-hour zones, from -12 to 14; the default is 0. `WeekStart` is a day name; the default is Monday. So a US-West game rolls its day at 08:00 UTC and its week on Monday in that clock.
+
+It is a fixed offset. Luau has no timezone database, so a region with daylight saving sees the reset move by an hour twice a year unless you move the offset with it. Changing the offset shifts every period index, so one partial period appears at the change and every player's baseline resets once. Do it between periods.
+
+### Time to the reset
+
+`Data.GetLeaderboardResetIn(name)` is the seconds until the board's current period ends, on the reset clock above, for a "resets in" label. It is always above zero, since at the instant of rollover the next period has begun, and `nil` for a board with no `Period`. Server-side, like `GetLeaderboardRefreshIn`.
+
+### Reading the previous period
+
+On the server, use `Data.GetLeaderboard(name, limit, -1)` to read the previous period. It is not replicated automatically; forward it through a Command if your client shows previous winners.
+
+Scribe reads that period at the first refresh after rollover and once more at the next refresh, to include late leave saves. It then serves the cached result for the rest of the current period. Treat the first result as provisional while that second read is still due.
+
+??? note "Overlapping refreshes and shutdown"
+    Only one refresh runs per board. A scheduled refresh is skipped if the previous one is still running. Concurrent `RefreshNow` calls share at most one waiting refresh, so slow requests do not build an unbounded queue.
+
+    `Stop` prevents waiting refreshes from starting. An in-flight refresh finishes its current read and goes no further. This keeps cache updates and the two previous-period reads from racing one another.
+
+### Cost
+
+Writes scale with the number of boards on a stat, but the pacer's dedup window already collapses a burst into one write per board, so three boards on `Wins` is three writes per player per settle, not three per increment. Reads are one more `GetSortedAsync` per periodic board per `RefreshInterval`, and the startup guard above counts them. Nothing runs per frame, the pacer parks while its queue is empty, and a bundle with only server boards never starts it.
+
+!!! warning "Upgrading to 2.4.0 changes the schema hash"
+    The baseline lives under the reserved `_Scribe` root, and a new child there changes the hash both realms compare at handshake. Deploy your server and client together, as with any template change, even if you declare no periodic board.
+
+## A board for this server
+
+`Scope = "Server"` ranks the players on this server and nothing else. There is no store behind it and no request spent on it: every refresh sorts the online players' stat in memory, five seconds apart by default and no faster than one.
+
+```lua
+Leaderboards = {
+    RoundWins  = { Stat = "Wins", Scope = "Server", Replicate = true, RefreshInterval = 2 },
+    TodayHere  = { Stat = "Wins", Scope = "Server", Period = "Daily" },
+},
+```
+
+It composes with `Period`, because the baseline is per player, not per board: `TodayHere` ranks the players here by what they earned today. `GetMyRank` works, `Replicate` works, and a server board is exempt from the read guard and from the migration reserve, since it reads nothing. A player who leaves drops off at the next refresh. `offset = -1` answers an empty list, since nothing was stored.
+
+## Erasure
+
+Roblox does not erase your stores for you. On a right-to-be-forgotten request it messages you, and deletes automatically only what matches the RTBF deletion templates you configure, where `{UserId}` is the only token and the store name is a literal. Roblox's own example lists an ordered leaderboard as user data, so board entries are in scope.
+
+A lifetime board fits one template, and with it Roblox erases that board without anyone calling anything:
+
+```json
+{ "key_template": { "data_store_type": "ORDERED", "data_store_name": "LB_Wins", "key_pattern": "{UserId}", "scope_pattern": "global" } }
+```
+
+A periodic board would need a template per day or week. `Data.Erase` therefore removes those entries itself, from the player's first recorded period through the current one, **before deleting the profile**. A server-scoped board stores nothing and needs no removal.
+
+A long history can take time. Each period costs one `RemoveAsync`, paced against `OrderedRemove` budget under `BudgetPolicy = "Defer"`. Scribe saves progress every twenty-five removals and on failure. If the sweep returns `(false, reason)`, retry: the profile remains and the sweep resumes from its checkpoint. Only the user being erased is prevented from rejoining during the work; [Offline Profiles](./profiles#gdpr-export-and-erase) explains the outcomes.
+
+The profile records which kind of period its baseline belongs to. Change a board from `Daily` to `Weekly` (or back) and the player's next write closes the old range on record and starts a new one, so the erase sweeps the daily stores they wrote to under their own names rather than skipping them, and a board that became daily does not sweep every day since the epoch. A baseline written before this record carried a kind is taken to be in the board's current kind.
 
 ## What a `Stat` may be
 
@@ -216,7 +319,7 @@ The annotation is what enables the strict check. Inside a single `Scribe({ ... }
 ## Where to next
 
 - [Derived Fields](./derived) for how `Level` is computed, and why a derived stat is rankable.
-- [Replication & Visibility](./visibility) for `Scribe.Shared`, the right tool for a live in-server scoreboard.
+- [Replication & Visibility](./visibility) for sharing individual player values alongside a board.
 - [Configuration](./configuration#monetization-services) for every leaderboard option in one table.
 - [Diagnostics](./diagnostics) for the queue and budget counters behind the write pacer.
 - [Log Code Reference](./log-codes#leaderboards) for every `LB_` code and what to do about it.

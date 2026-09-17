@@ -78,8 +78,11 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `EXPORT_ENCODE_FAIL` | Warn | A data export could not JSON-encode a player's profile, so `Export` returns nil instead of a payload. |
 | `OFFLINE_READ_FAIL` | Warn | An offline read of a non-active user's profile errored, so `GetOffline` returns nil. This is a retryable read failure and not a genuinely missing profile. |
 | `OFFLINE_WRITE_FAIL` | Warn | `UpdateOffline` could not complete because the DataStore call itself failed, so nothing was stored. A refused write, such as a live session elsewhere or a key that changed under the update, is the compare-and-set working and does not fire this. |
+| `NOSAVE_WRITE_REFUSED` | Warn | `UpdateOffline`, `RestoreVersion`, `Erase`, `SendMessage` or an offline gift delivery ran on a `Mode = "NoSave"` bundle, which never writes the store. Nothing was written. `Context.Verb` names the call. |
 | `PROFILE_ERASED` | Warn | A profile was permanently removed through the erase path. The log records the audit context and whether the leaderboard keys were cleared too. |
 | `PROFILE_ERASE_FAIL` | Warn | An erase did not complete, so the profile is still stored and the erase must be retried. A leaderboard key that survived a profile removal reports separately as `LB_ERASE_FAIL`. |
+| `PROFILE_ERASE_RESUMED` | Info | An erase found the marker a previous attempt left and is resuming from its recorded progress. |
+| `PROFILE_ERASE_PROGRESS_FAIL` | Warn | The erase could not write its progress and renew its lease, twice in a row; the sweep stops there, and a retry resumes from the last progress it saved. |
 | `PROFILE_RESET` | Warn | A profile was wiped back to template defaults because `ResetData` was enabled. Expected in testing, alarming in production. |
 | `PROFILE_RESTORED` | Warn | A profile was rolled back to an earlier version. The log records the restored version and the audit context. |
 | `PROFILE_RESTORE_FAIL` | Warn | A restore did not complete, so the stored profile is unchanged. The version was not found, a live session held the key, the live key no longer exists, or the commit failed. |

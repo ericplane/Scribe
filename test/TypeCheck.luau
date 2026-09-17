@@ -49,6 +49,8 @@ type T = typeof(template)
 -- numeric leaf-path union, and Grant's `data` is the typed accessor tree.
 local boards: { [string]: Scribe.LeaderboardConfig<T> } = {
 	TopCoins = { Stat = "Coins", Limit = 100, Replicate = true },
+	WinsDaily = { Stat = "Coins", Period = "Daily", Mode = "Gain" },
+	HereNow = { Stat = "Coins", Scope = "Server", Period = "Weekly" },
 	TopKills = { Stat = "Stats.Kills" },
 	-- A derived numeric field is a valid stat: boards read through the accessor
 	-- tree, which computes it like any other field.
@@ -68,6 +70,7 @@ local products: { [string]: Scribe.ProductConfig<T> } = {
 
 local bundle = Scribe({
 	Template = template,
+	PeriodReset = { UtcOffset = -8, WeekStart = "Monday" },
 	Transport = "Default",
 	ProfileStoreIndex = "MyGameData",
 	ProfileKeyPrefix = "PLAYER_",
@@ -197,11 +200,23 @@ local function serverUsage(player: Player)
 	-- reserved `_Scribe` root back with the rest is typed rather than `any`.
 	local _restoredPlain: boolean, _restoreReason: string? = Data.RestoreVersion(12345, "version-id")
 	local _restoredRolled: boolean = Data.RestoreVersion(12345, "version-id", { RollBackReserved = true })
+	-- UpdateOffline's options table is optional; validated, it hands back the findings third.
+	local _updatedRaw: boolean, _updateReason: string? = Data.UpdateOffline(12345, function(_raw) end)
+	local _updatedChecked: boolean, _checkedReason: string?, _violations: { { [string]: any } }? = Data.UpdateOffline(
+		12345,
+		function(raw)
+			raw.Coins = 5
+		end,
+		{ Validate = true }
+	)
 	local owns: boolean = Data.Owns(player, "VIP")
 	local ownsAsync: boolean = Data.OwnsAsync(player, "VIP")
 	local ok, err = Data.PromptGift(player, "GiftVIP", 12345)
 	-- These are on the returned Data type, not only on the runtime table.
 	local promptedOk: boolean, promptedWhy: string? = Data.PromptPurchase(player, "VIP")
+	local _previous: { Scribe.LeaderboardEntry } = Data.GetLeaderboard("WinsDaily", 10, -1)
+	local _refreshIn: number? = Data.GetLeaderboardRefreshIn("WinsDaily")
+	local _resetIn: number? = Data.GetLeaderboardResetIn("WinsDaily")
 	local productState: string = Data.GetProductState(player, "VIP")
 	local _purchasable: boolean = productState == Scribe.ProductState.Purchasable
 	local verdict: string?, exchangeWhy: string? = Data.Exchange.Attempt(player, {}, player, {})
@@ -626,7 +641,37 @@ local function clientUsage()
 	ClientData.PrefetchProductInfo({ "VIP" })
 	local _clientState: string = ClientData.GetProductState("VIP")
 	local _stopObservingState: () -> () = ClientData.ObserveProductState("VIP", function(_state) end)
+
+	-- A narrower caller type is accepted at every input position, nested fields included.
+	type InviteAction = "invite" | "accept_invite" | "deny_invite"
+	type InviteMessage = { AuthorId: number, Action: InviteAction, Nested: { Kind: InviteAction } }
+	local inviteTemplate = {
+		Messages = Scribe.ArrayOf({
+			AuthorId = Scribe.Int(0),
+			Action = Scribe.Enum("invite", { "invite", "accept_invite", "deny_invite" }),
+			Nested = { Kind = Scribe.Enum("invite", { "invite", "accept_invite", "deny_invite" }) },
+		}),
+		Latest = {
+			AuthorId = Scribe.Int(0),
+			Action = Scribe.Enum("invite", { "invite", "accept_invite", "deny_invite" }),
+			Nested = { Kind = Scribe.String("") },
+		},
+	}
+	local function narrowInputs(data: Scribe.PlayerData<typeof(inviteTemplate)>, message: InviteMessage)
+		data.Messages.Insert(message)
+		data.Messages.RemoveValue(message)
+		local _found: number? = data.Messages.Find(message)
+		local _has: boolean = data.Messages.Has(message)
+		data.Latest.Set(message)
+		data.Latest.Update(function(_current)
+			return message
+		end)
+	end
+	local _ = { narrowInputs, inviteTemplate }
 	ClientData.RefreshProductInfo("VIP")
+	ClientData.Batch(function()
+		ClientData.Coins.Set(1)
+	end)
 	ClientData.Stop()
 	local _pricing = { price, priceAsync, info, infoAsync, stopObserving }
 	return rank, owns, ownsAsync, requestOk, requestOnceOk, ready, music, inCombat
@@ -637,6 +682,20 @@ local function diagnosticsUsage()
 	local recent =
 		Scribe.GetRecentLogs({ Code = "PROFILE_LOAD_FAIL", Level = "Error", Category = "Persistence", Limit = 10 })
 	local count: number = #recent
+	local unregisterAddon: () -> () = Scribe.RegisterAddon("Fixture", {
+		Ping = {
+			Run = function(args: any)
+				return args
+			end,
+		},
+		Poke = {
+			Run = function()
+				return 1
+			end,
+			Writes = true,
+		},
+	})
+	unregisterAddon()
 	Scribe.AddLogSink(function(entry)
 		if entry.Code == "PROFILE_SIZE" or entry.Level == "Fatal" then
 			local _cat: Scribe.LogCategory = entry.Category
@@ -797,8 +856,41 @@ local function signalSurface()
 	Data.OnOwnershipChanged:Connect(function(_player: Player, _key: string, _owned: boolean) end)
 end
 
+local function telemetryUsage()
+	local ScribeTelemetry = require(script.Parent.Parent.Addons.Telemetry.ScribeTelemetry)
+	local telemetry = ScribeTelemetry.Start(Scribe, {
+		Webhooks = {
+			Alerts = {
+				Url = "https://discord.com/api/webhooks/1/token",
+				Mention = { RoleId = "123", On = { "Fatal", "Outage" }, Cooldown = 60 },
+			},
+			Health = { Url = "https://api.example.com/telemetry", Enabled = true },
+		},
+		Default = "Alerts",
+		Routes = { Health = "Health", Summaries = false, Performance = { "Alerts", "Health" } },
+		Warnings = { Include = { "PROFILE_SIZE" } },
+		Summaries = { Enabled = true, Interval = 600 },
+		Performance = { Rules = { SlowSaves = { Threshold = 2 } } },
+		Limits = { MaxQueued = 100 },
+		Environment = "staging",
+	})
+	local ok: boolean, reason: string? = telemetry:Test("Alerts")
+	local previewed: boolean, previewWhy: string? = telemetry:Preview("Alerts", "Outage")
+	local everything: boolean = telemetry:Preview("Alerts")
+	local drained: boolean = telemetry:Flush(5)
+	local stats = telemetry:GetStats()
+	local queued: number = stats.Queued
+	local previews: number = stats.Previews
+	local overflow: number = stats.Dropped.Overflow
+	local alerts = stats.Destinations.Alerts
+	local state: string? = if alerts then alerts.State else nil
+	telemetry:Stop()
+	return ok, reason, drained, queued, overflow, state, previewed, previewWhy, everything, previews
+end
+
 return {
 	serverUsage = serverUsage,
+	telemetryUsage = telemetryUsage,
 	clientUsage = clientUsage,
 	diagnosticsUsage = diagnosticsUsage,
 	typedApis = typedApis,

@@ -15,6 +15,7 @@ local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
 local Signal = require(Internal.Signal)
 local Failure = require(Internal.Failure)
+local Addons = require(Internal.Addons)
 
 local Persistence = require(script.Persistence)
 local Replication = require(script.Replication)
@@ -34,6 +35,9 @@ local Server = {}
 function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	local ctx = {} :: any
 	ctx.Options = options
+	Addons.SetProfileKeyPrefix(
+		if type(options.ProfileKeyPrefix) == "string" then options.ProfileKeyPrefix else "PLAYER_"
+	)
 	ctx.Compiled = compiled
 	-- Studio by default. Overridable because patching RunService is illegal on a real
 	-- service Instance, so a spec needing DevMode could not otherwise run in Studio.
@@ -195,7 +199,19 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		waiting up to `timeout` seconds (default 60). On failure returns `(nil, reason)`,
 		so always handle the `nil` branch. This is the safe way to read in `PlayerAdded`.
 
-		`reason` is one of seven values, exported as the `Scribe.LifecycleReason` type
+		**Before calling:** require your shared data module on the server. Handle a
+		missing result before using any fields:
+
+		```lua
+		local data, reason = Data.WaitForData(player)
+		if not data then
+		    warn("Data unavailable:", reason)
+		    return
+		end
+		print(data.Coins.Get())
+		```
+
+		`reason` is exported as the `Scribe.LifecycleReason` type
 		and the `Scribe.Reason` table so you can branch without guessing at spellings:
 
 		| Reason | Meaning | Retryable |
@@ -204,6 +220,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		| `still-loading` | The wait elapsed while the load was **still in flight**. Nothing has failed; call again, or read [Server.GetState] to watch it. | yes |
 		| `timeout` | The wait elapsed and Scribe has no session for this player at all, usually because the bundle was constructed after they joined. | no |
 		| `load-failed` | The profile could not be loaded. | no |
+		| `erasing` | This player's profile is being erased; joining is refused until the erase completes. | after the erase completes |
 		| `migration-failed` | A migration errored, so the profile was released unmigrated. | no |
 		| `session-ended` | The session ended while the player was still in game. | no |
 		| `shutdown` | The server is closing. | no |
@@ -314,11 +331,27 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param player Player
 		@param opts { Force: boolean?, Timeout: number? }?
 		@return boolean
-		Forces a save now instead of waiting for the next autosave. Call it right
-		after a grant or purchase. `Force = true` also pushes through a blocked
-		wipe-guard save. `Timeout` bounds the wait for save confirmation in
-		seconds (default 15); on timeout Flush returns `false`, though the save
-		may still complete afterwards.
+		Saves this player's pending changes and waits for confirmation.
+
+		**Requires:** a Ready profile; use [Server.WaitForData] first. A profile
+		that is not Ready returns `false` without starting a save.
+
+		```lua
+		local saved = Data.Flush(player)
+		if not saved then
+		    warn("Save not confirmed; keep the operation pending")
+		end
+		```
+
+		| Result | What to do |
+		| --- | --- |
+		| `true` | The save is confirmed, or this profile was already saved. |
+		| `false` | Check save state or retry the flush. A timed-out save can still finish; do not repeat the grant or undo it. |
+
+		`Timeout` limits the confirmation wait in seconds (default 15), not the
+		save itself. `Force = true` bypasses a blocked wipe guard as well as the
+		already-saved shortcut. Reserve it for a deliberate recovery operation;
+		ordinary grants and checkpoints should use `Data.Flush(player)`.
 
 		When the profile is already on disk (nothing written since the last save,
 		no save still in flight, and that save succeeded), this returns `true`
@@ -352,9 +385,13 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@yields
 		@param userId number
 		@return { [string]: any }?
-		Reads a profile that is not on this server (offline, or another server),
-		or `nil` if it doesn't exist. Read-only. Use [Server.UpdateOffline] to
-		write.
+		Returns a read-only snapshot of a user's raw profile data. For a Ready
+		player on this server, it clones the live data. Otherwise it reads the
+		last saved data, which may be older than another server's live session.
+
+		**Returns:** the data table, or `nil` if the profile is missing or the read
+		failed. Check the `OFFLINE_READ_FAIL` log before treating `nil` as proof
+		that no profile exists. Use [Server.UpdateOffline] to save an offline edit.
 	]=]
 	function Data.GetOffline(userId: number)
 		return ctx.Persistence.GetOffline(userId)
@@ -366,27 +403,68 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@yields
 		@param userId number
 		@param fn (data: { [string]: any }) -> ()
-		@return (boolean, string?)
-		Mutates an offline profile's raw data. Your callback runs against a copy and
+		@param options { Validate: boolean? }?
+		@return (boolean, string?, { { Path: { string | number }, Kind: string, Detail: string } }?)
+		Edits an existing offline profile and saves the result.
+
+		**Requires:** the player must be offline on every server. The callback
+		receives a plain data table, not the live field methods returned by
+		[Server.WaitForData]. Prefer `{ Validate = true }` for routine edits.
+
+		```lua
+		local ok, reason, findings = Data.UpdateOffline(userId, function(data)
+		    data.Coins = 100 -- example: set a field declared by your template
+		end, { Validate = true })
+		if not ok then
+		    warn("Offline edit refused:", reason)
+		end
+		```
+
+		| Return | Meaning |
+		| --- | --- |
+		| `ok` | `true` when the edit was saved; `false` on a refusal or error. |
+		| `reason` | Explanation of an unsuccessful edit, otherwise `nil`. |
+		| `findings` | Optional validation details, each with `Path`, `Kind`, and `Detail`. |
+
+		**Concurrent changes:** your callback runs against a copy and
 		may yield for as long as it likes, and the commit is a compare-and-set: the
 		write lands only if, at that instant, the profile is still free of a live
 		session **and** still byte-for-byte the one your callback was handed. **A
 		refusal writes nothing at all**, not even a key version.
 
-		Three reasons come back: `"profile does not exist"`, since it cannot create
+		By default the callback's result is checked only for what the DataStore cannot
+		store. `{ Validate = true }` also checks **the change** against the template.
+		It rejects invalid changes rather than clamping or repairing them: a type,
+		bound, member or size the callback got wrong
+		refuses with the offending path in the reason and the findings as a third
+		return (`{ Path, Kind, Detail }` each). A field that was already wrong before
+		the callback ran passes through as long as the callback left it alone, so one
+		legacy field cannot block an unrelated edit; changing it, or growing a container
+		already over its cap, is the callback's doing and refuses. A profile carrying
+		256 or more violations is refused outright rather than compared. Validation
+		also refuses a change under the reserved `_Scribe` root, a write to a derived or
+		`Scribe.Session` field, and, before the callback runs, a profile whose schema
+		version is not this build's. None of those refusals counts against service
+		health.
+
+		Common refusals include `"profile does not exist"`, since it cannot create
 		one; `"profile has an active session on another server"`, because it fails
 		closed rather than stealing a live lock; and `"profile changed while the
 		update was being prepared"`, meaning something else wrote the key first.
-		Nothing was written in any of them, so retrying the last against a fresh read
-		is always safe, and is the right response.
+		These refusals write nothing. For the changed-profile refusal, call again
+		to prepare the edit from fresh data. Keep external side effects out of the
+		callback so repeating it does not repeat a payment or other unrelated action.
+		A session on this server, validation errors, callback errors, and store
+		failures also return `false`; the examples above are not an exhaustive list.
 
 		A session whose last write is older than the store's dead-session threshold
 		counts as dead and the write proceeds, so a crashed server cannot lock a
 		profile out forever. [Offline Profiles](../profiles.md) covers the threshold
 		and the custom-store caveat.
 	]=]
-	function Data.UpdateOffline(userId: number, fn: (data: any) -> ())
-		return ctx.Persistence.UpdateOffline(userId, fn)
+	function Data.UpdateOffline(userId: number, fn: (data: any) -> (), opts: { Validate: boolean? }?)
+		checkOptions(opts, "Data.UpdateOffline", { Validate = true })
+		return ctx.Persistence.UpdateOffline(userId, fn, opts)
 	end
 	--[=[
 		@within Server
@@ -450,8 +528,23 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@yields
 		@param userId number
 		@return (boolean, string?)
-		GDPR right-to-erasure: removes the profile and the user's leaderboard
-		entries. Returns `(false, reason)` if any part failed so you can retry.
+		Deletes a user's profile and their leaderboard entries.
+
+		**Requires:** no live session for this user on any server. While the erase
+		is in progress, this user's joins are held or refused; other players can
+		join normally. A long leaderboard history can take multiple attempts.
+
+		```lua
+		local ok, reason = Data.Erase(userId)
+		if not ok then
+		    warn("Erase incomplete; inspect the reason before retrying:", reason)
+		end
+		```
+
+		**Returns:** `(true, nil)` on completion, or `(false, reason)` when it
+		cannot finish. Retrying the same user resumes recorded cleanup progress.
+		The profile's erase marker keeps joins blocked until cleanup completes.
+		See [Offline Profiles](../profiles.md) for retry and recovery details.
 	]=]
 	function Data.Erase(userId: number)
 		return ctx.Persistence.Erase(userId)
@@ -535,11 +628,10 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		| `Qty` | `{ Path = { "Coins" }, Kind = "Qty", Amount = n }` | An amount of a bounded `Scribe.Int` |
 		| `Stack` | `{ Path = { "Inventory" }, Kind = "Stack", Key = itemId, Amount = n }` | Part of one stacked entry |
 
-		Every path must be declared in the `Exchangeable` option. That list is proved safe
-		to move at startup, and every leg of both baskets is checked against it, by path
-		AND by kind, before a slot is claimed or any value moves. So a basket may be
-		built straight from what a client asked for: the worst a client can name is a
-		refusal that costs nothing.
+		Declare every path in `Exchangeable`. Scribe checks those declarations at startup
+		and checks each requested path and kind before claiming a slot or moving value.
+		Your server must still verify both players' consent and your game's trading rules
+		before calling `Attempt`. A structurally valid basket is not permission to trade.
 
 		```lua
 		local outcome, why = Data.Exchange.Attempt(alice, {
@@ -553,15 +645,17 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		end
 		```
 
-		`"Aborted"` is a completed operation, not a failure to clean up after: every basket
-		has been returned to its owner. A `nil` outcome is either a refusal before anything
-		moved, or an attempt that could not establish a verdict, and the reason says which.
+		`"Committed"` means each basket is owed to the other player. `"Aborted"` means
+		it is owed back to its original owner. These report the verdict; a delivery that
+		cannot fit may still be pending. Check `Exchange.Open` for open records.
+		A `nil` outcome means either an early refusal or an unknown verdict; inspect the
+		reason and open records. Do not manually refund an unresolved exchange.
 
-		**What this guarantees, stated exactly.** Atomic commit at a single verdict key.
-		ZERO isolation across the two profiles. Conservation without a bounded resolution
-		time: nothing is ever duplicated or destroyed, but an exchange interrupted at the
-		wrong moment can take until the next load to finish. The attempt itself IS
-		bounded and cancels rather than hanging.
+		Both profiles follow one stored verdict, but their changes are not isolated:
+		players can see value held in escrow while work is pending. Pending value stays
+		recorded rather than being dropped or granted twice. Recovery has no fixed time
+		limit. The attempt checks a deadline between stages, but storage calls can take
+		longer, so the deadline is not a guaranteed return time.
 
 		[Exchange](../exchange.md) covers the whole model, including what a player sees
 		while an exchange is in flight.
@@ -659,12 +753,17 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@server
 		@param name string
 		@param limit number?
+		@param offset number?
 		@return { LeaderboardEntry }
-		The cached top-N of an all-time board (`{ Rank, UserId, Name, Score }`).
-		Never triggers a live OrderedDataStore read.
+		The cached top-N of a board (`{ Rank, UserId, Name, Score }`). Never triggers a
+		live OrderedDataStore read.
+
+		`offset` is `0` for the current period and `-1` for the previous one, which a
+		periodic board reads once just after it rolls over. A lifetime or server board
+		has no previous period and answers an empty list for it.
 	]=]
-	function Data.GetLeaderboard(name: string, limit: number?)
-		return ctx.Leaderboards.GetLeaderboard(name, limit)
+	function Data.GetLeaderboard(name: string, limit: number?, offset: number?)
+		return ctx.Leaderboards.GetLeaderboard(name, limit, offset)
 	end
 	--[=[
 		@within Server
@@ -677,6 +776,34 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 	]=]
 	function Data.GetMyRank(player: Player, name: string)
 		return ctx.Leaderboards.GetMyRank(player, name)
+	end
+	--[=[
+		@within Server
+		@tag Leaderboards
+		@server
+		@param name string
+		@return number?
+		Seconds until a board next reads its store, for a "refreshes in" label. `0` while
+		a due refresh is waiting on the request budget. `nil` for a name that is not a
+		board, and until the refresh loop has scheduled its first cycle, a few seconds
+		after boot.
+	]=]
+	function Data.GetLeaderboardRefreshIn(name: string): number?
+		return ctx.Leaderboards.GetRefreshIn(name)
+	end
+	--[=[
+		@within Server
+		@tag Leaderboards
+		@server
+		@param name string
+		@return number?
+		Seconds until a periodic board's current period ends on the `PeriodReset` clock,
+		for a "resets in" label. Always above zero: at the instant of rollover the next
+		period has begun. `nil` for a board with no `Period`, and for a name that is not
+		a board.
+	]=]
+	function Data.GetLeaderboardResetIn(name: string): number?
+		return ctx.Leaderboards.GetResetIn(name)
 	end
 
 	--[=[
@@ -762,7 +889,8 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		Prompts `buyer` to gift a product's perk to `recipientUserId`. Records a
 		durable intent *before* money moves; delivery survives cross-server hops
 		and offline recipients, and a held gift credit is consumed with no charge.
-		Returns `(false, reason)` if the gift can't proceed.
+		Returns `(false, reason)` if the gift can't proceed. `reason` is a [Scribe.GiftReason]
+		sentence; every member but `InvalidRecipient` can be shown to the buyer as it is.
 	]=]
 	function Data.PromptGift(buyer: Player, productName: string, recipientUserId: number)
 		return ctx.Monetization.PromptGift(buyer, productName, recipientUserId)
@@ -923,6 +1051,10 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		An optional `IdempotencyKey` (up to 64 bytes, valid UTF-8) makes the purchase a
 		once-guard: a repeat under that key answers what the first call answered and
 		spends nothing. [Monetization](../monetization.md) covers claims and reasons.
+
+		`reason` is a [Scribe.PurchaseReason] sentence. `InsufficientFunds`, `DataNotLoaded`
+		and the two paid-random members can be shown to the player; the four `Cost`
+		refusals mean the call is wrong, and belong in a log.
 	]=]
 	function Data.Purchase(player: Player, spec: any)
 		return ctx.Monetization.Purchase(player, spec)
@@ -1206,6 +1338,10 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		that is what the idempotent payload above is for.
 	]=]
 	function Data.SendMessage(userId: number, message: any): boolean
+		if ctx.Persistence.Mode == "NoSave" then
+			ctx.Persistence.RefuseNoSave("SendMessage")
+			return false
+		end
 		-- `provablyClean` is MessageAsync's third return: true only where no attempt in
 		-- its own retry loop could have written. Read for the log line alone; the boolean
 		-- this function returns is unchanged.
@@ -1459,12 +1595,13 @@ end
 function Server.new(options: any, compiled: Template.Compiled): any
 	local Data, ctx = Server.build(options, compiled)
 
-	-- Studio-only debug hook for the Scribe Studio companion plugin. The remover Attach
-	-- hands back is kept: it releases a Log sink and a Health.OnStatusChanged listener,
-	-- both library-level singletons that outlive the bundle, and ends the digest pump.
-	-- Nil on the refusal and pcall failure paths, and Stop below tolerates both.
+	-- Studio-only debug hook for the Scribe Studio plugin, opt-in because it records from
+	-- the moment it attaches, plugin or not. The remover Attach hands back is kept: it
+	-- releases a Log sink and a Health.OnStatusChanged listener, both library-level
+	-- singletons that outlive the bundle, and ends the digest pump. Nil on the refusal
+	-- and pcall failure paths, and Stop below tolerates both.
 	local detachDebugHook: (() -> ())? = nil
-	if RunService:IsStudio() then
+	if options.StudioHook == true and RunService:IsStudio() then
 		local ok, err = pcall(function()
 			detachDebugHook = (require(script.DebugHook) :: any).Attach(Data, ctx)
 		end)

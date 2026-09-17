@@ -58,14 +58,19 @@ type Registered = {
 	Handler: Handler,
 	Args: { any }?, -- type strings and/or shape tables
 	Idempotent: boolean, -- requires a per-call key, and runs at most once per key
+	ActiveMetric: string,
+	DurationMetric: string,
+	ErrorMetric: string,
 }
+-- Open calls per name, across bundles: the gauge is one metric per name.
+local activeByName: { [string]: number } = {}
 -- One in-flight or settled call under an idempotency key.
 type IdemRecord = {
 	CacheKey: string,
 	At: number, -- Clock.Monotonic() at creation; drives expiry and eviction order
 	Done: boolean,
 	Ok: boolean,
-	Results: { any }?, -- the packed reply, `.n` intact (see settleIdempotent)
+	Reply: buffer?, -- the encoded reply, re-sent on a replay
 	Waiters: { number }, -- correlations of duplicates that arrived while in flight
 }
 
@@ -185,6 +190,10 @@ function Commands.new(ctx: any)
 			Handler = fn,
 			Args = args,
 			Idempotent = idempotent == true,
+			-- Built once; names are bounded by registration.
+			ActiveMetric = `CommandActive:{name}`,
+			DurationMetric = `CommandDuration:{name}`,
+			ErrorMetric = `CommandErrors:{name}`,
 		}
 	end
 
@@ -203,14 +212,12 @@ function Commands.new(ctx: any)
 		return Wire.Finish(w)
 	end
 
-	-- Send one reply frame. `replayed` marks a reply reconstructed from the idempotency
-	-- cache and suppresses the truncation warning only: the handler ran once, and a client
-	-- may repeat a key indefinitely, which would be an unthrottled path into the log ring.
-	local function reply(entry: any, correlation: number, ok: boolean, results: { any }, replayed: boolean?)
+	-- Send one reply frame; returns the bytes sent.
+	local function reply(entry: any, correlation: number, ok: boolean, results: { any }): buffer
 		-- encodeReply clamps to MAX_RETURNS, and the caller just sees trailing nils, so
 		-- say so. Only meaningful on success; failure replies are single-value.
 		local resultCount = (results :: any).n or #results
-		if ok and not replayed and resultCount > MAX_RETURNS then
+		if ok and resultCount > MAX_RETURNS then
 			Log.Warn(
 				"Commands",
 				"COMMAND_REPLY_TRUNCATED",
@@ -226,6 +233,15 @@ function Commands.new(ctx: any)
 			bytes = encodeReply(correlation, false, { "reply-encode-failed" })
 		end
 		ctx.Replication.SendTo(entry, bytes)
+		return bytes
+	end
+
+	-- A copy of a settled reply with the header's correlation overwritten.
+	local function replay(entry: any, correlation: number, bytes: buffer)
+		local copy = buffer.create(buffer.len(bytes))
+		buffer.copy(copy, 0, bytes)
+		buffer.writeu32(copy, 1, correlation)
+		ctx.Replication.SendTo(entry, copy)
 	end
 
 	-- Idempotency cache --------------------------------------------------------
@@ -248,7 +264,7 @@ function Commands.new(ctx: any)
 
 	-- Finish an in-flight record: answer every duplicate parked on it, and decide
 	-- whether it survives to answer later retries.
-	local function settleIdempotent(entry: any, record: IdemRecord?, ok: boolean, results: { any })
+	local function settleIdempotent(entry: any, record: IdemRecord?, ok: boolean, bytes: buffer)
 		if record == nil then
 			return
 		end
@@ -256,9 +272,7 @@ function Commands.new(ctx: any)
 		record.Waiters = {}
 		record.Done = true
 		record.Ok = ok
-		-- Stored as is, still packed: `.n` is the true arity and the only thing that
-		-- survives an embedded nil, so a replay is identical to the original reply.
-		record.Results = results
+		record.Reply = bytes
 		if not ok then
 			-- Dropped before the parked duplicates are answered. A handler that threw did
 			-- not happen, so the key stays retryable, and a synchronous transport can
@@ -269,7 +283,7 @@ function Commands.new(ctx: any)
 			end
 		end
 		for _, correlation in waiters do
-			reply(entry, correlation, ok, results, true)
+			replay(entry, correlation, bytes)
 		end
 	end
 
@@ -595,7 +609,7 @@ function Commands.new(ctx: any)
 			if existing ~= nil then
 				if existing.Done then
 					Metrics.Add("CommandsDeduped")
-					reply(entry, correlation, existing.Ok, existing.Results :: { any }, true)
+					replay(entry, correlation, existing.Reply :: buffer)
 				elseif #existing.Waiters < MAX_IDEMPOTENT_WAITERS then
 					-- Still running, so park this correlation on it; settleIdempotent
 					-- answers every duplicate when the handler returns.
@@ -652,18 +666,28 @@ function Commands.new(ctx: any)
 			end
 
 			record =
-				{ CacheKey = cacheKey, At = now, Done = false, Ok = false, Results = nil, Waiters = {} } :: IdemRecord
+				{ CacheKey = cacheKey, At = now, Done = false, Ok = false, Reply = nil, Waiters = {} } :: IdemRecord
 			store[cacheKey] = record
 		end
 
 		local results: { any } = {}
+		local active = (activeByName[name] or 0) + 1
+		activeByName[name] = active
+		Metrics.Set(registered.ActiveMetric, active)
+		local startedAt = Clock.Monotonic()
 		local ok, err = xpcall(function()
 			results = table.pack(registered.Handler(entry.Player, table.unpack(args, 1, argc))) :: any
 		end, function(e)
 			return debug.traceback(tostring(e), 2)
 		end)
+		-- Elapsed, awaits included.
+		Metrics.Observe(registered.DurationMetric, Clock.Monotonic() - startedAt)
+		active = activeByName[name] - 1
+		activeByName[name] = active
+		Metrics.Set(registered.ActiveMetric, active)
 		if not ok then
 			Metrics.Add("CommandErrors")
+			Metrics.Add(registered.ErrorMetric)
 			-- Throttled: a handler that throws on a given input is a bug the player can
 			-- replay at their full command rate, and each entry costs a JSONEncode, a
 			-- console write and a Sched.Spawn per sink. The metric above is unthrottled.
@@ -678,14 +702,11 @@ function Commands.new(ctx: any)
 					Suppressed = if suppressed > 0 then suppressed else nil,
 				})
 			end
-			local failure = { "error" }
-			reply(entry, correlation, false, failure)
-			settleIdempotent(entry, record, false, failure)
+			settleIdempotent(entry, record, false, reply(entry, correlation, false, { "error" }))
 			return
 		end
 		Metrics.Add("CommandsHandled")
-		reply(entry, correlation, true, results)
-		settleIdempotent(entry, record, true, results)
+		settleIdempotent(entry, record, true, reply(entry, correlation, true, results))
 	end
 
 	return self

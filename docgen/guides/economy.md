@@ -123,15 +123,11 @@ A dimension only reaches the dashboard if that currency lists it in `Fields`. A 
 
 For each declared field, in order, Scribe fills a pool from the shared `Resolve`, then the currency's own `Resolve`, then the per-call `Fields`. Later wins on a clash. It then records the ones the currency declares:
 
-```mermaid
-flowchart LR
-    A[global Resolve] --> P[value pool]
-    B[currency Resolve] --> P
-    C[per-call Fields] --> P
-    P --> D{declared by<br/>this currency?}
-    D -->|yes| S[CustomField01/02/03]
-    D -->|no| X[ignored]
-```
+1. **Collect values:** shared `Resolve` → currency `Resolve` → per-call `Fields`.
+   Each step replaces any matching values from the previous step.
+2. **Keep the declared fields:** ignore values that this currency does not declare.
+3. **Fill the slots:** send the declared values, in order, as
+   `CustomField01`, `CustomField02`, and `CustomField03`.
 
 ??? note "Why values are prefixed by default"
     Because the three slots are shared, two currencies can put different dimensions in the same slot. Emberfall's `Coins` puts `ItemType` in `CustomField02` while `Gems` puts `Party` there.

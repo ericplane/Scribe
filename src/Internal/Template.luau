@@ -1088,6 +1088,8 @@ local function buildInternalRoots(state: any, root: SchemaNode, config: CompileC
 		Exchange = {},
 		ExchangeInbox = {},
 		Timed = {},
+		-- Per periodic board: the gain baseline and the first period written, for the erase sweep.
+		Boards = {},
 		Version = Marker.make("Int", 1, { Min = 0 }),
 	}
 

@@ -46,7 +46,7 @@ export type Frame = { Player: any?, Bytes: buffer }
 --- refuse. Set `MaxFrameBytes` because you want a hostile transport, not because
 --- you are reproducing something the platform does; the specs that use it are
 --- defence in depth against an adapter that raises, which is a contract the repo
---- already keeps a spec for (test/Specs/InitWindow.spec.luau). See
+--- already keeps a spec for (test/Specs/replication/InitWindow.spec.luau). See
 --- test/Sim/Uncertain.luau, entry U14, for the measurement and its boundaries.
 function Link.new(config: { Name: string?, MaxFrameBytes: number?, MaxFramesPerPump: number? }?)
 	local cfg = config or {}

@@ -1,6 +1,8 @@
 # Reading & Writing Values
 
-Once a field is declared, you reach it by indexing into the player's accessor tree exactly the way you wrote the template. `data.Coins` is an **accessor**, and every read and write goes through a method on it. This page is the tour of those methods: which ones exist, which fields they apply to, and what they do that a plain table assignment would not.
+Use `Get` to read a field and `Set` to change it. For example, `data.Coins` gives you the methods for the `Coins` field in your template. This object is called an **accessor**.
+
+Start with [Getting Started](./intro) if you do not have a shared data module yet. The first example below works with its `Coins` field. Later inventory and level examples use the larger [Emberfall template](./emberfall).
 
 ## Get and Set
 
@@ -15,8 +17,6 @@ data.Coins.Set(100)           --> 100, the stored value
 data.Coins.Increment(50)      --> 150
 data.Coins.Decrement(25)      --> 125
 
-data.Inventory.Emberblade.Rarity.Set("Epic")
-data.Stats.Deaths.Increment(1)
 ```
 
 Every write is validated against the declarator before it lands, clamped if it is out of bounds, replicated to the owning client, and announced to any listener. `Set` returns the value that was actually stored, which is not always the value you passed: `data.Coins.Set(-10)` on a `{ Min = 0 }` field returns `0`.
@@ -38,6 +38,8 @@ That is the whole common case. Everything below is a method for a particular kin
 
 `Observe` calls you immediately with the current value and again on every change. `Changed` skips that first call. Both return a function that disconnects the listener.
 
+In this UI example, `coinsLabel` is a TextLabel you have created and `playLevelUpEffect` is your own effect function. Use `print(coins)` in place of the label assignment when trying it without a UI.
+
 ```lua
 -- client
 local stop = Data.Coins.Observe(function(coins)
@@ -50,6 +52,8 @@ Data.Level.Changed(function(new, old)
     end
 end)
 ```
+
+[Watch a change fire in the playground](playground.md?example=listen), including what happens after the listener disconnects.
 
 `Observe` is what you want for UI, because it removes the "what do I show before the first value arrives" question. `Changed` is what you want when only the transition matters.
 
@@ -75,8 +79,8 @@ data.Settings.Set(data.Settings.Default())  -- reset settings to the template de
 
 `Default` is read-only schema metadata, so it works on the client, on the server, and before any data has loaded. That makes it the right way to build a "reset to defaults" button, and the right way to tell whether a player has ever changed something.
 
-!!! warning "`Get` on a table hands you the stored table"
-    For a **table** field, `Get` returns the stored table itself, not a copy. Mutating it writes straight into authoritative state behind Scribe's back: no validation, no replication, and no `Changed`. The value changes on the server and even saves, and the client never hears about it.
+!!! warning "Treat tables returned by `Get` as read-only"
+    For ordinary **table** fields, `Get` returns the stored table itself. Mutating it bypasses validation, replication, and `Changed`: the server value changes and can save without the client hearing about it. Some reads return copies instead; editing those does not update the profile. Use field methods to write and `Clone` when you need an editable copy.
 
     ```lua
     -- WRONG: edits real state silently, and never replicates

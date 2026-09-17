@@ -6,14 +6,14 @@ It is the fastest way to exercise everything Scribe does without writing throwaw
 
 ## Getting started
 
-1. Open a place that initializes Scribe on the server.
+1. Open a place that initializes Scribe on the server, and set `StudioHook = true` in its Scribe options. The hook is off by default because it records every op, log line and send from the moment the bundle starts, whether or not the plugin is open, and a play-test without the plugin should not pay for that.
 2. Press **Play** or Run. The plugin discovers Scribe's Studio hook, handshakes, and attaches, **read-only by default**.
-3. To edit values, run mutating simulations, or inject receipts, flip **Enable writes** in Settings. It resets to off every session.
+3. To edit values, run mutating simulations, send a telemetry preview, or inject receipts, flip **Enable writes** in Settings. It resets to off every session.
 4. For the `script:line` column in the Changes panel, flip **Capture source attribution**. It is off by default because it costs a stack capture per write.
 
-Nothing extra is installed on the game side. Scribe ships the Studio debug hook in the box, and the plugin negotiates the protocol version with whatever hook the game speaks.
+Nothing extra is installed on the game side. Scribe ships the Studio debug hook in the box, gated by `StudioHook`, and the plugin negotiates the protocol version with whatever hook the game speaks. The option is inert outside Studio, so it can stay on in a published place.
 
-In a multi-client test the full toolset lives in the **server** view. Switching to the **client** view attaches to Scribe's read-only client hook, so you can confirm exactly what one client received.
+In a multi-client test the full toolset lives in the **server** view. Switching to the **client** view attaches to Scribe's read-only client hook, so you can confirm exactly what one client received, and read what its mirror updates cost it under Diagnostics.
 
 ## Panels
 
@@ -21,7 +21,7 @@ In a multi-client test the full toolset lives in the **server** view. Switching 
 | --- | --- | --- |
 | **Sessions** | Live player list with load state, profile size against the 4 MB ceiling, dirty flag, and save results, plus a virtualized data tree with visibility and declarator badges, search, and flash-on-change. One click turns a session into a `Data.Mock(...)` snapshot, and Compare diffs player against player or against defaults. | Play |
 | **Changes** | Filterable feed of every replication op, old value to new, with `script:line` attribution, open-at-line, export, and watch expressions. Time travel scrubs a slider to reconstruct any player's state at any past op, diffed against now. | Play |
-| **Diagnostics** | Health machine with transition history, per-second metric graphs, the log ring buffer with filters, simulation buttons for Degraded, Outage, load failure and session steal, and a flight recorder that saves whole sessions for replay in edit mode. | Play |
+| **Diagnostics** | Health machine with transition history, per-second metric graphs, a distributions table with every percentile and the samples, age and window behind it, a per-command table (elapsed per call, calls open, throws), outbound bytes by frame kind, the log ring buffer with filters, simulation buttons for Degraded, Outage, load failure and session steal, and a flight recorder that saves whole sessions for replay in edit mode. In the client view it shows that client's own metrics instead: apply timers, diffs applied, request timeouts by command. | Play |
 | **Bandwidth** | Real per-flush byte counts over time, the chattiest paths by field with their wire widths, and advisories. | Play |
 | **Commands** | Every `Data.Command` registration with an argument form generated from its spec. Invoke as any session player and see the return values, errors, and duration. | Play |
 | **Boards** | Leaderboard cached entries, per-player ranks, write-queue depth, refresh from store, and a gated queue flush. | Play |
@@ -40,7 +40,7 @@ Watching Emberfall in the Sessions panel is the quickest way to confirm that `Le
 ??? note "Why editing real data here is safe to allow"
     Editing production data is a serious capability, so the plugin is built so that you do not have to take its word for anything.
 
-    Nothing leaves your machine. There is no telemetry.
+    Nothing leaves your machine unless you ask it to. The plugin itself has no telemetry; its one outbound action, sending a telemetry preview to a webhook you configured, sits behind the write toggle.
 
     There are no privileged writes. Every plugin-initiated change goes through Scribe's normal server accessor API, so validation, bounds, logging, and replication all apply, exactly as they would for a write from your own game code. Writes require an explicit per-session opt-in and are attributed as `Source = "ScribeStudio"` in the change feed, so you can always tell them apart later.
 

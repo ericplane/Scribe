@@ -64,8 +64,11 @@ export type LogCode =
 	| "MODE_OVERRIDES_LEGACY"
 	| "OFFLINE_READ_FAIL"
 	| "OFFLINE_WRITE_FAIL"
+	| "NOSAVE_WRITE_REFUSED"
 	| "PROFILE_ERASED"
 	| "PROFILE_ERASE_FAIL"
+	| "PROFILE_ERASE_PROGRESS_FAIL"
+	| "PROFILE_ERASE_RESUMED"
 	| "PROFILE_LOADED"
 	| "PROFILE_LOAD_FAIL"
 	| "PROFILE_RESET"
@@ -248,6 +251,7 @@ export type SessionState = "Loading" | "Ready" | "SessionEnded"
 export type LifecycleReason =
 	"load-failed" -- the profile could not be loaded (DataStore failure, or the session could not be acquired)
 	| "migration-failed" -- a migration step errored, so the profile was released unmigrated (fail-closed)
+	| "erasing" -- the profile is being erased, so the join was refused to let the erase finish
 	| "session-ended" -- the session ended while the player was still in the game (usually stolen by another server)
 	| "player-left" -- the player left; the most common reason by far
 	| "shutdown" -- the server is closing
@@ -285,8 +289,8 @@ export type PurchaseReason =
 	| "invalid cost path"
 	| "cost path is not a spendable number"
 	| "insufficient funds"
-	| "paid-random-restricted"
-	| "policy-pending"
+	| "paid random items are not available for this account"
+	| "cannot check account settings right now; try again in a moment"
 
 -- The fixed refusals of Data.PromptGift. Two more are interpolated (`unknown
 -- product "<name>"` and `purchase prompt failed: <err>`) and cannot be members.
@@ -309,8 +313,8 @@ export type GiftReason =
 	| "gift delivery could not be confirmed; do not send it again"
 	| "a gift of this item is already pending; try again shortly"
 	| "could not record gift intent; try again later"
-	| "paid-random-restricted"
-	| "policy-pending"
+	| "paid random items are not available for this account"
+	| "cannot check account settings right now; try again in a moment"
 
 export type SaveInfo = {
 	LastSaveAt: number?,
@@ -346,6 +350,9 @@ export type LeaderboardConfig = {
 	Scale: number?,
 	SigFigs: number?, -- Scribe.Big stats only: ranking-key significant figures, 1 to 15 (default 12)
 	Replicate: boolean?, -- default false: server-only (Data.GetLeaderboard on the server); true streams the board to clients
+	Period: ("Daily" | "Weekly")?, -- a board that resets; nil is lifetime
+	Mode: ("Gain" | "Peak")?, -- with Period: rank the gain since it began (default) or the peak seen in it
+	Scope: ("Global" | "Server")?, -- "Server" ranks the players on this server, with no store behind it
 }
 
 export type ProductConfig = {

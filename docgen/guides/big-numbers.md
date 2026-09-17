@@ -13,6 +13,8 @@ Essence = Scribe.Big(0, { Min = 0 }),
 Banked  = Scribe.Big(0, { Min = 0 }),   -- Essence carried across a prestige reset
 ```
 
+[Count past the number limit in the playground](playground.md?example=big) and see how `Scribe.Short` renders it.
+
 Neither field is in the base Emberfall template on [Getting Started](./getting-started). They are the prestige slice, and they are the only two big fields in the game.
 
 ```lua

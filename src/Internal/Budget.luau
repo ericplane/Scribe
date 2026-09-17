@@ -10,9 +10,16 @@ local Defaults = require(script.Parent.Defaults)
 local Budget = {}
 
 -- The request types Scribe's own traffic spends. Saves ride UpdateAsync;
--- leaderboards ride the two Sorted pools, which are a separate allowance, so
--- gating a leaderboard write can never starve a save.
-local REQUEST_TYPES = { "GetAsync", "SetIncrementAsync", "UpdateAsync", "GetSortedAsync", "SetIncrementSortedAsync" }
+-- leaderboards ride the two Sorted pools and OrderedRemove, which are separate
+-- allowances, so gating a leaderboard write can never starve a save.
+local REQUEST_TYPES = {
+	"GetAsync",
+	"SetIncrementAsync",
+	"UpdateAsync",
+	"GetSortedAsync",
+	"SetIncrementSortedAsync",
+	"OrderedRemove",
+}
 
 export type Snapshot = {
 	Available: boolean, -- false when the engine could not be asked at all

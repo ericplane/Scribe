@@ -1,0 +1,9 @@
+{
+  "name": "ScribeUIAdapters",
+  "tree": {
+    "$className": "Folder",
+    "ScribeVide": { "$path": "../addons/ui/ScribeVide.luau" },
+    "ScribeReact": { "$path": "../addons/ui/ScribeReact.luau" },
+    "ScribeFusion": { "$path": "../addons/ui/ScribeFusion.luau" }
+  }
+}

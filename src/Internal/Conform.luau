@@ -255,7 +255,10 @@ local function checkContainer(walk: Walk, node: Template.SchemaNode, value: any,
 				maxIndex = key
 			end
 		elseif maxKeyLength ~= nil and type(key) == "string" and #key > maxKeyLength then
+			-- Each offending key is its own finding.
+			table.insert(path, key)
 			record(walk, path, "OverMaxLength", `key "{key}" is {#key} bytes, over MaxKeyLength {maxKeyLength}`, true)
+			table.remove(path)
 		end
 	end
 

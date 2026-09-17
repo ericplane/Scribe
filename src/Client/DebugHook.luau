@@ -19,14 +19,16 @@ local Template = require(Internal.Template)
 local Datatypes = require(Internal.Datatypes)
 local Health = require(Internal.Health)
 local Log = require(Internal.Log)
+local Metrics = require(Internal.Metrics)
 
 local ClientDebugHook = {}
 
 -- Versioned independently of the server hook: the two attach separately.
-ClientDebugHook.PROTOCOL_VERSION = 1
+ClientDebugHook.PROTOCOL_VERSION = 2
 ClientDebugHook.CONTAINER_NAME = "_ScribeClientDebugHook"
 
 local OPS_FLUSH_HZ = 8
+local METRICS_HZ = 1
 local RECENT_OPS_CAP = 1000
 local MAX_BATCH = 512
 local MAX_TREE_NODES = 2000
@@ -293,7 +295,7 @@ function ClientDebugHook.Attach(deps: any)
 
 	function handlers.SetSubscriptions(args: any): any
 		local had: { [string]: boolean } = {}
-		for _, stream in { "Ops", "Status" } do
+		for _, stream in { "Ops", "Status", "Metrics" } do
 			had[stream] = subscriptions[stream] == true
 			subscriptions[stream] = args[stream] == true
 			if not subscriptions[stream] and pending[stream] then
@@ -366,6 +368,17 @@ function ClientDebugHook.Attach(deps: any)
 		return { Ok = true, Hash = compiled.Hash, NodeCount = compiled.NodeCount, Nodes = nodes }
 	end
 
+	-- Same shape as the server hook's.
+	function handlers.GetMetrics(_args: any): any
+		return {
+			Ok = true,
+			T = os.clock(),
+			Metrics = Metrics.Get(),
+			Percentiles = Metrics.GetPercentiles(),
+			Status = Health.GetStatus(),
+		}
+	end
+
 	function handlers.GetStatusInfo(_args: any): any
 		return { Ok = true, Status = Health.GetStatus(), History = statusHistory }
 	end
@@ -409,13 +422,33 @@ function ClientDebugHook.Attach(deps: any)
 
 	container.Parent = ReplicatedStorage
 
-	-- Digest pump.
+	-- Digest pump; metrics ticks fire directly at 1 Hz.
 	task.spawn(function()
+		local lastMetrics = 0
+		local metricSeq = 0
 		while container.Parent ~= nil do
 			task.wait(1 / OPS_FLUSH_HZ)
 			pcall(function()
 				flushStream("Ops")
 				flushStream("Status")
+				local now = os.clock()
+				if subscriptions.Metrics and now - lastMetrics >= 1 / METRICS_HZ then
+					lastMetrics = now
+					metricSeq += 1
+					streamEv:Fire(
+						"Metrics",
+						encode({
+							{
+								MetricSeq = metricSeq,
+								T = now,
+								WallAt = os.time(),
+								Status = Health.GetStatus(),
+								Metrics = Metrics.Get(),
+								Percentiles = Metrics.GetPercentiles(),
+							},
+						})
+					)
+				end
 			end)
 		end
 	end)

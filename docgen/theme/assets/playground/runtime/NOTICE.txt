@@ -1,0 +1,38 @@
+Scribe documentation playground runtime
+=======================================
+
+luau-web 1.4.0
+Author: xNasuni
+Source: https://github.com/xNasuni/luau-web
+Package: https://www.npmjs.com/package/luau-web/v/1.4.0
+License: MIT, as declared in the original upstream-package.json.
+
+The upstream npm package does not include a separate LICENSE file for its
+JavaScript bindings. The original package manifest is retained alongside this
+notice. See the MIT permission and warranty terms in LICENSE-LUAU.txt.
+
+The local loader is adapted from upstream src/index.js: it always selects the
+Asyncify build and uses local .mjs import names. One worker-environment refusal
+assertion is removed from the generated Asyncify host script; its existing
+DOM-free WEB||WORKER branch is used. The embedded WebAssembly payload is unchanged.
+These adaptations do not change Scribe's validation or accessor behavior.
+
+Luau / Luau Interop
+Source: https://github.com/xNasuni/luau-interop
+Original project: https://github.com/luau-lang/luau
+License and copyright notices: LICENSE-LUAU.txt
+
+Lua
+Source: https://www.lua.org/
+License and copyright notices: LICENSE-LUA.txt
+
+Emscripten runtime
+Source: https://github.com/emscripten-core/emscripten
+License and copyright notices: LICENSE-EMSCRIPTEN.txt
+Emscripten is available under MIT or University of Illinois/NCSA terms; both
+original texts are preserved in that file.
+
+PROVENANCE.json records source URLs, the exact npm source commit, and SHA-256
+checksums of each vendored artifact. Scribe's generated runtime.luau comes from
+the Scribe source used for this documentation build; metadata.json contains its
+release version and complete source digest.

@@ -1,8 +1,8 @@
 # Session Lifecycle
 
-A player's profile does not exist the instant they join. Scribe has to fetch it from a DataStore, reconcile it against your template, and take a session lock on it, and all of that takes time. Knowing that sequence is the difference between smooth joins and a mysterious "data for Ava is Loading" error.
+A player's data takes time to load. Wait for it before reading or writing on the server. After that, Scribe autosaves it and saves again when the player leaves.
 
-This page follows one session from the moment a player arrives to the moment their last save lands.
+Start with [waiting for data](#waiting-for-data), [client readiness](#on-the-client), and [saving](#saving). The later sections cover startup hooks, migrations, and shutdown behavior when your game needs them. Examples use the shared module from [Getting Started](./intro) and the expanded [Emberfall template](./emberfall).
 
 ## Waiting for data
 
@@ -39,19 +39,20 @@ Once a session is Ready, `Data[player]` and [`Data.Get(player)`](/api/Server#Get
 
 ## When there is no data
 
-`reason` is one of exactly seven values, available as the `Scribe.LifecycleReason` type and the `Scribe.Reason` constants table. The `SessionEnded` signal carries the same set.
+`reason` comes from the `Scribe.LifecycleReason` type and the `Scribe.Reason` constants table. The `SessionEnded` signal carries the same set:
 
 | Reason | `Scribe.Reason` | Meaning | Retry? |
 | --- | --- | --- | --- |
 | `player-left` | `PlayerLeft` | The player left. By far the most common, and usually not an error. | no |
 | `still-loading` | `StillLoading` | The wait elapsed while the load was **still in flight**. Nothing has failed. | **yes** |
+| `erasing` | `Erasing` | The profile is being erased, so the join was refused to let the erase finish. The player was told to rejoin later. | later |
 | `timeout` | `Timeout` | The wait elapsed and Scribe has no session for this player at all. | no |
 | `load-failed` | `LoadFailed` | The profile could not be loaded. | no |
 | `migration-failed` | `MigrationFailed` | A migration errored, so the profile was released unmigrated. | no |
 | `session-ended` | `SessionEnded` | The session ended while the player was still in game. | no |
 | `shutdown` | `Shutdown` | The server is closing. | no |
 
-Only one of them is worth retrying:
+Retry `still-loading` while the player remains in the game. An `erasing` player should rejoin after the erase finishes:
 
 ```lua
 local data, reason = Data.WaitForData(player)
@@ -63,9 +64,7 @@ end
 ??? note "Why `still-loading` and `timeout` are different values"
     `WaitForData` waits 60 seconds by default, while a load is given [`LoadTimeout`](./configuration) seconds, 120 by default and floored at 60. So there is a band where the default wait runs out over a load that is simply taking its time and is going to succeed. A cross-server handoff waits out ProfileStore's session-steal window, about 40 seconds, and a slow DataStore stretches that further.
 
-    That band used to report `timeout`, the same value a player Scribe has no session for gets, so the two were indistinguishable. The default wait was deliberately **not** raised to match the load deadline: a bounded wait that tells you the truth is worth more than a longer one that does not, and a caller who wants to wait longer can say so.
-
-    If you branch on `timeout` today, handle `still-loading` alongside it.
+    `still-loading` tells you there is a load worth waiting for. `timeout` means this player has no session to wait on. Use a longer explicit wait only when your loading screen is prepared to keep waiting.
 
 ## On the client
 
@@ -83,6 +82,68 @@ To gate one-shot startup logic, use [`Data.IsReady()`](/api/Client#IsReady), whi
 if Data.WaitForData() then
     showMainMenu(Data.Level.Get())
 end
+```
+
+## Saving
+
+Scribe autosaves each profile every `SaveInterval` seconds, 300 by default. Lower it to shrink the window of progress a crash can cost. It also saves when a player leaves and on `BindToClose`.
+
+After a successful grant, request a save and check whether Scribe can confirm it:
+
+```lua
+local purchased, reason = Data.Purchase(player, spec)
+if not purchased then
+    warn(`Purchase refused: {reason}`)
+    return
+end
+
+if not Data.Flush(player) then
+    -- The purchase already changed the profile. Saving is not confirmed yet.
+    warn("Purchase applied; save confirmation is pending")
+    return -- retry Flush later, never repeat the grant to fix a save timeout
+end
+
+print("Purchase applied and saved")
+```
+
+[`Flush`](/api/Server#Flush) waits for save confirmation and returns `true` when it has that confirmation. An ordinary `Flush(player)` keeps the [wipe guard](./diagnostics) in place.
+
+??? warning "Use `Force` only after investigating a blocked save"
+    `Flush(player, { Force = true })` also bypasses a blocked wipe guard and requests a save even when the profile is clean. It is an administrative override, not a requirement for saving a purchase.
+
+Flushing costs nothing when there is nothing to save. If the profile has not changed since its last successful save and none is still in flight, `Flush` answers `true` straight away with no DataStore request. So flushing on a checkpoint or a timer is cheap, and flushing after a grant still always saves, because a grant leaves the profile dirty by definition.
+
+!!! warning "A `false` from `Flush` does not mean the save failed"
+    `Flush` waits at most `Timeout` seconds, 15 by default, and then returns `false` even though the save may still complete afterwards. It also returns `false` immediately, without attempting a save at all, if the profile is not Ready, which a `Flush` fired from `PlayerAdded` before `WaitForData` always is.
+
+    Log it or retry the flush. Never re-grant the purchase on `false`, or you double-grant the common case.
+
+Watch save state for "Saving... / Saved" UI:
+
+```lua
+Data.OnSave:Connect(function(info)
+    -- { Player, Ok, Duration, At }
+end)
+
+local info = Data.GetSaveInfo(player)   -- { LastSaveAt, LastResult, Dirty, Size }
+```
+
+??? note "Reads that answer with a default while a profile is loading"
+    `Owns`, `GetPurchases`, `GetGiftCredits` and `GetSaveInfo` answer with `false`, `{}` and `{ Dirty = false }` respectively while a profile is still Loading. Gate ownership logic behind `WaitForData` so a VIP owner is not treated as a non-owner on join.
+
+??? note "Writing a burst of changes at once"
+    Several writes in a row each replicate on their own frame. [`Data.Batch`](/api/Server#Batch) coalesces them into one flush, and [`Data.Transaction`](/api/Server#Transaction) additionally makes them all-or-nothing. Both are covered in [Cross-Key Transactions](./transactions), along with what "atomic" does and does not mean here.
+
+## Session end
+
+When a session ends, whether the player left or another server stole the session, [`SessionEnded`](/api/Server#SessionEnded) fires with `(player, reason)`. With `KickOnSessionEnd = true`, the default, the player is also kicked so their client cannot keep acting on stale data.
+
+```lua
+Data.SessionEnded:Connect(function(player, reason)
+    if reason == Scribe.Reason.SessionEnded then
+        analytics:Log("session_stolen", player.UserId)
+    end
+end)
 ```
 
 ## OnPlayerInit
@@ -150,54 +211,6 @@ If your template has changed shape since a profile was written, Scribe runs your
 
 Writing that chain is its own topic, because a migration step edits the stored profile rather than a live session. [Offline Profiles](./profiles#migrations) covers it.
 
-## Saving
-
-Scribe autosaves each profile every `SaveInterval` seconds, 300 by default. Lower it to shrink the window of progress a crash can cost. It also saves when a player leaves and on `BindToClose`.
-
-For a grant you do not want to lose, force a save:
-
-```lua
-Data.Purchase(player, spec)
-Data.Flush(player, { Force = true })   -- persist immediately
-```
-
-[`Flush`](/api/Server#Flush) yields until the save is confirmed and returns whether it landed. `Force = true` also pushes the save through if the [wipe guard](./diagnostics) had blocked it.
-
-Flushing costs nothing when there is nothing to save. If the profile has not changed since its last successful save and none is still in flight, `Flush` answers `true` straight away with no DataStore request. So flushing on a checkpoint or a timer is cheap, and flushing after a grant still always saves, because a grant leaves the profile dirty by definition.
-
-!!! warning "A `false` from `Flush` does not mean the save failed"
-    `Flush` waits at most `Timeout` seconds, 15 by default, and then returns `false` even though the save may still complete afterwards. It also returns `false` immediately, without attempting a save at all, if the profile is not Ready, which a `Flush` fired from `PlayerAdded` before `WaitForData` always is.
-
-    Log it or retry the flush. Never re-grant the purchase on `false`, or you double-grant the common case.
-
-Watch save state for "Saving... / Saved" UI:
-
-```lua
-Data.OnSave:Connect(function(info)
-    -- { Player, Ok, Duration, At }
-end)
-
-local info = Data.GetSaveInfo(player)   -- { LastSaveAt, LastResult, Dirty, Size }
-```
-
-??? note "Reads that answer with a default while a profile is loading"
-    `Owns`, `GetPurchases`, `GetGiftCredits` and `GetSaveInfo` answer with `false`, `{}` and `{ Dirty = false }` respectively while a profile is still Loading. Gate ownership logic behind `WaitForData` so a VIP owner is not treated as a non-owner on join.
-
-??? note "Writing a burst of changes at once"
-    Several writes in a row each replicate on their own frame. [`Data.Batch`](/api/Server#Batch) coalesces them into one flush, and [`Data.Transaction`](/api/Server#Transaction) additionally makes them all-or-nothing. Both are covered in [Cross-Key Transactions](./transactions), along with what "atomic" does and does not mean here.
-
-## Session end
-
-When a session ends, whether the player left or another server stole the session, [`SessionEnded`](/api/Server#SessionEnded) fires with `(player, reason)`. With `KickOnSessionEnd = true`, the default, the player is also kicked so their client cannot keep acting on stale data.
-
-```lua
-Data.SessionEnded:Connect(function(player, reason)
-    if reason == Scribe.Reason.SessionEnded then
-        analytics:Log("session_stolen", player.UserId)
-    end
-end)
-```
-
 ## Working with signals
 
 `OnSave` and `SessionEnded` are [signals](/api/Signal), and so is every other `On…` member on `Data`, `Client` and `Scribe`. They all work the same way:
@@ -260,7 +273,9 @@ Doing this from your own `Players.PlayerRemoving` handler instead is a race agai
 
     -- ... run the test ...
 
-    Data.Flush(player, { Force = true })   -- Stop does NOT save
+    if not Data.Flush(player) then
+        error("Save is not confirmed; keep the bundle alive to retry")
+    end
     Data.Stop()
     ```
 

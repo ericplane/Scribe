@@ -1,0 +1,41 @@
+---
+import DefaultPageTitle from '@astrojs/starlight/components/PageTitle.astro';
+const route = Astro.locals.starlightRoute;
+const isSplash = route.entry.data.template === 'splash';
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
+type Entry = (typeof route.sidebar)[number];
+interface Crumb { label: string; href: string | undefined }
+
+// A group has no page of its own, so its crumb leads to its first page.
+function firstLink(entries: Entry[]): string | undefined {
+    for (const entry of entries) {
+        if (entry.type === 'link') return entry.href;
+        const nested = firstLink(entry.entries);
+        if (nested) return nested;
+    }
+    return undefined;
+}
+
+function trail(entries: Entry[], path: Crumb[] = []): Crumb[] | null {
+    for (const entry of entries) {
+        if (entry.type === 'link' && entry.isCurrent) return path;
+        if (entry.type === 'group') {
+            const found = trail(entry.entries, [...path, { label: entry.label, href: firstLink(entry.entries) }]);
+            if (found) return found;
+        }
+    }
+    return null;
+}
+
+const crumbs = isSplash ? null : trail(route.sidebar);
+---
+{!isSplash && (
+    <nav class="scribe-crumbs" aria-label="Breadcrumb">
+        <ol>
+            <li><a href={base}>Docs</a></li>
+            {crumbs?.map((crumb) => <li>{crumb.href ? <a href={crumb.href}>{crumb.label}</a> : <span>{crumb.label}</span>}</li>)}
+        </ol>
+    </nav>
+)}
+{!isSplash && <DefaultPageTitle />}

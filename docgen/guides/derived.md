@@ -32,6 +32,8 @@ data.Level.Observe(function(level)
 end)
 ```
 
+[Open this example in the playground](playground.md?example=derived) to watch the level follow the XP, and to see a direct write refused.
+
 `Level` has no `Set`, no `Update` and no `Increment`. Those methods are absent from its type, so a write is a red squiggle before it is ever a runtime error. There is one source of truth, and changing `levelForXp` fixes every player at once with no migration and no backfill.
 
 ## Declaring one

@@ -65,6 +65,8 @@ data.RecentRuns.Remove(1)          -- by index, returns the removed entry
 data.RecentRuns.Count()
 ```
 
+[Open a capped inventory in the playground](playground.md?example=inventory) to watch `MaxItems` and `Evict` at work.
+
 By default an `Insert` at `MaxItems` is an error. `Evict` turns the cap into a rolling window instead, dropping an entry to make room. It takes `"Front"` or `"Back"`, and it requires `MaxItems`, since a bare `Evict` has nothing to drop from.
 
 `Evict` names the **end to drop from**, not an age, because which end holds the oldest entry depends on how you insert. Append with `Insert(item)` and the oldest sits at the front, so you want `"Front"`. Prepend with `Insert(item, 1)` and the oldest sits at the back, so you want `"Back"`. Picking the end your inserts do not target churns that end while the other freezes.
@@ -93,6 +95,8 @@ Friends = Scribe.MapOf("integer", {
 data.Friends[ben.UserId].Name.Set("Ben")   -- no tostring, no tonumber
 ```
 
+[Open an integer-keyed map in the playground](playground.md?example=friends) and try a fractional key.
+
 The declaration is not sugar. A DataStore serializes every object key to a JSON string, so an integer-keyed map comes back holding `"123"` where it stored `123`, and only the declared key type makes converting it back unambiguous. Scribe restores the keys on load, before anything reads them.
 
 Keys that could not have survived that round trip are refused at the write: fractional, infinite, and NaN. A key that is not a canonical integer spelling, such as `"07"`, is left exactly as it is on load rather than relocated, since this map never wrote it.
@@ -118,6 +122,8 @@ data.Unlocked.Remove("AshfallRidge")   --> true
 data.Unlocked.Count()                  --> 0
 data.Unlocked.Clear()
 ```
+
+[Open a set of unlocks in the playground](playground.md?example=set).
 
 `Add` on a value already present, and `Remove` on one that is absent, both return `false` and do nothing: no write, no replication op, no `Changed`. That makes `Add` a safe idempotent grant, which is exactly what you want when the same quest-complete path can run twice.
 

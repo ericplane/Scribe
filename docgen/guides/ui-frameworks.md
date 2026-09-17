@@ -2,7 +2,7 @@
 
 Scribe's client accessors already have the shape a reactive UI framework wants: a value you can read, and a subscription that tells you when it moved. Bridging one takes about five lines, and the repo ships those five lines for [Vide](https://github.com/centau/vide), [React](https://github.com/jsdotlua/react-lua) and [Fusion](https://github.com/dphfox/Fusion) so you do not have to write them.
 
-They live in [`adapters/`](https://github.com/ericplane/Scribe/tree/main/adapters) and are **not part of the package**. Wally installs `src` only, so copy the file you want into your game. Each one takes your framework as an argument, because the framework sits at a path in your project that Scribe cannot know:
+They live in [`addons/ui/`](https://github.com/ericplane/Scribe/tree/main/addons/ui) and are **not part of the package**. Wally installs `src` only, so copy the file you want into your game and name it whatever suits your project, or insert `ScribeUIAdapters-Addon.rbxm` from the [release page](https://github.com/ericplane/Scribe/releases), a folder holding all three; the snippets below call it `ScribeVide`, `ScribeReact` and `ScribeFusion` to keep it distinct from the framework itself. Each one takes your framework as an argument, because the framework sits at a path in your project that Scribe cannot know:
 
 ```lua
 local useScribe = require(ReplicatedStorage.Shared.ScribeVide)(vide)
@@ -12,7 +12,7 @@ local coins = useScribe(Data.Coins)
 ## Vide
 
 ```lua
-local useScribe = require(path.to.Vide)(vide)
+local useScribe = require(path.to.ScribeVide)(vide)
 
 local function CoinLabel()
     local coins, disconnect = useScribe(Data.Coins)
@@ -28,7 +28,7 @@ end
 ## React
 
 ```lua
-local ScribeReact = require(path.to.React)(React)
+local ScribeReact = require(path.to.ScribeReact)(React)
 
 local function CoinLabel()
     local coins = ScribeReact.useScribe(Data.Coins)
@@ -52,13 +52,13 @@ It is built on `useState`, `useEffect` and `useBinding`, the three hooks jsdotlu
 ## Fusion
 
 ```lua
-local useScribe = require(path.to.Fusion)(Fusion, scope)  -- 0.3, which takes a scope
-local useScribe = require(path.to.Fusion)(Fusion)         -- 0.2, which does not
+local useScribe = require(path.to.ScribeFusion)(Fusion, scope)  -- 0.3, which takes a scope
+local useScribe = require(path.to.ScribeFusion)(Fusion)         -- 0.2, which does not
 
 local coins, disconnect = useScribe(Data.Coins)
 ```
 
-On 0.3 the scope destroys the `Value` but never the Scribe listener, so still call the disconnect when the UI goes away.
+On 0.3 the disconnect is registered in the scope as well as returned, so `doCleanup(scope)` stops the Scribe listener with everything else, and calling the returned one early is safe. On 0.2 there is no scope, so call it yourself when the UI goes away.
 
 ## Why they are this short
 

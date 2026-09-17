@@ -1340,6 +1340,8 @@ function Profile.New(raw_data, key_info, profile_store, key, is_mock, session_to
 		LastSavedData = DeepCopyTable(data),
 
 		FirstSessionTime = raw_data.MetaData and raw_data.MetaData.ProfileCreateTime or 0,
+		-- SCRIBE PATCH: the key's lineage; false for a key minted before it.
+		Generation = raw_data.MetaData and raw_data.MetaData.Generation or false,
 		SessionLoadCount = raw_data.MetaData and raw_data.MetaData.SessionLoadCount or 0,
 		-- SCRIBE PATCH: exposed so a caller can fingerprint what it read and hand
 		-- that to UpdateOfflineAsync. Every owning save stamps it, so a key that
@@ -1711,10 +1713,27 @@ function ProfileStore:UpdateOfflineAsync(profile_key, expected, new_data, option
 	end
 
 	local outcome = "Failed"
+	local minted = nil
 	local transform_params
 	transform_params = {
 		ExistingProfileHandle = nil,
-		MissingProfileHandle = nil,
+		-- SCRIBE PATCH: with options.CreateIfMissing the key is minted inside the
+		-- transform, so a key that appeared meanwhile reads as a change below.
+		MissingProfileHandle = if options and options.CreateIfMissing == true
+			then function(latest_data)
+				minted = HttpService:GenerateGUID(false)
+				latest_data.Data = new_data
+				latest_data.MetaData = {
+					ProfileCreateTime = os.time(),
+					Generation = minted,
+					SessionLoadCount = 0,
+					WriteIndex = 0,
+					ActiveSession = nil,
+					ForceLoadSession = nil,
+					MetaTags = {},
+				}
+			end
+			else nil,
 		-- Set by EditProfile on every declining path; UpdateAsync's transform
 		-- returns nil when it is true, so a refusal commits nothing at all.
 		AbortWrite = false,
@@ -1723,6 +1742,14 @@ function ProfileStore:UpdateOfflineAsync(profile_key, expected, new_data, option
 			if type(latest_data.Data) ~= "table" or type(latest_data.MetaData) ~= "table" then
 				outcome = "Missing"
 				transform_params.AbortWrite = true
+				return
+			end
+
+			-- Minted by THIS run; a rerun over a key another server created sees its generation.
+			if minted ~= nil and latest_data.MetaData.Generation == minted then
+				latest_data.MetaData.LastUpdate = os.time()
+				latest_data.MetaData.WriteIndex = 1
+				outcome = "Written"
 				return
 			end
 
@@ -1753,10 +1780,13 @@ function ProfileStore:UpdateOfflineAsync(profile_key, expected, new_data, option
 				latest_data.MetaData.ForceLoadSession = nil
 			end
 
+			-- SCRIBE PATCH: Generation is the key's lineage; a recreated key can repeat the
+			-- three counters and, inside one second, its creation time.
 			if
 				latest_data.MetaData.SessionLoadCount ~= expected.SessionLoadCount
 				or latest_data.MetaData.LastUpdate ~= expected.LastUpdate
 				or (latest_data.MetaData.WriteIndex or 0) ~= (expected.WriteIndex or 0)
+				or (expected.Generation ~= nil and (latest_data.MetaData.Generation or false) ~= expected.Generation)
 			then
 				outcome = "Changed"
 				transform_params.AbortWrite = true
@@ -2147,6 +2177,7 @@ function ProfileStore:StartSessionAsync(profile_key, params)
 						latest_data.Data = DeepCopyTable(self.template)
 						latest_data.MetaData = {
 							ProfileCreateTime = os.time(),
+							Generation = HttpService:GenerateGUID(false), -- SCRIBE PATCH: the key's lineage
 							SessionLoadCount = 0,
 							WriteIndex = 0, -- SCRIBE PATCH: the compare-and-set fingerprint
 							ActiveSession = if is_cancel == false then {PlaceId, JobId, unique_session_id} else nil,
@@ -2509,6 +2540,7 @@ function ProfileStore:GetAsync(profile_key, version)
 					latest_data.Data = DeepCopyTable(self.template)
 					latest_data.MetaData = {
 						ProfileCreateTime = os.time(),
+						Generation = HttpService:GenerateGUID(false), -- SCRIBE PATCH: the key's lineage
 						SessionLoadCount = 0,
 						WriteIndex = 0, -- SCRIBE PATCH: the compare-and-set fingerprint
 						ActiveSession = nil,

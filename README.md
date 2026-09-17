@@ -8,7 +8,7 @@
 ```toml
 # wally.toml
 [dependencies]
-Scribe = "ericplane/scribe@2.3.0"
+Scribe = "ericplane/scribe@2.4.0"
 ```
 
 - **Fully typed.** A type-solver-generated accessor tree types your data end to end (`data.Coins.Increment(50)`, nested containers, arrays, and datatype fields), checked at compile time.
@@ -21,7 +21,10 @@ Scribe = "ericplane/scribe@2.3.0"
 
 ## Quick start
 
-One shared module declares the template and options and returns `{ Server, Client }`:
+One shared ModuleScript declares the template and returns `{ Server, Client }`.
+This example uses Mock mode, so it starts fresh and does not touch saved player
+data. The [step-by-step tutorial](https://ericplane.github.io/Scribe/getting-started/)
+includes installation, the Studio folder structure, and how to test real saving.
 
 ```lua
 -- ReplicatedStorage/Shared/Data.luau
@@ -31,11 +34,12 @@ return Scribe({
     Template = { Coins = 0, Settings = { Music = true } },
     ProfileStoreIndex = "PlayerData", -- required: your DataStore name
     ProfileKeyPrefix = "PLAYER_",     -- required: per-player key prefix
+    Mode = "Mock",                   -- learning mode; resets between server runs
 })
 ```
 
 ```lua
--- Server: wait for the profile to load, then use the typed accessor
+-- Script in ServerScriptService: wait for data, then change a field
 local Data = require(game:GetService("ReplicatedStorage").Shared.Data).Server
 
 game:GetService("Players").PlayerAdded:Connect(function(player)
@@ -47,23 +51,25 @@ end)
 ```
 
 ```lua
--- Client: read the same data reactively (writes are local-only; server wins)
+-- LocalScript in StarterPlayer/StarterPlayerScripts
 local Data = require(game:GetService("ReplicatedStorage").Shared.Data).Client
 
 Data.Coins.Observe(function(coins)
-    coinsLabel.Text = tostring(coins)
+    print("Coins:", coins) -- replace with your UI update once this works
 end)
 ```
 
 For declarators, replication + visibility, monetization, leaderboards, migrations, diagnostics, and the full API, see the **[documentation](https://ericplane.github.io/Scribe/)**.
+
+Optional add-ons live in [`addons/`](addons/README.md): copy-in UI bridges for Vide, React and Fusion, and `ScribeTelemetry`, which posts Scribe's health, failures and summaries to Discord webhooks from the server.
 
 ## Development
 
 ```bash
 rokit install              # wally + rojo + selene + luau-lsp + lune + stylua toolchain
 wally install              # dependencies
-selene src test lune       # lint
-stylua --check src test lune  # formatting (drop --check to apply)
+selene src test lune addons       # lint
+stylua --check src test lune addons  # formatting (drop --check to apply)
 lune run lune/run-tests    # run the test suite (headless, ~2s)
 ```
 
@@ -72,7 +78,7 @@ pull request (`.github/workflows/ci.yml`), and releases are gated on a green run
 Mark the `test`, `lint`, `format`, `analyze`, and `version-check` checks as
 required in the repository's branch-protection settings to enforce them on merge.
 
-Docs are built with Material for MkDocs from the doc-comments in `src/` and the guides in `docgen/guides/`. See [docgen/README.md](docgen/README.md) for details.
+Docs are built with [Astro Starlight](https://starlight.astro.build/) from the doc-comments in `src/` and the guides in `docgen/guides/`. The site lives in `docs-site/`; see [docgen/README.md](docgen/README.md) for preview and check commands.
 
 ## License
 

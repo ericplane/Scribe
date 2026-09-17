@@ -1,5 +1,5 @@
 ---
-# selene standard library for TestEZ globals (used by test/Specs/*.spec.luau)
+# selene standard library for TestEZ globals (used by test/Specs/*/*.spec.luau)
 globals:
   describe:
     args:

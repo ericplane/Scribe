@@ -1,8 +1,19 @@
 # Monetization
 
-Emberfall sells coin packs and gem packs for Robux, and it sells a VIP pass. Scribe handles the Roblox side of that for you: it listens for receipts, applies the purchase to the player's saved profile, and only tells Roblox the sale went through once the data is durable. The rule the whole system is built around is that a player never pays Robux and gets nothing.
+Scribe can sell developer products, check game-pass ownership, and spend in-game currency. For developer products, it handles the receipt and confirms the purchase to Roblox only after the grant is saved.
 
-This page covers products, passes, perks, ownership checks, and spending soft currency. Sending a purchase to someone else lives in [Gifting](./gifting).
+Choose the task you need; you do not need every feature to build a shop:
+
+| Task | Start here |
+| --- | --- |
+| Sell coins or another repeatable Robux product | [Selling a coin pack](#selling-a-coin-pack) |
+| Show a purchase dialog | [Prompting the sale](#prompting-the-sale) |
+| Spend coins earned in your game | [Soft-currency purchases](#soft-currency-purchases) |
+| Check a pass or saved perk | [Checking what a player owns](#checking-what-a-player-owns) |
+| Display the player's price | [Showing the price](#showing-the-price) |
+| Send a purchase to another player | [Gifting](./gifting) |
+
+Examples use the [Emberfall template](./emberfall). Keep grants on the server, and wait for the player's data before using their accessors.
 
 ## Selling a coin pack
 
@@ -260,13 +271,33 @@ local ok, reason = Data.Purchase(player, {
     Category = "Item",
     ItemId = "EmberLantern",
     Grant = function(data)
-        data.Inventory.EmberLantern.Set({ Qty = 1, Rarity = "Rare" })
+        data.Inventory.EmberLantern.Update(function(entry)
+            local quantity = if entry then entry.Qty else 0
+            if quantity >= 999 then
+                error("Lantern stack is full")
+            end
+            return { Qty = quantity + 1, Rarity = "Rare" }
+        end)
     end,
 })
 
 if not ok then
-    showToast(player, reason)
+    if reason == Scribe.PurchaseReason.InsufficientFunds then
+        showToast(player, "You need 250 coins to buy a lantern.")
+    elseif reason == Scribe.PurchaseReason.DataNotLoaded then
+        showToast(player, "Your data is still loading. Try again shortly.")
+    else
+        warn(`Lantern purchase refused: {reason}`)
+        showToast(player, "The purchase could not be completed. Please try again later.")
+    end
+    return
 end
+
+if not Data.Flush(player) then
+    showToast(player, "Your lantern was added. Saving is still pending.")
+    return -- retry Flush later; do not purchase or grant the lantern again
+end
+showToast(player, "Lantern purchased and saved!")
 ```
 
 If the player has 200 coins, nothing happens at all: no debit, no lantern, and `reason` is `"insufficient funds"`. If the `Grant` throws, the debit rolls back with it. There is no window in which the coins are gone and the item is missing.
@@ -275,7 +306,9 @@ If the player has 200 coins, nothing happens at all: no debit, no lantern, and `
 
 `Cost.Path` may also point into a typed container, such as a `Scribe.DictOf` key like `"Wallet.Gold"`, and the element's own `Min` floor and int rule apply to the debit exactly as a plain currency field's would. A dictionary accepts any key, though, so a typo there does **not** report an invalid cost path: `"Wallet.Glod"` resolves, spends the element default as a balance nobody granted, and leaves the phantom key behind. Point costs at declared fields unless the currency set is genuinely open-ended.
 
-Notice the grant uses a whole-element `Set` rather than `data.Inventory.EmberLantern.Qty.Increment(1)`. Both work, but `Set` states plainly that a new element is being created, and it keeps the seeded-element warning below quiet.
+The grant uses a whole-element `Update` so a repeat purchase adds to the existing quantity. An unwritten entry is `nil`, so the same callback also creates the first lantern. The stack-full check matches the template's maximum of `999`; it prevents charging for a write that would clamp at that limit.
+
+`showToast` represents your game's UI function; keep internal error details in server logs. A successful `Purchase` changes the live profile; the explicit `Flush` above asks for save confirmation before showing a saved result.
 
 !!! danger "A grant that writes through an unresolved key takes the Robux and delivers nothing"
 
@@ -294,8 +327,12 @@ Notice the grant uses a whole-element `Set` rather than `data.Inventory.EmberLan
 
     ```lua
     Grant = function(data)
-        if data.Inventory[itemId].Qty.Get() == nil then
+        local quantity = data.Inventory[itemId].Qty.Get()
+        if quantity == nil then
             error(`Emberfall: no inventory entry "{itemId}" to upgrade`)
+        end
+        if quantity >= 999 then
+            error("Item stack is full")
         end
         data.Inventory[itemId].Qty.Increment(1)
     end,
@@ -310,15 +347,28 @@ Notice the grant uses a whole-element `Set` rather than `data.Inventory.EmberLan
 A double-clicked button, a re-fired RemoteEvent, or a client that reconnected mid-request will debit twice. Pass an `IdempotencyKey` and the repeat is free:
 
 ```lua
-Data.Purchase(player, {
+local ok, reason = Data.Purchase(player, {
     Cost = { Path = "Coins", Amount = 250 },
     Category = "Item",
     ItemId = "EmberLantern",
     IdempotencyKey = `buy:{orderId}`,   -- your id for this one intent
     Grant = function(data)
-        data.Inventory.EmberLantern.Set({ Qty = 1, Rarity = "Rare" })
+        data.Inventory.EmberLantern.Update(function(entry)
+            local quantity = if entry then entry.Qty else 0
+            if quantity >= 999 then
+                error("Lantern stack is full")
+            end
+            return { Qty = quantity + 1, Rarity = "Rare" }
+        end)
     end,
 })
+if not ok then
+    warn(`Purchase refused: {reason}`)
+    return
+end
+if not Data.Flush(player) then
+    warn("Purchase applied; save confirmation is pending")
+end
 ```
 
 A repeat under the same key returns exactly what the first call returned and spends nothing. The caller needs no special case: the "this was a duplicate" signal goes to the `PURCHASE_DUPLICATE` log code and the `PurchasesDuplicate` counter, not into the return value. The key is up to 64 bytes of valid UTF-8, and it is yours to choose. Anything stable for one intent and unique across intents will do.
@@ -336,18 +386,18 @@ The claim is persisted, so it survives a rejoin, and it is taken inside the tran
 
 ### Reading the refusal
 
-`Purchase` returns `(false, reason)` for eight fixed refusals, and Scribe exports them as a frozen table so you can branch on them without pasting strings:
+`Purchase` returns `(false, reason)` for eight fixed refusals, and Scribe exports them as a frozen table so you can branch on them without pasting strings. Four are for the player; the other four say the call itself is wrong, and belong in a log rather than a toast:
 
-| `Scribe.PurchaseReason` member | The string |
-| --- | --- |
-| `DataNotLoaded` | `"player data not loaded"` |
-| `InvalidCostSpec` | `"invalid Cost spec"` |
-| `InvalidCostAmount` | `"invalid Cost amount"` |
-| `InvalidCostPath` | `"invalid cost path"` |
-| `CostPathNotSpendable` | `"cost path is not a spendable number"` |
-| `InsufficientFunds` | `"insufficient funds"` |
-| `PaidRandomRestricted` | `"paid-random-restricted"` |
-| `PolicyPending` | `"policy-pending"` |
+| `Scribe.PurchaseReason` member | The string | For |
+| --- | --- | --- |
+| `DataNotLoaded` | `"player data not loaded"` | the player, as "try again" |
+| `InvalidCostSpec` | `"invalid Cost spec"` | the developer |
+| `InvalidCostAmount` | `"invalid Cost amount"` | the developer |
+| `InvalidCostPath` | `"invalid cost path"` | the developer |
+| `CostPathNotSpendable` | `"cost path is not a spendable number"` | the developer |
+| `InsufficientFunds` | `"insufficient funds"` | the player |
+| `PaidRandomRestricted` | `"paid random items are not available for this account"` | the player |
+| `PolicyPending` | `"cannot check account settings right now; try again in a moment"` | the player |
 
 ```lua
 local ok, reason = Data.Purchase(player, spec)
@@ -360,7 +410,7 @@ if not ok then
 end
 ```
 
-Anything outside that table is your `Grant`'s own error text passing through, which means the grant threw. The five refusals other than `InsufficientFunds` are bugs in your call site, so treat them as something to fix rather than something to show a player.
+Anything outside that table can be your `Grant`'s own error text. Log it for investigation and show a general failure message. The four `Cost` refusals describe mistakes in the purchase definition; the other four describe a player's current ability to buy. Map those to suitable UI text rather than displaying every returned string directly.
 
 ## Purchase history
 

@@ -25,6 +25,8 @@ local template = {
 }
 ```
 
+[See these wrappers side by side in the playground](playground.md?example=visibility). Its Fields panel marks which ones persist and who receives them.
+
 | Wrapper | Persists? | Replicates to | Use for |
 | --- | --- | --- | --- |
 | *(none)* | yes | the owner | most player data |
@@ -102,7 +104,9 @@ Inventory = Scribe.DictOf({
 
 ## Reading another player's shared data
 
-`Scribe.Shared` roots stream to everyone. Read them on the client with [`GetShared`](/api/Client#GetShared), which accepts a `Player` or a `userId`:
+`Scribe.Shared` roots stream to everyone, and that is the cost to keep in mind. Writes coalesce per frame, and every flush of one is a frame to each other player on the server, so N players each changing a shared field once a second cost on the order of N squared frames a second, and every join sends the joiner all other players' Shared roots and the joiner's to everyone else. Keep a Shared root small and slow: a title or a tier, not a balance that moves every second.
+
+Read them on the client with [`GetShared`](/api/Client#GetShared), which accepts a `Player` or a `userId`:
 
 ```lua
 local shared = Data.GetShared(ben)

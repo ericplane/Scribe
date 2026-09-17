@@ -915,7 +915,7 @@ end
 --- Release a slot that never took value. Restricted to Phase "Claimed" on purpose: once
 --- any escrow has committed the only exit is the verdict-gated abort, and dropping a
 --- staked record here would destroy the value it holds with nothing left to say where it
---- went.
+--- went. A take is refused for the same reason: it is the only pointer to value owed.
 function ExchangeLeg.Unclaim(ctx: any, exchangeId: string): (boolean, string?)
 	if type(exchangeId) ~= "string" or #exchangeId == 0 then
 		fail("Unclaim needs an exchange id")
@@ -931,6 +931,9 @@ function ExchangeLeg.Unclaim(ctx: any, exchangeId: string): (boolean, string?)
 		end
 		if type(record.Escrow) == "table" and next(record.Escrow) ~= nil then
 			fail(`exchange "{exchangeId}" holds escrowed value and cannot be unclaimed`)
+		end
+		if type(record.Take) == "table" and next(record.Take) ~= nil then
+			fail(`exchange "{exchangeId}" records a take and cannot be unclaimed; only the verdict may release it`)
 		end
 		if ctx.Tree.Reserved.Exchange.Remove(exchangeId) == nil then
 			fail(`claim for "{exchangeId}" vanished before it could be released`)

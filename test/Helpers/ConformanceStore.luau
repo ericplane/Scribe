@@ -62,7 +62,7 @@ end
 -- why it stayed unexamined.
 --
 -- The route that DOES work already exists twice in the repo and is not invented
--- here: `test/Specs/StoreAccessors.spec.luau` builds a one-server `Universe` and
+-- here: `test/Specs/persistence/StoreAccessors.spec.luau` builds a one-server `Universe` and
 -- reaches in for the store module that server loaded, and `test/Sim/Server.luau`
 -- loads it with `Loader.LoadChunk(Loader.Source("src/Internal/Store/..."), env)`
 -- into an environment from `test/Sim/Env.luau`, which supplies a real

@@ -14,6 +14,7 @@ on:
   pull_request:
     paths:
       - "src/**"
+      - "addons/**"
       - "bundle/**"
       - "wally.toml"
       - "rokit.toml" # toolchain (wally/rojo) bump can break assembly
@@ -26,6 +27,7 @@ on:
     branches: [main]
     paths:
       - "src/**"
+      - "addons/**"
       - "bundle/**"
       - "wally.toml"
       - "rokit.toml"
@@ -58,8 +60,11 @@ jobs:
         with:
           version: ${{ steps.ver.outputs.value }}
 
-      - name: Upload built model for inspection
+      - name: Upload built models for inspection
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Scribe-rbxm-pr
-          path: Scribe.rbxm
+          path: |
+            Scribe.rbxm
+            ScribeTelemetry-Addon.rbxm
+            ScribeUIAdapters-Addon.rbxm

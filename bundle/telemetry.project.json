@@ -1,0 +1,6 @@
+{
+  "name": "ScribeTelemetry",
+  "tree": {
+    "$path": "../addons/telemetry/ScribeTelemetry"
+  }
+}

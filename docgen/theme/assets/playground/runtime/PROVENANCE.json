@@ -1,0 +1,51 @@
+{
+  "package": "luau-web",
+  "version": "1.4.0",
+  "license": "MIT",
+  "author": "xNasuni",
+  "npm_git_head": "5a79f31cc3ca974358a5f5d32c7dad5005dce46a",
+  "luau_version": "0.711 (reported by upstream release)",
+  "modifications": [
+    "src/index.js: select Asyncify directly; rename local imports to .mjs.",
+    "Luau.Web.Asyncify.js: remove one worker-environment refusal assertion. Its existing WEB||WORKER host branch uses fetch and no DOM; there are no other worker-dependent paths. Embedded Wasm payload is unchanged. Verified in an actual browser worker, not only Node worker_threads."
+  ],
+  "files": [
+    {
+      "file": "upstream-package.json",
+      "upstream_url": "https://cdn.jsdelivr.net/npm/luau-web@1.4.0/package.json",
+      "upstream_sha256": "0af67f740a965781315c29eca26b9b082b84adc92add93f6c78da152d65b856d",
+      "local_sha256": "0af67f740a965781315c29eca26b9b082b84adc92add93f6c78da152d65b856d"
+    },
+    {
+      "file": "luau-web.mjs",
+      "upstream_url": "https://cdn.jsdelivr.net/npm/luau-web@1.4.0/src/index.js",
+      "upstream_sha256": "14287a5444bf0d43358c936d521bcf2333576a1ead028a7a01153c9c0f9fde0a",
+      "local_sha256": "061ec5660f12f4c4f45243955e5fdbb515348d618187bd05314426fd9af10b07"
+    },
+    {
+      "file": "Luau.Web.Asyncify.mjs",
+      "upstream_url": "https://cdn.jsdelivr.net/npm/luau-web@1.4.0/src/lib/Luau.Web.Asyncify.js",
+      "upstream_sha256": "3b3036d27d7b1983c6d6f91da546f5171bf98af00c77416fe46d88933efb98ca",
+      "local_sha256": "aa3408e50d2c718c469a55becc7a2321debb1cd01982e430802ef4dae64c5f27"
+    },
+    {
+      "file": "LICENSE-LUAU.txt",
+      "upstream_url": "https://raw.githubusercontent.com/xNasuni/luau-interop/7be716561367fdb486e7f4b73c816a94249f4f30/LICENSE.txt",
+      "upstream_sha256": "1597b423ca8f9c76225b498071f03b2b3609c4960b8dc30e63b230490fc82efd",
+      "local_sha256": "1597b423ca8f9c76225b498071f03b2b3609c4960b8dc30e63b230490fc82efd"
+    },
+    {
+      "file": "LICENSE-LUA.txt",
+      "upstream_url": "https://raw.githubusercontent.com/xNasuni/luau-interop/7be716561367fdb486e7f4b73c816a94249f4f30/lua_LICENSE.txt",
+      "upstream_sha256": "8fc3b1ad94d6ca69763e5553eed4551dfacfd49785a76680fd4e5f1c1518c656",
+      "local_sha256": "8fc3b1ad94d6ca69763e5553eed4551dfacfd49785a76680fd4e5f1c1518c656"
+    },
+    {
+      "file": "LICENSE-EMSCRIPTEN.txt",
+      "upstream_url": "https://raw.githubusercontent.com/emscripten-core/emscripten/main/LICENSE",
+      "upstream_sha256": "620a78084fc7ca97c0b5dea9abf891f3ffcadfdbf305276f099c9c4e12fc1d86",
+      "local_sha256": "620a78084fc7ca97c0b5dea9abf891f3ffcadfdbf305276f099c9c4e12fc1d86"
+    }
+  ],
+  "embedded_wasm_sha256": "922ec950bb3c30604cf06654ad554cded3a43d7d65378f292aefe506c0b2903b"
+}

@@ -1,17 +1,20 @@
 name: Docs check
 
-# Builds the MkDocs site with --strict on PRs that touch docs sources, so a
-# broken doc-comment tag (@function/@within/...) or dead internal link is caught
-# on the PR. Build only, no GitHub Pages deploy; that stays in docs.yml on main.
+# Builds Starlight, validates rendered links, and checks the generator and
+# playground on PRs that touch docs sources. No GitHub Pages deployment here.
 
 on:
   pull_request:
     paths:
       - "src/**"
       - "docgen/**"
-      - "mkdocs.yml"
-      - "requirements-docs.txt"
+      - "CHANGELOG.md"
+      - "docs-site/**"
+      - "rokit.toml"
+      - "lune/run-tests.luau"
+      - "test/**"
       - ".github/workflows/docs-check.yml"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:
@@ -26,10 +29,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.x"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+      - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
       - name: Install docs dependencies
-        run: pip install -r requirements-docs.txt
-      - name: Build site (strict)
-        run: mkdocs build --strict # runs docgen/gen.py via the mkdocs hook
+        run: npm ci --prefix docs-site
+      - name: Build site and validate links
+        run: npm run build --prefix docs-site
+      - name: Check conversion, headings, and the playground
+        run: npm run check --prefix docs-site
+      - name: Run examples extracted from the guides
+        run: lune run docgen/check_examples

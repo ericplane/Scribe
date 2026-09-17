@@ -1,0 +1,17 @@
+---
+import manifest from '../../../wally.toml?raw';
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+const version = manifest.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+if (!version) throw new Error('Could not read the Scribe version from wally.toml.');
+// The changelog page keeps the previous site's heading ids, where 2.4.0 became 240.
+const changelog = `${base}changelog/#${version.replace(/[^\w\s-]/g, '')}`;
+---
+<span class="scribe-brand">
+    <a class="scribe-brand-home" href={base} aria-label="Scribe home">
+        <img src={`${base}assets/logo.svg`} width="38" height="38" alt="" />
+        <span class="scribe-wordmark">Scribe</span>
+    </a>
+    <span class="scribe-brand-divider" aria-hidden="true"></span>
+    <a class="scribe-brand-label" href={`${base}getting-started/`} aria-label="Browse the docs">Docs</a>
+    <a class="scribe-brand-version" href={changelog} title={`What changed in ${version}`}>v{version}</a>
+</span>

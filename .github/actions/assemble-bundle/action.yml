@@ -1,8 +1,9 @@
 name: Assemble Scribe bundle
 description: >
-  Stamp the version into the bundle and build Scribe.rbxm at the repo root.
-  Shared by the release workflow (which publishes the result) and the PR smoke
-  test (which discards it). Assumes rojo is already on PATH (setup-rokit).
+  Stamp the version into the bundle and build Scribe.rbxm, plus the two add-on
+  models, at the repo root. Shared by the release workflow (which publishes the
+  result) and the PR smoke test (which discards it). Assumes rojo is already on
+  PATH (setup-rokit).
 inputs:
   version:
     description: Version string stamped into the bundle (README + root folder name).
@@ -36,3 +37,10 @@ runs:
     - name: Build Scribe.rbxm
       shell: bash
       run: rojo build bundle/rbxm.project.json -o Scribe.rbxm
+
+    # Outside the package and outside the URL backstop: telemetry names Discord by design.
+    - name: Build the add-on models
+      shell: bash
+      run: |
+        rojo build bundle/telemetry.project.json -o ScribeTelemetry-Addon.rbxm
+        rojo build bundle/ui-adapters.project.json -o ScribeUIAdapters-Addon.rbxm

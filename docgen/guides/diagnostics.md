@@ -44,7 +44,7 @@ local detach = Scribe.AddLogSink(function(entry)
 end)
 ```
 
-`Code`, `Level` and `Category` are typed string unions, so your editor autocompletes them both in a filter and on `entry` inside a sink. Raise the ring size with the `LogRingSize` option when 512 entries is not enough history. Scribe has no built-in webhooks: keep the credentials in your own game code.
+`Code`, `Level` and `Category` are typed string unions, so your editor autocompletes them both in a filter and on `entry` inside a sink. Raise the ring size with the `LogRingSize` option when 512 entries is not enough history. Scribe itself has no webhooks; the optional [ScribeTelemetry](./telemetry) add-on posts these entries to Discord, and the credentials stay in your own game code either way.
 
 Every code Scribe can emit, with its severity and its meaning, is in the [Log Code Reference](./log-codes). Skim that page once when you decide which codes to route to your own backend.
 
@@ -93,17 +93,21 @@ These are the ones worth putting on a panel first.
 | `ProfilesLoaded`, `ProfileLoadFailures` | counter | Loads that succeeded, and loads that did not |
 | `SavesOk`, `SavesFailed` | counter | Save outcomes, counted once per save |
 | `SaveDuration` | distribution | Seconds per save |
-| `ProfileSize` | distribution | Approximate bytes of the last saved payload, against the 4 MB ceiling |
+| `ProfileSize` | distribution | Estimated bytes of the last saved data payload, excluding the record around it |
 | `HealthStatus` | gauge | `0` Healthy, `1` Degraded, `2` Outage |
 | `DataStoreErrors` | counter | DataStore errors seen against this bundle's store, counted per attempt |
 | `WipeGuardTrips`, `Anomalies` | counter | Integrity events, each of which also fires [`OnAnomaly`](/api/Server#OnAnomaly) |
 | `SchemaNodes` | gauge | Compiled template size, a useful canary for template growth |
+| `BytesOut` | counter | Bytes the transport accepted, summed over every recipient, a broadcast once per session |
+| `BytesOut<Kind>`, `BytesOutResync` | counter | The same bytes by frame kind (`BytesOutDiff`, `BytesOutInit`, ...), and the snapshot bytes sent to clients that already had one |
+| `CommandDuration:<name>`, `CommandActive:<name>`, `CommandErrors:<name>` | distribution, gauge, counter | Per registered command: elapsed seconds per call, calls open now, handlers that threw |
+| `InitApplyDuration`, `DiffApplyDuration`, `SharedApplyDuration` | distribution | Client only: elapsed seconds to apply one frame; inline listeners in full, an `OnSharedChanged` handler to its first yield |
 
 Per-player save state is separate. [`Data.GetSaveInfo(player)`](/api/Server#GetSaveInfo) returns `{ LastSaveAt, LastResult, Dirty, Size }` and is mirrored to that player, so a "Saved" or "Unsaved changes" indicator in the Emberfall UI reads [the client copy](/api/Client#GetSaveInfo) with no round trip.
 
 ### Percentiles, not averages
 
-[`Scribe.GetPercentiles()`](/api/Scribe#GetPercentiles) returns `{ P50, P90, P99 }` for every distribution, over a rolling window of the most recent 256 samples.
+[`Scribe.GetPercentiles()`](/api/Scribe#GetPercentiles) returns `{ P50, P90, P99, Samples, Age, Window }` for every distribution, over a rolling window of the most recent 256 samples. `Samples` is how many the window holds, `Age` is seconds since the newest, and `Window` is the seconds the ring spans, which is what tells you whether the percentiles describe a burst or a day.
 
 ```lua
 local saveDuration = Scribe.GetPercentiles().SaveDuration
@@ -219,7 +223,7 @@ These describe what Scribe is putting on the wire. Reach for them when the Ember
 
     `LeavingHooksSkipped` counts hooks that never started because the hook phase's share of the shutdown budget was already spent. `LeavingHooksTimedOut` counts hooks still running when it expired, whose profiles were saved without their remaining writes. A non-zero count of either means shutdown is losing exit writes.
 
-The counters are a library-level singleton per context. The server bundle owns everything above. `Scribe.GetMetrics()` on the client reports one key, `DiffsApplied`, the number of diff frames the client mirror has applied.
+The counters are a library-level singleton per context. The server bundle owns everything above. `Scribe.GetMetrics()` on the client reports the client's own set: `DiffsApplied`, the fragment counters, `RequestTimeouts` and `RequestTimeouts:<name>`, and the three apply timers described in [What Scribe Costs](./cost#on-the-client).
 
 ## Version and bundle skew
 
@@ -243,14 +247,15 @@ Every save is compared against the last good one. If top-level keys vanish or th
 - `WipeGuardPolicy = "Warn"` is the default. The trip is logged and the save goes through, because a reset is sometimes legitimate.
 - `WipeGuardPolicy = "Block"` persists the last good snapshot instead, until you push the live data through with `Data.Flush(player, { Force = true })`.
 
-Scribe also warns with `PROFILE_SIZE` as a profile approaches the 4 MB DataStore value ceiling, so runaway Emberfall inventory growth shows up before saves start failing. The measurement is deliberately an upper bound on the stored encoding, so it reads slightly high rather than low and a profile is never nearer the ceiling than the number says.
+Scribe also warns with `PROFILE_SIZE` as a profile approaches the 4 MB DataStore value ceiling, so runaway Emberfall inventory growth shows up before saves start failing. The measurement is an estimate of the data payload's stored size, sized to read high per value rather than low; the record around the payload, the store's metadata and any queued messages, is not in it, so the number is a guide to the trend rather than a guarantee of headroom.
 
 ## Seeing it live
 
-Everything on this page, meaning the log ring, the health machine, the metrics and the per-flush bandwidth, is rendered as an interactive dock by the [Scribe Studio](./studio-plugin). It also lets you simulate outages and profile traffic without waiting for one to happen.
+Everything on this page, meaning the log ring, the health machine, the metrics and the per-flush bandwidth, is rendered as an interactive dock by the [Scribe Studio](./studio-plugin) once `StudioHook = true` is in your options. It also lets you simulate outages and profile traffic without waiting for one to happen.
 
 ## Where to next
 
+- [Discord Telemetry](./telemetry) posts the health changes, failures and summaries on this page to Discord webhooks, with the optional add-on.
 - [Log Code Reference](./log-codes) lists every code, its severity and what to do about it.
 - [Scribe Studio](./studio-plugin) turns this page into a live dock you can watch while you play-test.
 - [Configuration](./configuration) covers `LogRingSize`, `LogLevel`, `WipeGuardPolicy` and `BudgetPolicy`.

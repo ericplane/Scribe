@@ -79,6 +79,7 @@ export type Entry = {
 	-- which a write belonged nowhere and was silently dropped.
 	QueueOpen: boolean,
 	HandshakeReady: boolean,
+	InitDelivered: boolean, -- a snapshot has reached this client
 	LastInitAt: number,
 	-- A frame did not reach the transport, so this client's mirror is stale and it
 	-- cannot ask for a repair (a loaded client never re-Hellos). The flush loop
@@ -273,6 +274,10 @@ function Persistence.new(ctx: any)
 			Fallback = "LoadFailureMessage",
 			Default = "Roblox's data service is busy right now. Please rejoin in a moment!",
 		},
+		Erasing = {
+			Option = "ErasingMessage",
+			Default = "Your data is being reset. Please rejoin in a few minutes!",
+		},
 		Load = {
 			Option = "LoadFailureMessage",
 			Default = "We couldn't load your data. Please rejoin!",
@@ -331,6 +336,7 @@ function Persistence.new(ctx: any)
 	-- Floored at 60s: ProfileStore steals a held session after SESSION_STEAL (40s), so a
 	-- shorter deadline aborts every legitimate cross-server handoff.
 	local loadTimeout: number = math.max(60, tonumber(options.LoadTimeout) or 120)
+	local eraseJoinTimeout: number = math.max(0.1, tonumber(options.EraseJoinTimeout) or 10)
 	local compiled: Template.Compiled = ctx.Compiled
 
 	-- Storage location is explicit and never defaulted (see Scribe() guard).
@@ -411,6 +417,14 @@ function Persistence.new(ctx: any)
 
 	self.Mode = mode
 	self.TargetUserId = targetUserId
+
+	-- The offline verbs write the real key, which a NoSave bundle promises never to touch.
+	local function refuseNoSave(verb: string): string
+		local reason = `Mode = "NoSave" never writes the store, so {verb} is refused`
+		Log.Warn("Persistence", "NOSAVE_WRITE_REFUSED", reason, { Verb = verb })
+		return reason
+	end
+	self.RefuseNoSave = refuseNoSave
 
 	local store = if useMockStore then baseStore.Mock else baseStore
 
@@ -624,7 +638,7 @@ function Persistence.new(ctx: any)
 				Level = "Error",
 				Category = "Integrity",
 				Code = "PROFILE_OVERWRITTEN",
-				Message = `stored data for key "{profileKey}" was not a valid profile and has been REPLACED with a fresh `
+				Message = "stored data for this key was not a valid profile and has been REPLACED with a fresh "
 					.. "template by ProfileStore; this session starts from defaults and the previous data is gone. "
 					.. "Restore from version history before the player saves over it",
 				Context = { Player = if entry then entry.Player else nil, Store = storeName, Key = profileKey },
@@ -731,8 +745,12 @@ function Persistence.new(ctx: any)
 	end
 
 	--- UpdateAsync tracks the session count because its worst case is the shutdown
-	--- drain: every online session saving at once.
+	--- drain: every online session saving at once. Process-wide, so a stopped bundle
+	--- leaves them alone.
 	local function syncBudgetReserves()
+		if self.Stopped then
+			return
+		end
 		Budget.SetReserve("UpdateAsync", self.EntryCount)
 		Budget.SetReserve("GetAsync", GET_RESERVE)
 		local boards = if ctx.Leaderboards ~= nil then ctx.Leaderboards.BoardCount or 0 else 0
@@ -1420,6 +1438,7 @@ function Persistence.new(ctx: any)
 		ctx.Leaderboards.OnUnload(entry)
 		ctx.Monetization.OnUnload(entry)
 		ctx.Timed.OnUnload(entry)
+		ctx.Exchanges.OnUnload(entry)
 
 		if entry.Tree then
 			entry.Tree:Destroy()
@@ -1460,6 +1479,18 @@ function Persistence.new(ctx: any)
 		local profile = entry.Profile :: any
 		local player = entry.Player
 
+		-- Marked for erasure: release without saving.
+		local markedReserved = if type(profile.Data) == "table" then profile.Data[Template.RESERVED_ROOT] else nil
+		if type(markedReserved) == "table" and type(markedReserved.Erase) == "table" then
+			entry.LocalSessionEnd = true
+			releaseWithoutWriting(profile)
+			if player.Parent == Players then
+				player:Kick(kickText("Erasing"))
+			end
+			teardown(entry, "erasing")
+			return
+		end
+
 		-- Stop the store holding a second full copy of this profile all session. The wipe
 		-- guard's top-level key set and its size are recorded on the entry by each
 		-- successful save. Not under Block policy, which persists those bytes back. This
@@ -1482,6 +1513,14 @@ function Persistence.new(ctx: any)
 		-- skipped. Negative ids are excluded because AddUserId no-ops for them outside
 		-- mock, so the signal can never accumulate.
 		local hadPriorSave = entry.UserId >= 0 and profile:HasCompletedSave()
+
+		-- Decided once, so a refused reset loads like an ordinary join.
+		local resetStaked, resetParked = 0, 0
+		local willReset = false
+		if options.ResetData then
+			resetStaked, resetParked = exchangeStateOf(profile.Data)
+			willReset = resetStaked == 0 and resetParked == 0
+		end
 
 		-- Legacy import ---------------------------------------------------------
 		-- Adopt a player's data from another library, ONCE, before Scribe has written for
@@ -1610,7 +1649,7 @@ function Persistence.new(ctx: any)
 				-- new profile or the player keeps the shared sample.
 				-- `isNew and not imported`: an imported profile is new to Scribe but not
 				-- to the player, so a Dynamic value the import carried is left alone.
-				if (isNew and not imported) or options.ResetData or not present then
+				if (isNew and not imported) or willReset or not present then
 					table.insert(dynamicToSeed, node)
 				end
 			end
@@ -1634,7 +1673,7 @@ function Persistence.new(ctx: any)
 		-- real stored values, which is the run an audit most wants to shadow.
 		local rawStored: { [string]: any }? = if options.MigrationShadow == true
 				and (not isNew or imported)
-				and not options.ResetData
+				and not willReset
 				and (preReconcileVersion == nil or preReconcileVersion < currentVersion)
 			then Util.deepClone(profile.Data)
 			else nil
@@ -1680,8 +1719,7 @@ function Persistence.new(ctx: any)
 			end
 		end
 
-		local resetStaked, resetParked = exchangeStateOf(profile.Data)
-		if options.ResetData and (resetStaked > 0 or resetParked > 0) then
+		if options.ResetData and not willReset then
 			-- The wipe would take the reserved root with it, and with it the only record
 			-- that the staked value ever existed. Refused rather than reported: there is
 			-- nothing to report to afterwards.
@@ -1692,7 +1730,7 @@ function Persistence.new(ctx: any)
 					.. `resolve or discard them before resetting`,
 				{ Player = player, Staked = resetStaked, Parked = resetParked }
 			)
-		elseif options.ResetData then
+		elseif willReset then
 			local fresh = Util.deepClone(persistentDefaults)
 			table.clear(profile.Data)
 			for k, v in fresh do
@@ -1707,7 +1745,7 @@ function Persistence.new(ctx: any)
 		-- player, or a rename step overwriting a field's default with nil. `not imported`:
 		-- adopted data has never seen a Scribe migration, so it enters at version 1 and
 		-- runs the entire chain, and stamping it current here would skip every step.
-		if (isNew or options.ResetData or freshAsTemplate) and not imported then
+		if (isNew or willReset or freshAsTemplate) and not imported then
 			local reserved = profile.Data[Template.RESERVED_ROOT]
 			if type(reserved) == "table" then
 				reserved.Version = currentVersion
@@ -1914,7 +1952,7 @@ function Persistence.new(ctx: any)
 			-- mean "no prior saved data", which is what starter kits need. An IMPORTED
 			-- profile does not: they arrive carrying a full inventory, and the starter kit
 			-- on top is the exact double-grant this flag prevents elsewhere.
-			local isNewProfile = (isNew or options.ResetData == true or freshAsTemplate) and not imported
+			local isNewProfile = (isNew or willReset or freshAsTemplate) and not imported
 			-- ImportLegacyData only fires for a player who has never saved, so a game
 			-- already on Scribe finishes moving stores here instead. NOT behind the import
 			-- cap: this runs on every join, and serialising those throttles ordinary logins.
@@ -2164,6 +2202,11 @@ function Persistence.new(ctx: any)
 		runHook("Replication", ctx.Replication.OnEntryReady)
 	end
 
+	-- Erasures in flight, per user.
+	local erasing: { [number]: number } = {}
+	local NO_PROFILE = "profile does not exist"
+	local LIVE_ELSEWHERE = "profile has an active session on another server"
+
 	local function loadProfile(entry: Entry)
 		local player = entry.Player
 
@@ -2186,6 +2229,18 @@ function Persistence.new(ctx: any)
 				teardown(entry, "load-failed")
 			end
 			return
+		end
+
+		local heldSince = Clock.Monotonic()
+		while (erasing[entry.UserId] or 0) > 0 and not entry.TornDown and not self.Stopped do
+			if Clock.Monotonic() - heldSince >= eraseJoinTimeout then
+				if player.Parent == Players then
+					player:Kick(kickText("Erasing"))
+				end
+				teardown(entry, "erasing")
+				return
+			end
+			Clock.Wait(0.1)
 		end
 
 		local attempt = 0
@@ -2306,6 +2361,7 @@ function Persistence.new(ctx: any)
 			HelloReceived = false,
 			QueueOpen = false,
 			HandshakeReady = false,
+			InitDelivered = false,
 			LastInitAt = 0,
 			ResyncPending = false,
 			Queue = {},
@@ -2675,14 +2731,180 @@ function Persistence.new(ctx: any)
 	-- precondition refusal or a throwing callback is a LOGIC error, and reporting those to
 	-- Health would let ordinary refusals flip the server to Outage. `mutate` runs against
 	-- a CLONE, so a callback that errors partway commits nothing. The active-session check
+	-- Validate judges the change, not the profile; at the cap the two scans cannot be compared.
+	local VALIDATE_LIMIT = 256
+	local TOO_MANY_VIOLATIONS =
+		`the profile already carries {VALIDATE_LIMIT} or more template violations, too many for validation to tell the change apart; repair it or write raw`
+
+	-- Length-prefixed, so a dotted key and a nested path differ.
+	local function violationKey(violation: Conform.Violation): string
+		local parts = table.create(#violation.Path + 1)
+		for i, segment in violation.Path do
+			parts[i] = if type(segment) == "number" then `#{segment}` else `{#segment}:{segment}`
+		end
+		parts[#parts + 1] = violation.Kind
+		return table.concat(parts, "/")
+	end
+
+	local function readPath(data: any, path: { string | number }): any
+		local value = data
+		for _, segment in path do
+			if type(value) ~= "table" then
+				return nil
+			end
+			value = value[segment]
+		end
+		return value
+	end
+
+	local function schemaAt(path: { string | number }): Template.SchemaNode?
+		local node: Template.SchemaNode? = compiled.Root
+		for _, segment in path do
+			if node == nil then
+				return nil
+			end
+			node = Template.ChildSchema(node, segment)
+		end
+		return node
+	end
+
+	-- A set counts distinct members, as its cap does.
+	local function entryCount(value: any, node: Template.SchemaNode?): number
+		local n = 0
+		if node ~= nil and node.Unique then
+			local seen: { [any]: boolean } = {}
+			for _, item in value :: { any } do
+				if not seen[item] then
+					seen[item] = true
+					n += 1
+				end
+			end
+			return n
+		end
+		for _ in value :: { [any]: any } do
+			n += 1
+		end
+		return n
+	end
+
+	-- An over-cap container keeps its size (edited, not grown); everything else a copy of its value.
+	local function violationFootprint(draft: { [string]: any }, violation: Conform.Violation): any
+		local value = readPath(draft, violation.Path)
+		if violation.Kind == "OverMaxLength" and type(value) == "table" then
+			return { Count = entryCount(value, schemaAt(violation.Path)) }
+		end
+		return { Value = Util.deepClone(value) }
+	end
+
+	local function stillTheSame(before: any, after: any): boolean
+		if before.Count ~= nil then
+			return after.Count ~= nil and after.Count <= before.Count
+		end
+		return after.Count == nil and deepSame(before.Value, after.Value)
+	end
+
+	-- Before the callback: an old-shape profile would report every difference as its doing.
+	local function offlineVersionRefusal(draft: { [string]: any }): string?
+		local reserved = draft[Template.RESERVED_ROOT]
+		local stored = if type(reserved) == "table" and type(reserved.Version) == "number" then reserved.Version else 1
+		if stored < currentVersion then
+			return `profile is at schema version {stored} and this build is {currentVersion}; load it in a session to migrate it first`
+		elseif stored > currentVersion then
+			return `profile is at schema version {stored}, newer than this build's {currentVersion}; update the place before editing it`
+		end
+		return nil
+	end
+
+	type OfflineBaseline = {
+		Violations: { [string]: any },
+		Full: boolean,
+		Reserved: any,
+		Derived: { [string]: any },
+		Session: { [string]: any },
+	}
+
+	local function offlineBaseline(draft: { [string]: any }): OfflineBaseline
+		local derived = {}
+		for _, node in compiled.DerivedNodes do
+			if #node.Path == 1 then
+				derived[node.Path[1]] = draft[node.Path[1]]
+			end
+		end
+		local session = {}
+		for name, child in compiled.Root.Children or {} do
+			if not child.Persist then
+				session[name] = { Value = Util.deepClone(draft[name]) }
+			end
+		end
+		local found = Conform.Check(compiled, draft, { Limit = VALIDATE_LIMIT })
+		local violations = {}
+		for _, violation in found do
+			violations[violationKey(violation)] = violationFootprint(draft, violation)
+		end
+		return {
+			Violations = violations,
+			Full = #found >= VALIDATE_LIMIT,
+			Reserved = Util.deepClone(draft[Template.RESERVED_ROOT]),
+			Derived = derived,
+			Session = session,
+		}
+	end
+
+	local function offlineChangeRefusal(
+		draft: { [string]: any },
+		baseline: OfflineBaseline
+	): (string?, { Conform.Violation }?)
+		if baseline.Full then
+			return TOO_MANY_VIOLATIONS, nil
+		end
+		if not deepSame(draft[Template.RESERVED_ROOT], baseline.Reserved) then
+			return `the change touches "{Template.RESERVED_ROOT}", which Scribe owns and an offline edit may not change`,
+				nil
+		end
+		for name, was in baseline.Derived do
+			if draft[name] ~= was then
+				return `the change writes "{name}", a derived field that is computed and never stored`, nil
+			end
+		end
+		for _, node in compiled.DerivedNodes do
+			if #node.Path == 1 and baseline.Derived[node.Path[1]] == nil and draft[node.Path[1]] ~= nil then
+				return `the change writes "{node.Path[1]}", a derived field that is computed and never stored`, nil
+			end
+		end
+		for name, before in baseline.Session do
+			if not deepSame(draft[name], before.Value) then
+				return `the change writes "{name}", a Session field that is never stored`, nil
+			end
+		end
+		local found = Conform.Check(compiled, draft, { Limit = VALIDATE_LIMIT })
+		if #found >= VALIDATE_LIMIT then
+			return TOO_MANY_VIOLATIONS, nil
+		end
+		local introduced = {}
+		for _, violation in found do
+			local before = baseline.Violations[violationKey(violation)]
+			if before == nil or not stillTheSame(before, violationFootprint(draft, violation)) then
+				table.insert(introduced, violation)
+			end
+		end
+		if #introduced > 0 then
+			local first = introduced[1]
+			return `the change does not match the template at "{Util.pathString(first.Path)}": {first.Detail}`,
+				introduced
+		end
+		return nil, nil
+	end
+
 	-- is a pure read, deliberately: ProfileStore has no non-stealing acquire, and the
 	-- first StartSessionAsync attempt writes ForceLoadSession and kicks an online player
 	-- off another server. Losing the read-then-write race costs one clobbered write;
 	-- closing it that way costs evicted players and eaten Robux.
 	local function updateOfflineProfile(
 		userId: number,
-		mutate: (data: { [string]: any }) -> ()
-	): (boolean, string?, boolean)
+		mutate: (data: { [string]: any }) -> (),
+		validate: boolean,
+		createIfMissing: boolean?
+	): (boolean, string?, boolean, { Conform.Violation }?)
 		local readOk, profile = pcall(function()
 			return store:GetAsync(self.KeyFor(userId))
 		end)
@@ -2690,20 +2912,29 @@ function Persistence.new(ctx: any)
 			return false, tostring(profile), true
 		end
 		if not profile then
-			return false, "profile does not exist", false
-		end
-		-- A read, not an acquire: StartSessionAsync writes ForceLoadSession and would kick a
-		-- live player, and EndSession only task.spawns its save, so acquiring would also cost
-		-- this path its promise that the write landed.
-		if sessionLooksLive(profile) then
-			return false, "profile has an active session on another server", false
+			if not createIfMissing then
+				return false, NO_PROFILE, false
+			end
+		elseif sessionLooksLive(profile) then
+			-- A read, not an acquire: StartSessionAsync writes ForceLoadSession and would kick
+			-- a live player, and EndSession only task.spawns its save, so acquiring would also
+			-- cost this path its promise that the write landed.
+			return false, LIVE_ELSEWHERE, false
 		end
 
-		local draft = Util.deepClone(profile.Data)
+		local draft = if profile then Util.deepClone(profile.Data) else {}
 		-- Same integer-key coercion the session load does, so the callback sees the keys
 		-- its template declares rather than the DataStore's string forms. The commit
 		-- writes them back as numbers, which the store re-encodes as for a live save.
 		Template.CoerceMapKeys(compiled, draft)
+		local baseline: OfflineBaseline? = nil
+		if validate then
+			local refusal = offlineVersionRefusal(draft)
+			if refusal ~= nil then
+				return false, refusal, false
+			end
+			baseline = offlineBaseline(draft)
+		end
 		local mutateOk, mutateErr = pcall(mutate, draft)
 		if not mutateOk then
 			return false, tostring(mutateErr), false
@@ -2715,6 +2946,12 @@ function Persistence.new(ctx: any)
 		if bad ~= nil then
 			return false, `unpersistable data ({bad.Detail}) at "{Util.pathString(bad.Path)}"`, false
 		end
+		if baseline ~= nil then
+			local refusal, introduced = offlineChangeRefusal(draft, baseline)
+			if refusal ~= nil then
+				return false, refusal, false, introduced
+			end
+		end
 
 		-- Commit conditionally, in ONE call. `mutate` above is developer code and may yield
 		-- for as long as it likes, so a player can join another server inside that window.
@@ -2723,27 +2960,27 @@ function Persistence.new(ctx: any)
 		-- DISOWNS the server holding the key, and everything it wrote since its last save
 		-- is gone. The compare-and-set makes the check and the write one DataStore call.
 		if type((store :: any).UpdateOfflineAsync) == "function" then
+			-- LastUpdate has one-second granularity and a view-mode SetAsync moves neither
+			-- counter, hence WriteIndex; a recreated key can repeat all three, hence Generation.
+			-- An empty fingerprint matches no stored key.
+			local expected = if profile
+				then {
+					SessionLoadCount = profile.SessionLoadCount,
+					LastUpdate = profile.LastUpdate,
+					WriteIndex = profile.WriteIndex,
+					Generation = profile.Generation,
+				}
+				else {}
 			local casOk, outcome = pcall(function()
-				return (store :: any):UpdateOfflineAsync(
-					self.KeyFor(userId),
-					{
-						SessionLoadCount = profile.SessionLoadCount,
-						LastUpdate = profile.LastUpdate,
-						-- The field that does the work: LastUpdate has one-second
-						-- granularity, so two writers off one snapshot can both pass it,
-						-- and a view-mode SetAsync (how RestoreVersion commits) moves
-						-- neither of the other two at all.
-						WriteIndex = profile.WriteIndex,
-					},
-					draft,
-					{
-						-- The same dead-session age sessionLooksLive uses, and the one
-						-- StartSessionAsync steals at. Without it the CAS refuses on
-						-- ActiveSession ~= nil at ANY age, so a crashed server locks
-						-- UpdateOffline out forever.
-						StaleSessionAfter = ASSUME_DEAD_SECONDS,
-					}
-				)
+				return (store :: any):UpdateOfflineAsync(self.KeyFor(userId), expected, draft, {
+					-- The same dead-session age sessionLooksLive uses, and the one
+					-- StartSessionAsync steals at. Without it the CAS refuses on
+					-- ActiveSession ~= nil at ANY age, so a crashed server locks
+					-- UpdateOffline out forever.
+					StaleSessionAfter = ASSUME_DEAD_SECONDS,
+					-- Only when the read found nothing, so a key erased since stays erased.
+					CreateIfMissing = createIfMissing == true and profile == nil,
+				})
 			end)
 			if not casOk then
 				return false, tostring(outcome), true
@@ -2752,7 +2989,10 @@ function Persistence.new(ctx: any)
 		end
 
 		-- Fallback for an injected store without the compare-and-set: re-read, then
-		-- write, with the window that leaves.
+		-- write, with the window that leaves. It cannot create a key.
+		if profile == nil then
+			return false, NO_PROFILE, false
+		end
 		local recheckOk, latest = pcall(function()
 			return store:GetAsync(self.KeyFor(userId))
 		end)
@@ -2774,14 +3014,22 @@ function Persistence.new(ctx: any)
 		return true, nil, false
 	end
 
-	function self.UpdateOffline(userId: number, fn: (data: { [string]: any }) -> ()): (boolean, string?)
+	function self.UpdateOffline(
+		userId: number,
+		fn: (data: { [string]: any }) -> (),
+		opts: { Validate: boolean? }?
+	): (boolean, string?, { Conform.Violation }?)
+		if mode == "NoSave" then
+			return false, refuseNoSave("UpdateOffline")
+		end
 		if self.EntryForUserId(userId) then
 			return false, "user has an active session on this server"
 		end
+		local validate = opts ~= nil and opts.Validate == true
 		acquireOffline(userId)
 		-- Still pcalled so an unexpected internal error cannot skip releaseOffline;
 		-- such an error is not a DataStore failure either, so it does not report.
-		local callOk, ok, reason, dataStoreFailed = pcall(updateOfflineProfile, userId, fn)
+		local callOk, ok, reason, dataStoreFailed, violations = pcall(updateOfflineProfile, userId, fn, validate)
 		releaseOffline(userId)
 		if not callOk then
 			return false, tostring(ok)
@@ -2801,7 +3049,7 @@ function Persistence.new(ctx: any)
 					Context = { UserId = userId },
 				})
 			end
-			return false, reason
+			return false, reason, violations
 		end
 		Health.ReportSuccess("OfflineWrite")
 		return true, nil
@@ -2869,6 +3117,9 @@ function Persistence.new(ctx: any)
 		versionId: string,
 		opts: { RollBackReserved: boolean? }?
 	): (boolean, string?)
+		if mode == "NoSave" then
+			return false, refuseNoSave("RestoreVersion")
+		end
 		if Health.GetStatus() == "Outage" then
 			return false, "data services are experiencing an outage"
 		end
@@ -2913,6 +3164,7 @@ function Persistence.new(ctx: any)
 				SessionLoadCount = live.SessionLoadCount,
 				LastUpdate = live.LastUpdate,
 				WriteIndex = live.WriteIndex,
+				Generation = live.Generation,
 			}
 			local versionProfile = store:GetAsync(self.KeyFor(userId), versionId)
 			if not versionProfile then
@@ -3042,27 +3294,184 @@ function Persistence.new(ctx: any)
 
 	-- GDPR ---------------------------------------------------------------------
 
-	function self.Erase(userId: number): (boolean, string?)
-		if Health.GetStatus() == "Outage" then
-			return false, "data services are experiencing an outage"
+	local ERASE_LOST = "the erase was finished or replaced elsewhere"
+	local ERASE_BUSY = "another erase of this profile is still running"
+	-- Longer than a budget wait plus a request; a crashed worker blocks a retry this long.
+	local ERASE_LEASE = 300
+
+	local function leaseLive(lease: any): boolean
+		return type(lease) == "table" and type(lease.Until) == "number" and lease.Until > Clock.Now()
+	end
+
+	--- nil while `profile` carries a marker leased to `leaseId`, else why this attempt lost it.
+	local function markerLost(profile: any, leaseId: string): string?
+		if profile == nil then
+			return NO_PROFILE
 		end
-		local entry = self.EntryForUserId(userId)
-		if entry then
-			return false, "user has an active session on this server"
+		local data = profile.Data
+		local reserved = if type(data) == "table" then data[Template.RESERVED_ROOT] else nil
+		local stored = if type(reserved) == "table" then reserved.Erase else nil
+		if type(stored) ~= "table" then
+			return "the profile was recreated since this erase began"
 		end
-		local ok, err = pcall(function()
-			-- Fail closed if the user is active on another server: RemoveAsync bypasses
-			-- the session lock, so a live session elsewhere would re-save and resurrect
-			-- the "erased" profile (same guard as UpdateOffline/RestoreVersion).
-			local profile = store:GetAsync(self.KeyFor(userId))
-			if sessionLooksLive(profile) then
-				error("profile has an active session on another server")
+		if type(stored.Lease) ~= "table" or stored.Lease.Id ~= leaseId then
+			return "another erase replaced this one"
+		end
+		return nil
+	end
+
+	--- Takes the erase lease in the same compare-and-set as the read it decides on; a user with
+	--- no profile gets a placeholder holding only the marker. Returns the marker, the board
+	--- ranges and whether an earlier attempt left the marker. Errors with the refusal.
+	local function claimErase(userId: number, leaseId: string): (any, any, boolean)
+		local marker: any = nil
+		local ranges: any = nil
+		local resumed = false
+		local wrote, why = updateOfflineProfile(userId, function(draft)
+			local reserved = draft[Template.RESERVED_ROOT]
+			if type(reserved) ~= "table" then
+				reserved = {}
+				draft[Template.RESERVED_ROOT] = reserved
 			end
-			if not store:RemoveAsync(self.KeyFor(userId)) then
-				error("RemoveAsync returned false")
+			ranges = if type(reserved.Boards) == "table" then Util.deepClone(reserved.Boards) else nil
+			local existing = reserved.Erase
+			if type(existing) == "table" then
+				if leaseLive(existing.Lease) then
+					error(ERASE_BUSY, 0)
+				end
+				resumed = true
+				marker = {
+					StartedAt = existing.StartedAt,
+					Done = if type(existing.Done) == "table" then Util.deepClone(existing.Done) else {},
+					Cursors = if type(existing.Cursors) == "table" then Util.deepClone(existing.Cursors) else {},
+				}
+			else
+				marker = { StartedAt = Clock.Now(), Done = {}, Cursors = {} }
+			end
+			marker.Lease = { Id = leaseId, Until = Clock.Now() + ERASE_LEASE }
+			reserved.Erase = Util.deepClone(marker)
+		end, false, true)
+		if wrote then
+			return marker, ranges, resumed
+		end
+		if why == ERASE_BUSY or why == LIVE_ELSEWHERE then
+			error(why, 0)
+		end
+		error(`could not mark the profile for erasure: {tostring(why)}`, 0)
+	end
+
+	--- Writes the sweep's progress and renews the lease, or with `release` drops it. The third
+	--- return is true once the key no longer carries this attempt's lease.
+	local function renewErase(
+		userId: number,
+		marker: any,
+		leaseId: string,
+		release: boolean
+	): (boolean, string?, boolean)
+		local wrote, why = updateOfflineProfile(userId, function(draft)
+			local reserved = draft[Template.RESERVED_ROOT]
+			local existing = if type(reserved) == "table" then reserved.Erase else nil
+			if type(existing) ~= "table" or type(existing.Lease) ~= "table" or existing.Lease.Id ~= leaseId then
+				error(ERASE_LOST, 0)
+			end
+			marker.Lease = if release then nil else { Id = leaseId, Until = Clock.Now() + ERASE_LEASE }
+			reserved.Erase = Util.deepClone(marker)
+		end, false)
+		if wrote then
+			return true, nil, false
+		end
+		if why == NO_PROFILE or why == ERASE_LOST then
+			return false, why, true
+		end
+		-- A live session refuses the write before the marker is seen; only a read can tell.
+		if why == LIVE_ELSEWHERE then
+			local readOk, stored = pcall(function()
+				return store:GetAsync(self.KeyFor(userId))
+			end)
+			if readOk and markerLost(stored, leaseId) ~= nil then
+				return false, ERASE_LOST, true
+			end
+		end
+		return false, why, false
+	end
+
+	local function eraseHeld(userId: number): (boolean, string?)
+		local leaseId = Util.guid()
+		local marker: any = nil
+		local ranges: any = nil
+		local ok, err = pcall(function()
+			local resumed
+			marker, ranges, resumed = claimErase(userId, leaseId)
+			if resumed then
+				Log.Info("Persistence", "PROFILE_ERASE_RESUMED", "resuming an erase that did not finish", {
+					UserId = userId,
+					StartedAt = marker.StartedAt,
+				})
 			end
 		end)
+		local progress: any = nil
+		if ok then
+			progress = { Done = marker.Done, Cursors = marker.Cursors, Lost = false, Stopped = nil }
+			-- Past a failed renewal the key may be another attempt's, so the sweep stops.
+			progress.Save = function(): boolean
+				local why
+				for attempt = 1, 2 do
+					local saved, reason, lost = renewErase(userId, marker, leaseId, false)
+					if lost then
+						progress.Lost = true
+						return false
+					end
+					if saved then
+						return true
+					end
+					why = reason
+					if attempt == 1 then
+						Clock.Wait(1)
+					end
+				end
+				Log.Warn(
+					"Persistence",
+					"PROFILE_ERASE_PROGRESS_FAIL",
+					"erase progress was not saved; the sweep stops and a retry resumes it",
+					{ UserId = userId, Reason = why }
+				)
+				progress.Stopped = tostring(why)
+				return false
+			end
+			local lbOk, lbErr = ctx.Leaderboards.EraseUser(userId, ranges, progress)
+			-- A lost erase is judged by the key below, not by the sweep it cut short.
+			if progress.Stopped ~= nil then
+				ok, err = false, `the erase lease could not be renewed: {progress.Stopped}`
+			elseif not lbOk and not progress.Lost then
+				ok, err = false, `leaderboard entries remain: {tostring(lbErr)}`
+			end
+		end
+		local finishedElsewhere = false
+		if ok then
+			ok, err = pcall(function()
+				-- The sweep yields, so the key may have changed hands since the claim.
+				local stored = store:GetAsync(self.KeyFor(userId))
+				if stored == nil then
+					finishedElsewhere = true
+					return
+				end
+				if sessionLooksLive(stored) then
+					error(LIVE_ELSEWHERE, 0)
+				end
+				local lost = markerLost(stored, leaseId)
+				if lost ~= nil then
+					error(lost, 0)
+				end
+				if not store:RemoveAsync(self.KeyFor(userId)) then
+					error("RemoveAsync returned false")
+				end
+			end)
+		end
 		if not ok then
+			-- Drop the lease so a retry need not wait for it; a refused drop leaves it to lapse.
+			if marker ~= nil and not (progress ~= nil and progress.Lost) then
+				renewErase(userId, marker, leaseId, true)
+			end
 			-- Same as Restore: without this a failed GDPR erase reaches no sink at all.
 			Failure.Report({
 				Subsystem = "Erase",
@@ -3075,19 +3484,34 @@ function Persistence.new(ctx: any)
 			})
 			return false, tostring(err)
 		end
-		local lbOk, lbErr = ctx.Leaderboards.EraseUser(userId)
+		if finishedElsewhere then
+			return true, nil
+		end
 		Log.Warn("Persistence", "PROFILE_ERASED", "profile erased (GDPR)", {
 			UserId = userId,
 			PlaceId = game.PlaceId,
 			JobId = game.JobId,
-			LeaderboardOk = lbOk,
 		})
-		if not lbOk then
-			-- The profile is gone but a leaderboard key was not removed; report
-			-- failure so the operator retries (Erase is idempotent end to end).
-			return false, lbErr
-		end
 		return true, nil
+	end
+
+	function self.Erase(userId: number): (boolean, string?)
+		if mode == "NoSave" then
+			return false, refuseNoSave("Erase")
+		end
+		if Health.GetStatus() == "Outage" then
+			return false, "data services are experiencing an outage"
+		end
+		if self.EntryForUserId(userId) then
+			return false, "user has an active session on this server"
+		end
+		erasing[userId] = (erasing[userId] or 0) + 1
+		local callOk, ok, reason = pcall(eraseHeld, userId)
+		erasing[userId] = if erasing[userId] > 1 then erasing[userId] - 1 else nil
+		if not callOk then
+			return false, tostring(ok)
+		end
+		return ok, reason
 	end
 
 	local function jsonSafe(value: any): any

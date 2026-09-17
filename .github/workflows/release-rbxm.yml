@@ -54,16 +54,20 @@ jobs:
             exit 1
           fi
 
-      # Shared with bundle-smoke.yml: install deps, copy & sanitize ProfileStore,
-      # run the off-platform URL backstop, stamp the version, and build the model.
-      - name: Assemble & build Scribe.rbxm
+      # Shared with bundle-smoke.yml: URL backstop, version stamp, package and add-on models.
+      - name: Assemble & build the models
         uses: ./.github/actions/assemble-bundle
         with:
           version: ${{ steps.ver.outputs.value }}
 
+      # "-Addon" in the file name and "(Addon)" in the label mark them optional.
       - name: Attach to the release
         if: github.event_name == 'release'
-        run: gh release upload "$TAG_NAME" Scribe.rbxm --clobber
+        run: |
+          gh release upload "$TAG_NAME" --clobber \
+            Scribe.rbxm \
+            "ScribeTelemetry-Addon.rbxm#ScribeTelemetry (Addon).rbxm" \
+            "ScribeUIAdapters-Addon.rbxm#ScribeUIAdapters (Addon).rbxm"
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.event.release.tag_name }}
@@ -73,4 +77,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Scribe-rbxm
-          path: Scribe.rbxm
+          path: |
+            Scribe.rbxm
+            ScribeTelemetry-Addon.rbxm
+            ScribeUIAdapters-Addon.rbxm

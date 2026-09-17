@@ -22,6 +22,22 @@ local Reassemble = require(script.Parent.Reassemble)
 
 local TestCtx = {}
 
+-- Stopped by the harness's Cleanup; an unloaded client otherwise retries its Hello for ever.
+local clientsByCompiled: { [any]: { any } } = setmetatable({}, { __mode = "k" }) :: any
+local realClientNew = Client.new
+Client.new = function(options: any, compiled: any): any
+	local client = realClientNew(options, compiled)
+	if compiled ~= nil then
+		local list = clientsByCompiled[compiled]
+		if list == nil then
+			list = {}
+			clientsByCompiled[compiled] = list
+		end
+		table.insert(list, client)
+	end
+	return client
+end
+
 --- A template that exercises every declarator and wire shape.
 function TestCtx.defaultTemplate(): { [string]: any }
 	return {
@@ -322,6 +338,10 @@ function TestCtx.make(
 		--
 		-- pcall'd and idempotent, because specs call Cleanup on early-return paths and
 		-- again at the end.
+		for _, client in clientsByCompiled[compiled] or {} do
+			pcall(client.Stop)
+		end
+		clientsByCompiled[compiled] = nil
 		pcall(Data.Stop)
 		-- The Health singleton is shared across harnesses: walk it back to
 		-- Healthy so failure-injection tests don't poison later specs.

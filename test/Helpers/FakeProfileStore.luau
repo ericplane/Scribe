@@ -22,6 +22,7 @@ local RELEASED_LAST_SAVED = table.freeze({})
 local FakeProfileStore = {}
 
 type AnyTable = { [string]: any }
+type KeyMeta = { LastUpdate: number, WriteIndex: number, SessionLoadCount: number, Generation: string }
 
 local function reconcileInto(target: AnyTable, template: AnyTable)
 	for key, value in template do
@@ -99,7 +100,9 @@ function FakeProfileStore.new()
 	-- `type(store.UpdateOfflineAsync) == "function"` was false, so Persistence took
 	-- its injected-store FALLBACK, and the compare-and-set the library actually
 	-- ships was unreached by the whole suite.
-	fake.Meta = {} :: { [string]: { LastUpdate: number, WriteIndex: number, SessionLoadCount: number } }
+	fake.Meta = {} :: { [string]: KeyMeta }
+	-- A counter stands in for the real store's per-key GUID.
+	fake.Created = 0
 	fake.SaveCounts = {} :: { [string]: number }
 	fake.Constants = {} :: { [string]: number } -- records ProfileStore.SetConstant calls
 
@@ -197,10 +200,12 @@ function FakeProfileStore.new()
 				-- so its count is 1. Specs seed fake.Persisted directly all over the
 				-- suite, and if the view and the compare-and-set disagreed about this
 				-- field every such key would fingerprint as "Changed" forever.
+				fake.Created += 1
 				meta = {
 					LastUpdate = 0,
 					WriteIndex = 0,
 					SessionLoadCount = if fake.Persisted[key] then 1 else 0,
+					Generation = `gen-{fake.Created}`,
 				}
 				fake.Meta[key] = meta
 			end
@@ -622,6 +627,7 @@ function FakeProfileStore.new()
 			-- on Profile.New with the same `or 0` normalisation.
 			view.LastUpdate = metaFor(key).LastUpdate
 			view.WriteIndex = metaFor(key).WriteIndex
+			view.Generation = metaFor(key).Generation
 			view.view_mode = true
 			view.Session = if fake.ActiveProfiles[key] then { PlaceId = 0, JobId = "mock" } else nil
 			function view.IsActive(_self: any): boolean
@@ -698,7 +704,13 @@ function FakeProfileStore.new()
 			end
 			local key = fullKey(profileKey)
 			if fake.Persisted[key] == nil then
-				return "Missing"
+				if not (options and options.CreateIfMissing == true) then
+					return "Missing"
+				end
+				fake.Persisted[key] = Util.deepClone(newData)
+				bumpWrite(key, true)
+				recordVersion(profileKey, newData)
+				return "Written"
 			end
 
 			local meta = metaFor(key)
@@ -727,6 +739,7 @@ function FakeProfileStore.new()
 				meta.SessionLoadCount ~= expected.SessionLoadCount
 				or meta.LastUpdate ~= expected.LastUpdate
 				or (meta.WriteIndex or 0) ~= (expected.WriteIndex or 0)
+				or (expected.Generation ~= nil and meta.Generation ~= expected.Generation)
 			then
 				return "Changed"
 			end

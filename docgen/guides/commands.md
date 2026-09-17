@@ -1,23 +1,20 @@
 # Commands & Requests
 
-A player clicks a button in Emberfall and something has to actually change: coins are spent, a setting flips, a daily reward is claimed. The client cannot make that change itself, because anything a client writes stays on the client and never reaches the server. A **command** is how you close that gap. You register a named function on the server, the client calls it by name, and the server's answer comes back.
+A **command** lets a client ask the server to change data. Register a named function on the server, then call it from a LocalScript. The server checks the request and sends back its answer.
+
+Client field writes stay local, so use a command for lasting changes such as a setting, purchase, or reward.
 
 ## Your first command
 
-Register the handler on the server, once, at startup.
+This example continues [Getting Started](./intro), using its `GameData` module and plain `Settings.Music` boolean. Register the handler in a server Script, once, at startup. The later daily-reward example uses the larger [Emberfall template](./emberfall).
 
 ```lua
--- ServerScriptService/EmberfallServer.server.luau
+-- ServerScriptService/MusicCommand (Script)
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Scribe = require(ReplicatedStorage.Packages.Scribe)
-local Data = require(ReplicatedStorage.Shared.EmberfallData).Server
+local Data = require(ReplicatedStorage.Shared.GameData).Server
 
 Data.Command("ToggleMusic", { Args = { "boolean" } }, function(player, on)
-    if on then
-        Data[player].Settings.Enable("Music")
-    else
-        Data[player].Settings.Disable("Music")
-    end
+    Data[player].Settings.Music.Set(on)
     return on
 end)
 ```
@@ -25,15 +22,27 @@ end)
 Call it from a `LocalScript`.
 
 ```lua
--- StarterPlayerScripts/EmberfallUi.client.luau
+-- StarterPlayer/StarterPlayerScripts/MusicRequest (LocalScript)
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Scribe = require(ReplicatedStorage.Packages.Scribe)
-local Data = require(ReplicatedStorage.Shared.EmberfallData).Client
+local Data = require(ReplicatedStorage.Shared.GameData).Client
 
-local musicOn = Data.Request("ToggleMusic", false)
+if not Data.WaitForData() then
+    warn("Data did not arrive; try again after loading")
+    return
+end
+
+local musicOn, reason, failed = Data.Request("ToggleMusic", false)
+if failed == Scribe.RequestFailed then
+    warn("Music request could not be confirmed:", reason)
+    return
+end
+print("Music enabled:", musicOn) -- false: the server accepted the setting
 ```
 
-[`Data.Request`](/api/Client#Request) yields until the reply arrives and hands back whatever the handler returned, so `musicOn` is `false` here. The `player` your handler receives comes from the transport, so a client cannot claim to be someone else. Never accept a user id as an argument and act on it.
+[`Data.Request`](/api/Client#Request) waits for a reply and returns the handler's result. Here, `false` is a successful result: music is off. The third return value distinguishes a request failure from that valid boolean. Your existing `Observe` listeners can display the updated setting.
+
+The `player` passed to the handler is the real sender. For player-owned actions, use that Player rather than trusting a user ID supplied by the client. [Failure handling](#what-the-caller-gets-back-on-failure) explains timeouts and other outcomes.
 
 ## Registering
 

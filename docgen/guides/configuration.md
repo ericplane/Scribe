@@ -49,7 +49,7 @@ Scribe({
 | `Mock` | ProfileStore's in-memory mock | Mock | To the mock only |
 | `NoSave` | A snapshot of the real profile | None | Never |
 
-`TargetUserId` pairs with any mode and loads that user's profile instead of the joining player's. `Mode = "NoSave", TargetUserId = 101` is the safe way to inspect Ava's real profile: you see genuine stored data and nothing can write it back.
+`TargetUserId` pairs with any mode and loads that user's profile instead of the joining player's. `Mode = "NoSave", TargetUserId = 101` is the safe way to inspect Ava's real profile: you see genuine stored data and nothing can write it back. The offline verbs honour it too: `UpdateOffline`, `RestoreVersion`, `Erase` and `SendMessage` refuse under `NoSave` and log `NOSAVE_WRITE_REFUSED`, and a gift receipt for an offline recipient answers `NotProcessedYet` instead of queueing the gift in their real mailbox.
 
 `Mode` is the only switch a play-test needs. Under both `Mock` and `NoSave`, declared [leaderboards](./leaderboards) swap to an in-memory ordered store too, so a test session cannot write a score into a live OrderedDataStore. Those boards start empty and are discarded when the session ends. `Mode = "Mock"` is also what unlocks receipt injection in [Scribe Studio](./studio-plugin), which refuses to inject against any other mode.
 
@@ -104,6 +104,7 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | `ProfileStore` | `any?` | auto-discovered | An explicit ProfileStore module or ModuleScript. Set it only when auto-discovery fails or you need a specific build. |
 | `ResetData` | `boolean?` | off | Wipes each loaded profile back to template defaults and logs a reset warning. Deliberate destruction, so leave it off. |
 | `LoadTimeout` | `number?` | 120 | Seconds one session attempt may take before `LoadFailurePolicy` applies. Floored at 60. |
+| `EraseJoinTimeout` | `number?` | 10 | Seconds a join waits for a `Data.Erase` of that user running on this server before it is refused with the reason `erasing`. The erase keeps running either way. |
 | `LoadFailurePolicy` | `("Kick" \| "Wait")?` | `"Kick"` | What to do when a load keeps failing. `"Kick"` removes the player. `"Wait"` retries with backoff and never serves template data. |
 | `VersionAheadPolicy` | `("Kick" \| "Allow")?` | `"Kick"` | What to do with a profile written by a newer deploy. `"Kick"` fails closed. `"Allow"` runs older code against newer data and warns. |
 | `KickOnSessionEnd` | `boolean?` | `true` | Kicks a player whose session ends unexpectedly, so they can rejoin with a working one. |
@@ -113,6 +114,7 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | `VersionAheadMessage` | `string?` | "Your data is from a newer version of the game than this server…" | Shown when `VersionAheadPolicy = "Kick"` fails closed on a profile a newer deploy already migrated. Their data is fine; this server is the old one. |
 | `SchemaFailureMessage` | `string?` | "Your saved data doesn't match this version of the game…" | Shown when `SchemaPolicy = "Reject"` rejects the stored profile. |
 | `RateLimitedMessage` | `string?` | "Roblox's data service is busy right now…" | Shown when the load failed and the DataStore's last error for that key was a throttle (a 3xx code). The one load failure worth rejoining for. |
+| `ErasingMessage` | `string?` | "Your data is being reset. Please rejoin in a few minutes!" | Shown to a player refused because their profile is being erased. Not a load failure, so `LoadFailureMessage` does not reach it. |
 | `SessionEndMessage` | `string?` | "Your data session has ended. Please rejoin!" | The kick message when `KickOnSessionEnd` fires. Setting it overrides both causes below. |
 | `SessionStolenMessage` | `string?` | "Your data was opened on another server…" | Shown when another server took the profile, which is what almost every unexpected session end actually is. |
 | `SessionInterruptedMessage` | `string?` | "Your data session ended before it finished loading…" | Shown when the session went away mid-load, so the player never had a session to lose. |
@@ -155,7 +157,8 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | `Products` | `{ [string]: ProductConfig }?` | none | Declares developer products by name, each with an `Id` and an optional `Category`, `Grant`, `Grants` and `PaidRandom`. See [Monetization](./monetization). |
 | `Passes` | `{ [string]: PassConfig }?` | none | Declares game passes by name, each with an `Id` and an optional `Category`. |
 | `Perks` | `{ string }?` | none | A list of valid perk names, used only as a typo guard. Without it any perk name is accepted silently. |
-| `Leaderboards` | `{ [string]: LeaderboardConfig }?` | none | Registers all-time OrderedDataStore boards. See [Leaderboards](./leaderboards). |
+| `Leaderboards` | `{ [string]: LeaderboardConfig }?` | none | Registers boards: lifetime, `Period = "Daily"` or `"Weekly"`, and `Scope = "Server"` for the players on this server. See [Leaderboards](./leaderboards). |
+| `PeriodReset` | `{ UtcOffset: number?, WeekStart: string? }?` | `0`, `"Monday"` | The clock periodic boards reset on: hours from UTC (-12 to 14) and the day a week starts. One per bundle. See [Leaderboards](./leaderboards#the-reset-clock). |
 | `OwnReceipts` | `boolean?` | `true` | Whether this bundle installs the single global `ProcessReceipt` callback. Set false on a secondary bundle and route its receipts through `Data.HandleReceipt`. |
 | `PurchaseLog` | table | caps of 100, server-only | Tunes the per-player purchase history rings. |
 | `UserOwnsGamePassAsync` | `((userId, passId) -> boolean)?` | the real service call | A test seam for pass ownership. Leave it unset in production. |
@@ -379,11 +382,12 @@ Absent, the policy follows [`DevMode`](#diagnostics): `"Warn"` while you develop
 | `LogRingSize` | `number?` | 512 | How many entries [`Scribe.GetRecentLogs`](/api/Scribe#GetRecentLogs) retains. |
 | `StatusThresholds` | `{ FailWindow, FailCount, RecoverStreak }?` | `{ 60, 3, 5 }` | Tunes the health machine that moves the service between Healthy, Degraded and Outage. |
 | `Banner` | `boolean?` | `true` | Prints one "Running Scribe vX.Y.Z" line when the bundle loads. |
+| `StudioHook` | `boolean?` | `false` | Attaches the Studio debug hooks [Scribe Studio](./studio-plugin) reads, on the server and on each client. Inert outside Studio. Off by default because the hooks record every op, log line and send from the moment the bundle starts, whether or not the plugin is open. |
 
 ??? note "Exactly what `DevMode` gates"
     It supplies the default for [`SchemaPolicy`](#checking-stored-data-against-the-template), and it gates `UNKNOWN_ROOT_KEYS`, the **server-side** `API_NAME_COLLISION` scan, `UNDECLARED_PERK`, `UNDECLARED_CATEGORY`, `UNKNOWN_OWNS_KEY`, `ECONOMY_FIELD_UNDECLARED`, `ECONOMY_FIELDS_OVERFLOW`, `LB_UNKNOWN_BOARD`, and the `DEV_WARNING` a `Decrement` with a negative delta fires. The client-side name-collision scan is ungated and logs at Error on live servers too.
 
-    Set it `true` in a headless or CI run, where the Studio default is `false` and every one of those warnings is otherwise absent. Set it `false` to quiet them inside Studio. It is independent of the `UNKNOWN_OPTION` scan, which is Studio-only either way. On the client it also gates the debug hook [Scribe Studio](./studio-plugin) reads.
+    Set it `true` in a headless or CI run, where the Studio default is `false` and every one of those warnings is otherwise absent. Set it `false` to quiet them inside Studio. It is independent of the `UNKNOWN_OPTION` scan, which is Studio-only either way, and of `StudioHook`, which is what gates the debug hooks [Scribe Studio](./studio-plugin) reads.
 
 ??? note "`LogRingSize` is the only knob a bug report depends on"
     `LogLevel` controls what reaches the console. Every entry enters the ring whatever its level, and past `LogRingSize` the oldest is overwritten. So the ring is the only thing that decides what a bug report can still see.

@@ -153,7 +153,7 @@ end
 ---
 --- What it is FOR: a Scribe module whose state is a once-per-process latch cannot
 --- be re-armed, so a spec that must not spend the shared one takes a private copy
---- instead. test/Specs/DebugHookIntegration.spec is the case, and the reason it is
+--- instead. test/Specs/diagnostics/DebugHookIntegration.spec is the case, and the reason it is
 --- worth supporting here is that it is not a headless problem at all -- headless
 --- the latch is never even reached -- it is what made the Studio run's ordering
 --- decide which of two specs got to measure the hook.
@@ -568,7 +568,7 @@ services.AnalyticsService = {
 
 -- A simulation installs a modelled backend here; with nothing installed this
 -- behaves exactly as it always has, and the two error strings below are
--- byte-identical to the originals on purpose. test/Specs/LeaderboardMode.spec
+-- byte-identical to the originals on purpose. test/Specs/leaderboards/LeaderboardMode.spec
 -- names that GetOrderedDataStore error as its discriminator, so changing a word
 -- of it silently rewrites what that spec asserts.
 --
@@ -922,9 +922,12 @@ end
 local root = newInstance("ScribeDev", "Folder")
 addChild(root, buildTree("Scribe", "src"))
 addChild(root, buildTree("Test", "test"))
--- Mirrors test.project.json: the UI-framework adapters are not part of the package
--- (wally publishes src only), but their specs drive them, so they have to be reachable.
-addChild(root, buildTree("Adapters", "adapters"))
+-- Mirrors test.project.json: the add-ons are not part of the package (wally publishes
+-- src only), but their specs drive them, so they have to be reachable.
+local addons = newInstance("Addons", "Folder")
+addChild(addons, buildTree("UI", "addons/ui"))
+addChild(addons, buildTree("Telemetry", "addons/telemetry"))
+addChild(root, addons)
 
 -- The escape hatch a simulation needs, and the ONLY one.
 --
@@ -1010,27 +1013,52 @@ end
 local plan = newNode("root")
 local collectErrors = {}
 
-local specNames = {}
-for name in rawget(specsFolder, "_children") do
-	table.insert(specNames, name)
-end
-table.sort(specNames)
-
-for _, name in specNames do
-	local child = rawget(specsFolder, "_children")[name]
-	if string.sub(name, -5) == ".spec" then
-		local ok, result = pcall(shimRequire, child)
-		if not ok then
-			table.insert(collectErrors, `{name}: failed to load: {result}`)
-			continue
-		end
-		if type(result) ~= "function" then
-			table.insert(collectErrors, `{name}: spec module must return a function`)
-			continue
-		end
-		runnerState = plan
-		describe(string.sub(name, 1, -6), result)
+-- One level of topic folders under test/Specs; the describe keeps the bare spec name.
+local specs = {}
+local function collectSpecs(folder, prefix)
+	local names = {}
+	for name in rawget(folder, "_children") do
+		table.insert(names, name)
 	end
+	table.sort(names)
+	for _, name in names do
+		local child = rawget(folder, "_children")[name]
+		if rawget(child, "ClassName") == "Folder" then
+			collectSpecs(child, `{prefix}{name}/`)
+		elseif string.sub(name, -5) == ".spec" then
+			table.insert(specs, { Name = name, Path = `{prefix}{name}`, Node = child })
+		end
+	end
+end
+collectSpecs(specsFolder, "")
+
+-- SCRIBE_SPECS=persistence/WipeGuard,addons runs only the specs whose path contains a fragment.
+local specFilter = process.env.SCRIBE_SPECS
+if specFilter ~= nil and specFilter ~= "" then
+	local kept = {}
+	for _, spec in specs do
+		for fragment in string.gmatch(specFilter, "[^,]+") do
+			if string.find(spec.Path, fragment, 1, true) then
+				table.insert(kept, spec)
+				break
+			end
+		end
+	end
+	specs = kept
+end
+
+for _, spec in specs do
+	local ok, result = pcall(shimRequire, spec.Node)
+	if not ok then
+		table.insert(collectErrors, `{spec.Path}: failed to load: {result}`)
+		continue
+	end
+	if type(result) ~= "function" then
+		table.insert(collectErrors, `{spec.Path}: spec module must return a function`)
+		continue
+	end
+	runnerState = plan
+	describe(string.sub(spec.Name, 1, -6), result)
 end
 runnerState = nil
 

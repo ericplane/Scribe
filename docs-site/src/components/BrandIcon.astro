@@ -1,0 +1,24 @@
+---
+interface Props {
+    name: 'arrow' | 'code' | 'book' | 'layers' | 'search' | 'lifebuoy' | 'check' | 'branch' | 'shield' | 'spark' | 'play' | 'stop' | 'refresh' | 'link';
+    size?: number;
+}
+const { name, size = 22 } = Astro.props;
+const paths = {
+    arrow: 'M5 12h14m-6-6 6 6-6 6',
+    code: 'm8 7-5 5 5 5m8-10 5 5-5 5m-3-13-2 16',
+    book: 'M12 5c-3-2-7-2-10-1v15c3-1 7-1 10 1m0-15c3-2 7-2 10-1v15c-3-1-7-1-10 1V5',
+    layers: 'm12 3 10 5-10 5L2 8l10-5Zm-10 9 10 5 10-5M2 16l10 5 10-5',
+    search: 'm21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z',
+    lifebuoy: 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Zm-1-3 3-3M6 18l3-3m6 0 3 3M6 6l3 3',
+    check: 'm5 12 4 4L19 6',
+    branch: 'M7 5v14m10-14v4a4 4 0 0 1-4 4H7M9 5a2 2 0 1 1-4 0 2 2 0 0 1 4 0Zm0 14a2 2 0 1 1-4 0 2 2 0 0 1 4 0ZM19 5a2 2 0 1 1-4 0 2 2 0 0 1 4 0Z',
+    shield: 'm12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Zm-4 9 3 3 5-6',
+    spark: 'm12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3Z',
+    play: 'M7 5v14l12-7-12-7Z',
+    stop: 'M6 6h12v12H6Z',
+    refresh: 'M3 12a9 9 0 0 1 15.5-6.3L21 8M21 3v5h-5M21 12a9 9 0 0 1-15.5 6.3L3 16M3 21v-5h5',
+    link: 'M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1.5 1.5M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1.5-1.5',
+};
+---
+<svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={paths[name]} /></svg>

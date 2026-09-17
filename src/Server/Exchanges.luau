@@ -70,6 +70,16 @@ function Exchanges.new(ctx: any)
 	-- exchangeId per userId, for THIS server only. The cheap local check, never the
 	-- authority: the record answers the same question durably.
 	local inFlight: { [number]: string } = {}
+	local sweepParked = false
+	-- Entries with an exchange open; the sweep parks when there are none.
+	local candidates: { [any]: boolean } = {}
+	local function watch(entry: any)
+		candidates[entry] = true
+		if sweepParked and sweepThread ~= nil and not stopped then
+			sweepParked = false
+			Sched.Resume(sweepThread)
+		end
+	end
 
 	self.UsesMockStore = useMock
 	self.InFlight = inFlight
@@ -117,6 +127,11 @@ function Exchanges.new(ctx: any)
 		end
 		storeHandle = store
 		return storeHandle
+	end
+
+	--- A forced save of one side. Not true means unproved, never failed.
+	local function flushSide(side: any): boolean
+		return ctx.Persistence.Flush(side.Ctx.Entry.Player, { Force = true, Timeout = 8 })
 	end
 
 	--- The side descriptor the resolver takes, built from a loaded entry.
@@ -216,6 +231,7 @@ function Exchanges.new(ctx: any)
 		if #open == 0 then
 			return 0
 		end
+		watch(entry)
 		if self.VerdictStore() == nil then
 			return 0
 		end
@@ -268,6 +284,28 @@ function Exchanges.new(ctx: any)
 	--- One sweep over the profiles this server is holding, for sessions that never end: a
 	--- load resolves what it finds, but a player who stays on for six hours after a
 	--- counterparty vanished would otherwise wait six hours. Returns how many it resolved.
+	--- What the sweep may resolve on one entry, and whether any exchange stays open.
+	local function sweepEntry(entry: any): (number, boolean)
+		if entry.Tree == nil or entry.Tree.Dead then
+			return 0, false
+		end
+		if entry.State ~= "Ready" then
+			return 0, true
+		end
+		local side = sideFor(entry)
+		local resolved = 0
+		for _, exchangeId in Exchange.OpenExchangeIds(side) do
+			if stopped then
+				break
+			end
+			local record = entry.Tree.Reserved.Exchange[exchangeId].Get()
+			if sweepMayResolve(record, entry.UserId, exchangeId) and resolveExchange(side, exchangeId, entry) then
+				resolved += 1
+			end
+		end
+		return resolved, #Exchange.OpenExchangeIds(side) > 0
+	end
+
 	function self.Sweep(): number
 		if stopped then
 			return 0
@@ -286,19 +324,47 @@ function Exchanges.new(ctx: any)
 			if stopped then
 				break
 			end
-			if entry.State == "Ready" and entry.Tree ~= nil and not entry.Tree.Dead then
-				local side = sideFor(entry)
-				for _, exchangeId in Exchange.OpenExchangeIds(side) do
-					local record = entry.Tree.Reserved.Exchange[exchangeId].Get()
-					if
-						sweepMayResolve(record, entry.UserId, exchangeId) and resolveExchange(side, exchangeId, entry)
-					then
-						resolved += 1
-					end
-				end
+			resolved += (sweepEntry(entry))
+		end
+		return resolved
+	end
+
+	--- The periodic pass over the entries with an exchange open; a failure keeps its entry.
+	function self.SweepCandidates(): number
+		local batch = candidates
+		candidates = {}
+		local resolved = 0
+		for entry in batch do
+			if stopped then
+				break
+			end
+			if entry.TornDown then
+				continue
+			end
+			local ok, count, open = pcall(sweepEntry, entry)
+			if ok then
+				resolved += count
+			end
+			if stopped or entry.TornDown then
+				continue
+			end
+			if not ok or open then
+				candidates[entry] = true
 			end
 		end
 		return resolved
+	end
+
+	function self.CandidateCount(): number
+		local count = 0
+		for _ in candidates do
+			count += 1
+		end
+		return count
+	end
+
+	function self.Parked(): boolean
+		return sweepParked
 	end
 
 	local function sweepLoop()
@@ -306,12 +372,19 @@ function Exchanges.new(ctx: any)
 		-- background work: an accessor write runs on the game's calling thread and stays
 		-- under the game's category.
 		Profile.MemoryCategory("Scribe")
-		-- Jittered so a shard restart does not put every server's sweep on the same
-		-- second, which is how a quiet key becomes a throttled one.
-		Clock.Wait(Rng.Jitter(SWEEP_INTERVAL))
 		while not stopped do
-			pcall(self.Sweep)
+			if next(candidates) == nil then
+				sweepParked = true
+				coroutine.yield()
+				sweepParked = false
+				if stopped then
+					break
+				end
+			end
+			-- Jittered so a shard restart does not put every server's sweep on the same
+			-- second, which is how a quiet key becomes a throttled one.
 			Clock.Wait(Rng.Jitter(SWEEP_INTERVAL))
+			self.SweepCandidates()
 		end
 	end
 
@@ -362,7 +435,12 @@ function Exchanges.new(ctx: any)
 			if store == nil then
 				return false, "the verdict store is unreachable, so no discard can be proved safe"
 			end
-			local verdict = ExchangeVerdict.Read(store, exchangeId)
+			-- A failed read is not an absent verdict.
+			local verdict, readErr = ExchangeVerdict.Read(store, exchangeId)
+			if readErr ~= nil then
+				return false,
+					`the verdict key for "{exchangeId}" could not be read ({readErr}); nothing can be discarded until it can`
+			end
 			if verdict ~= nil then
 				return false, `exchange "{exchangeId}" already has a {verdict.V} verdict; use settle, not discard`
 			end
@@ -445,6 +523,15 @@ function Exchanges.new(ctx: any)
 						return false,
 							`"{exchangeId}" holds escrow for {side.UserId} with no take recorded; a Commit would destroy `
 								.. "it. Abort returns it to its owner"
+					end
+				end
+				-- Attempt's ordering proof: no Commit verdict until both takes are on disk.
+				for _, side in sides do
+					local flushOk, flushed = pcall(flushSide, side)
+					if not flushOk or flushed ~= true then
+						return false,
+							`"{exchangeId}" cannot Commit until both records are durable, and the save for {side.UserId} `
+								.. "did not complete. Retry once the store answers, or Abort"
 					end
 				end
 			end
@@ -594,16 +681,15 @@ function Exchanges.new(ctx: any)
 		local sideB = sideFor(entryB)
 		sideA.Legs = basketA or {}
 		sideB.Legs = basketB or {}
+		watch(entryA)
+		watch(entryB)
 
 		return Exchange.Attempt({
 			ExchangeId = `{entryA.UserId}-{entryB.UserId}-{HttpService:GenerateGUID(false)}`,
 			VerdictStore = store,
 			InFlight = inFlight,
 			Options = ctx.Options.Exchange,
-			Flush = function(side)
-				local player = if side.UserId == entryA.UserId then playerA else playerB
-				return ctx.Persistence.Flush(player, { Force = true, Timeout = 8 })
-			end,
+			Flush = flushSide,
 		}, sideA, sideB)
 	end
 
@@ -622,6 +708,10 @@ function Exchanges.new(ctx: any)
 		self.Resolve(entry)
 	end
 
+	function self.OnUnload(entry: any)
+		candidates[entry] = nil
+	end
+
 	function self.Stop()
 		if stopped then
 			return
@@ -634,6 +724,7 @@ function Exchanges.new(ctx: any)
 			sweepThread = nil
 		end
 		table.clear(inFlight)
+		table.clear(candidates)
 	end
 
 	return self

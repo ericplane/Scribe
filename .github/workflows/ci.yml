@@ -60,7 +60,7 @@ jobs:
       # std on first run. If a runner ever flakes on that fetch, add a
       # `selene generate-roblox-std` step before this one.
       - name: Lint
-        run: selene src test lune adapters
+        run: selene src test lune addons
 
   format:
     runs-on: ubuntu-latest
@@ -73,7 +73,7 @@ jobs:
           path: ~/.rokit
           key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
       - name: Check formatting
-        run: stylua --check src test lune adapters
+        run: stylua --check src test lune addons
 
   analyze:
     runs-on: ubuntu-latest

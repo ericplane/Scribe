@@ -18,13 +18,18 @@ wally.lock
 *.rbxmx
 node_modules/
 package-lock.json
+!/docs-site/package-lock.json
 
 # rbxm bundle build staging (deps copied out of Wally _Index in CI)
 /bundle/deps/
 
-# MkDocs docs build
+# Documentation build output (docs_gen is retained for older local builds)
 /docs_gen/*
 !/docs_gen/.gitkeep
+/docs-site/src/content/docs/
+/docs-site/public/assets/
+/docs-site/.astro/
+/docs-site/dist/
 /site/
 __pycache__/
 .venv/
@@ -36,4 +41,5 @@ __pycache__/
 .DS_Store
 !README.md
 !CHANGELOG.md
+!CONTRIBUTING.md
 .*/

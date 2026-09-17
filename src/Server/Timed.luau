@@ -62,6 +62,19 @@ function Timed.new(ctx: any)
 	local self = {} :: any
 	local compiled: Template.Compiled = ctx.Compiled
 
+	local stopped = false
+	local sweepThread: thread? = nil
+	local sweepParked = false
+	-- Entries holding a timer; the sweep parks when there are none.
+	local active: { [any]: boolean } = {}
+	local function watch(entry: any)
+		active[entry] = true
+		if sweepParked and sweepThread ~= nil and not stopped then
+			sweepParked = false
+			Sched.Resume(sweepThread)
+		end
+	end
+
 	local function timedStore(entry: any): { [string]: number }?
 		-- While a save is in flight the profile carries a converted copy (see BeforeSave)
 		-- and the live deadlines move here, so no reader ever sees the persisted form.
@@ -105,6 +118,9 @@ function Timed.new(ctx: any)
 		store[pathKey] = value
 		if entry.SaveInfo then
 			entry.SaveInfo.Dirty = true
+		end
+		if value ~= nil then
+			watch(entry)
 		end
 	end
 
@@ -449,6 +465,10 @@ function Timed.new(ctx: any)
 	function self.OnLoad(entry: any)
 		restoreDeadlines(entry)
 		sweepEntry(entry)
+		local store = timedStore(entry)
+		if store ~= nil and next(store) ~= nil then
+			watch(entry)
+		end
 	end
 
 	-- One pass of the periodic sweep, including the OnCooldownEnded signal. Named so
@@ -457,10 +477,43 @@ function Timed.new(ctx: any)
 		sweepEntry(entry, true)
 	end
 
-	function self.OnUnload(_entry: any) end
+	function self.OnUnload(entry: any)
+		active[entry] = nil
+	end
 
-	local stopped = false
-	local sweepThread: thread? = nil
+	--- One pass over the entries holding a timer; an entry with none left is forgotten.
+	function self.SweepActive()
+		local batch = active
+		active = {}
+		for entry in batch do
+			if entry.TornDown then
+				continue
+			end
+			if entry.State == "Ready" then
+				self.Sweep(entry)
+			end
+			if stopped or entry.TornDown then
+				continue
+			end
+			local store = timedStore(entry)
+			if store ~= nil and next(store) ~= nil then
+				active[entry] = true
+			end
+		end
+	end
+
+	function self.ActiveCount(): number
+		local count = 0
+		for _ in active do
+			count += 1
+		end
+		return count
+	end
+
+	function self.Parked(): boolean
+		return sweepParked
+	end
+
 	-- Called by Server.build once the full ctx is assembled, so the sweep never runs
 	-- against a half-constructed context.
 	function self.Start()
@@ -470,16 +523,17 @@ function Timed.new(ctx: any)
 			-- stays under the game's category.
 			Profile.MemoryCategory("Scribe")
 			while not stopped do
-				-- Jittered so every server in the place does not sweep on one tick.
-				Clock.Wait(Rng.Jitter(SWEEP_INTERVAL))
-				local persistence = ctx.Persistence
-				if persistence then
-					for _, entry in persistence.Entries do
-						if entry.State == "Ready" then
-							self.Sweep(entry)
-						end
+				if next(active) == nil then
+					sweepParked = true
+					coroutine.yield()
+					sweepParked = false
+					if stopped then
+						break
 					end
 				end
+				-- Jittered so every server in the place does not sweep on one tick.
+				Clock.Wait(Rng.Jitter(SWEEP_INTERVAL))
+				self.SweepActive()
 			end
 		end)
 	end
@@ -496,6 +550,7 @@ function Timed.new(ctx: any)
 			pcall(task.cancel, sweepThread)
 			sweepThread = nil
 		end
+		table.clear(active)
 	end
 
 	return self

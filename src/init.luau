@@ -13,6 +13,7 @@ local Template = require(script.Internal.Template)
 local Log = require(script.Internal.Log)
 local Metrics = require(script.Internal.Metrics)
 local Health = require(script.Internal.Health)
+local Addons = require(script.Internal.Addons)
 local Config = require(script.Internal.Config)
 local Budget = require(script.Internal.Budget)
 -- Named BigMath because `Scribe.Big` is the declarator; this is the arithmetic.
@@ -163,6 +164,32 @@ export type function ValueType(T)
 	-- the branded declarators their label has to be an ordinary field and a
 	-- whole-subtree read strips it here. This only ever removes a wrapper, which is
 	-- what keeps it cheap enough to run over every node.
+	-- Inputs are read-only so a narrower caller type is accepted; a mutable property is
+	-- invariant. Indexers are copied as is, since the runtime cannot make one read-only.
+	local readOnlyCache: { [type]: type } = {}
+	local function readOnlyDeep(t: type, depth: number): type
+		if depth > MAX_DEPTH or not t:is("table") then
+			return t
+		end
+		local cached = readOnlyCache[t]
+		if cached ~= nil then
+			return cached
+		end
+		local indexer = t:indexer()
+		local spec = if indexer ~= nil
+			then { index = indexer.index, readresult = indexer.readresult, writeresult = indexer.writeresult }
+			else nil
+		local out = ts.newtable(nil, spec, t:metatable())
+		readOnlyCache[t] = out
+		for key, prop in t:properties() do
+			local childType = prop.read or prop.write
+			if childType ~= nil then
+				out:setreadproperty(key, readOnlyDeep(childType, depth + 1))
+			end
+		end
+		return out
+	end
+
 	local unwrapCache: { [type]: type } = {}
 	local function unwrapWrappers(t: type, depth: number): type
 		if depth > MAX_DEPTH or not t:is("table") then
@@ -443,6 +470,7 @@ export type function ValueType(T)
 			local indexer = t:indexer()
 			if indexer ~= nil then
 				local elementType = widen(indexer.readresult)
+				local elementIn = readOnlyDeep(elementType, depth + 1)
 				if indexer.index:is("number") then
 					-- Array node: the indexer makes `arr[i]` an accessor node, which is
 					-- the only way to reach a Scribe.ArrayOf element field.
@@ -452,12 +480,12 @@ export type function ValueType(T)
 						readresult = elemNode,
 						writeresult = elemNode,
 					}
-					add("Insert", fn({ elementType, optNumber, optBool }, {}))
+					add("Insert", fn({ elementIn, optNumber, optBool }, {}))
 					-- Remove returns nil on an empty/missing array (matches RemoveValue).
 					add("Remove", fn({ optNumber, optBool }, { optional(elementType) }))
-					add("RemoveValue", fn({ elementType, optBool }, { optional(elementType), optNumber }))
-					add("Find", fn({ elementType }, { optNumber }))
-					add("Has", fn({ elementType }, { ts.boolean }))
+					add("RemoveValue", fn({ elementIn, optBool }, { optional(elementType), optNumber }))
+					add("Find", fn({ elementIn }, { optNumber }))
+					add("Has", fn({ elementIn }, { ts.boolean }))
 					add("OnInsert", fn({ fn({ elementType, ts.number }, {}) }, { disconnectType }))
 					add("OnRemove", fn({ fn({ elementType, ts.number }, {}) }, { disconnectType }))
 				else
@@ -520,8 +548,9 @@ export type function ValueType(T)
 			local writeType = if mapKey ~= nil and mapElement ~= nil
 				then ts.newtable(nil, { index = mapKey, readresult = mapElement, writeresult = mapElement }, nil)
 				else valueType
-			add("Set", fn({ writeType, optBool }, { valueType }))
-			add("Update", fn({ fn({ valueType }, { writeType }), optBool }, { valueType }))
+			local writeIn = if mapKey ~= nil then writeType else readOnlyDeep(writeType, depth + 1)
+			add("Set", fn({ writeIn, optBool }, { valueType }))
+			add("Update", fn({ fn({ valueType }, { writeIn }), optBool }, { valueType }))
 		end
 		add("Clone", fn({}, { valueType }))
 		add("Default", fn({}, { valueType }))
@@ -564,9 +593,10 @@ export type function ValueType(T)
 			-- Membership surface. Get/Set still take the whole { T }.
 			local setIndexer = t:indexer()
 			local element = if setIndexer ~= nil then widen(setIndexer.readresult) else anyType
-			add("Add", fn({ element, optBool }, { ts.boolean }))
-			add("Remove", fn({ element, optBool }, { ts.boolean }))
-			add("Has", fn({ element }, { ts.boolean }))
+			local elementIn = readOnlyDeep(element, depth + 1)
+			add("Add", fn({ elementIn, optBool }, { ts.boolean }))
+			add("Remove", fn({ elementIn, optBool }, { ts.boolean }))
+			add("Has", fn({ elementIn }, { ts.boolean }))
 			add("Count", fn({}, { ts.number }))
 			add("Clear", fn({ optBool }, {}))
 		end
@@ -821,6 +851,7 @@ export type function ClientDataType(T)
 	end
 
 	add("IsReady", fn({}, { ts.boolean }))
+	add("Batch", fn({ fn({}, {}) }, {}))
 	add("Stop", fn({}, {}))
 	add("WaitForData", fn({ optional(ts.number) }, { ts.boolean }))
 	add("Request", ts.newfunction({ head = { ts.string }, tail = ts.any }, { tail = ts.any }))
@@ -941,6 +972,7 @@ export type function ServerDataType(T, P)
 	local reasonUnion = ts.unionof(
 		ts.singleton("load-failed"),
 		ts.singleton("migration-failed"),
+		ts.singleton("erasing"),
 		ts.singleton("session-ended"),
 		ts.singleton("player-left"),
 		ts.singleton("shutdown"),
@@ -966,7 +998,16 @@ export type function ServerDataType(T, P)
 	add("Flush", fn({ P, flushOpts }, { ts.boolean }))
 	add("GetSaveInfo", fn({ P }, { saveInfo }))
 	add("GetOffline", fn({ ts.number }, { optAnyTable }))
-	add("UpdateOffline", fn({ ts.number, fn({ anyTable }, {}) }, boolAndReason))
+	local updateOfflineOptsProps: { [type]: type } = {}
+	updateOfflineOptsProps[ts.singleton("Validate")] = optional(ts.boolean)
+	local updateOfflineOpts = optional(ts.newtable(updateOfflineOptsProps, nil, nil))
+	add(
+		"UpdateOffline",
+		fn(
+			{ ts.number, fn({ anyTable }, {}), updateOfflineOpts },
+			{ ts.boolean, optional(ts.string), optional(anyArray) }
+		)
+	)
 	add("ListVersions", fn({ ts.number, optional(ts.number) }, { versionArray }))
 	add("GetVersion", fn({ ts.number, ts.string }, { optAnyTable }))
 	add("RestoreVersion", fn({ ts.number, ts.string, restoreOpts }, boolAndReason))
@@ -983,8 +1024,10 @@ export type function ServerDataType(T, P)
 	local commandHandler = ts.newfunction({ head = { P }, tail = ts.any }, { tail = ts.any })
 	add("Command", fn({ ts.string, ts.unionof(commandSpec, commandHandler), optional(commandHandler) }, {}))
 
-	add("GetLeaderboard", fn({ ts.string, optional(ts.number) }, { entryArray }))
+	add("GetLeaderboard", fn({ ts.string, optional(ts.number), optional(ts.number) }, { entryArray }))
 	add("GetMyRank", fn({ P, ts.string }, { optional(ts.number) }))
+	add("GetLeaderboardRefreshIn", fn({ ts.string }, { optional(ts.number) }))
+	add("GetLeaderboardResetIn", fn({ ts.string }, { optional(ts.number) }))
 
 	add("PromptGift", fn({ P, ts.string, ts.number }, boolAndReason))
 	add("PromptPurchase", fn({ P, ts.string }, boolAndReason))
@@ -1167,7 +1210,10 @@ export type LeaderboardConfig<T = any> = {
 	SigFigs: number?,
 	Replicate: boolean?, -- default false: server-only (Data.GetLeaderboard on the server); true streams the board to clients
 	RefreshInterval: number?, -- approximate seconds between reads of this board (default 60, floor 60, jittered)
-	StoreName: string?, -- override the OrderedDataStore name (default "LB_<board>")
+	StoreName: string?, -- override the OrderedDataStore name (default "LB_<board>"); a periodic board appends the period
+	Period: ("Daily" | "Weekly")?, -- a board that resets; nil is lifetime
+	Mode: ("Gain" | "Peak")?, -- with Period: the gain since it began (default) or the peak seen in it
+	Scope: ("Global" | "Server")?, -- "Server" ranks the players on this server, with no store behind it
 }
 
 export type ProductConfig<T = any> = {
@@ -1196,6 +1242,10 @@ type LeaderboardConfigLoose = {
 	read SigFigs: number?,
 	read Replicate: boolean?,
 	read RefreshInterval: number?,
+	read StoreName: string?,
+	read Period: string?,
+	read Mode: string?,
+	read Scope: string?,
 }
 
 type ProductConfigLoose = {
@@ -1272,6 +1322,7 @@ export type ScribeOptions<T> = {
 	ResetData: boolean?,
 	LoadFailurePolicy: ("Kick" | "Wait")?,
 	LoadTimeout: number?,
+	EraseJoinTimeout: number?,
 	VersionAheadPolicy: ("Kick" | "Allow")?, -- default "Kick": fail closed when data is from a newer deploy
 	KickOnSessionEnd: boolean?,
 	LoadFailureMessage: string?,
@@ -1282,6 +1333,7 @@ export type ScribeOptions<T> = {
 	VersionAheadMessage: string?,
 	SchemaFailureMessage: string?,
 	RateLimitedMessage: string?,
+	ErasingMessage: string?,
 	SessionEndMessage: string?,
 	-- Per-cause overrides for the session-end kick, falling back to SessionEndMessage.
 	SessionStolenMessage: string?,
@@ -1289,6 +1341,7 @@ export type ScribeOptions<T> = {
 
 	-- services
 	Leaderboards: { read [string]: LeaderboardConfigLoose }?,
+	PeriodReset: { read UtcOffset: number?, read WeekStart: string? }?, -- the clock periodic boards reset on: hours from UTC (-12 to 14, default 0) and the day a week starts (default Monday)
 	Products: { read [string]: ProductConfigLoose }?,
 	Passes: { [string]: PassConfig }?,
 	Perks: { string }?,
@@ -1339,6 +1392,7 @@ export type ScribeOptions<T> = {
 	LogRingSize: number?, -- entries Log.GetRecent retains (default 512)
 	StatusThresholds: { FailWindow: number?, FailCount: number?, RecoverStreak: number? }?,
 	Banner: boolean?, -- default true: print one "Scribe vX.Y.Z ... ready" line on load
+	StudioHook: boolean?, -- default false: the Studio debug hooks the Scribe Studio plugin reads
 }
 
 export type ServerData<T> = ServerDataType<T, Player>
@@ -1705,7 +1759,7 @@ export type Bundle<T> = {
 ]=]
 
 --[=[
-	@type LifecycleReason "load-failed" | "migration-failed" | "session-ended" | "player-left" | "shutdown" | "still-loading" | "timeout"
+	@type LifecycleReason "load-failed" | "migration-failed" | "erasing" | "session-ended" | "player-left" | "shutdown" | "still-loading" | "timeout"
 	@tag Reasons
 	Why a data session ended, or why waiting for data produced no tree. There is
 	one value per state so you can branch exhaustively. It is the second return
@@ -1726,7 +1780,7 @@ export type Bundle<T> = {
 ]=]
 
 --[=[
-	@type PurchaseReason "player data not loaded" | "invalid Cost spec" | "invalid Cost amount" | "invalid cost path" | "cost path is not a spendable number" | "insufficient funds" | "paid-random-restricted" | "policy-pending"
+	@type PurchaseReason "player data not loaded" | "invalid Cost spec" | "invalid Cost amount" | "invalid cost path" | "cost path is not a spendable number" | "insufficient funds" | "paid random items are not available for this account" | "cannot check account settings right now; try again in a moment"
 	@tag Reasons
 	The fixed refusals of [Server.Purchase]. They are not exhaustive over the
 	second return: a Grant that throws passes its own error text through instead.
@@ -1747,7 +1801,8 @@ export type Bundle<T> = {
 	`"gift delivery could not be confirmed; do not send it again"`,
 	`"could not record gift intent; try again later"`,
 	`"a gift of this item is already pending; try again shortly"`,
-	`"paid-random-restricted"` and `"policy-pending"`. Two further
+	`"paid random items are not available for this account"` and
+	`"cannot check account settings right now; try again in a moment"`. Two further
 	refusals interpolate a value and so cannot be members. The names are also on
 	[Scribe.GiftReason]. See [Gifting](../gifting.md).
 
@@ -1805,7 +1860,10 @@ export type Bundle<T> = {
 	.SigFigs number? -- Scribe.Big stats only: ranking-key significant figures, 1 to 15 (default 12)
 	.Replicate boolean? -- default false (server-only); true streams the board to clients
 	.RefreshInterval number? -- approximate seconds between reads (default 60, floor 60, jittered)
-	.StoreName string? -- override the OrderedDataStore name (default "LB_<board>")
+	.StoreName string? -- override the OrderedDataStore name (default "LB_<board>"); a periodic board appends the period
+	.Period ("Daily" | "Weekly")? -- a board that resets on the bundle's `PeriodReset` clock; nil is lifetime
+	.Mode ("Gain" | "Peak")? -- with Period: rank the gain since it began (default) or the peak seen in it
+	.Scope ("Global" | "Server")? -- "Server" ranks the players on this server only, with no store, no request cost, and a 5 second default refresh
 	One entry in the `Leaderboards` table. See [Leaderboards](../leaderboards.md).
 ]=]
 
@@ -1971,6 +2029,7 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	ResetData = true,
 	LoadFailurePolicy = true,
 	LoadTimeout = true,
+	EraseJoinTimeout = true,
 	VersionAheadPolicy = true,
 	KickOnSessionEnd = true,
 	LoadFailureMessage = true,
@@ -1979,10 +2038,12 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	VersionAheadMessage = true,
 	SchemaFailureMessage = true,
 	RateLimitedMessage = true,
+	ErasingMessage = true,
 	SessionEndMessage = true,
 	SessionStolenMessage = true,
 	SessionInterruptedMessage = true,
 	Leaderboards = true,
+	PeriodReset = true,
 	Products = true,
 	Passes = true,
 	Perks = true,
@@ -2013,6 +2074,7 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	LogRingSize = true,
 	StatusThresholds = true,
 	Banner = true,
+	StudioHook = true,
 }
 
 local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
@@ -2907,6 +2969,7 @@ end
 Scribe.Reason = table.freeze({
 	LoadFailed = "load-failed" :: Types.LifecycleReason,
 	MigrationFailed = "migration-failed" :: Types.LifecycleReason,
+	Erasing = "erasing" :: Types.LifecycleReason,
 	SessionEnded = "session-ended" :: Types.LifecycleReason,
 	PlayerLeft = "player-left" :: Types.LifecycleReason,
 	Shutdown = "shutdown" :: Types.LifecycleReason,
@@ -2990,8 +3053,8 @@ Scribe.PurchaseReason = table.freeze({
 	InvalidCostPath = "invalid cost path" :: Types.PurchaseReason,
 	CostPathNotSpendable = "cost path is not a spendable number" :: Types.PurchaseReason,
 	InsufficientFunds = "insufficient funds" :: Types.PurchaseReason,
-	PaidRandomRestricted = "paid-random-restricted" :: Types.PurchaseReason,
-	PolicyPending = "policy-pending" :: Types.PurchaseReason,
+	PaidRandomRestricted = "paid random items are not available for this account" :: Types.PurchaseReason,
+	PolicyPending = "cannot check account settings right now; try again in a moment" :: Types.PurchaseReason,
 })
 
 --[=[
@@ -3022,8 +3085,8 @@ Scribe.GiftReason = table.freeze({
 	DeliveryUnconfirmed = "gift delivery could not be confirmed; do not send it again" :: Types.GiftReason,
 	AlreadyPending = "a gift of this item is already pending; try again shortly" :: Types.GiftReason,
 	IntentRecordFailed = "could not record gift intent; try again later" :: Types.GiftReason,
-	PaidRandomRestricted = "paid-random-restricted" :: Types.GiftReason,
-	PolicyPending = "policy-pending" :: Types.GiftReason,
+	PaidRandomRestricted = "paid random items are not available for this account" :: Types.GiftReason,
+	PolicyPending = "cannot check account settings right now; try again in a moment" :: Types.GiftReason,
 })
 
 --[=[
@@ -3050,6 +3113,112 @@ Scribe.ProductState = table.freeze({
 	PolicyPending = "policy-pending" :: Types.ProductState,
 	NotLoaded = "not-loaded" :: Types.ProductState,
 })
+
+--[=[
+	@within Scribe
+	@tag Diagnostics
+	@prop OpKind { [string]: OpKind }
+	The kinds of replication op, as named constants.
+]=]
+Scribe.OpKind = table.freeze({
+	Init = "Init" :: Types.OpKind,
+	Set = "Set" :: Types.OpKind,
+	Insert = "Insert" :: Types.OpKind,
+	Remove = "Remove" :: Types.OpKind,
+	Clear = "Clear" :: Types.OpKind,
+})
+
+--[=[
+	@within Scribe
+	@tag Diagnostics
+	@prop LogLevel { [string]: LogLevel }
+	The log levels, as named constants, for [Scribe.GetRecentLogs] filters.
+]=]
+Scribe.LogLevel = table.freeze({
+	Debug = "Debug" :: Types.LogLevel,
+	Info = "Info" :: Types.LogLevel,
+	Warn = "Warn" :: Types.LogLevel,
+	Error = "Error" :: Types.LogLevel,
+	Fatal = "Fatal" :: Types.LogLevel,
+})
+
+--[=[
+	@within Scribe
+	@tag Diagnostics
+	@prop LogCategory { [string]: LogCategory }
+	The log categories, as named constants, for [Scribe.GetRecentLogs] filters.
+]=]
+Scribe.LogCategory = table.freeze({
+	Persistence = "Persistence" :: Types.LogCategory,
+	Replication = "Replication" :: Types.LogCategory,
+	Transport = "Transport" :: Types.LogCategory,
+	Commands = "Commands" :: Types.LogCategory,
+	Leaderboards = "Leaderboards" :: Types.LogCategory,
+	Monetization = "Monetization" :: Types.LogCategory,
+	Gifting = "Gifting" :: Types.LogCategory,
+	Integrity = "Integrity" :: Types.LogCategory,
+	Lifecycle = "Lifecycle" :: Types.LogCategory,
+	Derived = "Derived" :: Types.LogCategory,
+	Exchanges = "Exchanges" :: Types.LogCategory,
+})
+
+--[=[
+	@within Scribe
+	@tag Diagnostics
+	@prop Status { [string]: Status }
+	The DataStore health states, as named constants. See [Scribe.GetStatus] and [Client.GetServiceStatus].
+]=]
+Scribe.Status = table.freeze({
+	Healthy = "Healthy" :: Types.Status,
+	Degraded = "Degraded" :: Types.Status,
+	Outage = "Outage" :: Types.Status,
+})
+
+--[=[
+	@within Scribe
+	@tag Lifecycle
+	@prop SessionState { [string]: SessionState }
+	A profile's session states, as named constants. See [Server.GetState].
+]=]
+Scribe.SessionState = table.freeze({
+	Loading = "Loading" :: Types.SessionState,
+	Ready = "Ready" :: Types.SessionState,
+	SessionEnded = "SessionEnded" :: Types.SessionState,
+})
+
+--[=[
+	@within Scribe
+	@tag Visibility
+	@prop Visibility { [string]: Visibility }
+	The root visibilities, as named constants.
+]=]
+Scribe.Visibility = table.freeze({
+	Replicated = "Replicated" :: Types.Visibility,
+	ServerOnly = "ServerOnly" :: Types.Visibility,
+	Shared = "Shared" :: Types.Visibility,
+})
+
+--[=[
+	@within Scribe
+	@tag Reasons
+	@prop LifecycleReason { [string]: LifecycleReason }
+	The same table as [Scribe.Reason], under the name of the type it holds.
+	`Scribe.Reason` is the older name and both stay.
+]=]
+Scribe.LifecycleReason = Scribe.Reason
+
+--[=[
+	@within Scribe
+	@tag Diagnostics
+	@function GetProfileKeyPrefix
+	@return string
+	The `ProfileKeyPrefix` the running server bundle was started with, or `"PLAYER_"` before
+	any and on the client. Add-ons use it to recognise profile keys in log text, so a custom
+	prefix is redacted as the default one is.
+]=]
+function Scribe.GetProfileKeyPrefix(): string
+	return Addons.ProfileKeyPrefix()
+end
 
 --[=[
 	@within Scribe
@@ -3107,6 +3276,24 @@ end
 --[=[
 	@within Scribe
 	@tag Diagnostics
+	@function RegisterAddon
+	@param name string
+	@param actions { [string]: { Run: (args: any) -> any, Writes: boolean? } }
+	@return () -> ()
+	Registers actions an add-on offers to the Scribe Studio plugin, which lists them
+	and runs one on request. An action with `Writes = true` needs the plugin's write
+	toggle. Registering the same name again replaces the earlier actions.
+
+	Returns a function that removes this registration and never a later one; keep
+	it for the add-on's Stop.
+]=]
+function Scribe.RegisterAddon(name: string, actions: Addons.Actions): () -> ()
+	return Addons.Register(name, actions)
+end
+
+--[=[
+	@within Scribe
+	@tag Diagnostics
 	@function GetRecentLogs
 	@param filter { Level: LogLevel?, Category: LogCategory?, Code: LogCode?, Limit: number? }?
 	@return { LogEntry }
@@ -3138,13 +3325,16 @@ end
 	@within Scribe
 	@tag Diagnostics
 	@function GetPercentiles
-	@return { [string]: { P50: number, P90: number, P99: number } }
+	@return { [string]: { P50: number, P90: number, P99: number, Samples: number, Age: number, Window: number } }
 	Nearest-rank percentiles for every distribution [`GetMetrics`](#getmetrics)
 	reports as a `{ Count, Average, Max }` record: save durations, profile sizes,
 	per-frame flush costs, bytes per send.
 	
 	The half `GetMetrics` cannot give you: an average hides the tail, and a P99 save
 	duration is what a player actually waits for on a bad key.
+
+	From a `LocalScript` it returns the client's own distributions: the three apply
+	timers, elapsed seconds per frame received, inline listeners included.
 
 	Keyed by metric name. A name that has never been observed is **absent** rather
 	than present with zeroes, so `next()` on the result tells you whether anything
@@ -3153,9 +3343,11 @@ end
 	Computed over a rolling window of the most recent 256 samples per name, bounded
 	because an unbounded sample list on a metric observed once per save is a slow
 	leak. So these describe recent behaviour, and `GetMetrics().<name>.Count` is the
-	all-time count, which deliberately does not agree with the window.
+	all-time count, which deliberately does not agree with the window. `Samples` is
+	how many the window holds, `Age` the seconds since the newest, and `Window` the
+	seconds the ring spans, so a caller can tell a burst from an afternoon.
 ]=]
-function Scribe.GetPercentiles(): { [string]: { P50: number, P90: number, P99: number } }
+function Scribe.GetPercentiles(): { [string]: Metrics.Percentiles }
 	return Metrics.GetPercentiles()
 end
 

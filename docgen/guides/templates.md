@@ -1,44 +1,55 @@
 # Declaring Your Template
 
-Your **template** is a plain Luau table that describes the shape of one player's data: which fields exist, what type each one holds, and what a brand-new player starts with. Scribe compiles it once at startup and everything else is driven from it, including typing, validation, wire packing, and saving. This page is about writing that table.
+Your **template** describes one player's data: its fields, their types, and their starting values. Start with plain values. Add rules only where your game needs them.
+
+This guide builds on the shared module in [Getting Started](./intro). The larger [Emberfall example](./emberfall) shows how the same ideas fit together in an RPG.
 
 ## Declaring a field
 
-Here is the currency and progression slice of the Emberfall template. Each field is one line.
+The tutorial starts with `Coins = 0`. To make coins a whole number that stays above or equal to zero, replace that field with `Scribe.Int`:
 
 ```lua
 local template = {
     Coins = Scribe.Int(0, { Min = 0 }),
-    Gems  = Scribe.Int(0, { Min = 0 }),
-    Xp    = Scribe.Int(0, { Min = 0 }),
-
-    Stats = {
-        Deaths   = Scribe.Int(0, { Min = 0 }),
-        Playtime = Scribe.Int(0, { Min = 0 }),
+    Settings = {
+        Music = true,
     },
 }
 ```
 
-`Scribe.Int(0, { Min = 0 })` is a **declarator**. It says three things at once: a new player starts at `0`, the field is a `number` as far as Luau is concerned, and a write that would take it below zero is not allowed. `Stats` is a plain nested table, and Scribe walks into it and treats `Deaths` and `Playtime` as ordinary declared fields one level down.
+`Scribe.Int(0, { Min = 0 })` gives the field a starting value and rules. Scribe calls this a **declarator**. The starting value is `0`; the rules require a whole number with a minimum of `0`.
 
-That is the whole idea. Write the table the way you want to read it back, and reach for a declarator wherever a field needs rules.
+By default, an out-of-range write is **clamped** to the nearest allowed value. It does not throw an error:
+
+```lua
+-- On the server, after Data.WaitForData(player) succeeds:
+data.Coins.Set(-10)
+print(data.Coins.Get()) -- 0
+
+data.Coins.Set(2.7)
+print(data.Coins.Get()) -- 3
+```
+
+Set `BoundsPolicy = "Reject"` alongside `Template` in your Scribe options if you want these writes to throw instead. Wrong types, such as writing a string to `Coins`, are always rejected.
+
+[Try clamping and rejection in the playground](playground.md?example=clamp). Change the bounds or the written value and inspect the result before adding the field to your game.
+
+Nested tables work the same way: `Settings.Music = true` becomes `data.Settings.Music.Get()`. You do not need a special declaration for a group of fixed fields.
 
 ## Plain values and declarators
 
 A plain value works too. `Playtime = 0` would give you a number field defaulting to zero, with its type inferred and no rules attached. Use one when the field genuinely needs nothing else.
 
-A declarator adds the rules: bounds, a fixed set of allowed strings, a length cap, or a compact wire form. Keep three separate things in mind, because a declarator carries all of them:
+A declarator adds rules such as bounds, allowed strings, or a length limit. It also gives your editor the field's type, so autocomplete matches the value you declared.
 
-- the **default value**, what a new profile starts with
-- the **Luau type**, what your code sees when it reads the field
-- the **runtime metadata**, the validation and packing Scribe applies on every write
+Use this table to find the kind of field you need. You do not need to learn every declaration before using Scribe.
 
 | Declarator | Use it for |
 | --- | --- |
-| [`Scribe.Int(default, { Min, Max })`](/api/Scribe#Int) | Whole numbers. Bounded ints pack to a smaller wire width. |
-| [`Scribe.Number(default, { Min, Max, Precision })`](/api/Scribe#Number) | Floating-point values. `Precision` [narrows the wire form](#narrowing-a-float). |
+| [`Scribe.Int(default, { Min, Max })`](/api/Scribe#Int) | Whole numbers, such as coins or levels. |
+| [`Scribe.Number(default, { Min, Max, Precision })`](/api/Scribe#Number) | Numbers that can have a fractional part. Optional `Precision` [reduces network size](#narrowing-a-float). |
 | [`Scribe.String(default, { MaxLength })`](/api/Scribe#String) | Strings, optionally capped by byte length. |
-| [`Scribe.Enum(default, members)`](/api/Scribe#Enum) | A fixed set of string values. Packs to one byte. |
+| [`Scribe.Enum(default, members)`](/api/Scribe#Enum) | One of a fixed set of strings, such as an item's rarity. |
 | [`Scribe.Optional(inner)`](/api/Scribe#Optional) | A field that may legitimately be absent. |
 | [`Scribe.Dynamic(factory)`](/api/Scribe#Dynamic) | A default computed once per profile, such as a creation timestamp. |
 | [`Scribe.Big(default, { Min, Max })`](/api/Scribe#Big) | Numbers past `2^53`, for idle and simulator currencies. |
@@ -49,7 +60,7 @@ A declarator adds the rules: bounds, a fixed set of allowed strings, a length ca
 | [`Scribe.DictOf(shape, opts)`](/api/Scribe#DictOf) | A string-keyed map whose values have a declared shape. |
 | [`Scribe.MapOf(keyType, value, opts)`](/api/Scribe#MapOf) | A map whose **key** type is declared, `"integer"` or `"string"`. |
 | [`Scribe.SetOf(element, opts)`](/api/Scribe#SetOf) | A collection of unique scalars, for membership rather than order. |
-| [`Scribe.Vector3(default)`](/api/Scribe#Vector3) and 16 siblings | Roblox datatypes, stored as compact packed buffers. |
+| [`Scribe.Vector3(default)`](/api/Scribe#Vector3) and related declarations | Roblox values such as positions, colors, and transforms. |
 
 The container declarators, the datatype family, `Scribe.Flags`, `Scribe.Big`, `Scribe.Timed` and `Scribe.Derived` each have a guide of their own, linked at the foot of this page. Everything else in that table is covered here.
 
@@ -71,7 +82,7 @@ Rarity = Scribe.Enum("", RARITIES),         -- error naming the field
 An empty string standing in for "no value yet" is a template error. If a field should genuinely read `nil` until something writes it, that is what `Scribe.Optional` is for, and the enum default inside it is still required to be a member.
 
 ??? note "What clamping actually does, and how to turn it off"
-    Out-of-range numbers clamp by default, and a clamp fires an anomaly you can watch. Set [`BoundsPolicy = "Reject"`](./configuration) and the write throws at the call site instead, which is what you want while you are hunting down whatever produced the bad value. The same switch governs over-long strings and out-of-set enum members.
+    Out-of-range numbers clamp by default and report an anomaly for diagnostics. Set [`BoundsPolicy = "Reject"`](./configuration) and the write throws at the call site instead. The same switch governs over-long strings. An enum value outside its declared members is always rejected, under either policy.
 
     Some values are always rejected, under either policy, because nothing could store them: functions, threads, Instances and other userdata, non-finite numbers, strings or table keys that are not valid UTF-8, and tables that mix array indices with string keys, which the DataStore's JSON encoder cannot write at all.
 
@@ -111,14 +122,16 @@ The field takes the factory's return type, so `CreatedUnix` is a `number` and `J
 
 Scribe evaluates the factory whenever a profile has no stored value for that field: on a brand-new profile, and on an existing profile that gains the field after you add it. A stored value is **never** overwritten, so a returning player keeps what they had. The flip side is worth planning for. Add a creation-timestamp field long after launch and existing players get it computed on their next load, not their true creation date.
 
-??? note "Why the factory must be pure"
+??? note "Factory restrictions"
     Scribe calls the factory once at module load to sample its return type, so a factory that yields, errors, or has a side effect does that at startup as well as per profile. Keep it to a clock read, a random seed, or an id.
 
     A no-argument factory also cannot see the player, so defaults that depend on `player.Name` or a `UserId` lookup do not fit here. Use [`OnPlayerInit`](./lifecycle) for those. `Scribe.Dynamic` cannot be combined with [`Scribe.Session`](./visibility) either, for the same reason: a session field is rebuilt every session, and `OnPlayerInit` is the hook that runs then.
 
 ## Narrowing a float
 
-A `Scribe.Number` is a double, so it costs eight bytes on the wire every time. Most game floats do not need eight bytes, and `Precision` lets you say so.
+This section is an optional network optimization. You can leave `Precision` unset and move on to [reading and writing values](./values).
+
+A `Scribe.Number` uses an eight-byte double in numeric replication. `Precision` can reduce that size when a slightly rounded client value is acceptable.
 
 It is opt-in and it stays opt-in. Omit `Precision` and nothing changes. Declaring `Min` and `Max` alone narrows nothing, because bounds have meant "validate and clamp" since long before this option existed.
 
@@ -171,13 +184,15 @@ Two sets of names are off limits, and both are reported at startup rather than d
 
 **Method names.** A field called `Count`, `Get`, `Set`, `Insert`, or any other accessor method name is shadowed by the method and unreachable through the typed API, at any depth. Scribe logs `API_NAME_COLLISION` naming the field.
 
-**Root fields that collide with a client method.** On the client you read a root field as `Data.Coins`, so a root named after a client method loses to the method. The four to avoid are `Owns`, `Request`, `Mock`, and `Raw`. The rest of the client surface is `Get`-shaped or `On`-shaped, which no data field is likely to hit. This applies to root fields only, since a nested field is reached through its parent.
+**Root fields that collide with a client API name.** On the client you read a root field as `Data.Coins`, so a root named after a client method or property becomes unreachable by that name. Examples include `Owns`, `Request`, `Mock`, `Raw`, `IsReady`, and `Stop`; check the [client API](/api/Client) when choosing a name. This rule applies to root fields, since nested fields are reached through their parent. Accessor method names remain reserved at every depth.
 
 The `_Scribe` root is reserved outright, along with any root name beginning with it, and the template refuses to compile if you declare one.
 
 ## Naming the accessor type
 
-To hold a player's accessor tree in your own class or table you need a name for its type. That is `Scribe.PlayerData<T>`, the type of `Data.Get(player)` on the server and `Data.Get()` on the client:
+This section is for adding type annotations to your own modules. Ordinary reads and writes do not need these annotations.
+
+Scribe calls the object returned by `WaitForData` an **accessor tree**: each field provides methods such as `Get` and `Set`. Its type is `Scribe.PlayerData<T>`, also returned by `Data.Get(player)` on the server and `Data.Get()` on the client:
 
 ```lua
 export type Template = typeof(template) -- from the module that calls Scribe()

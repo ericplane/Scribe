@@ -117,7 +117,15 @@ local function emit(
 	-- Capped so a client-supplied string or a long traceback cannot bloat the ring
 	-- buffer, the console fallback, or the structured context.
 	if #message > MAX_MESSAGE_LEN then
-		message = string.sub(message, 1, MAX_MESSAGE_LEN) .. "…"
+		local cut = string.sub(message, 1, MAX_MESSAGE_LEN)
+		-- A cut inside a character leaves invalid UTF-8, which no sink can JSON-encode.
+		for _ = 1, 3 do
+			if utf8.len(cut) ~= nil then
+				break
+			end
+			cut = string.sub(cut, 1, -2)
+		end
+		message = cut .. "…"
 	end
 	local entry: LogEntry = {
 		At = Clock.Now(),

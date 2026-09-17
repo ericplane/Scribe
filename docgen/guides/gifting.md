@@ -67,26 +67,26 @@ end
 
 ## Reading the refusal
 
-Ownership is checked twice, at prompt time and again at receipt time, so a race between two gifters cannot double-deliver. That is one of twelve fixed refusals, exported as a frozen table:
+Ownership is checked twice, at prompt time and again at receipt time, so a race between two gifters cannot double-deliver. That is one of fourteen fixed refusals, exported as a frozen table. All but one are text the buyer can be shown; `InvalidRecipient` means the call was handed a user id that is not one, which is the developer's to fix:
 
-| `Scribe.GiftReason` member | The string |
-| --- | --- |
-| `BuyerDataNotLoaded` | `"buyer data not loaded"` |
-| `InvalidRecipient` | `"invalid recipient"` |
-| `CannotGiftYourself` | `"cannot gift yourself"` |
-| `GiftCooldown` | `"gift cooldown"` |
-| `TooManyPending` | `"too many pending gifts"` |
-| `DataServicesDown` | `"data services are experiencing issues; try again later"` |
-| `RecipientAlreadyOwns` | `"recipient already owns this"` |
-| `CreditReserveFailed` | `"could not reserve gift credit; try again later"` |
-| `DeliveryFailed` | `"could not deliver gift; try again later"` |
-| `DeliveryUnconfirmed` | `"gift delivery could not be confirmed; do not send it again"` |
-| `AlreadyPending` | `"a gift of this item is already pending; try again shortly"` |
-| `IntentRecordFailed` | `"could not record gift intent; try again later"` |
-| `PaidRandomRestricted` | `"paid-random-restricted"` |
-| `PolicyPending` | `"policy-pending"` |
+| `Scribe.GiftReason` member | The string | For |
+| --- | --- | --- |
+| `BuyerDataNotLoaded` | `"buyer data not loaded"` | the player, as "try again" |
+| `InvalidRecipient` | `"invalid recipient"` | the developer |
+| `CannotGiftYourself` | `"cannot gift yourself"` | the player |
+| `GiftCooldown` | `"gift cooldown"` | the player |
+| `TooManyPending` | `"too many pending gifts"` | the player |
+| `DataServicesDown` | `"data services are experiencing issues; try again later"` | the player |
+| `RecipientAlreadyOwns` | `"recipient already owns this"` | the player |
+| `CreditReserveFailed` | `"could not reserve gift credit; try again later"` | the player |
+| `DeliveryFailed` | `"could not deliver gift; try again later"` | the player |
+| `DeliveryUnconfirmed` | `"gift delivery could not be confirmed; do not send it again"` | the player |
+| `AlreadyPending` | `"a gift of this item is already pending; try again shortly"` | the player |
+| `IntentRecordFailed` | `"could not record gift intent; try again later"` | the player |
+| `PaidRandomRestricted` | `"paid random items are not available for this account"` | the player |
+| `PolicyPending` | `"cannot check account settings right now; try again in a moment"` | the player |
 
-The last two belong to a product declared `PaidRandom = true`: the buyer is restricted, or the buyer's or recipient's policy is not known, which for a recipient who is not on this server it never is. [Paid random items](./monetization.md#paid-random-items) has the rule.
+The last two belong to a product declared `PaidRandom = true`: the buyer is restricted, or the buyer's or recipient's policy is not known, which for a recipient who is not on this server it never is. They are sentences, like the rest of this table; `Data.PromptPurchase` answers those same two conditions with the shorter `Scribe.ProductState` codes, because a shop branches on those rather than showing them. [Paid random items](./monetization.md#paid-random-items) has the rule.
 
 ```lua
 local ok, reason = Data.PromptGift(ava, "GemPack100", benUserId)

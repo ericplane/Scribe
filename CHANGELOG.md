@@ -1,5 +1,330 @@
 # Changelog
 
+## 2.4.0
+
+Released 2026-09-17.
+
+Daily and weekly leaderboards, a board scoped to the server you are on, a resumable `Data.Erase`,
+an optional Discord telemetry add-on, and two community reports addressed: a naming pass over the
+strings the public API returns, and a typing fix so a caller's narrower type is accepted wherever
+an accessor takes a value in.
+
+### Behaviour changes
+
+- The Studio debug hooks are off unless the new `StudioHook = true` option is set. They used to
+  attach in every Studio session, and each keeps rings of two thousand ops, logs and sends, a
+  metrics ring and a mirror of every player's data from the moment the bundle starts, whether
+  or not the plugin is open. A play-test without the plugin no longer pays for that. The option
+  is inert outside Studio, so it can stay on in a published place; the plugin's "not detected"
+  message says to set it.
+
+- The reserved `_Scribe` root gained a `Boards` child, which changes the schema hash both realms
+  compare at handshake. Deploy your server and client together, as with any template change,
+  even if you declare no periodic board.
+
+- `Data.Erase` removes leaderboard entries before the profile rather than after. A periodic board
+  is swept over the periods the profile records, so a sweep that fails has to leave the profile
+  for the retry. A failed erase now returns `(false, reason)` with the profile intact, where it
+  used to leave the profile gone and a board entry behind. The sweep can take minutes for a
+  long periodic history, so the erase now writes a marker into the profile first: a join that
+  loads a marked profile on any server is refused with the new reason `erasing` and the
+  `ErasingMessage` kick text, and a join on the erasing server waits at most `EraseJoinTimeout`
+  seconds before the same refusal. The marker records which boards are done and where an
+  unfinished one stopped, saved every twenty-five removals and on any failure, so a retry after
+  a failure or a shutdown resumes there. Under `BudgetPolicy = "Defer"` each removal waits for
+  the `OrderedRemove` budget rather than a fixed pause. The marker is taken in one
+  compare-and-set with the read that decides it and carries a five-minute lease, renewed at
+  every checkpoint: a second `Erase` while it is live is refused, a failed attempt drops it, a
+  lapsed one is taken over with its progress, and every checkpoint and the final removal verify
+  it, so an attempt whose erase another server finished, or whose profile a rejoin recreated
+  meanwhile, stops instead of deleting the fresh data. Every key minted by this build carries a
+  generation id in its store metadata (earlier keys read as having none and keep working), and
+  the offline compare-and-set fingerprints it, so a key removed and recreated between a read
+  and its write no longer passes; the same compare-and-set can mint a key, which is how an
+  erase of a user with no profile places its marker. Renewals that keep failing stop the sweep.
+  The erase still reads the key once more before removing it and refuses if a session is live.
+
+- `Scribe.PurchaseReason` and `Scribe.GiftReason` answer their two paid random refusals in
+  sentences rather than codes. Both are sentence unions, whose members read as they are, and
+  `"paid-random-restricted"` and `"policy-pending"` broke that promise. They now
+  read "paid random items are not available for this account" and "cannot check account settings
+  right now; try again in a moment". `Data.PromptPurchase` still refuses with the shorter
+  `Scribe.ProductState` codes, because a shop branches on those rather than showing them.
+  Reported by a community member.
+
+### Added
+
+- Each GitHub release attaches `ScribeTelemetry-Addon.rbxm` and `ScribeUIAdapters-Addon.rbxm`
+  beside `Scribe.rbxm`, labelled as add-ons on the release page, so the optional pieces can be
+  inserted in Studio without a checkout. `wally.toml` still publishes `src` alone.
+- `EraseJoinTimeout` and `ErasingMessage` options, the `erasing` lifecycle reason with
+  `Scribe.Reason.Erasing`, and the `PROFILE_ERASE_RESUMED` and `PROFILE_ERASE_PROGRESS_FAIL`
+  log codes, all for the resumable erase described under behaviour changes.
+- `Scribe.GetProfileKeyPrefix()`, the `ProfileKeyPrefix` the running server bundle was started
+  with. `ScribeTelemetry` redacts every context field named `Key` or ending in `Key`, and the
+  grouping subject built from one, whatever they hold, since a profile key may carry any
+  prefix or none; in message text it redacts the configured prefix, asked of Scribe on every
+  entry, and any word ending in an underscore. Scribe's own `PROFILE_OVERWRITTEN` message no
+  longer names the key, which its context carries. A failed request's error text reaches
+  `GetStats().Destinations[name].LastError` with any URL replaced and cut on a character
+  boundary. When a limit every webhook shares is full, the lowest-priority item queued on any
+  webhook goes first, oldest among equals, so a preview waiting on one webhook makes room for a
+  real report on another rather than the report's own predecessor, and the evictions are planned
+  first, so a report the limits could not admit even after every evictable item went is refused
+  with the queue untouched. An embed whose fields fill the 6000 characters gets an empty
+  description, not a lone ellipsis over the limit.
+
+- `Scribe.RegisterAddon(name, actions)` registers actions an add-on offers to the Scribe Studio
+  plugin, each with a `Run` and an optional `Writes = true` that puts it behind the plugin's write
+  toggle. The Studio hook answers `ListAddons` and `AddonAction`, running an action under the
+  plugin's own write attribution, and the plugin's Diagnostics tab gains a telemetry preview row.
+  `ScribeTelemetry` registers `Status` and `Preview` on start and removes them on `Stop`.
+
+- `ScribeTelemetry`: `telemetry:Preview(destination, kind?)` sends synthetic examples of every
+  report design to one destination, from the real builders and through the normal queue, titled
+  `PREVIEW:` with a field saying the data is synthetic, never mentioning a role, and without
+  touching the summary baseline, performance streaks, groups or mention cooldowns. `kind` is
+  `All`, a group such as `Health`, or one scenario such as `Outage`; previews count in
+  `GetStats().Previews`. A preview queues below every real report, so a full queue refuses it
+  rather than displacing an alert, and a real report displaces a queued preview first. A
+  report that arrives while a preview is being delivered is a real report.
+
+- `ScribeTelemetry`: every embed from a live server, one with a place id and a `JobId`, carries a
+  `Server` field whose link launches the game into that server; health reports and summaries
+  carry the place id and the Scribe version, and the footer
+  is down to the report id, the place version, the environment and the time in UTC. The report id
+  now starts with the server's first eight characters.
+
+- Daily and weekly leaderboards. `Period = "Daily"` or `"Weekly"` on a board writes to a store
+  named for the period (`LB_WinsDaily_d20708`), so a rollover is a new name and nothing is reset
+  or deleted. What goes on the board is what the player did this period, not the stat: `Mode =
+"Gain"` (the default) writes the increase since the period began, floored at 0, and `Mode =
+"Peak"` the highest value seen. The baseline lives in the profile, so it survives leave and
+  rejoin and resets when a player returns after a rollover. `Data.GetLeaderboard(name, limit, -1)`
+  reads the previous period on the server. `PeriodReset = { UtcOffset, WeekStart }` sets the
+  clock, one per bundle. Old period stores are left in place; the guide has the storage math and
+  the RTBF template for lifetime boards. A board changed between `Daily` and `Weekly` keeps the
+  old range on record, so an erase still sweeps what the profile wrote under the old kind, and the
+  previous period is read at most twice per rollover, counting only reads that succeeded. One
+  refresh of a board runs at a time and at most one waits: a scheduled slot that finds the last
+  refresh still running is dropped until the next interval, explicit `RefreshNow` callers share
+  one waiting refresh, nothing waiting starts after `Stop`, and a refresh in flight at `Stop`
+  goes no further after its current read, so two refreshes never race over the caches or the
+  previous-period reads and a slow store cannot build a queue.
+
+- `Scope = "Server"` on a board ranks the players on this server in memory, with no store behind
+  it and no request spent on it: five seconds between refreshes by default, one at the floor,
+  exempt from the read guard, the migration reserve and the `BudgetPolicy` gate. It composes with `Period`, `Replicate`
+  and `GetMyRank`, and it is what the guide used to send to `Scribe.Shared`.
+
+- `Data.GetLeaderboardRefreshIn(name)`: seconds until a board next reads its store, `0` while a due
+  refresh waits on budget, `nil` before the first cycle is scheduled or for an unknown name.
+  `Data.GetLeaderboardResetIn(name)`: seconds until a periodic board's period ends on the
+  `PeriodReset` clock, always above zero, `nil` for a board with no period.
+
+- Three client timers, `InitApplyDuration`, `DiffApplyDuration` and `SharedApplyDuration`, one
+  sample per frame applied: elapsed time from decode to the end of the dispatch, with inline
+  `Changed` and `Observe` listeners counted in full and an `OnSharedChanged` handler to its first
+  yield. Readable from `Scribe.GetPercentiles()` in a `LocalScript`; the client debug hook
+  answers `GetMetrics` like the server's. And a server counter, `BytesOut`: the bytes the
+  transport accepted, fragment headers included, summed over every recipient, so delivery cost
+  is one number rather than `BytesOutPerSend` times a guess at the audience.
+
+- Every distribution `Scribe.GetPercentiles()` reports carries `Samples`, `Age` and `Window`
+  beside its percentiles: how many samples the window holds, seconds since the newest, and the
+  seconds the ring spans from oldest to newest, so a p99 over a burst and one over an afternoon
+  no longer read the same.
+
+- `BytesOut` split by frame kind, one counter per kind the wire has (`BytesOutDiff`,
+  `BytesOutInit`, `BytesOutSharedDiff` and the rest), plus `BytesOutResync` for the handshake
+  bytes spent repairing a client rather than joining one.
+
+- Per-command metrics, named after the command: `CommandDuration:<name>`, `CommandActive:<name>`
+  and `CommandErrors:<name>` on the server, aggregated across bundles, and `RequestTimeouts:<name>`
+  (with a `RequestTimeouts` total) on the client, where a timeout is the one thing the server
+  cannot see. Client request names are unbounded, so the named timeout series stop at 32 and a
+  later name counts as `RequestTimeouts:Other`. Both Studio debug hooks carry `Percentiles` beside
+  the counters, in the `GetMetrics` reply and in every metrics tick, and the client hook now
+  streams metrics ticks at all (client hook protocol 2). The Studio plugin's Diagnostics panel
+  shows the distributions with their windows, the per-command table and bytes by frame kind, and
+  opens in the client view with that client's own timers.
+
+- Frozen tables for the six string unions that had none: `Scribe.OpKind`, `Scribe.LogLevel`,
+  `Scribe.LogCategory`, `Scribe.Status`, `Scribe.SessionState` and `Scribe.Visibility`, so a
+  caller can branch on a named constant instead of pasting a string. `Scribe.LifecycleReason` is
+  added as the matching name for `Scribe.Reason`, which predates the convention; both stay.
+  Requested by community members.
+
+- `Data.UpdateOffline(userId, fn, { Validate = true })` checks the callback's change against the
+  template before committing, as a live write would, and refuses with the offending path in the
+  reason and the findings (`{ Path, Kind, Detail }`) as a third return. It judges the change
+  rather than the profile: a field that was already wrong passes through while the callback
+  leaves it alone, and making it worse, growing an over-cap container, or a profile with too
+  many violations to compare refuses; it also refuses a change under the reserved `_Scribe`
+  root, a write to a derived or Session field, and a profile whose schema version is not this
+  build's. Nothing is
+  clamped, a refusal writes nothing and does not count against service health, and raw stays
+  the default, which is what Scribe's own offline paths use. Proposed by a community member.
+
+- `Data.Batch(fn)` on the client. Local writes inside it coalesce into one `Changed` pass per
+  container, as `Server.Batch` does on the server, so a UI that updates several fields at once
+  fires its listeners once. Frames from the server were already applied as one batch each; this
+  covers the optimistic writes the client makes itself. Nothing on the wire changes. Asked for by
+  a community member.
+
+- `ScribeTelemetry`, an optional server add-on in `addons/telemetry/`, posts Scribe's health
+  transitions, every `Error` and `Fatal` entry, an allowlist of warnings, performance rules and
+  periodic summaries to Discord webhooks. Destinations are named, each category routes to one,
+  several or none with a default for the rest, repeats fold into follow-ups, a role can be
+  mentioned on a cooldown, player identifiers and webhook URLs are redacted by default, and
+  delivery is bounded: queues per webhook and overall, Discord's rate limits and backoff honoured
+  per webhook, a dead webhook dropped rather than retried. The handle has `Test`, `Flush`,
+  `GetStats` and `Stop`, and a handle disabled in Studio answers `GetStats` with the same zeroed
+  counters as a running one. Typed end to end under the new solver: `Options`, `Handle`, `Stats` and the
+  `ScribeModule` slice it reads are exported, and the type fixtures cover them. Built on the
+  public diagnostics API alone, disabled in Studio unless allowed, and not part of the
+  package: copy the folder in. `Url` is any http or https endpoint
+  that takes Discord's webhook JSON: Discord itself, a proxy in front of it (Discord refuses
+  requests from Roblox servers, and a 403 from `discord.com` says so in `GetStats`), or a service
+  of your own. The guide records the live checks that remain unperformed.
+
+### Fixed
+
+- `Data.Exchange.Discard` treated a verdict read that failed as a verdict that did not exist,
+  and accepted a Claimed record whose take already named incoming value. In a one-way transfer
+  the receiver escrows nothing, so once a Commit had released the giver's escrow, a discard
+  during a store outage deleted the receiver's take and the item was gone from both profiles
+  with nothing left to say so. A failed read now refuses the discard, and a record with a take
+  cannot be unclaimed.
+- `Data.Exchange.Settle(id, "Commit")` proposed the verdict from the in-memory records without
+  proving either was saved, so a crash after the Commit could lose the recipient's only copy. It
+  now forces a save of both profiles first, the same proof `Attempt` makes, and refuses with a
+  reason naming the side whose save did not complete.
+- A `Mode = "NoSave"` bundle never saved its own session but still let `UpdateOffline`,
+  `RestoreVersion`, `Erase` and `SendMessage` write the real store, and a gift receipt for an
+  offline recipient queued the gift in that recipient's real mailbox. All five now refuse under
+  NoSave and log `NOSAVE_WRITE_REFUSED`; the gift receipt answers `NotProcessedYet`, so a live
+  server delivers it.
+- A `ResetData` wipe refused for an exchange in flight still stamped the profile at the current
+  version, so every pending migration was skipped, and the stamp kept them from running on any
+  later join. Dynamic seeds, the migration shadow and the `isNew` flag `OnPlayerInit` receives
+  keyed on the option the same way, so a starter kit was granted a second time. Every step now
+  keys on whether the wipe happened.
+- A gamepass ownership check that answered "not owned" after a purchase had been confirmed
+  cleared the cache, so a player who bought a pass during the join scan, or during a slow
+  `OwnsAsync`, lost it until the next session. Ownership only gains for a session, and both
+  paths now fold their answer into the cache instead of overwriting it.
+- Log messages over 400 bytes were cut by byte, which could split a multi-byte character and
+  leave a string no sink could JSON-encode; the telemetry add-on then dropped the alert. The cut
+  now backs off to a character boundary.
+- A custom transport whose `Send` writes Shared data from inside the call could double or
+  lose an op. A write to another player made while a joiner's handshake was going out reached
+  the joiner twice, once in that player's `SharedInit` and again in the next `SharedDiff`; a
+  write to the new player made while their own `SharedInit` was going out was cleared with the
+  queue and reached nobody. Each other player's snapshot is now taken and their queue detached
+  in one step before any send, with the detached ops going to everyone but the joiner, and a
+  new player's queue is cleared before the broadcast rather than after it, so a write made
+  during any of those sends reaches every client once, with the next flush.
+- A server store op queued when a joiner's Init was taken reached that client twice: the
+  snapshot already held it, and the frame's store flush then broadcast it to the now-ready
+  joiner as well, so an `Insert` landed as two elements and a `Remove`, which is by index, took
+  a different element out. The ops queued before the snapshot are now sent to the other clients
+  after it is taken, which also covers a custom transport whose `Send` runs game code that
+  writes the store while the Init is prepared: however many such writes there are, each lands
+  past the boundary.
+
+- `PROFILE_SCHEMA_VIOLATION` reports an overlong dictionary key at the key's own path
+  (`Resources.Obsidian`) rather than at the dictionary's, so two long keys are two findings and
+  a log line names the key it means.
+
+- A stopped bundle no longer writes the process-wide DataStore budget reserves. A session ending
+  after `Data.Stop()`, its final save landing late, tore down through the reserve sync and
+  reinstalled two `GetAsync` reads for a bundle that was gone, which starved whatever paced on
+  the budget next. Only a process that stops one bundle and keeps running could see it.
+
+- A caller's narrower type is accepted where an accessor takes a value in. `Insert`, `RemoveValue`,
+  `Find`, `Has`, `Set` and `Update` typed their input as the element's mutable shape, and Luau
+  treats a mutable property as invariant, so `{ Action: "invite" | "deny" }` was refused by an
+  element typed `Action: string` as "not exactly string". Those parameters are read-only now,
+  which is what they always were: Scribe reads the table it is handed and never writes back into
+  it, and a read-only property accepts any subtype. The transform is deep, so a nested narrower
+  field passes too. A map (`DictOf`) handed to `Set` is the one place this does not reach: the
+  type runtime cannot build a read-only indexer, and an indexer stays invariant. Reported by a
+  community member against a `Scribe.Enum` field, whose members are enforced at runtime but
+  type as `string`.
+
+- A board refresh in flight at a `Data.Erase`, whether parked on `GetSortedAsync` or on a name
+  lookup, could put the erased user back in the cached board when it returned. A refresh now
+  drops anyone erased since it began before it publishes.
+
+- A `RequestOnce` replay could carry values other than the original reply's. The idempotency
+  record kept the handler's return tables by reference, so a handler that went on mutating a
+  table it had returned changed what a retry received. The record holds the encoded reply and
+  a replay re-sends it under its own correlation, so a table the wire could not carry, a cyclic
+  one included, replays as the same `reply-encode-failed` it answered the first time.
+
+- A snapshot that a client's Hello retry delivered after a refused first attempt no longer
+  triggers a second, redundant snapshot from the repair loop: the request the failure left
+  behind is met by the one that landed.
+
+- `FlushDuration` records a frame that flushed only the server store, or only re-sent a
+  snapshot to a client being repaired. It was gated on player entries having flushed, so a game
+  driving most of its traffic through `Data.ServerStore` saw those frames missing from the
+  distribution, and a resync spike never appeared in it at all.
+
+- The signal runner thread kept the first fire's arguments alive for the session. It was started
+  with them as its call arguments, which stay on its stack for its lifetime; `OnSharedChanged`
+  fires a full clone of a player's shared data, so the pinned object could be large. The runner
+  is primed to its first yield before it carries a payload, the fix GoodSignal itself shipped.
+
+### Changed
+
+- An idle bundle does no periodic work. The leaderboard write pacer parks while its queue is
+  empty and wakes on the next score; no leaderboard worker starts without a board, and a bundle
+  with only server boards starts the refresh loop alone. The timed sweep and the exchange sweep
+  visit only the entries holding a timer or an open exchange, and park when there are none.
+  The replication flush visits only the entries with something queued or a repair due. The
+  pass-purchase listener connects only when a pass is declared, and a bundle without passes
+  settles ownership on the loader's thread instead of a spawned one. A departed player leaves
+  every tracking set at once, Stop clears them, neither a sweep that was yielding nor a send
+  that failed re-adds a torn-down entry or marks a stopped bundle, and a frame with nothing to
+  flush returns before it is timed. The Studio hook's leaderboard reply carries `Workers`,
+  so the plugin's Boards panel can say whether the pacer is parked. Autosaves,
+  session-lock maintenance and load-time recovery are unchanged. Under the test harness an
+  idle bundle with one player made 44 timed waits in ten frames before and none after.
+
+- The UI adapters moved from `adapters/` to `addons/ui/` and are named for the file you copy in:
+  `ScribeVide.luau`, `ScribeReact.luau` and `ScribeFusion.luau`. `addons/` now holds every
+  official add-on, with `addons/README.md` as the index; `wally.toml` still publishes `src`
+  alone. Copy-in files, so nothing changes for a game until it copies again.
+
+- The Fusion adapter registers its disconnect in the 0.3 scope it is given, so `doCleanup(scope)`
+  stops the Scribe listener along with the `Value`, which is what a scope is for. It used to build
+  the `Value` in the scope and leave the listener to a manual call. The disconnect is still
+  returned, and a second call is a no-op, so disconnecting early stays safe. A copy-in file, so
+  it takes effect when you copy it again. Proposed by a community member.
+
+### Documentation
+
+- A new CONTRIBUTING.md records how a public string is named: PascalCase for a state or category,
+  kebab-case for a code a caller branches on, and a lower-case sentence for the answer a call
+  gives when it did not proceed. It also states that a union never mixes the three, which is what
+  the fix above restores.
+
+- The UI adapter snippets said `require(path.to.Vide)(vide)`, which reads as though you require
+  the framework and pass it to itself. The placeholder is now `path.to.ScribeVide`, naming the
+  adapter file you copied in, which is what the argument was always for.
+
+- CONTRIBUTING.md's naming section now states the principle the casing rules follow from, a
+  stable identifier a caller branches on against text a game shows, and stops calling every
+  code a refusal and every sentence player-facing. The `Purchase` and `PromptGift` reason tables
+  say which members are for the player and which mean the call itself is wrong.
+
+- The cost guide indexed `.Status` on `Scribe.GetStatus()`, which returns the status string
+  itself. The visibility guide now states what a `Shared` root costs: one frame to every other
+  player per frame in which it changed, since writes coalesce, and every other player's roots to
+  each joiner.
+
 ## 2.3.0
 
 Released 2026-09-04.
@@ -10,7 +335,7 @@ would say before it prompts.
 ### Behaviour changes
 
 - `PromptPurchase`'s refusal reasons are now the `Scribe.ProductState` strings: `player data not
-  loaded` became `not-loaded` and `player already owns "VIP"` became `owned`. The two interpolated
+loaded` became `not-loaded` and `player already owns "VIP"` became `owned`. The two interpolated
   reasons, an unknown name and an engine-refused prompt, are unchanged. No export ever promised
   the old text, but a caller comparing it should read `Scribe.ProductState` instead.
   `Scribe.PurchaseReason` and `Scribe.GiftReason` gain `PaidRandomRestricted` and `PolicyPending`.

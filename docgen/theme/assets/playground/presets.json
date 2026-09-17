@@ -1,0 +1,110 @@
+[
+  {
+    "id": "clamp",
+    "title": "Keep coins within bounds",
+    "description": "Clamp brings writes into the allowed range. Integer fields also round fractional writes.",
+    "policy": "Clamp",
+    "template": "return {\n    Coins = Scribe.Int(20, { Min = 0, Max = 100 }),\n}",
+    "actions": "print(\"Starting coins:\", data.Coins.Get())\ndata.Coins.Set(175)\nprint(\"After Set(175):\", data.Coins.Get())\ndata.Coins.Set(5.8)\nprint(\"After Set(5.8):\", data.Coins.Get())\ndata.Coins.Increment(10)\nprint(\"After Increment(10):\", data.Coins.Get())",
+    "expected": "The output should show 20, 100, 6, then 16. The final Coins value is 16."
+  },
+  {
+    "id": "reject",
+    "title": "Reject an invalid write",
+    "description": "Reject raises an error instead of changing a value that falls outside the declared bounds.",
+    "policy": "Reject",
+    "template": "return {\n    Coins = Scribe.Int(20, { Min = 0, Max = 100 }),\n}",
+    "actions": "local ok, reason = pcall(function()\n    data.Coins.Set(175)\nend)\nprint(\"Write accepted:\", ok)\nif not ok then\n    print(reason)\nend\nprint(\"Coins are still:\", data.Coins.Get())",
+    "expected": "The write is refused, the error explains the bounds, and Coins remains 20."
+  },
+  {
+    "id": "type",
+    "title": "Try the wrong value type",
+    "description": "A numeric field refuses a string even when the bounds policy is Clamp.",
+    "policy": "Clamp",
+    "template": "return {\n    Coins = Scribe.Int(20, { Min = 0, Max = 100 }),\n}",
+    "actions": "data.Coins.Set(\"lots\")\nprint(\"This line is not reached.\")",
+    "expected": "The run reports an invalid write. Coins remains 20."
+  },
+  {
+    "id": "inventory",
+    "title": "Cap an inventory and evict the oldest",
+    "description": "ArrayOf gives every element a schema. MaxItems with Evict = \"Front\" drops the oldest entry once the array is full.",
+    "policy": "Clamp",
+    "template": "return {\n    Inventory = Scribe.ArrayOf({\n        Id = Scribe.String(\"\", { MaxLength = 32 }),\n        Amount = Scribe.Int(1, { Min = 1, Max = 99 }),\n    }, { MaxItems = 3, Evict = \"Front\" }),\n}",
+    "actions": "data.Inventory.Insert({ Id = \"sword\", Amount = 1 })\ndata.Inventory.Insert({ Id = \"shield\" })\ndata.Inventory.Insert({ Id = \"bow\", Amount = 2 })\ndata.Inventory.Insert({ Id = \"potion\", Amount = 500 })\nprint(\"Items:\", data.Inventory.Count())\nprint(\"First item:\", data.Inventory[1].Id.Get())\nprint(\"Potion count clamped to:\", data.Inventory[3].Amount.Get())\nprint(\"Has a bow?\", data.Inventory.Has({ Id = \"bow\", Amount = 2 }))",
+    "expected": "Three items remain, the sword was evicted, the omitted Amount defaulted to 1, and 500 potions clamped to 99."
+  },
+  {
+    "id": "set",
+    "title": "Track unique unlocks",
+    "description": "SetOf keeps membership, not order. Adding a member twice changes nothing.",
+    "policy": "Clamp",
+    "template": "return {\n    Unlocked = Scribe.SetOf(Scribe.String(\"\", { MaxLength = 32 }), { MaxItems = 10 }),\n}",
+    "actions": "print(\"Added:\", data.Unlocked.Add(\"AshfallRidge\"))\nprint(\"Added again:\", data.Unlocked.Add(\"AshfallRidge\"))\ndata.Unlocked.Add(\"DeepMines\")\nprint(\"Unlocked:\", data.Unlocked.Count())\nprint(\"Has DeepMines?\", data.Unlocked.Has(\"DeepMines\"))\nprint(\"Removed:\", data.Unlocked.Remove(\"AshfallRidge\"))\nprint(\"Unlocked now:\", data.Unlocked.Count())",
+    "expected": "The first Add returns true and the repeat returns false. Two areas are unlocked, then one after the Remove."
+  },
+  {
+    "id": "derived",
+    "title": "Compute a level from XP",
+    "description": "Derived fields are computed from other fields, recompute whenever an input changes, and refuse writes.",
+    "policy": "Clamp",
+    "template": "return {\n    Xp = Scribe.Int(0, { Min = 0 }),\n    Level = Scribe.Derived(Scribe.Int(1), { \"Xp\" }, function(xp)\n        return 1 + math.floor(xp / 100)\n    end),\n}",
+    "actions": "data.Level.Observe(function(level)\n    print(\"Level is now\", level)\nend)\ndata.Xp.Increment(250)\nlocal ok, reason = pcall(function()\n    data.Level.Set(9)\nend)\nprint(\"Direct write accepted:\", ok)",
+    "expected": "Observe reports level 1 immediately and level 3 after the XP change. The direct write is refused."
+  },
+  {
+    "id": "choices",
+    "title": "Enumerate teams and perks",
+    "description": "Enum accepts one declared member. Flags is a set of declared switches you enable and disable by name.",
+    "policy": "Clamp",
+    "template": "return {\n    Team = Scribe.Enum(\"Red\", { \"Red\", \"Blue\" }),\n    Perks = Scribe.Flags({ \"Fast\", \"Strong\", \"Lucky\" }),\n}",
+    "actions": "data.Team.Set(\"Blue\")\nprint(\"Team:\", data.Team.Get())\nlocal ok, reason = pcall(function()\n    data.Team.Set(\"Green\")\nend)\nprint(\"Green accepted:\", ok)\ndata.Perks.Enable(\"Fast\")\ndata.Perks.Enable(\"Lucky\")\ndata.Perks.Disable(\"Fast\")\nprint(\"Enabled perks:\", table.concat(data.Perks.Get(), \", \"))",
+    "expected": "Team becomes Blue, Green is refused, and only Lucky remains enabled."
+  },
+  {
+    "id": "pets",
+    "title": "Name pets in a dictionary",
+    "description": "DictOf keys exist once something writes them. Optional fields have no default and read as nil until set.",
+    "policy": "Clamp",
+    "template": "return {\n    Pets = Scribe.DictOf({\n        Species = Scribe.String(\"\", { MaxLength = 20 }),\n        Nickname = Scribe.Optional(Scribe.String(\"\", { MaxLength = 20 })),\n    }, { MaxKeys = 3 }),\n}",
+    "actions": "print(\"Pets before:\", data.Pets.Count())\ndata.Pets.Ember.Species.Set(\"Fox\")\nprint(\"Nickname before:\", data.Pets.Ember.Nickname.Get())\ndata.Pets.Ember.Nickname.Set(\"Em\")\nprint(\"Nickname after:\", data.Pets.Ember.Nickname.Get())\ndata.Pets.Ash.Species.Set(\"Wolf\")\nprint(\"Pets after:\", data.Pets.Count())",
+    "expected": "No pets exist until a write. The nickname reads nil, then Em. Two pets exist at the end."
+  },
+  {
+    "id": "friends",
+    "title": "Key a map by user id",
+    "description": "MapOf declares the key type, so integer keys stay integers instead of becoming strings.",
+    "policy": "Clamp",
+    "template": "return {\n    Friends = Scribe.MapOf(\"integer\", {\n        Name = Scribe.String(\"\", { MaxLength = 20 }),\n    }, { MaxKeys = 50 }),\n}",
+    "actions": "data.Friends[42].Name.Set(\"Ava\")\ndata.Friends[7].Name.Set(\"Kai\")\nprint(\"Friends:\", data.Friends.Count())\nprint(\"Friend 42:\", data.Friends[42].Name.Get())\nlocal ok, reason = pcall(function()\n    data.Friends[1.5].Name.Set(\"Half\")\nend)\nprint(\"Fractional key accepted:\", ok)",
+    "expected": "Two friends are stored under numeric keys and the fractional key is refused."
+  },
+  {
+    "id": "big",
+    "title": "Count past the number limit",
+    "description": "Big fields hold currencies that outgrow a double. Scribe.Short renders any number the way a player reads it.",
+    "policy": "Clamp",
+    "template": "return {\n    Bank = Scribe.Big(\"1e21\"),\n    Coins = Scribe.Int(1500),\n}",
+    "actions": "data.Bank.Increment(\"5e20\")\nprint(\"Bank:\", tostring(data.Bank.Get()))\nprint(\"Bank, short:\", data.Bank.Get():Short())\nprint(\"Coins, short:\", Scribe.Short(data.Coins.Get(), 1))",
+    "expected": "The bank reads 1.5e21, renders as 1.50Sx, and the coins render as 1.5K."
+  },
+  {
+    "id": "visibility",
+    "title": "Separate saved data from session state",
+    "description": "Session fields reset on rejoin, ServerOnly fields never reach a client, and Shared fields replicate to everyone. All three read the same way on the server.",
+    "policy": "Clamp",
+    "template": "return {\n    Coins = Scribe.Int(0, { Min = 0 }),\n    Title = Scribe.Shared(Scribe.String(\"Newcomer\", { MaxLength = 24 })),\n    Secret = Scribe.ServerOnly(Scribe.String(\"\", { MaxLength = 64 })),\n    Session = Scribe.Session({ InCombat = false }),\n}",
+    "actions": "data.Title.Set(\"Champion\")\ndata.Secret.Set(\"server-only note\")\ndata.Session.InCombat.Set(true)\nprint(\"Title:\", data.Title.Get())\nprint(\"In combat:\", data.Session.InCombat.Get())",
+    "expected": "Every field reads normally on the server. The Fields panel shows which ones persist and who receives them."
+  },
+  {
+    "id": "listen",
+    "title": "React to a change",
+    "description": "Changed fires after a write with the new and old values. Update reads, transforms, and writes in one step.",
+    "policy": "Clamp",
+    "template": "return {\n    Coins = Scribe.Int(10, { Min = 0, Max = 100 }),\n    Settings = { Music = true, Volume = 0.5 },\n}",
+    "actions": "local disconnect = data.Coins.Changed(function(new, old)\n    print(\"Coins changed from\", old, \"to\", new)\nend)\ndata.Coins.Update(function(current)\n    return current * 3\nend)\ndisconnect()\ndata.Coins.Increment(1)\ndata.Settings.Music.Toggle()\nprint(\"Music on?\", data.Settings.Music.Get())",
+    "expected": "One change message appears for the Update. The Increment after disconnect is silent, and Music is off."
+  }
+]

@@ -1,0 +1,104 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import Icon from '../components/BrandIcon.astro';
+import manifest from '../../../wally.toml?raw';
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+const href = (path: string) => `${base}${path}/`;
+const version = manifest.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+if (!version) throw new Error('Could not read the Scribe version from wally.toml.');
+const cards = [
+    { icon: 'book', label: 'Start here', title: 'Your first player data', text: 'Set up a template, give a player coins, and watch the client update. One small, working example.', path: 'getting-started', cta: 'Learn the basics' },
+    { icon: 'layers', label: 'Build something', title: 'From idea to game feature', text: 'Inventories, shops, rewards, and leaderboards. Pick the feature you need and follow a focused recipe.', path: 'recipes', cta: 'Find a recipe' },
+    { icon: 'code', label: 'Reference', title: 'The answer, one lookup away', text: 'Find arguments, return values, and examples. Generated from the same source as the library.', path: 'reference', cta: 'Explore the API' },
+    { icon: 'lifebuoy', label: 'Get unstuck', title: 'Something not quite right?', text: 'Start with what you see. Find help for data that will not load, changes that will not save, and more.', path: 'troubleshooting', cta: 'Solve a problem' },
+] as const;
+---
+<StarlightPage frontmatter={{ title: 'Player data, without the plumbing', description: 'Typed player data for Roblox. Save profiles, define your rules, and keep the client in sync with Scribe.', template: 'splash', tableOfContents: false, editUrl: false, lastUpdated: false, prev: false, next: false }}>
+    <div class="scribe-home not-content">
+        <section class="scribe-hero" aria-labelledby="_top">
+            <div class="hero-copy">
+                <a class="release-label" href="https://github.com/ericplane/Scribe/releases">
+                    <span class="release-dot" aria-hidden="true"></span>
+                    Scribe {version}<span class="release-separator" aria-hidden="true">/</span> Open source
+                    <Icon name="arrow" size={14} />
+                </a>
+                <span id="player-data-without-the-plumbing"></span>
+                <h1 id="_top">Player data,<br /><span>without the<br class="hero-break" /> plumbing.</span></h1>
+                <p class="hero-description">Build the game you have in mind. Scribe handles saving, typed data, and client updates — from your first coin to your next big feature.</p>
+                <div class="hero-actions">
+                    <a class="scribe-button primary" href={href('getting-started')}>Start building <Icon name="arrow" size={19} /></a>
+                    <a class="scribe-button secondary" href={href('playground')}><Icon name="code" size={19} /> Try the playground</a>
+                </div>
+                <p class="hero-note">A small template. A familiar Luau API. Yours to build on.</p>
+            </div>
+
+            <div class="hero-visual" aria-label="Example of a player data template and an update reaching the client">
+                <div class="visual-grid" aria-hidden="true"></div>
+                <div class="code-window">
+                    <div class="code-window-top"><span class="file-icon" aria-hidden="true"><Icon name="code" size={16} /></span><span>GameData.luau</span><span class="file-tag">Shared module</span></div>
+                    <pre class="hero-code"><code><span class="syntax-comment">-- Describe your player's data.</span>{'\n'}<span class="syntax-keyword">return</span> <span class="syntax-function">Scribe</span>({'{'}{'\n'}    Template = {'{'}{'\n'}        Coins = <span class="syntax-number">0</span>,{'\n'}        Settings = {'{'}{'\n'}            Music = <span class="syntax-keyword">true</span>,{'\n'}        {'}'},{'\n'}    {'}'},{'\n'}    ProfileStoreIndex = <span class="syntax-string">"MyGame"</span>,{'\n'}    ProfileKeyPrefix = <span class="syntax-string">"PLAYER_"</span>,{'\n'}    Mode = <span class="syntax-string">"Mock"</span>,{'\n'}{'}'})</code></pre>
+                    <div class="code-window-bottom"><span><span class="tiny-dot" aria-hidden="true"></span> Template defined</span><span>Luau</span></div>
+                </div>
+                <div class="data-bridge" aria-hidden="true"><span></span><Icon name="arrow" size={16} /><span></span></div>
+                <div class="update-card">
+                    <div class="update-main"><span class="update-icon"><Icon name="branch" size={20} /></span><div><span class="update-label">Change it on the server</span><code>data.Coins.<span>Increment</span>(50)</code></div><span class="update-check" aria-hidden="true"><Icon name="check" size={17} /></span></div>
+                    <div class="client-preview"><span><span class="tiny-dot" aria-hidden="true"></span> Client receives the update</span><span class="coin-value">Coins <strong>50</strong></span></div>
+                </div>
+                <p class="visual-caption">Illustrated after setup and profile load · Mock mode</p>
+            </div>
+        </section>
+
+        <div id="what-scribe-handles" class="foundation-strip" aria-label="Scribe foundations" data-reveal>
+            <span><Icon name="shield" size={19} /> Built on ProfileStore</span>
+            <span><Icon name="code" size={19} /> Typed Luau API</span>
+            <span><Icon name="branch" size={19} /> Automatic client updates</span>
+            <span><Icon name="layers" size={19} /> Optional game features</span>
+        </div>
+
+        <section class="start-section" aria-labelledby="choose-a-path">
+            <span id="what-would-you-like-to-do"></span>
+            <div class="section-heading" data-reveal><div><p class="eyebrow">MAKE YOURSELF AT HOME</p><h2 id="choose-a-path">A clear next step.</h2></div><p>Start small, or go straight to what you need.<br />You do not have to learn everything at once.</p></div>
+            <div class="path-grid">
+                {cards.map((card, index) => <a class="path-card" href={href(card.path)} data-reveal style={`--delay: ${index * 80}ms`}>
+                    <div class="card-top"><span class="card-icon"><Icon name={card.icon} size={24} /></span><span class="card-number">0{index + 1}</span></div>
+                    <p class="card-label">{card.label}</p>
+                    <h3>{card.title}</h3>
+                    <p class="card-description">{card.text}</p>
+                    <span class="card-link">{card.cta}<Icon name="arrow" size={19} /></span>
+                </a>)}
+            </div>
+        </section>
+
+        <section class="playground-banner" aria-labelledby="playground-heading" data-reveal>
+            <div class="playground-art" aria-hidden="true"><Icon name="code" size={34} /></div>
+            <div class="playground-copy"><p class="eyebrow">A LITTLE ROOM TO EXPERIMENT</p><h2 id="playground-heading">Meet your template. In the browser.</h2><p>Try field rules, change values, and see the result. The playground runs Scribe's supported template and value code without touching saved player data.</p></div>
+            <a class="scribe-button secondary" href={href('playground')}>Open playground <Icon name="arrow" size={19} /></a>
+        </section>
+
+        <div class="home-bottom" data-reveal>
+            <p>Bringing an existing game? <a href={href('migrating')}>Read the migration guide <Icon name="arrow" size={15} /></a></p>
+            <a href={href('cost')}>Understand performance <Icon name="arrow" size={15} /></a>
+        </div>
+        <footer id="get-scribe" class="scribe-home-footer"><a class="footer-brand" href={base}><img src={`${base}assets/logo.svg`} width="27" height="27" alt="" />Scribe</a><p>Made for the games you want to build.</p><div><a href="https://wally.run/package/ericplane/scribe">Wally</a><a href={`${href('getting-started')}#install`}>Install in Studio</a><a href="https://github.com/ericplane/Scribe">GitHub</a><span>MIT License</span></div></footer>
+    </div>
+</StarlightPage>
+<script>
+    // Below-the-fold sections rise into view once; without the observer nothing is hidden.
+    const targets = document.querySelectorAll<HTMLElement>('[data-reveal]');
+    if ('IntersectionObserver' in window && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        const observer = new IntersectionObserver((entries) => {
+            for (const entry of entries) {
+                if (!entry.isIntersecting) continue;
+                entry.target.classList.add('is-visible');
+                observer.unobserve(entry.target);
+            }
+        }, { rootMargin: '0px 0px -8% 0px', threshold: 0.1 });
+        for (const target of targets) {
+            if (target.getBoundingClientRect().top < innerHeight * 0.9) continue;
+            target.classList.add('reveal');
+            observer.observe(target);
+        }
+        // Show everything even if no intersection is ever reported.
+        setTimeout(() => { for (const target of targets) target.classList.add('is-visible'); }, 3000);
+    }
+</script>

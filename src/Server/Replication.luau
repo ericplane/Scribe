@@ -31,8 +31,11 @@ local STATUS_TO_ID: { [string]: number } = { Healthy = 0, Degraded = 1, Outage =
 
 -- Inverted once at load, so the oversize warning can name the kind of frame.
 local FRAME_NAMES: { [number]: string } = {}
+-- BytesOut by frame kind, keyed by the type byte.
+local BYTES_OUT_BY_FRAME: { [number]: string } = {}
 for name, id in Wire.Frames :: { [string]: number } do
 	FRAME_NAMES[id] = name
+	BYTES_OUT_BY_FRAME[id] = `BytesOut{name}`
 end
 
 function Replication.new(ctx: any)
@@ -107,6 +110,15 @@ function Replication.new(ctx: any)
 		end
 	end
 
+	-- Entries with something to flush or repair; never a departed one or a stopped bundle's.
+	local dirty: { [any]: boolean } = {}
+	local stopped = false
+	local function markDirty(entry: any)
+		if not stopped and not entry.TornDown then
+			dirty[entry] = true
+		end
+	end
+
 	function self.PushOp(entry: any, op: Wire.Op, schema: Template.SchemaNode?)
 		local visibility = if schema then schema.Visibility else Template.VisibilityOf(compiled, op.Path)
 		if visibility == "ServerOnly" then
@@ -121,6 +133,7 @@ function Replication.new(ctx: any)
 		local pathKey = Util.pathKey(op.Path);
 		(op :: any)._pk = pathKey
 		if entry.QueueOpen then
+			markDirty(entry)
 			local queue: { Wire.Op } = entry.Queue
 			if op.Kind == "Set" and op.Value ~= nil and type(op.Value) ~= "table" then
 				-- Scalar leaf Set: coalesce consecutive writes to the same path in place.
@@ -158,6 +171,7 @@ function Replication.new(ctx: any)
 
 		if visibility == "Shared" then
 			table.insert(entry.SharedQueue, op)
+			markDirty(entry)
 		end
 	end
 
@@ -202,6 +216,18 @@ function Replication.new(ctx: any)
 	-- One delivery to one client, with no accounting of its own: the callers count
 	-- once per frame. pcall takes the function and its arguments rather than a
 	-- closure because on the Shared fanout that is N^2 allocations a frame.
+	-- `bytes` names the kind, `accepted` is what the transport took, `repair` a re-sent snapshot.
+	local function countBytesOut(bytes: buffer, accepted: number, repair: boolean?)
+		Metrics.Add("BytesOut", accepted)
+		local kind = BYTES_OUT_BY_FRAME[buffer.readu8(bytes, 0)]
+		if kind ~= nil then
+			Metrics.Add(kind, accepted)
+		end
+		if repair then
+			Metrics.Add("BytesOutResync", accepted)
+		end
+	end
+
 	local function deliver(entry: any, bytes: buffer): boolean
 		local ok, err = pcall(transport.SendToClient, transport, entry.Player, bytes)
 		if not ok then
@@ -224,6 +250,7 @@ function Replication.new(ctx: any)
 			return
 		end
 		entry.ResyncPending = true
+		markDirty(entry)
 		-- Both flags, and the queue with them: HandshakeReady false stops broadcasts to
 		-- a client whose mirror is wrong, and clearing QueueOpen keeps out the
 		-- (ready, not open) state in which PushOp silently discards every owner op.
@@ -244,12 +271,24 @@ function Replication.new(ctx: any)
 	-- which sendInit needs: a snapshot that did not land must not mark the client
 	-- ready. Fragmentation happens here rather than in `deliver` so a broadcast splits
 	-- once. `snapshotOps` and `snapshotSpans` are passed only by sendInit.
-	local function sendBuffer(entry: any, bytes: buffer, snapshotOps: { Wire.Op }?, snapshotSpans: { number }?): boolean
+	local function sendBuffer(
+		entry: any,
+		bytes: buffer,
+		snapshotOps: { Wire.Op }?,
+		snapshotSpans: { number }?,
+		repair: boolean?
+	): boolean
 		fragmentSeq = (fragmentSeq + 1) % 65536
 		local parts = 0
+		-- BytesOut counts what the transport accepted.
+		local accepted = 0
 		local whole = Wire.Fragment(bytes, maxOutbound, fragmentSeq, function(part)
 			parts += 1
-			return deliver(entry, part)
+			if not deliver(entry, part) then
+				return false
+			end
+			accepted += buffer.len(part)
+			return true
 		end)
 		if whole == nil then
 			if not deliver(entry, bytes) then
@@ -257,6 +296,7 @@ function Replication.new(ctx: any)
 			end
 			Metrics.Add("FramesSent")
 			Metrics.Observe("BytesOutPerSend", buffer.len(bytes))
+			countBytesOut(bytes, buffer.len(bytes), repair)
 			return true
 		end
 		if not whole then
@@ -264,6 +304,7 @@ function Replication.new(ctx: any)
 			-- the receiver believes is contiguous could splice two frames together. A
 			-- partial stays a prefix, which the next frame's index 0 discards cleanly.
 			Metrics.Add("FragmentedSendFailed")
+			countBytesOut(bytes, accepted, repair)
 			return false
 		end
 		if parts > OVERSIZE_FRAGMENTS and not warnedOversize then
@@ -291,6 +332,7 @@ function Replication.new(ctx: any)
 		-- The logical frame's size, once. BytesOutPerSend means bytes per outbound
 		-- frame, so sampling the fragments would describe the budget, not the frames.
 		Metrics.Observe("BytesOutPerSend", buffer.len(bytes))
+		countBytesOut(bytes, accepted, repair)
 		return true
 	end
 
@@ -301,7 +343,7 @@ function Replication.new(ctx: any)
 	-- BytesOutPerSend is observed once here, not once per recipient: per-recipient
 	-- sampling cost O(N^2) reservoir writes a frame and skewed the distribution toward
 	-- the fanout. FramesSent still counts every hand-off to the transport.
-	local function broadcastBuffer(bytes: buffer, exceptEntry: any?): { any }?
+	local function broadcastBuffer(bytes: buffer, exceptEntry: any?, alsoExcept: any?): { any }?
 		-- Split once, before the recipient loop and before the fast-path branch: the
 		-- split depends only on the buffer, and the fast path never reaches `deliver`,
 		-- so a fragmenter placed there would let every broadcast out unsplit.
@@ -312,7 +354,7 @@ function Replication.new(ctx: any)
 			return true
 		end) ~= nil
 
-		if transport.SendToAllClients and exceptEntry == nil then
+		if transport.SendToAllClients and exceptEntry == nil and alsoExcept == nil then
 			-- No per-recipient attribution on this path: one raise means the frame
 			-- reached NOBODY, so every ready client is a missed recipient.
 			local function everyReady(): { any }
@@ -324,42 +366,54 @@ function Replication.new(ctx: any)
 				end
 				return all
 			end
+			-- Once per session: the O(1) stand-in for the clients the engine delivers to.
+			local sessions = ctx.Persistence.EntryCount
+			local accepted = 0
 			if not split then
 				local ok, err = pcall(transport.SendToAllClients, transport, bytes)
 				if not ok then
 					Log.Warn("Transport", "SEND_FAIL", tostring(err), {})
 					return everyReady()
 				end
+				accepted = buffer.len(bytes)
 			else
 				for _, part in parts do
 					local ok, err = pcall(transport.SendToAllClients, transport, part)
 					if not ok then
 						Log.Warn("Transport", "SEND_FAIL", tostring(err), {})
 						Metrics.Add("FragmentedSendFailed")
+						countBytesOut(bytes, accepted * sessions)
 						return everyReady()
 					end
+					accepted += buffer.len(part)
 				end
 				Metrics.Add("FramesFragmented")
 				Metrics.Add("FragmentsSent", #parts)
 			end
 			Metrics.Add("FramesSent")
 			Metrics.Observe("BytesOutPerSend", buffer.len(bytes))
+			countBytesOut(bytes, accepted * sessions)
 			return nil
 		end
 
 		local sent = 0
+		local accepted = 0
 		local missed: { any }? = nil
 		for _, entry in ctx.Persistence.Entries do
-			if entry.HandshakeReady and entry ~= exceptEntry then
+			if entry.HandshakeReady and entry ~= exceptEntry and entry ~= alsoExcept then
 				local complete = true
 				if not split then
 					complete = deliver(entry, bytes)
+					if complete then
+						accepted += buffer.len(bytes)
+					end
 				else
 					for _, part in parts do
 						if not deliver(entry, part) then
 							complete = false
 							break
 						end
+						accepted += buffer.len(part)
 					end
 				end
 				if complete then
@@ -382,6 +436,9 @@ function Replication.new(ctx: any)
 				Metrics.Add("FragmentsSent", #parts * sent)
 			end
 			Metrics.Observe("BytesOutPerSend", buffer.len(bytes))
+		end
+		if accepted > 0 then
+			countBytesOut(bytes, accepted)
 		end
 		return missed
 	end
@@ -441,12 +498,17 @@ function Replication.new(ctx: any)
 	-- Flush an entry's queued Shared ops as SharedDiff frames to every other ready
 	-- client. Extracted so sendInit can drain the queue before a new client snapshots
 	-- that player; otherwise the op lands twice, double-applying Insert/Remove/Clear.
-	local function flushSharedQueue(entry: any)
+	--- Takes the queued Shared ops, leaving a fresh queue for writes made during a send.
+	local function detachSharedQueue(entry: any): { Wire.Op }
 		local shared: { Wire.Op } = entry.SharedQueue
+		entry.SharedQueue = {}
+		return shared
+	end
+
+	local function sendSharedOps(entry: any, shared: { Wire.Op }, alsoExcept: any?)
 		if #shared == 0 then
 			return
 		end
-		entry.SharedQueue = {}
 		shared = compactOps(shared)
 		local offset = 1
 		while offset <= #shared do
@@ -457,7 +519,7 @@ function Replication.new(ctx: any)
 			if ok then
 				-- A SharedDiff cannot be replayed to the client that missed it: the other
 				-- recipients already applied it. It gets a whole new snapshot instead.
-				local missed = broadcastBuffer(bytesOrErr, entry)
+				local missed = broadcastBuffer(bytesOrErr, entry, alsoExcept)
 				if missed ~= nil then
 					for _, other in missed do
 						markResync(other, "SharedDiff")
@@ -468,6 +530,10 @@ function Replication.new(ctx: any)
 			end
 			offset += MAX_OPS_PER_FRAME
 		end
+	end
+
+	local function flushSharedQueue(entry: any)
+		sendSharedOps(entry, detachSharedQueue(entry))
 	end
 
 	function self.FlushEntry(entry: any)
@@ -538,20 +604,18 @@ function Replication.new(ctx: any)
 	end
 
 	--- Encode whatever the store queued and broadcast it to every ready client.
-	function self.FlushStoreQueue()
-		if #storeQueue == 0 then
-			return
-		end
-		local queue = compactOps(storeQueue)
-		storeQueue = {}
+	--- `except` skips one entry: the joiner whose snapshot already holds these ops.
+	local function sendStoreOps(queue: { Wire.Op }, except: any?): number
+		local sentOps = 0
 		local offset = 1
 		while offset <= #queue do
 			local chunk = table.move(queue, offset, math.min(offset + MAX_OPS_PER_FRAME - 1, #queue), 1, {})
 			local ok, bytesOrErr = pcall(Wire.EncodeOpsFrame, Wire.Frames.Diff, compiled, chunk)
 			if ok then
 				-- An ordinary Diff against the full compiled: no new frame kind needed.
-				local missed = broadcastBuffer(bytesOrErr)
+				local missed = broadcastBuffer(bytesOrErr, except)
 				Metrics.Add("OpsSent", #chunk)
+				sentOps += #chunk
 				if missed ~= nil then
 					-- Nothing else repairs a missed store diff, so force a re-Init.
 					for _, entry in missed do
@@ -564,12 +628,28 @@ function Replication.new(ctx: any)
 			end
 			offset += MAX_OPS_PER_FRAME
 		end
+		return sentOps
 	end
 
-	local function flushFrame(): (number, number)
+	function self.FlushStoreQueue(except: any?): number
+		if #storeQueue == 0 then
+			return 0
+		end
+		local queue = compactOps(storeQueue)
+		storeQueue = {}
+		return sendStoreOps(queue, except)
+	end
+
+	local function flushFrame(): (number, number, boolean)
 		local flushed = 0
 		local queued = 0
-		for _, entry in ctx.Persistence.Entries do
+		local resynced = 0
+		local batch = dirty
+		dirty = {}
+		for entry in batch do
+			if entry.TornDown then
+				continue
+			end
 			-- Repair before flushing: a resync re-snapshots live state, so any op that
 			-- would have flushed this frame is already in it. Throttled on the previous
 			-- attempt, not on LastInitAt, whose clock starts at the join: gating on that
@@ -582,10 +662,12 @@ function Replication.new(ctx: any)
 					-- pcall for the reason onHello gives: a throw escaping here would take
 					-- down the flush loop for every other player.
 					local okInit, initErr = pcall(sendInit, entry)
+					resynced += 1
 					if not okInit then
 						Log.Error("Replication", "INIT_SEND_FAIL", tostring(initErr), { Player = entry.Player })
 						Metrics.Add("InitSendFailed")
 						entry.ResyncPending = true
+						markDirty(entry)
 					end
 				end
 			end
@@ -597,27 +679,49 @@ function Replication.new(ctx: any)
 				queued += pending
 				self.FlushEntry(entry)
 			end
+			if entry.ResyncPending or #entry.Queue > 0 or #entry.SharedQueue > 0 then
+				markDirty(entry)
+			end
 		end
 		-- The store drains once per frame, not per entry: one queue, one broadcast.
+		local storeOps = 0
 		if hasStore then
-			self.FlushStoreQueue()
+			storeOps = self.FlushStoreQueue()
 		end
-		return flushed, queued
+		return flushed, queued, flushed > 0 or storeOps > 0 or resynced > 0
+	end
+
+	--- Ask for a fresh Init on the next frame, as a lost frame would.
+	function self.RequestResync(entry: any, what: string)
+		markResync(entry, what)
+	end
+
+	function self.DirtyCount(): number
+		local count = 0
+		for _ in dirty do
+			count += 1
+		end
+		return count
 	end
 
 	connections[#connections + 1] = RunService.PostSimulation:Connect(function()
 		-- No memory category here: this body runs on a thread the engine may recycle,
 		-- so the tag would outlive the call and stain whatever ran next on it.
+		if next(dirty) == nil and (not hasStore or #storeQueue == 0) then
+			return
+		end
 		local startedAt = Clock.Monotonic()
 		-- SyncSpan, and flushFrame is synchronous: it encodes and fires, and waits on
 		-- nothing. That is the precondition, not an incidental property.
-		local flushed, queued = Profile.SyncSpan("Scribe.Flush", flushFrame)
+		local flushed, queued, worked = Profile.SyncSpan("Scribe.Flush", flushFrame)
 		-- Nothing is recorded for an idle frame: a distribution padded with zeroes
 		-- would drag every percentile down and hide the busy frames.
 		if flushed > 0 then
 			Metrics.Observe("FlushEntriesPerFrame", flushed)
 			Metrics.Observe("FlushQueuedPerFrame", queued)
-			-- The frame cost itself, in seconds; the counts above say only how much work.
+		end
+		-- The frame cost, in seconds, whatever the work was.
+		if worked then
 			Metrics.Observe("FlushDuration", Clock.Monotonic() - startedAt)
 		end
 	end)
@@ -696,16 +800,27 @@ function Replication.new(ctx: any)
 	local lastInitBytes: number? = nil
 
 	function sendInit(entry: any)
+		-- Sent after the snapshot is taken, so a write made inside Send lands past the boundary.
+		local pending: { Wire.Op }? = nil
+		if hasStore and #storeQueue > 0 then
+			pending = compactOps(storeQueue)
+			storeQueue = {}
+		end
 		-- Open the queue in the same breath as taking the snapshot, with no yield
 		-- between them, so every write from here on is either in this clone or in the
 		-- queue behind it. The clear drops what the snapshot supersedes.
 		entry.Queue = {}
 		entry.QueueIndex = {}
 		entry.QueueOpen = true
+		-- A repair is an Init for a client that already has a snapshot.
+		local repair = entry.InitDelivered == true
 		-- Stamped at the start of the snapshot: measuring from completion would let a
 		-- slow encode widen its own cooldown.
 		entry.LastInitAt = Clock.Monotonic()
 		local ops = ownerSnapshotOps(entry)
+		if pending ~= nil then
+			sendStoreOps(pending, entry)
+		end
 		-- Per-root byte spans, filled by the encode, so the oversize warning can name
 		-- what is large. `shippedOps` is what the delivered frame holds, not `ops`.
 		local spans: { number } = {}
@@ -751,19 +866,6 @@ function Replication.new(ctx: any)
 			end
 			bytesOrErr = safeBytes
 		end
-		-- Drain every other ready player's pending Shared ops before this client becomes
-		-- ready and snapshots them below: a queued op is already in other.LiveData, so it
-		-- lands in the snapshot and would also be re-broadcast on the next flush,
-		-- double-applying Insert/Remove/Clear. Gated on HasShared, which without a Shared
-		-- root would walk every entry to find nothing.
-		if compiled.HasShared then
-			for _, other in ctx.Persistence.Entries do
-				if other ~= entry and other.State == "Ready" and #other.SharedQueue > 0 then
-					flushSharedQueue(other)
-				end
-			end
-		end
-
 		-- What this handshake costs the client in bytes, summed across every frame it
 		-- takes, not just the Init: the SharedInit fan-out that follows can dwarf it.
 		local joinBytes = buffer.len(bytesOrErr :: buffer)
@@ -774,7 +876,7 @@ function Replication.new(ctx: any)
 		-- only one a first join has.
 		entry.InitSizeHint = joinBytes
 		lastInitBytes = joinBytes
-		if not sendBuffer(entry, bytesOrErr, shippedOps, spans) then
+		if not sendBuffer(entry, bytesOrErr, shippedOps, spans, repair) then
 			-- The snapshot never reached the transport, so this client has no mirror for
 			-- anything that follows. Leaving HandshakeReady false keeps that recoverable:
 			-- the client's Hello retry asks again, and the handshake alarm still fires.
@@ -795,17 +897,22 @@ function Replication.new(ctx: any)
 			-- since a loaded client has no Hello left to send.
 			entry.HandshakeReady = false
 			entry.ResyncPending = true
+			markDirty(entry)
 			return
 		end
 		-- Only now: a client marked ready before its snapshot is on the wire can be
 		-- handed a diff it has no mirror to apply to. broadcastBuffer skips unready
 		-- entries, which is also what kept the Shared drain above safe.
 		entry.HandshakeReady = true
+		entry.InitDelivered = true
+		-- Any pending repair request is met by this snapshot.
+		entry.ResyncPending = false
 		-- The snapshot landed but the handshake is not finished: a Status or SharedInit
 		-- that does not arrive leaves this client correct about itself and blind to
 		-- everyone else. Ask for the whole handshake again.
 		if not sendStatus(entry) then
 			entry.ResyncPending = true
+			markDirty(entry)
 		end
 		if ctx.Leaderboards then
 			ctx.Leaderboards.OnClientReady(entry)
@@ -816,7 +923,12 @@ function Replication.new(ctx: any)
 		if compiled.HasShared then
 			for _, other in ctx.Persistence.Entries do
 				if other ~= entry and other.State == "Ready" then
+					-- Snapshot and detach before any send: the snapshot carries what was queued,
+					-- the others get it as a diff, and a write made during either send waits for
+					-- the next flush.
+					local drained = detachSharedQueue(other)
 					local sharedOps = sharedSnapshotOps(other)
+					sendSharedOps(other, drained, entry)
 					if #sharedOps > 0 then
 						local okShared, sharedBytes = pcall(
 							Wire.EncodeOpsFrame,
@@ -828,12 +940,13 @@ function Replication.new(ctx: any)
 							end
 						)
 						if okShared then
-							if sendBuffer(entry, sharedBytes) then
+							if sendBuffer(entry, sharedBytes, nil, nil, repair) then
 								joinBytes += buffer.len(sharedBytes)
 							else
 								-- A joiner that misses another player's SharedInit has no
 								-- mirror of them for the rest of the session.
 								entry.ResyncPending = true
+								markDirty(entry)
 							end
 						end
 					end
@@ -908,8 +1021,10 @@ function Replication.new(ctx: any)
 				Metrics.Add("InitSendFailed")
 			end
 		end
-		-- Broadcast this player's Shared snapshot to everyone else.
+		-- Broadcast this player's Shared snapshot. The queue is cleared before the send: what
+		-- was queued is in the snapshot, and a write made during the send is the next flush's.
 		local sharedOps = sharedSnapshotOps(entry)
+		entry.SharedQueue = {}
 		if #sharedOps > 0 then
 			local ok, bytes = pcall(Wire.EncodeOpsFrame, Wire.Frames.SharedInit, compiled, sharedOps, function(w)
 				Wire.F64(w, entry.UserId)
@@ -923,10 +1038,6 @@ function Replication.new(ctx: any)
 				end
 			end
 		end
-		-- Anything queued before this snapshot is already in it, and the next flush
-		-- would broadcast it again as a SharedDiff, permanently doubling a
-		-- non-idempotent Insert. Clear unconditionally: the snapshot is authoritative.
-		entry.SharedQueue = {}
 		Clock.Delay(HANDSHAKE_TIMEOUT, function()
 			if not entry.TornDown and not entry.HandshakeReady then
 				if entry.HelloReceived then
@@ -956,6 +1067,7 @@ function Replication.new(ctx: any)
 	end
 
 	function self.OnEntryRemoved(entry: any)
+		dirty[entry] = nil
 		entry.HandshakeReady = false
 		-- Symmetry rather than a fix: a removed entry's tree is already dead, so
 		-- nothing can push to it.
@@ -1125,12 +1237,14 @@ function Replication.new(ctx: any)
 	-- Release the per-frame flush handler and the status listener; without this a
 	-- discarded bundle keeps flushing against a dead Persistence forever.
 	function self.Stop()
+		stopped = true
 		for _, connection in connections do
 			pcall(function()
 				connection:Disconnect()
 			end)
 		end
 		table.clear(connections)
+		table.clear(dirty)
 	end
 
 	return self

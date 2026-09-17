@@ -1,0 +1,24 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+const canonical = new URL(`${base}404.html`, Astro.site).href;
+---
+<StarlightPage frontmatter={{ title: 'Page not found', template: 'splash', tableOfContents: false, editUrl: false, lastUpdated: false, head: [
+  { tag: 'meta', attrs: { name: 'robots', content: 'noindex' } },
+  { tag: 'link', attrs: { rel: 'canonical', href: canonical } },
+  { tag: 'meta', attrs: { property: 'og:url', content: canonical } },
+] }}>
+  <section class="missing-page not-content" aria-labelledby="_top">
+    <p class="eyebrow">404 · PAGE NOT FOUND</p>
+    <h1 id="_top">Let's get you back on track.</h1>
+    <p>This page may have moved. Search the docs above, or pick up from the beginning.</p>
+    <a class="scribe-button primary" href={base}>Back to Scribe</a>
+    <a class="scribe-button secondary" href={`${base}getting-started/`}>Start the tutorial</a>
+  </section>
+</StarlightPage>
+<style>
+  .missing-page { max-width: 48rem; padding-block: clamp(3rem, 10vw, 8rem); }
+  h1 { font-size: clamp(2.25rem, 5vw, 4rem); letter-spacing: -.04em; line-height: 1.1; }
+  p:not(.eyebrow) { max-width: 38rem; margin-block: 1.5rem 2rem; color: var(--sl-color-gray-2); }
+  a { margin: 0 .75rem .75rem 0; }
+</style>

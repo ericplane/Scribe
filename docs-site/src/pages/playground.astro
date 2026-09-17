@@ -1,0 +1,70 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import Icon from '../components/BrandIcon.astro';
+import '../styles/playground.css';
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+const href = (path: string) => `${base}${path}/`;
+---
+<StarlightPage frontmatter={{
+    title: 'Try Scribe in your browser',
+    description: 'Declare a template, run actions against real Scribe field accessors, and watch the data change. Autocomplete and live checks included.',
+    tableOfContents: false,
+    editUrl: 'https://github.com/ericplane/Scribe/edit/main/docs-site/src/pages/playground.astro',
+}}>
+    <p>Declare a template on the left and run actions against it on the right. The editors complete Scribe's declarators and your own fields, and they flag mistakes as you type. Everything runs in your browser on Scribe's real template compiler and field accessors. Nothing is saved.</p>
+
+    <div class="scribe-playground not-content" data-playground data-assets={`${base}assets/playground/`}>
+        <div class="pg-toolbar">
+            <label>Example <select id="pg-preset" disabled></select></label>
+            <label>Writes outside the bounds <select id="pg-policy"><option value="Clamp">Clamp to the bounds</option><option value="Reject">Reject the write</option></select></label>
+            <span class="pg-version" id="pg-version">Loading example details...</span>
+        </div>
+        <p class="pg-description" id="pg-description"></p>
+        <div class="pg-editors">
+            <section class="pg-editor" aria-labelledby="pg-template-heading">
+                <header><span class="pg-step" aria-hidden="true">1</span><h3 id="pg-template-heading">Template</h3><span class="pg-hint">return a table of fields</span></header>
+                <div id="pg-template" class="pg-cm"></div>
+            </section>
+            <section class="pg-editor" aria-labelledby="pg-actions-heading">
+                <header><span class="pg-step" aria-hidden="true">2</span><h3 id="pg-actions-heading">Actions</h3><span class="pg-hint">your fields live under data</span></header>
+                <div id="pg-actions" class="pg-cm"></div>
+            </section>
+        </div>
+        <div class="pg-actions-row">
+            <button id="pg-run" class="scribe-button primary" type="button" disabled><Icon name="play" size={17} /> Run <kbd id="pg-shortcut">Ctrl+Enter</kbd></button>
+            <button id="pg-stop" class="scribe-button secondary" type="button" hidden><Icon name="stop" size={16} /> Stop</button>
+            <button id="pg-reset" class="scribe-button secondary" type="button" disabled><Icon name="refresh" size={16} /> Reset example</button>
+            <button id="pg-share" class="scribe-button secondary" type="button" disabled><Icon name="link" size={16} /> Copy link</button>
+            <p id="pg-status" class="pg-status" role="status" aria-live="polite">Loading examples...</p>
+        </div>
+        <p id="pg-expected" class="pg-expected"></p>
+        <div class="pg-lower">
+            <section class="pg-panel" aria-labelledby="pg-fields-heading">
+                <header><h3 id="pg-fields-heading">Fields</h3><span class="pg-hint">what the template compiles to</span></header>
+                <div id="pg-fields" class="pg-fields"><p class="pg-hint">Compiling the template...</p></div>
+            </section>
+            <section class="pg-results" aria-labelledby="pg-results-heading">
+                <div class="pg-snapshots">
+                    <div class="pg-panel"><header><h3 id="pg-results-heading">Before</h3><span class="pg-hint">starting data</span></header><pre id="pg-before" tabindex="0">Run the example to see its starting data.</pre></div>
+                    <div class="pg-panel"><header><h3>After</h3><span class="pg-hint">changed lines are highlighted</span></header><pre id="pg-after" tabindex="0">Each run starts fresh.</pre></div>
+                </div>
+                <div class="pg-panel"><header><h3>Output</h3><span class="pg-hint">prints and errors</span></header><pre id="pg-output" tabindex="0" aria-label="Printed output and errors">Your prints and errors appear here.</pre></div>
+            </section>
+        </div>
+        <p class="pg-footnote">Runs stop after two seconds. Each run starts from the template's defaults. <a href={`${base}assets/playground/runtime/NOTICE.txt`} target="_blank" rel="noopener">Runtime credits and licenses</a>.</p>
+    </div>
+
+    <h2 id="what-this-playground-runs">What this playground runs</h2>
+    <p>The template compiler, field validation and every accessor method come from the same Scribe source these docs are generated from. The declarators available here are <code>Int</code>, <code>Number</code>, <code>Big</code>, <code>String</code>, <code>Enum</code>, <code>Flags</code>, <code>Dynamic</code>, <code>Derived</code>, <code>Optional</code>, <code>ArrayOf</code>, <code>SetOf</code>, <code>MapOf</code> and <code>DictOf</code>, plus the <code>ServerOnly</code>, <code>Shared</code> and <code>Session</code> wrappers and <code>Scribe.Short</code>. <code>Scribe.Timed</code> needs the server scheduler and the Roblox datatype declarators need the engine, so both stay in Studio.</p>
+    <p>The editors check syntax with the real Luau compiler, compile your template to list its fields, and flag unknown field names, methods that do not fit a field, writes to derived fields, and literal values of the wrong type. That covers the mistakes Scribe would refuse at runtime. It is not Luau's static type checker, so type annotations and inferred types are not verified here.</p>
+    <p>Each run creates fresh data from the template's defaults and exposes it as <code>data</code>, the same accessor tree your server receives after <a href={`${href('getting-started')}#3-give-the-player-coins-on-the-server`}>waiting for a player's data</a>. The runtime is served with this site, and running an example never contacts another service.</p>
+
+    <h2 id="what-to-check-in-studio">What to check in Studio</h2>
+    <p>DataStores, player sessions, replication, purchases, timers and other Roblox services are unavailable here. Use the <a href={href('testing')}>testing guide</a> for those. Browser execution speed also says nothing about Scribe's performance in Roblox.</p>
+
+    <h2 id="continue-in-your-game">Continue in your game</h2>
+    <p>Copy the template into your shared data module and use the actions after <code>Data.WaitForData(player)</code> succeeds. Follow <a href={href('getting-started')}>Getting Started</a> for the complete folder layout and loading code, or <a href={href('values')}>Read and write values</a> for more field operations. The Copy link button captures the current template, actions and bounds policy, so an example is easy to hand to a teammate.</p>
+</StarlightPage>
+<script>
+    import '../playground/app';
+</script>

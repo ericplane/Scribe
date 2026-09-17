@@ -651,6 +651,12 @@ function Monetization.new(ctx: any)
 		return policy
 	end
 
+	-- Purchase and PromptGift answer in sentences; PromptPurchase answers in ProductState.
+	local PAID_RANDOM_REASON: { [string]: string } = {
+		["paid-random-restricted"] = "paid random items are not available for this account",
+		["policy-pending"] = "cannot check account settings right now; try again in a moment",
+	}
+
 	-- nil when the player may buy paid random items.
 	local function paidRandomState(entry: any): string?
 		local policy = ensurePolicy(entry)
@@ -703,6 +709,16 @@ function Monetization.new(ctx: any)
 		if entry.Tree and not entry.Tree.Dead then
 			entry.Tree.Accessor[Template.SESSION_ROOT].OwnsCache[key].Set(if owned then true else nil)
 		end
+	end
+
+	-- Ownership only gains during a session, so a late answer must not clear a confirmed pass.
+	local function foldOwnsCache(entry: any, key: string, owned: boolean): boolean
+		if not entry.Tree or entry.Tree.Dead then
+			return owned
+		end
+		local kept = owned or entry.Tree.Accessor[Template.SESSION_ROOT].OwnsCache[key].Get() == true
+		setOwnsCache(entry, key, kept)
+		return kept
 	end
 
 	-- Every key whose ownership is worth tracking: everything registered, plus whatever
@@ -852,7 +868,7 @@ function Monetization.new(ctx: any)
 					if last ~= nil and entry.Tree and not entry.Tree.Dead then
 						last[name] = last[name] == true or owned == true
 					end
-					setOwnsCache(entry, name, owned == true)
+					foldOwnsCache(entry, name, owned == true)
 				elseif not ok then
 					-- A throw or throttle leaves this pass unresolved and the cache not-owned.
 					-- Surface it rather than treating a failed check as a confirmed not-owned.
@@ -898,7 +914,7 @@ function Monetization.new(ctx: any)
 			end)
 			if ok then
 				if not entry.TornDown then
-					setOwnsCache(entry, key, owned == true)
+					return foldOwnsCache(entry, key, owned == true)
 				end
 				return owned == true
 			end
@@ -1078,6 +1094,11 @@ function Monetization.new(ctx: any)
 		local recipientEntry = ctx.Persistence.EntryForUserId(recipientUserId)
 		if recipientEntry and recipientEntry.State == "Ready" then
 			return deliverGiftLocal(recipientEntry, product, purchaseId, giftId, fromUserId)
+		end
+		-- Not durable and not refundable: the receipt retries on a live server.
+		if ctx.Persistence.Mode == "NoSave" then
+			ctx.Persistence.RefuseNoSave("GiftDelivery")
+			return false, false, false
 		end
 		local ok, delivered, reason, provablyClean = pcall(function()
 			return ctx.Persistence.Store:MessageAsync(ctx.Persistence.KeyFor(recipientUserId), {
@@ -2036,7 +2057,7 @@ function Monetization.new(ctx: any)
 			end
 			if refused ~= nil then
 				Metrics.Add("PaidRandomRefused")
-				return false, refused
+				return false, PAID_RANDOM_REASON[refused]
 			end
 		end
 
@@ -2329,7 +2350,7 @@ function Monetization.new(ctx: any)
 			local refused = paidRandomState(entry)
 			if refused ~= nil then
 				Metrics.Add("PaidRandomRefused")
-				return false, refused
+				return false, PAID_RANDOM_REASON[refused]
 			end
 		end
 		-- Optional caller-supplied idempotency key. Deliberately NOT stored in
@@ -2526,7 +2547,11 @@ function Monetization.new(ctx: any)
 				)
 			end
 		end
-		Sched.Spawn(refreshOwnership, entry)
+		if next(passesByName) == nil then
+			refreshOwnership(entry)
+		else
+			Sched.Spawn(refreshOwnership, entry)
+		end
 		watchOwnership(entry)
 		-- Last and spawned: the hooks after this one end with the first snapshot.
 		if anyPaidRandom then
@@ -2545,6 +2570,9 @@ function Monetization.new(ctx: any)
 	end
 
 	local connections: { any } = {}
+	function self.ListenerCount(): number
+		return #connections
+	end
 	local boundReceipts = false
 
 	function self.Start()
@@ -2572,11 +2600,13 @@ function Monetization.new(ctx: any)
 			)
 		end
 
-		connections[#connections + 1] = MarketplaceService.PromptGamePassPurchaseFinished:Connect(
-			function(player: Player, passId: number, purchased: boolean)
-				self.OnPassPurchaseFinished(player, passId, purchased)
-			end
-		)
+		if next(passesByName) ~= nil then
+			connections[#connections + 1] = MarketplaceService.PromptGamePassPurchaseFinished:Connect(
+				function(player: Player, passId: number, purchased: boolean)
+					self.OnPassPurchaseFinished(player, passId, purchased)
+				end
+			)
+		end
 
 		connections[#connections + 1] = Players.PlayerMembershipChanged:Connect(function(player: Player)
 			local entry = ctx.Persistence.EntryFor(player)

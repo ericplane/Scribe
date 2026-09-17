@@ -67,7 +67,7 @@
 --   open either: see the third reading below.
 --
 --   MEASURED, on 2026-08-23 and again on 2026-08-24, by running
---   test/Specs/DeferredWakeHeadroom.spec.luau in Studio. Both halves of the claim this
+--   test/Specs/lifecycle/DeferredWakeHeadroom.spec.luau in Studio. Both halves of the claim this
 --   paragraph used to hedge now have an answer, and they are DIFFERENT answers:
 --
 --     * INHERITANCE IS CONFIRMED. A thread woken from inside a deferred callback is

@@ -1,30 +1,49 @@
 """Scribe docs generator.
 
 Parses the `--[=[ ]=]` Luau doc-comments straight from ../src/, converts the
-hand-written guides in ./guides/, and emits Material-for-MkDocs Markdown into
-../docs_gen/ (the mkdocs `docs_dir`). No Moonwave, no Docusaurus.
-
-Run directly (`python docgen/gen.py`) or let mkdocs_hooks.py invoke main() on
-every build/serve.
+hand-written guides in ./guides/, and emits Starlight-compatible Markdown into
+../docs-site/src/content/docs/. The website build invokes this before Astro.
 """
 import re
 import sys
 import pathlib
 import textwrap
 import shutil
+import tempfile
+
+from playground.build import build_playground
+import subprocess
+from starlight import convert_page
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 SRC = ROOT / "src"            # Luau source (API doc-comments live here)
 DOCS = HERE / "guides"        # hand-written guide sources
-OUT = ROOT / "docs_gen"       # generated mkdocs docs_dir (git-ignored)
-THEME = HERE / "theme"        # static css + assets copied into OUT
+SITE = ROOT / "docs-site"
+OUT = SITE / "src" / "content" / "docs"  # generated, git-ignored
+PUBLIC = SITE / "public"
+THEME = HERE / "theme"        # canonical logos and standalone playground assets
 
 BLOCK = re.compile(r"--\[=\[(.*?)\]=\]", re.S)
 
 DATATYPES = []                # datatype-declarator family; filled by main()
 VERSION = "0.0.0"             # wally.toml package version; filled by main()
 TYPES = {}                    # exported type name -> its anchor on api/types.md
+
+
+_GIT_DATES = {}
+
+
+def git_date(path):
+    """The last commit date of a source file, for the page footer; None outside git."""
+    if path not in _GIT_DATES:
+        try:
+            result = subprocess.run(["git", "log", "-1", "--format=%cI", "--", path], cwd=ROOT,
+                                    capture_output=True, text=True, timeout=20)
+            _GIT_DATES[path] = result.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            _GIT_DATES[path] = None
+    return _GIT_DATES[path]
 
 
 def read_version():
@@ -180,7 +199,7 @@ def collect():
             "",
         ]
         # Print explicitly (not just via SystemExit's arg) so the message is visible
-        # even when mkdocs surfaces the hook failure, then fail the build non-zero.
+        # even when the website build wraps this command, then fail non-zero.
         print("\n".join(lines), file=sys.stderr)
         raise SystemExit(1)
     return classes, types
@@ -206,8 +225,8 @@ def convert_xref(text):
     # Doc-comments cross-reference with the Moonwave autolink form, [Class] or
     # [Class.member]. The guide-style `](/api/Server#WaitForData)` is NOT rewritten
     # here (that is convert_guide's job), so it would ship as a site-absolute path
-    # that resolves nowhere, and with the wrong anchor case besides. mkdocs only
-    # mentions it at INFO level, so catch it here instead.
+    # that resolves nowhere, and with the wrong anchor case besides. Catch the
+    # source convention here before the final website link check.
     bad = re.search(r"\]\((/api/[^)]*)\)", text)
     if bad:
         raise SystemExit(
@@ -224,7 +243,7 @@ def convert_xref(text):
         return f"[`{n}`](types.md#{TYPES[n]})" if n in TYPES else m.group(0)
     text = re.sub(r"\[([A-Z]\w*)\](?!\()", repl_type, text)
 
-    # [Class.member] / [Class] Moonwave autolinks -> Material links
+    # [Class.member] / [Class] Moonwave autolinks -> intermediate Markdown links
     def repl(m):
         cls, _, mem = m.group(1).partition(".")
         page = slug(cls)
@@ -261,12 +280,9 @@ def convert_admonitions(text):
 
 
 def unescape_code_pipes(text):
-    # Moonwave's Markdown tables required a literal pipe inside a cell to be
-    # written as backslash-pipe. Python-Markdown instead prints the backslash
-    # verbatim AND already refuses to split a table row on a pipe that lives
-    # inside an inline-code span -- so the escape is both unnecessary and ugly.
-    # Drop the backslash inside inline code only; leave fenced blocks and any
-    # plain-text pipes (which genuinely still need escaping) untouched.
+    # Normalize legacy pipe escaping inside inline code. The Starlight conversion
+    # adds GFM's required escapes back inside table rows, while ordinary inline
+    # code should display the pipe alone. Runnable fenced code stays untouched.
     fences = []
     def stash(m):
         fences.append(m.group(0)); return f"\x00F{len(fences) - 1}\x00"
@@ -296,18 +312,12 @@ def signature(e, cls):
         return re.split(r"\s+--\s", param, maxsplit=1)[0].rstrip()
 
     ps = ", ".join(strip_note(p).replace(" ", ": ", 1) for p in e["params"])
-    # Signatures render in a ```lua block, and Pygments' Lua lexer desyncs on a
-    # quoted literal inside the PARAMETER list: it emits Error for the opening
-    # quote, then reads the closing one as an opening quote, so the last quote
-    # starts a string that swallows the rest of the line (it renders as one wall
-    # of string colour). Quotes in the RETURN type are fine, since the lexer is
-    # past the parameter context by then. Name the exported type instead of
-    # inlining a shape with string literals, e.g. `@param filter PurchaseFilter?`.
+    # Keep parameter signatures compact and linkable by naming exported types
+    # instead of inlining shapes with string literals, e.g. PurchaseFilter?.
     if '"' in ps:
         raise SystemExit(
-            f'[docgen] {cls}.{e["name"]}: a @param type contains a string literal, which breaks '
-            f"Lua syntax highlighting for the whole signature. Reference the exported type by "
-            f"name instead.\n          {ps}"
+            f'[docgen] {cls}.{e["name"]}: a @param type contains a string literal. '
+            f"Reference the exported type by name to keep the signature compact and linkable.\n          {ps}"
         )
     sig = f'{cls}{member_sep(e)}{e["name"]}({ps})'
     if e["returns"]:
@@ -347,11 +357,11 @@ def render_member(e, cls):
     if e["kind"] == "prop":
         raw.insert(0, "signal" if e["ptype"] == "Signal" else "property")
     if raw:
-        pills = "".join(f'<span class="badge badge--{b}">{b}</span>' for b in raw)
+        pills = " ".join(f'<span class="badge badge--{b}">{b}</span>' for b in raw)
         out.append(f'<div class="badges">{pills}</div>')
         out.append("")
-    # Tagged so extra.css can let ONLY signatures wrap. Guide code examples keep
-    # horizontal scrolling, where wrapping would mangle real Lua.
+    # The final Starlight conversion turns this intermediate marker into an
+    # Expressive Code block with wrapping. Runnable guide examples keep scrolling.
     sig = signature(e, cls)
     out.append("``` { .lua .api-signature }")
     out.append(sig)
@@ -394,6 +404,18 @@ def render_class(name, data):
         tag = (e["tags"] or ["General"])[0]
         if tag not in groups: order.append(tag); groups[tag] = []
         groups[tag].append(e)
+    # An index lets readers choose a task before scanning full signatures. Keep
+    # member anchors unchanged so existing links into the reference still work.
+    if len(data["members"]) >= 8:
+        out += ["## Find a member", "", "Choose a group, then follow a member link for its signature and behavior.", ""]
+        for tag in order:
+            out += [f"**{tag}**", ""]
+            links = [f'[`{e["name"]}`](#{slug(e["name"])})' for e in groups[tag]]
+            # Datatype siblings are generated below even without their own block.
+            if any(e["name"] in DATATYPES for e in groups[tag]):
+                links = [f'[`{e["name"]}`](#{slug(e["name"])})' for e in groups[tag] if e["name"] not in DATATYPES]
+                links += [f'[`{v}`](#{slug(v)})' for v in DATATYPES]
+            out += [" · ".join(links), ""]
     # The datatype declarators are one family sharing a doc block; some members
     # (Vector3, CFrame) carry their own richer block, the rest none. Emit the
     # whole family ONCE, in source order, using each type's own block if it has
@@ -450,9 +472,8 @@ def render_type(e):
     if e["fields"]:
         out += ["| Field | Type | What it is |", "| --- | --- | --- |"]
         for fname, ftype, fdesc in e["fields"]:
-            # A pipe inside the type (a union) is safe: Python-Markdown does not split
-            # a row on a pipe inside an inline-code span. A pipe in the prose cell is
-            # not, so escape that one.
+            # The final conversion escapes pipes inside inline type code for GFM.
+            # Escape plain prose here so it cannot create additional table cells.
             out.append(f'| `{fname}` | {type_cell(ftype)} | {md(fdesc).replace("|", chr(92) + "|")} |')
         out.append("")
     if e["desc"]:
@@ -548,57 +569,154 @@ def convert_guide(text, source="guide"):
     return text
 
 
-def copy_theme():
-    # the stylesheet + logo/favicon live in docgen/theme/ and are referenced by
-    # mkdocs.yml relative to docs_dir, so copy them into OUT on every build
-    for sub in ("stylesheets", "assets"):
-        src = THEME / sub
-        if src.is_dir():
-            shutil.copytree(src, OUT / sub, dirs_exist_ok=True)
+def scoped_path(path):
+    """Refuse generated writes or cleanup outside this website project."""
+    resolved, site = path.resolve(), SITE.resolve()
+    if resolved == site or not resolved.is_relative_to(site):
+        raise ValueError(f"Generated path escapes the documentation project: {path}")
+    return path
 
 
-def main():
-    global DATATYPES, VERSION, TYPES
-    DATATYPES = find_datatypes()
-    VERSION = read_version()
+def publish_generated(trees, stage):
+    """Publish changed files only, rolling back filesystem errors during writes."""
+    changes = []
+    for source, destination in trees:
+        scoped_path(source)
+        scoped_path(destination)
+        incoming = {path.relative_to(source): path for path in source.rglob("*") if path.is_file()}
+        existing = {path.relative_to(destination): path for path in destination.rglob("*") if path.is_file()}
+        for relative, path in incoming.items():
+            target = scoped_path(destination / relative)
+            if relative not in existing or path.read_bytes() != target.read_bytes():
+                changes.append((path, target))
+        for relative in existing.keys() - incoming.keys():
+            changes.append((None, scoped_path(destination / relative)))
 
-    # OUT is fully generated; wipe it clean so deleted sources don't leave stragglers
-    shutil.rmtree(OUT, ignore_errors=True)
-    (OUT / "api").mkdir(parents=True, exist_ok=True)
-    (OUT / ".gitkeep").write_text("", encoding="utf-8")
+    # Back up only files that will change, before touching published output. This
+    # also preserves old timestamps if a filesystem error interrupts publishing.
+    backup = scoped_path(stage / "rollback")
+    backup.mkdir()
+    backups = []
+    for index, (_, target) in enumerate(changes):
+        old = backup / str(index) if target.is_file() else None
+        if old:
+            shutil.copy2(target, old)
+        backups.append(old)
+    attempted = []
+    try:
+        for index, (source, target) in enumerate(changes):
+            attempted.append(index)
+            if source is None:
+                target.unlink()
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source.replace(target)
+    except OSError:
+        for index in reversed(attempted):
+            target, old = changes[index][1], backups[index]
+            if old:
+                old.replace(target)
+            else:
+                target.unlink(missing_ok=True)
+        raise
+
+    # Only generated empty directories can be removed. Never recurse over the
+    # project or remove a directory containing unrelated public/source files.
+    for _, destination in trees:
+        for path in sorted(destination.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+            if path.is_dir():
+                scoped_path(path)
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+    return len(changes)
+
+
+def summary(desc):
+    """The first paragraph of a doc block as plain text, for editor tooltips."""
+    first = desc.split("\n\n", 1)[0]
+    if first.lstrip().startswith("```"):
+        return ""
+    text = " ".join(line.strip() for line in first.splitlines())
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([A-Za-z_.:]+)\]", r"\1", text)
+    return re.sub(r"\*\*([^*]+)\*\*", r"\1", text).strip()
+
+
+def playground_api(classes):
+    """Members the browser playground can complete: declarators, helpers and field methods."""
+    entries = []
+    for cls, member_filter in (("Scribe", lambda e: bool({"Field Types", "Visibility"} & set(e["tags"]))
+                                          or e["name"] in ("Short", "SetShortSuffixes")),
+                               ("Value", lambda e: True), ("BigValue", lambda e: True)):
+        for e in classes.get(cls, {"members": []})["members"]:
+            if not member_filter(e):
+                continue
+            entries.append({
+                "class": cls, "name": e["name"], "kind": e["kind"], "tags": e["tags"],
+                "signature": signature(e, cls), "summary": summary(e["desc"]),
+            })
+    return entries
+
+
+def stage_site(output, assets):
+    global TYPES
+
+    (output / "api").mkdir(parents=True, exist_ok=True)
 
     classes, types = collect()
     # The registry has to exist before ANY page renders: render_member consults it
     # for the type links under each signature, and convert_xref for [ExportedType].
     TYPES = {key: slug(key) for key in types}
+    class_sources = {
+        "Server": "src/Server/init.luau", "Client": "src/Client/init.luau",
+        "Scribe": "src/init.luau", "Value": "src/Internal/Node.luau",
+        "BigValue": "src/Internal/Big.luau", "Signal": "src/Internal/Signal.luau",
+        "Connection": "src/Internal/Signal.luau",
+    }
     for cls, data in classes.items():
-        (OUT / "api" / f"{slug(cls)}.md").write_text(render_class(cls, data), encoding="utf-8")
+        name = f"api/{slug(cls)}.md"
+        source = class_sources.get(cls, "src/init.luau")
+        (output / name).write_text(convert_page(render_class(cls, data), name, source, git_date(source)), encoding="utf-8")
     print("[docgen] API:", ", ".join(f"{k}({len(v['members'])})" for k, v in classes.items()))
     if types:
-        (OUT / "api" / "types.md").write_text(render_types(types), encoding="utf-8")
+        (output / "api" / "types.md").write_text(convert_page(render_types(types), "api/types.md", "src/init.luau",
+                                                              git_date("src/init.luau")), encoding="utf-8")
     print(f"[docgen] types: {len(types)} exported shapes")
 
     guides = sorted(DOCS.glob("*.md"))
     for path in guides:
         name = "getting-started.md" if path.stem == "intro" else path.name
-        (OUT / name).write_text(
-            convert_guide(path.read_text(encoding="utf-8"), f"guides/{path.name}"), encoding="utf-8"
+        (output / name).write_text(
+            convert_page(convert_guide(path.read_text(encoding="utf-8"), f"guides/{path.name}"),
+                         name, f"docgen/guides/{path.name}", git_date(f"docgen/guides/{path.name}")), encoding="utf-8"
         )
     print(f"[docgen] guides: {len(guides)} converted")
 
-    # the landing page keeps its Material syntax and frontmatter; it is the home page
-    home = HERE / "home.md"
-    if home.exists():
-        home_text = home.read_text(encoding="utf-8")
-        # home.md is copied verbatim rather than run through convert_guide, so it
-        # needs the grid check applied explicitly. It is also the file most likely
-        # to have one: it is the only page built entirely out of cards.
-        check_grid_cards(home_text, "home.md")
-        (OUT / "index.md").write_text(home_text.replace("{{version}}", VERSION), encoding="utf-8")
-        print("[docgen] home: home.md -> index.md")
+    # The changelog is plain Markdown already, so it skips the guide conventions.
+    (output / "changelog.md").write_text(
+        convert_page((ROOT / "CHANGELOG.md").read_text(encoding="utf-8"), "changelog.md", "CHANGELOG.md",
+                     git_date("CHANGELOG.md")), encoding="utf-8")
 
-    copy_theme()
-    print(f"[docgen] wrote {OUT.relative_to(ROOT)}")
+    shutil.copytree(THEME / "assets", assets)
+    build_playground(ROOT, assets / "playground", VERSION, playground_api(classes))
+
+
+def main():
+    global DATATYPES, VERSION, _PUBLIC_SCRIBE
+    DATATYPES = find_datatypes()
+    VERSION = read_version()
+    _PUBLIC_SCRIBE = None
+    SITE.mkdir(parents=True, exist_ok=True)
+    # Invalid source saves never erase the last working preview. Validate and
+    # generate everything in a scoped temporary directory before publishing.
+    with tempfile.TemporaryDirectory(prefix=".docgen-", dir=SITE) as directory:
+        stage = scoped_path(pathlib.Path(directory))
+        output, assets = stage / "docs", stage / "assets"
+        stage_site(output, assets)
+        changed = publish_generated(((output, OUT), (assets, PUBLIC / "assets")), stage)
+    print(f"[docgen] published {changed} changed files to {SITE.name}")
 
 
 if __name__ == "__main__":

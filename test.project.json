@@ -18,8 +18,14 @@
         "Test": {
           "$path": "test"
         },
-        "Adapters": {
-          "$path": "adapters"
+        "Addons": {
+          "$className": "Folder",
+          "UI": {
+            "$path": "addons/ui"
+          },
+          "Telemetry": {
+            "$path": "addons/telemetry"
+          }
         },
         "DevPackages": {
           "$path": "DevPackages"

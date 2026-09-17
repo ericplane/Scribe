@@ -18,6 +18,7 @@ local Datatypes = require(Internal.Datatypes)
 local Log = require(Internal.Log)
 local Metrics = require(Internal.Metrics)
 local Health = require(Internal.Health)
+local Addons = require(Internal.Addons)
 
 local DebugHook = {}
 
@@ -616,6 +617,7 @@ function DebugHook.Attach(Data: any, ctx: any): (() -> ())?
 							WallAt = os.time(),
 							Status = Health.GetStatus(),
 							Metrics = Metrics.Get(),
+							Percentiles = Metrics.GetPercentiles(),
 						}
 						ringPush(metricsRing, tick)
 						if subscriptions.Metrics then
@@ -1058,7 +1060,13 @@ function DebugHook.Attach(Data: any, ctx: any): (() -> ())?
 	end
 
 	function handlers.GetMetrics(_args: any): any
-		return { Ok = true, T = os.clock(), Metrics = Metrics.Get(), Status = Health.GetStatus() }
+		return {
+			Ok = true,
+			T = os.clock(),
+			Metrics = Metrics.Get(),
+			Percentiles = Metrics.GetPercentiles(),
+			Status = Health.GetStatus(),
+		}
 	end
 
 	function handlers.GetStatusInfo(_args: any): any
@@ -1364,6 +1372,7 @@ function DebugHook.Attach(Data: any, ctx: any): (() -> ())?
 			Ok = true,
 			Boards = boards,
 			QueueDepth = tonumber(Metrics.Get().LbQueueDepth) or 0,
+			Workers = ctx.Leaderboards.Workers(),
 		}
 	end
 
@@ -1384,6 +1393,25 @@ function DebugHook.Attach(Data: any, ctx: any): (() -> ())?
 			ctx.Leaderboards.FlushAllBlocking(5)
 		end)
 		return if ok then { Ok = true } else { Ok = false, Error = tostring(err) }
+	end
+
+	function handlers.ListAddons(_args: any): any
+		return { Ok = true, Addons = Addons.List() }
+	end
+
+	function handlers.AddonAction(args: any): any
+		local name, action = tostring(args.Addon), tostring(args.Action)
+		if Addons.Writes(name, action) then
+			local gate = requireWrites()
+			if gate then
+				return { Ok = false, Error = gate }
+			end
+		end
+		local called, ok, result = studioCall(Addons.Invoke, name, action, args.Args)
+		if not called then
+			return { Ok = false, Error = tostring(ok) }
+		end
+		return if ok then { Ok = true, Result = result } else { Ok = false, Error = tostring(result) }
 	end
 
 	-- Template defaults (player comparison baseline) ------------------------------

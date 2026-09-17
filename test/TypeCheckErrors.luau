@@ -4,7 +4,7 @@
 -- exactly EXPECTED_ERRORS diagnostics: if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
--- EXPECTED_ERRORS: 27
+-- EXPECTED_ERRORS: 33
 
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -94,6 +94,16 @@ local function badTypedApis(player: Player)
 	Data.GetPurchases(player, { Kind = "Bitcoin" }) -- TypeError: Kind not "Robux" | "InGame"
 	-- 12) SendMessage's userId must be a number.
 	Data.SendMessage("not-a-number", {}) -- TypeError: string vs number
+	local ScribeTelemetry = require(script.Parent.Parent.Addons.Telemetry.ScribeTelemetry)
+	ScribeTelemetry.Start(Scribe, { Webhooks = { A = { Url = 5 } } }) -- TypeError: number vs string
+	ScribeTelemetry.Start(
+		Scribe,
+		{ Webhooks = { A = { Url = "u", Mention = { RoleId = "1", On = { "Sometimes" } } } } }
+	) -- TypeError: not a MentionKind
+	local _drained: number = ScribeTelemetry.Start(Scribe, { Webhooks = {} }):Flush(1) -- TypeError: boolean vs number
+	ScribeTelemetry.Start(Scribe, { Webhooks = {} }):Preview("Alerts", "Sometimes") -- TypeError: not a PreviewKind
+	local _remover: number = Scribe.RegisterAddon("Fixture", {}) -- TypeError: function vs number
+	Data.UpdateOffline(1, function(_raw) end, { Validate = "yes" }) -- TypeError: string vs boolean?
 end
 
 local function badLifecycleReason()

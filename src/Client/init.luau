@@ -23,6 +23,24 @@ local Defaults = require(Internal.Defaults)
 -- For RequestFailed only: the identity Request appends to its own refusals.
 local Types = require(script.Parent.Types)
 
+-- Request names are the client's to choose, so the named series are capped.
+local MAX_TIMEOUT_SERIES = 32
+local timeoutSeries: { [string]: true } = {}
+local timeoutSeriesCount = 0
+
+local function timeoutMetric(name: string): string
+	local key = `RequestTimeouts:{name}`
+	if timeoutSeries[key] then
+		return key
+	end
+	if timeoutSeriesCount >= MAX_TIMEOUT_SERIES then
+		return "RequestTimeouts:Other"
+	end
+	timeoutSeries[key] = true
+	timeoutSeriesCount += 1
+	return key
+end
+
 local Client = {}
 
 -- Test seam: Players.LocalPlayer is read-only in Studio.
@@ -344,8 +362,11 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			return
 		end
 
+		-- The apply timers include the listeners a frame fires: what the update costs the device.
 		if frameType == Wire.Frames.Init then
+			local startedAt = Clock.Monotonic()
 			applyInit(reader)
+			Metrics.Observe("InitApplyDuration", Clock.Monotonic() - startedAt)
 		elseif frameType == Wire.Frames.Diff then
 			if not loaded then
 				-- Op before Init is a protocol error: request a re-Init.
@@ -353,11 +374,13 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				sendHello()
 				return
 			end
+			local startedAt = Clock.Monotonic()
 			local ops = Wire.DecodeOps(reader, compiled)
 			-- One frame, one batch: a Server.Batch that coalesced into this frame
 			-- must not fan back out into one container fire per op.
 			tree:ApplyOps(ops)
 			Metrics.Add("DiffsApplied")
+			Metrics.Observe("DiffApplyDuration", Clock.Monotonic() - startedAt)
 		elseif frameType == Wire.Frames.CommandReply then
 			local correlation = Wire.RU32(reader)
 			local ok = Wire.RU8(reader) == 1
@@ -384,6 +407,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			Health.AdoptBroadcast(status :: any)
 			OnServiceStatus:Fire(status)
 		elseif frameType == Wire.Frames.SharedInit or frameType == Wire.Frames.SharedDiff then
+			local startedAt = Clock.Monotonic()
 			local userId = Wire.RF64(reader)
 			local ops = Wire.DecodeOps(reader, compiled)
 			local shared: { [string]: any } = sharedMirrors[userId] or {}
@@ -404,6 +428,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			if OnSharedChanged:HasListeners() then
 				OnSharedChanged:Fire(userId, Node.CloneUnpack(compiled.Root, shared))
 			end
+			Metrics.Observe("SharedApplyDuration", Clock.Monotonic() - startedAt)
 		elseif frameType == Wire.Frames.SharedGone then
 			local userId = Wire.RF64(reader)
 			sharedMirrors[userId] = nil
@@ -429,9 +454,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		end
 	end
 
-	-- Studio-only client debug hook for the Scribe Studio plugin. Attached before the
-	-- transport connects so the Init snapshot application is captured too.
-	if isRunning and devMode and (options.IsClient == true or RunService:IsClient()) then
+	-- Studio-only, opt-in; attached before the transport connects so the Init frame is captured.
+	if isRunning and options.StudioHook == true and (options.IsClient == true or RunService:IsClient()) then
 		local hookOk, hookErr = pcall(function()
 			(require(script.DebugHook) :: any).Attach({
 				Compiled = compiled,
@@ -604,6 +628,10 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		-- the spawn below ever goes. Clock.Delay cannot be cancelled, so the callback
 		-- always fires and settleRequest is what makes a late one a no-op.
 		Clock.Delay(options.RequestTimeout or Defaults.Request, function()
+			if not slot.Settled then
+				Metrics.Add("RequestTimeouts")
+				Metrics.Add(timeoutMetric(name))
+			end
 			settleRequest(slot, { false, "timeout", Types.RequestFailed }, 3)
 		end)
 		-- Spawned, not deferred. Sched.Spawn runs the send immediately on this stack, so
@@ -1745,6 +1773,32 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			proxy[key] = tree.Accessor[key]
 		end
 		Data.ServerStore = table.freeze(proxy)
+	end
+
+	--[=[
+		@within Client
+		@tag Lifecycle
+		@client
+		@param fn () -> ()
+		Runs `fn` as a batch: every local write inside coalesces into one `Changed` pass
+		per container, the same way [Server.Batch] does on the server. Client writes are
+		optimistic and never leave the client, so this changes nothing on the wire; it
+		only stops a listener firing once per write when a UI updates several fields at
+		once.
+
+		Frames the server sends are already applied as one batch each, so a
+		[Server.Batch] arrives as one fire without any call here.
+
+		```lua
+		Data.Batch(function()
+		    Data.Equipped.Set("Sword")
+		    Data.Inventory.Sword.Qty.Decrement(1)
+		end)
+		-- Data.Inventory.Changed fires ONCE
+		```
+	]=]
+	function Data.Batch(fn: () -> ())
+		tree:RunBatch(fn)
 	end
 
 	--[=[

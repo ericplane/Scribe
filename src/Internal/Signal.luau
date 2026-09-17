@@ -31,8 +31,9 @@ local function acquireRunnerThreadAndCallEventHandler(fn: (...any) -> (), ...)
 	freeRunnerThread = acquired
 end
 
-local function runEventHandlerInFreeThread(...)
-	acquireRunnerThreadAndCallEventHandler(...)
+-- Primed to its first yield: a runner started with the handler's arguments keeps
+-- them on its stack for life.
+local function runEventHandlerInFreeThread()
 	while true do
 		acquireRunnerThreadAndCallEventHandler(coroutine.yield())
 	end
@@ -198,6 +199,7 @@ function Signal.Fire(self: any, ...: any)
 		if item.Connected then
 			if not freeRunnerThread then
 				freeRunnerThread = coroutine.create(runEventHandlerInFreeThread)
+				coroutine.resume(freeRunnerThread :: thread)
 			end
 			task.spawn(freeRunnerThread :: thread, item._fn, ...)
 		end
