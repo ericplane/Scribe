@@ -14,7 +14,7 @@ from urllib.parse import unquote, urljoin, urlsplit
 
 
 ROOT = Path(__file__).resolve().parent.parent
-ORIGIN = "https://ericplane.github.io"
+ORIGIN = "https://scribe.ericplane.dev"
 
 
 class Page(HTMLParser):
@@ -34,9 +34,14 @@ class Page(HTMLParser):
             self.links.append((attrs[attribute], self.getpos()[0]))
 
 
-def check_site(site, base="/Scribe/", legacy_snapshot=None):
+def check_site(site, base="/", legacy_snapshot=None, *, origin=ORIGIN):
     if not site.is_dir():
         raise ValueError(f"Build output does not exist: {site}")
+    deployment = urlsplit(origin)
+    if (deployment.scheme not in ("http", "https") or not deployment.netloc
+            or deployment.path not in ("", "/") or deployment.query or deployment.fragment):
+        raise ValueError("The deployment origin must be an http(s) origin without a path; use --base for the path.")
+    origin = origin.rstrip("/")
     base = "/" + base.strip("/") + "/" if base.strip("/") else "/"
     pages = {path.relative_to(site).as_posix(): Page(path) for path in site.rglob("*.html")}
     errors, checked = [], 0
@@ -47,10 +52,10 @@ def check_site(site, base="/Scribe/", legacy_snapshot=None):
         if duplicate:
             errors.append(f"{relative}: duplicate anchor IDs: {', '.join(duplicate)}")
         path_url = relative.removesuffix("index.html") if relative.endswith("/index.html") or relative == "index.html" else relative
-        page_url = ORIGIN + base + path_url
+        page_url = origin + base + path_url
         for href, line in page.links:
             absolute = urlsplit(urljoin(page_url, href))
-            if absolute.scheme not in ("http", "https") or absolute.netloc != urlsplit(ORIGIN).netloc:
+            if absolute.scheme not in ("http", "https") or absolute.netloc != deployment.netloc:
                 continue
             # Only this repository's published site is local to this build.
             if not absolute.path.startswith(base):
@@ -86,11 +91,12 @@ def check_site(site, base="/Scribe/", legacy_snapshot=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site", type=Path, default=ROOT / "docs-site" / "dist")
-    parser.add_argument("--base", default="/Scribe/")
+    parser.add_argument("--base", default="/", help="Published path prefix (default: /).")
+    parser.add_argument("--origin", default=ORIGIN, help="Published origin used to resolve local links.")
     parser.add_argument("--legacy-snapshot", type=Path)
     args = parser.parse_args()
     try:
-        pages, links = check_site(args.site, args.base, args.legacy_snapshot)
+        pages, links = check_site(args.site, args.base, args.legacy_snapshot, origin=args.origin)
     except ValueError as error:
         print(f"[docs check] FAILED\n{error}", file=sys.stderr)
         raise SystemExit(1)

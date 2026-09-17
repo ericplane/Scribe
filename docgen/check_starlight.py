@@ -55,12 +55,48 @@ class ConversionChecks(unittest.TestCase):
             (site / "guide").mkdir()
             (site / "guide" / "index.html").write_text('<h1 id="works">Works</h1>', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "missing target"):
-                check_site(site)
+                check_site(site, base="/Scribe/")
             (site / "logo.svg").write_text('<svg/>', encoding="utf-8")
-            self.assertEqual(check_site(site), (2, 2))
+            self.assertEqual(check_site(site, base="/Scribe/"), (2, 2))
             (site / "guide" / "index.html").write_text('<h1 id="renamed">Renamed</h1>', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "missing anchor"):
+                check_site(site, base="/Scribe/")
+
+    def test_root_deployment_checks_custom_domain_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory)
+            (site / "index.html").write_text(
+                '<link rel="stylesheet" href="https://scribe.ericplane.dev/_astro/site.css">'
+                '<script src="/_astro/site.js"></script><img src="assets/logo.svg">'
+                '<a href="https://example.com/elsewhere/">External</a>', encoding="utf-8")
+            (site / "_astro").mkdir()
+            (site / "assets").mkdir()
+            (site / "_astro/site.js").write_text("", encoding="utf-8")
+            (site / "assets/logo.svg").write_text("<svg/>", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing target: https://scribe.ericplane.dev/_astro/site.css"):
                 check_site(site)
+            (site / "_astro/site.css").write_text("", encoding="utf-8")
+            self.assertEqual(check_site(site), (1, 3))
+
+    def test_root_deployment_rejects_stale_repository_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory)
+            (site / "index.html").write_text('<link rel="stylesheet" href="/Scribe/site.css">', encoding="utf-8")
+            (site / "site.css").write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing target: /Scribe/site.css"):
+                check_site(site)
+            self.assertEqual(check_site(site, base="/Scribe/", origin="https://ericplane.github.io"), (1, 1))
+
+    def test_checker_supports_an_explicit_deployment_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory)
+            (site / "index.html").write_text('<img src="https://docs.example.com/logo.svg">', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing target"):
+                check_site(site, origin="https://docs.example.com")
+            (site / "logo.svg").write_text("<svg/>", encoding="utf-8")
+            self.assertEqual(check_site(site, origin="https://docs.example.com/"), (1, 1))
+            with self.assertRaisesRegex(ValueError, "without a path"):
+                check_site(site, origin="https://docs.example.com/Scribe/")
 
 
 class PublishChecks(unittest.TestCase):

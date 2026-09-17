@@ -36,7 +36,7 @@ npm ci --prefix docs-site
 npm run dev --prefix docs-site
 ```
 
-Open the local URL printed by Astro, normally `http://localhost:4321/Scribe/`.
+Open the local URL printed by Astro, normally `http://localhost:4321/`.
 The development command generates
 the pages, then watches `src/` and `docgen/` for source changes. Astro also reloads
 when you edit the site's styles and components.
@@ -127,11 +127,11 @@ contents line.
 
 Keep guide links in their existing source form, such as
 `[Visibility](./visibility#wipe-guard)` or `[ArrayOf](/api/Scribe#ArrayOf)`. The
-generator converts them into published Starlight routes under `/Scribe/`. It also
+generator converts them into published Starlight routes at the site root. It also
 maps the source `intro.md` guide to the existing `getting-started/` URL.
 
 In doc-comments, use Moonwave autolinks such as `[Scribe.ArrayOf]`. The generator
-links them to the API member's lowercase anchor (`/Scribe/api/scribe/#arrayof`).
+links them to the API member's lowercase anchor (`/api/scribe/#arrayof`).
 Do not hand-write `#ArrayOf`: fragment names are case-sensitive.
 
 Existing guide URLs and explicit heading IDs remain stable through the migration.
@@ -183,6 +183,13 @@ release; this also permits docs fixes for that release. A manual run can explici
 override the version gate. Builds deploy to GitHub Pages **as an artifact** (no
 branch, nothing committed to git).
 Enable it once in **Settings → Pages → Build and deployment → Source: GitHub
-Actions**. The `site` and `base` options in `docs-site/astro.config.mjs` publish the
-site at `https://ericplane.github.io/Scribe/`. Update both if the hosting location
-changes.
+Actions**. The site is published at `https://scribe.ericplane.dev/`, with the custom
+domain configured in GitHub Pages. `docs-site/astro.config.mjs` sets that `site`
+and leaves `base` at `/`; `docs-site/public/CNAME` records the domain. Do not add
+the repository prefix `/Scribe`: on the custom domain, that makes asset and page
+URLs point to paths that do not exist.
+
+If the hosting location changes, update the Astro settings, `public/CNAME`, and
+the default origin/base in `docgen/check_site.py` together. The build checks local
+links against this deployment location, including absolute links on the custom
+domain.

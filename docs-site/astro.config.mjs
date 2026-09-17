@@ -4,12 +4,11 @@ import { unified } from '@astrojs/markdown-remark';
 import scribeHeadings from '../docgen/starlight-headings.mjs';
 import { dark, light, styleOverrides } from './src/code-theme.mjs';
 
-const SITE = 'https://ericplane.github.io';
-const BASE = '/Scribe';
+// GitHub Pages serves this custom domain at /, without the repository prefix.
+const SITE = 'https://scribe.ericplane.dev';
 
 export default defineConfig({
   site: SITE,
-  base: BASE,
   trailingSlash: 'always',
   outDir: './dist',
   markdown: { processor: unified({ remarkPlugins: [scribeHeadings] }) },
@@ -19,12 +18,12 @@ export default defineConfig({
     description: 'Persistent, typed, auto-replicated player data for Roblox. Learn the basics, build a feature, or explore the API.',
     favicon: '/assets/favicon.png',
     head: [
-      { tag: 'meta', attrs: { property: 'og:image', content: `${SITE}${BASE}/assets/social-card.png` } },
+      { tag: 'meta', attrs: { property: 'og:image', content: `${SITE}/assets/social-card.png` } },
       { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
       { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
       { tag: 'meta', attrs: { property: 'og:image:alt', content: 'Scribe: player data, without the plumbing' } },
       { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
-      { tag: 'meta', attrs: { name: 'twitter:image', content: `${SITE}${BASE}/assets/social-card.png` } },
+      { tag: 'meta', attrs: { name: 'twitter:image', content: `${SITE}/assets/social-card.png` } },
     ],
     customCss: ['./src/styles/scribe.css'],
     components: {
