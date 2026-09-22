@@ -392,10 +392,25 @@ function Monetization.new(ctx: any)
 		return if fromAim then GIFT_AIMS else PENDING_GIFTS
 	end
 
+	local function validRecipientId(value: any): number?
+		local recipientId = tonumber(value)
+		if
+			recipientId == nil
+			or recipientId ~= recipientId
+			or recipientId == math.huge
+			or recipientId == -math.huge
+			or recipientId <= 0
+			or recipientId % 1 ~= 0
+		then
+			return nil
+		end
+		return recipientId
+	end
+
 	--- The stored record for this product, or nil unless it is complete and belongs to
 	--- this product. A differing Product name means a retired product reused this Id, so
-	--- the recipient was aimed at something else; a missing RecipientId is the phantom
-	--- shape a blind `Ts` write leaves behind, and honouring one gifts to userId 0.
+	--- the recipient was aimed at something else; malformed recipient values are rejected
+	--- before the receipt path can attempt a delivery.
 	local function readGiftRecord(
 		reserved: { [string]: any },
 		fromAim: boolean,
@@ -410,7 +425,7 @@ function Monetization.new(ctx: any)
 		if record.Product ~= nil and record.Product ~= product.Name then
 			return nil
 		end
-		if (tonumber(record.RecipientId) or 0) <= 0 or record.GiftId == nil then
+		if validRecipientId(record.RecipientId) == nil or record.GiftId == nil then
 			return nil
 		end
 		-- No age check here on purpose: the horizon bounds what a record may be PRESUMED
@@ -1314,7 +1329,22 @@ function Monetization.new(ctx: any)
 		fromAim: boolean
 	): Enum.ProductPurchaseDecision
 		local purchaseId = tostring(receiptInfo.PurchaseId)
-		local recipientId = tonumber(intent.RecipientId) or 0
+		local recipientId = validRecipientId(intent.RecipientId)
+		if recipientId == nil then
+			Log.Error(
+				"Gifting",
+				"GIFT_INVALID_RECIPIENT",
+				"gift intent has an invalid recipient; holding the receipt for repair",
+				{
+					Player = entry.Player,
+					Product = product.Name,
+					PurchaseId = purchaseId,
+					RecipientId = intent.RecipientId,
+				}
+			)
+			Metrics.Add("ReceiptsRetried")
+			return NOT_PROCESSED
+		end
 		local giftId = tostring(intent.GiftId)
 		local productIdStr = tostring(product.Id)
 
@@ -1587,7 +1617,22 @@ function Monetization.new(ctx: any)
 		fromAim: boolean
 	): Enum.ProductPurchaseDecision
 		local purchaseId = tostring(receiptInfo.PurchaseId)
-		local recipientId = tonumber(record.RecipientId) or 0
+		local recipientId = validRecipientId(record.RecipientId)
+		if recipientId == nil then
+			Log.Error(
+				"Gifting",
+				"GIFT_INVALID_RECIPIENT",
+				"gift record has an invalid recipient; holding the receipt for repair",
+				{
+					UserId = userId,
+					Product = product.Name,
+					PurchaseId = purchaseId,
+					RecipientId = record.RecipientId,
+				}
+			)
+			Metrics.Add("ReceiptsRetried")
+			return NOT_PROCESSED
+		end
 		local giftId = tostring(record.GiftId)
 		local productIdStr = tostring(product.Id)
 

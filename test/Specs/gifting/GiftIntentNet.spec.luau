@@ -71,9 +71,8 @@ return function()
 	end
 
 	--- Every slot that exists must carry BOTH halves of an intent's identity. A
-	--- slot missing either is a phantom: `tonumber(intent.RecipientId) or 0`
-	--- resolves it to userId 0 and deliverGift MessageAsyncs a paid gift to the
-	--- DataStore key for user 0, which answers true.
+	--- slot missing either is a phantom. The receipt path must reject it before
+	--- `deliverGift` can turn a missing recipient into the userId 0 DataStore key.
 	local function describePending(entry): string
 		local keys = {}
 		for productIdStr, intent in pending(entry) do
@@ -221,8 +220,7 @@ return function()
 			-- The trap a one-line "just refresh the timestamp" fix falls into.
 			-- PendingGifts is a free-form dynamic node, so `PendingGifts[id].Ts.Set(x)`
 			-- on an ABSENT slot creates `{Ts = n}` -- no RecipientId, no GiftId. A later
-			-- retry reads `tonumber(intent.RecipientId) or 0` and MessageAsyncs a paid
-			-- gift to the DataStore key for userId 0, which answers true.
+			-- retry must reject it before any paid delivery is attempted.
 			withClock(1700000000, function(advance)
 				local harness = makeHarness()
 				local buyer, entry = harness.Join(80121)
@@ -673,48 +671,34 @@ return function()
 		end)
 	end)
 
-	describe("DEFECT CHARACTERISATION: nothing re-validates the recipient on the receipt path", function()
-		it("MessageAsyncs a paid gift to the DataStore key for userId 0", function()
-			-- The consequence of a phantom, and the reason the guarded-refresh specs
-			-- above matter. PromptGift validates the recipient at its own entry
-			-- (`recipientUserId <= 0` is refused); NOTHING re-validates it afterwards.
-			-- handleGiftReceipt reads `tonumber(intent.RecipientId) or 0` and hands the
-			-- result straight to deliverGift, which MessageAsyncs to the recipient's
-			-- key. There is no live entry for user 0, so the send goes to the mailbox
-			-- for PLAYER_0 -- and MessageAsync answers true, which is a durable
-			-- delivery as far as every layer above it is concerned. The receipt then
-			-- answers PurchaseGranted and Roblox consumes the Robux.
-			--
-			-- The intent below is planted directly rather than produced by a bug,
-			-- because it has to be: with the guard at the failure arm intact there is
-			-- no reachable way to MAKE a phantom today. That is exactly what the
-			-- phantom specs above protect, and this block records what it costs if one
-			-- ever gets through.
-			--
-			-- THIS BLOCK MUST FLIP IF A `recipientUserId > 0` GUARD IS ADDED to the
-			-- receipt path. That guard is a scope call, not part of F2 or F3 -- flag
-			-- it, do not smuggle it in.
+	describe("invalid recipient is held before delivery", function()
+		it("does not send a paid gift to the DataStore key for userId 0", function()
+			-- PromptGift validates the recipient at its own entry, but persisted intent
+			-- data can still be malformed after a partial write, migration, or future
+			-- caller. The receipt path must fail closed rather than coerce nil to userId 0.
 			withClock(1700000000, function()
 				local harness = makeHarness()
 				local buyer, entry = harness.Join(81101)
+				local invalid, unsubscribe = codeCounter("GIFT_INVALID_RECIPIENT")
 
 				-- A phantom: the shape a blind `PendingGifts[id].Ts.Set(x)` produces.
 				entry.Tree.Reserved.PendingGifts["222"].Set({ Ts = Clock.Now() })
 
 				local decision = harness.Data.HandleReceipt(receipt(81101, 222, "phantom-delivery"))
+				task.wait()
+				unsubscribe()
 				local zeroKey = "Default/" .. harness.Ctx.Persistence.KeyFor(0)
 				local zeroBox = harness.Fake.Mailboxes[zeroKey] or {}
 				local sent = harness.Data.GetPurchases(buyer, { Kind = "Robux" })
-				local line = sent[#sent]
 
 				expect(
-					("d=%s toUserZero=%d loggedTo=%s type=%s"):format(
-						tostring(decision == GRANTED),
+					("d=%s toUserZero=%d logged=%d errors=%d"):format(
+						tostring(decision == NOT_PROCESSED),
 						#zeroBox,
-						tostring(line.From.ToUserId),
-						tostring(line.From.Type)
+						#sent,
+						invalid()
 					)
-				).to.equal("d=true toUserZero=1 loggedTo=0 type=GiftSent")
+				).to.equal("d=true toUserZero=0 logged=0 errors=1")
 
 				harness.Cleanup()
 			end)
