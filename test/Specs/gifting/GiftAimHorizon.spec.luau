@@ -460,15 +460,10 @@ return function()
 		end)
 	end)
 
-	describe("a phantom never becomes an aim, and an aim is never a phantom", function()
-		-- A phantom is the `{ Ts = n }` shape a blind timestamp write leaves in a slot:
-		-- no RecipientId, no GiftId. GiftIntentNet pins what honouring one costs -- a
-		-- paid gift MessageAsync'd to the DataStore key for userId 0, with the receipt
-		-- answering PurchaseGranted. The aim store adds a second door into that, and
-		-- both sides of it are shut: the sweep will not archive a phantom, and the
-		-- reader will not honour one it somehow finds.
+	describe("malformed gift records hold receipts", function()
+		-- Preserve incomplete records so rejoining cannot turn a gift into a self purchase.
 
-		it("the sweep refuses to archive an incomplete intent", function()
+		it("the sweep preserves an incomplete intent for repair", function()
 			withClock(T0, function(advance)
 				local harness = makeHarness()
 				local buyer, entry = harness.Join(BUYER)
@@ -490,17 +485,14 @@ return function()
 						tostring(owns(reserved, "VIP")),
 						#(harness.Fake.Mailboxes[zeroKey] or {})
 					)
-				).to.equal("aims=[] d=GRANTED buyerVIP=true toUserZero=0")
+				).to.equal("aims=[] d=NOT_PROCESSED buyerVIP=false toUserZero=0")
+				expect(reserved.PendingGifts["222"] ~= nil).to.equal(true)
 
 				harness.Cleanup()
 			end)
 		end)
 
-		it("a phantom sitting in the aim store is not honoured", function()
-			-- Planted directly, because with the sweep's guard intact there is no
-			-- reachable way to MAKE one -- exactly as GiftIntentNet plants its phantom
-			-- intent. This is the guard for a store written by an older deploy, a
-			-- migration, or a future caller.
+		it("an incomplete aim holds the receipt without granting to the buyer", function()
 			withClock(T0, function()
 				local harness = makeHarness()
 				local buyer, entry = harness.Join(BUYER)
@@ -518,7 +510,8 @@ return function()
 						#(harness.Fake.Mailboxes[zeroKey] or {}),
 						ledger(reserved)
 					)
-				).to.equal("d=GRANTED buyerVIP=true toUserZero=0 ledger=[Purchase]")
+				).to.equal("d=NOT_PROCESSED buyerVIP=false toUserZero=0 ledger=[]")
+				expect(reserved.GiftAims["222"] ~= nil).to.equal(true)
 
 				harness.Cleanup()
 			end)

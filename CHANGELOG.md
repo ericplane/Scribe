@@ -80,6 +80,10 @@ countdowns, roblox-ts support, and an optional leaderstats add-on.
 
 ### Fixed
 
+- Invalid recipient IDs in stored gift intents or aims now hold the receipt for repair
+  with `GIFT_INVALID_RECIPIENT`, before saving a new receipt destination or attempting
+  delivery. Based on the validation contributed in [#16](https://github.com/ericplane/Scribe/pull/16).
+
 - Fixed the public constructor ignoring `ServerStore` and reporting it as an unknown option.
   Store templates now infer field and accessor types on server and client, including typed
   template modules; client types hide `ServerOnly` fields. Store roots named `Get`, `Changed`,

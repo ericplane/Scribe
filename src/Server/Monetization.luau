@@ -553,6 +553,21 @@ function Monetization.new(ctx: any)
 		return if fromAim then GIFT_AIMS else PENDING_GIFTS
 	end
 
+	local function validRecipientId(value: any): number?
+		local recipientId = tonumber(value)
+		if
+			recipientId == nil
+			or recipientId ~= recipientId
+			or recipientId == math.huge
+			or recipientId == -math.huge
+			or recipientId <= 0
+			or recipientId % 1 ~= 0
+		then
+			return nil
+		end
+		return recipientId
+	end
+
 	-- Receipt-bound routes outlive replaceable product intents and aims.
 	local function readReceiptRoute(reserved: any, purchaseId: string, product: Product): (any?, boolean)
 		local route = reserved.ReceiptReservations[purchaseId]
@@ -564,8 +579,7 @@ function Monetization.new(ctx: any)
 			or route.Product ~= product.Name
 			or route.ProductId ~= product.Id
 			or type(route.RecipientId) ~= "number"
-			or route.RecipientId <= 0
-			or route.RecipientId % 1 ~= 0
+			or validRecipientId(route.RecipientId) == nil
 			or type(route.GiftId) ~= "string"
 			or route.GiftId == ""
 			or type(route.FromAim) ~= "boolean"
@@ -579,16 +593,13 @@ function Monetization.new(ctx: any)
 		return {
 			Product = product.Name,
 			ProductId = product.Id,
-			RecipientId = tonumber(record.RecipientId) or 0,
-			GiftId = tostring(record.GiftId),
+			RecipientId = validRecipientId(record.RecipientId),
+			GiftId = record.GiftId,
 			FromAim = fromAim,
 		}
 	end
 
-	--- The stored record for this product, or nil unless it is complete and belongs to
-	--- this product. A differing Product name means a retired product reused this Id, so
-	--- the recipient was aimed at something else; a missing RecipientId is the phantom
-	--- shape a blind `Ts` write leaves behind, and honouring one gifts to userId 0.
+	-- Only complete records for this product can supply a destination.
 	local function readGiftRecord(
 		reserved: { [string]: any },
 		fromAim: boolean,
@@ -603,7 +614,7 @@ function Monetization.new(ctx: any)
 		if record.Product ~= nil and record.Product ~= product.Name then
 			return nil
 		end
-		if (tonumber(record.RecipientId) or 0) <= 0 or record.GiftId == nil then
+		if validRecipientId(record.RecipientId) == nil or type(record.GiftId) ~= "string" or record.GiftId == "" then
 			return nil
 		end
 		-- Age does not release an unresolved destination.
@@ -706,8 +717,13 @@ function Monetization.new(ctx: any)
 
 	-- Archive only when the destination fits; otherwise keep the pending intent.
 	local function archiveGiftAim(entry: any, productIdStr: string, intent: any): boolean
-		if type(intent) ~= "table" or (tonumber(intent.RecipientId) or 0) <= 0 or intent.GiftId == nil then
-			return true -- Preserve the existing malformed-intent cleanup.
+		if
+			type(intent) ~= "table"
+			or validRecipientId(intent.RecipientId) == nil
+			or type(intent.GiftId) ~= "string"
+			or intent.GiftId == ""
+		then
+			return false -- Keep malformed records for repair.
 		end
 		local aims = reservedRaw(entry.LiveData).GiftAims
 		local existing = aims[productIdStr]
@@ -1469,6 +1485,50 @@ function Monetization.new(ctx: any)
 		return NOT_PROCESSED
 	end
 
+	local function checkGiftRecord(userId: number, product: Product, purchaseId: string, record: any): boolean
+		if type(record) ~= "table" then
+			retryGiftRoute(userId, product, purchaseId)
+			return false
+		end
+		if validRecipientId(record.RecipientId) == nil then
+			Log.Error(
+				"Gifting",
+				"GIFT_INVALID_RECIPIENT",
+				"gift has an invalid recipient; holding the receipt for repair",
+				{
+					UserId = userId,
+					Product = product.Name,
+					PurchaseId = purchaseId,
+					RecipientId = record.RecipientId,
+				}
+			)
+			Metrics.Add("ReceiptsRetried")
+			return false
+		end
+		if type(record.GiftId) ~= "string" or record.GiftId == "" then
+			retryGiftRoute(userId, product, purchaseId)
+			return false
+		end
+		return true
+	end
+
+	-- Malformed gift slots cannot fall through to a self purchase.
+	local function checkGiftSlots(reserved: any, userId: number, product: Product, purchaseId: string): boolean
+		for _, key in { PENDING_GIFTS, GIFT_AIMS } do
+			local record = reserved[key][tostring(product.Id)]
+			if record == nil then
+				continue
+			end
+			if type(record) == "table" and record.Product ~= nil and record.Product ~= product.Name then
+				continue
+			end
+			if not checkGiftRecord(userId, product, purchaseId, record) then
+				return false
+			end
+		end
+		return true
+	end
+
 	local function recipientAlreadyOwns(recipientUserId: number, perkKey: string): boolean
 		local recipientEntry = ctx.Persistence.EntryForUserId(recipientUserId)
 		if recipientEntry and recipientEntry.State == "Ready" then
@@ -1559,6 +1619,9 @@ function Monetization.new(ctx: any)
 			return retryGiftRoute(entry.UserId, product, purchaseId)
 		end
 		if route == nil then
+			if not checkGiftRecord(entry.UserId, product, purchaseId, intent) then
+				return NOT_PROCESSED
+			end
 			route = giftReceiptRoute(product, intent, fromAim)
 			if not canRecordReceipt(entry.LiveData, purchaseId, entry, nil, route) then
 				return NOT_PROCESSED
@@ -1570,9 +1633,9 @@ function Monetization.new(ctx: any)
 			Metrics.Add("ReceiptsRetried")
 			return NOT_PROCESSED
 		end
-		intent, fromAim = route, route.FromAim
-		local recipientId = tonumber(intent.RecipientId) or 0
-		local giftId = tostring(intent.GiftId)
+		fromAim = route.FromAim
+		local recipientId = route.RecipientId
+		local giftId = route.GiftId
 		local productIdStr = tostring(product.Id)
 
 		-- The recipient may have acquired the perk between the prompt and the receipt, so
@@ -1676,6 +1739,12 @@ function Monetization.new(ctx: any)
 		end
 		if route then
 			return handleGiftReceipt(entry, product, route, receiptInfo, route.FromAim)
+		end
+		if
+			(canInferGift(receiptInfo) or reserved.ReceiptReservations[purchaseId] == true)
+			and not checkGiftSlots(reserved, entry.UserId, product, purchaseId)
+		then
+			return NOT_PROCESSED
 		end
 		-- Older builds could leave two destinations for one product. Never guess.
 		if
@@ -1870,11 +1939,34 @@ function Monetization.new(ctx: any)
 				completed = true
 				return
 			end
-			local route, invalid = readReceiptRoute(reservedRaw(offlineData), purchaseId, product)
+			local reserved = reservedRaw(offlineData)
+			local route, invalid = readReceiptRoute(reserved, purchaseId, product)
 			if invalid then
 				error("gift receipt route does not match this product", 0)
 			end
 			if route == nil then
+				if not checkGiftRecord(userId, product, purchaseId, record) then
+					error("invalid gift record", 0)
+				end
+				if canInferGift(receiptInfo) or reserved.ReceiptReservations[purchaseId] == true then
+					if not checkGiftSlots(reserved, userId, product, purchaseId) then
+						error("invalid gift record", 0)
+					end
+					if hasConflictingGiftRecords(reserved, product.Id) then
+						retryGiftRoute(userId, product, purchaseId)
+						error("ambiguous gift route", 0)
+					end
+				end
+				-- Recheck the selected destination against the writable profile.
+				local current = readGiftRecord(reserved, fromAim, product)
+				if
+					current == nil
+					or current.GiftId ~= record.GiftId
+					or validRecipientId(current.RecipientId) ~= validRecipientId(record.RecipientId)
+				then
+					retryGiftRoute(userId, product, purchaseId)
+					error("gift destination changed before reservation", 0)
+				end
 				route = giftReceiptRoute(product, record, fromAim)
 			end
 			if not canRecordReceipt(offlineData, purchaseId, nil, userId, route) then
@@ -1889,8 +1981,8 @@ function Monetization.new(ctx: any)
 		if completed then
 			return GRANTED
 		end
-		local recipientId = tonumber(record.RecipientId) or 0
-		local giftId = tostring(record.GiftId)
+		local recipientId = record.RecipientId
+		local giftId = record.GiftId
 
 		-- Same recipient re-check as the online intent path: a no-op delivery burns the
 		-- buyer's Robux, so convert to a credit, but only if this exact purchase is undelivered.
@@ -2027,6 +2119,12 @@ function Monetization.new(ctx: any)
 		end
 		if route then
 			return settleOfflineGift(userId, product, receiptInfo, route, route.FromAim)
+		end
+		if
+			(canInferGift(receiptInfo) or reserved.ReceiptReservations[purchaseId] == true)
+			and not checkGiftSlots(reserved, userId, product, purchaseId)
+		then
+			return NOT_PROCESSED
 		end
 		if
 			hasConflictingGiftRecords(reserved, product.Id)

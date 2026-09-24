@@ -31,6 +31,8 @@ If the buyer leaves before cancellation is recorded, or the server crashes befor
 
 Older profiles can contain conflicting pending and archived gifts for one product. Scribe holds an unbound receipt in that case for repair; an exact destination already saved for its purchase ID still takes precedence.
 
+A stored intent or aim with an invalid recipient ID also holds the receipt for repair. Scribe logs `GIFT_INVALID_RECIPIENT` before saving a new receipt destination or attempting delivery. Check the original gift records; do not delete them to force the receipt through.
+
 !!! warning "An earlier ordinary purchase can still arrive late"
     Roblox's receipt identifies the buyer and product, but not the gift prompt. Do not start a gift while an earlier ordinary purchase of the same product is still awaiting its receipt. Use separate developer-product IDs for normal purchases and gifts if your flow needs to overlap them. Prompts opened directly through `MarketplaceService` also bypass Scribe's guards.
 
@@ -168,5 +170,5 @@ A second paid gift of the **same** product by the same sender is refused with `A
 
 - [Monetization](./monetization) for products, passes, perks and soft-currency purchases.
 - [Configuration](./configuration#gifting) for every gifting option and its default.
-- [Log Code Reference](./log-codes#gifting) for the fifteen codes the gift path can emit and what each one means.
+- [Log Code Reference](./log-codes#gifting) for gift log codes and what each one means.
 - [Diagnostics](./diagnostics) for the `GiftPrompts` and `GiftsDelivered` counters.
