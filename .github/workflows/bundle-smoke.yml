@@ -61,4 +61,4 @@ jobs:
             ScribeTelemetry-Addon.rbxm
             ScribeUIAdapters-Addon.rbxm
             ScribeLeaderstats-Addon.rbxm
-            Scribe-source-map.json
+            Scribe-Debug-SourceMap.json

@@ -2,7 +2,7 @@
 
 ## 2.5.0
 
-Unreleased.
+Released 2026-09-24.
 
 Safer purchase and gift recovery, fewer leaderboard requests, client purchase prompts and
 countdowns, roblox-ts support, and an optional leaderstats add-on.

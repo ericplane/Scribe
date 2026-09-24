@@ -69,7 +69,7 @@ jobs:
             "ScribeTelemetry-Addon.rbxm#ScribeTelemetry (Addon).rbxm" \
             "ScribeUIAdapters-Addon.rbxm#ScribeUIAdapters (Addon).rbxm" \
             "ScribeLeaderstats-Addon.rbxm#ScribeLeaderstats (Addon).rbxm" \
-            Scribe-source-map.json
+            Scribe-Debug-SourceMap.json
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.event.release.tag_name }}
@@ -84,4 +84,4 @@ jobs:
             ScribeTelemetry-Addon.rbxm
             ScribeUIAdapters-Addon.rbxm
             ScribeLeaderstats-Addon.rbxm
-            Scribe-source-map.json
+            Scribe-Debug-SourceMap.json

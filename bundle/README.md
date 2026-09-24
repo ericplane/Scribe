@@ -31,9 +31,10 @@ Each staging run replaces its target: `dist/rbxm/`, `dist/wally/`, or `dist/npm-
 ## Error line numbers
 
 Removing documentation lines changes error locations relative to GitHub. Each
-release includes `Scribe-source-map.json` beside the models and inside each Wally
-or npm package; it is not loaded into the game. Its `files` keys are repository
-paths, with source and packed SHA-256 hashes to identify the exact files. npm maps
+GitHub release includes `Scribe-Debug-SourceMap.json` beside the models. This optional
+debugging file is not needed to use Scribe and is not loaded into the game. Wally
+and npm packages include the same mapping as `Scribe-source-map.json`. Its `files`
+keys are repository paths, with source and packed SHA-256 hashes to identify the exact files. npm maps
 also include `packagePath` for files renamed or moved inside the package.
 
 Each file's `segments` contains `[packedLine, sourceLine]` pairs. For an error at

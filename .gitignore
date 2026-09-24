@@ -17,6 +17,7 @@ wally.lock
 *.rbxm
 *.rbxmx
 /Scribe-source-map.json
+/Scribe-Debug-SourceMap.json
 node_modules/
 # Local verification logs, package archives, and generated output.
 *.log
