@@ -1131,6 +1131,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	end
 
 	local function notifyProduct(name: string)
+		if stopped then
+			return
+		end
 		local observers = productObservers[name]
 		if observers == nil then
 			return
@@ -1142,6 +1145,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	end
 
 	local function settleProduct(name: string, info: any)
+		if stopped then
+			return
+		end
 		productQueued[name] = nil
 		if info ~= nil then
 			productInfo[name] = info
@@ -1156,7 +1162,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				if not waiter.Settled then
 					waiter.Settled = true
 					-- Directly: a wake must never travel the defer queue.
-					Sched.Resume(waiter.Thread, info)
+					Sched.Resume(waiter.Thread, if stopped then nil else info)
 				end
 			end
 		end
@@ -1169,7 +1175,13 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			return
 		end
 		for attempt = 1, PRODUCT_ATTEMPTS do
+			if stopped then
+				return
+			end
 			local ok, result = pcall(getProductInfoAsync, asset.Id, asset.InfoType)
+			if stopped then
+				return
+			end
 			if ok and type(result) == "table" then
 				settleProduct(name, result)
 				return
@@ -1197,17 +1209,23 @@ function Client.new(options: any, compiled: Template.Compiled): any
 
 	local function flushProductQueue()
 		productFlushScheduled = false
+		if stopped then
+			return
+		end
 		local batch = productQueue
 		productQueue = {}
 		-- Together on purpose: the engine only coalesces calls in flight at the same
 		-- time, so one burst costs one request where N singles cost N.
 		for _, name in batch do
+			if stopped then
+				break
+			end
 			Sched.Spawn(fetchProduct, name)
 		end
 	end
 
 	local function enqueueProduct(name: string)
-		if productInfo[name] ~= nil or productQueued[name] then
+		if stopped or productInfo[name] ~= nil or productQueued[name] then
 			return
 		end
 		productQueued[name] = true
@@ -1221,6 +1239,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	-- Observers hear about the new value landing, not the old one being dropped, so a
 	-- successful refresh does not blink the price to nil.
 	local function refreshProduct(name: string?)
+		if stopped then
+			return
+		end
 		local names: { string } = {}
 		if name ~= nil then
 			names[1] = name
@@ -1243,7 +1264,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	-- The signal is on the PLAYER. Asking the Players service for it raises, and the
 	-- pcall would swallow that into a watch that silently never fires.
 	local function watchMembership()
-		if membershipWatched then
+		if stopped or membershipWatched then
 			return
 		end
 		-- Left unarmed while there is no LocalPlayer, so the next read retries.
@@ -1375,6 +1396,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	-- Reads cached player-specific marketplace info, fetching on demand.
 	function Data.GetProductInfo(name: string): { [string]: any }?
 		productAsset(name, "GetProductInfo")
+		if stopped then
+			return nil
+		end
 		watchMembership()
 		enqueueProduct(name)
 		return productInfo[name]
@@ -1404,11 +1428,14 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@param timeout number?
 		@return { [string]: any }?
 		Like [Client.GetProductInfo], but yields until the read lands. Returns nil if it
-		times out (default 10s), or if Marketplace refused every attempt.
+		times out (default 10s), Marketplace refused every attempt, or [Client.Stop] is called.
 	]=]
 	-- Waits for marketplace info, returning nil on timeout or failure.
 	function Data.GetProductInfoAsync(name: string, timeout: number?): { [string]: any }?
 		productAsset(name, "GetProductInfoAsync")
+		if stopped then
+			return nil
+		end
 		watchMembership()
 		local cached = productInfo[name]
 		if cached ~= nil then
@@ -1445,7 +1472,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@param timeout number?
 		@return number?
 		Shorthand for the `PriceInRobux` of [Client.GetProductInfoAsync]: the Robux this
-		player pays. nil if the read times out (default 10s) or was refused.
+		player pays. nil on timeout (default 10s), refusal, or [Client.Stop].
 	]=]
 	-- Waits for the local player's Robux price.
 	function Data.GetPriceAsync(name: string, timeout: number?): number?
@@ -1468,11 +1495,14 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	-- Reports cached product info and updates; returns a disconnect.
 	function Data.ObserveProductInfo(name: string, callback: ({ [string]: any }?) -> ()): () -> ()
 		productAsset(name, "ObserveProductInfo")
+		if stopped then
+			return function() end
+		end
 		watchMembership()
 		local last: any = UNRESOLVED
 		local alive = true
 		local function push()
-			if not alive then
+			if not alive or stopped then
 				return
 			end
 			local info = productInfo[name]
@@ -1513,6 +1543,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	]=]
 	-- Warms selected product info in one batch.
 	function Data.PrefetchProductInfo(names: { string }?)
+		if stopped then
+			return
+		end
 		watchMembership()
 		if anyPaidRandom() then
 			ensurePolicy()
@@ -1927,6 +1960,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Releases what this client bundle holds on the process: the transport listener,
 		the Hello retry loop, the subscription watch behind [Client.GetProductInfo], and
 		the mirror tree's listeners. The counterpart of [Server.Stop].
+		Product-info retries and observers stop; pending info/price reads return nil.
 
 		A game never needs it. A storybook that remounts a bundle per story, or a test
 		suite that builds many, otherwise stacks a listener per build. Idempotent.
@@ -1937,6 +1971,12 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			return
 		end
 		stopped = true
+		table.clear(productQueue)
+		table.clear(productQueued)
+		table.clear(productInfo)
+		table.clear(productObservers)
+		local waiters = productWaiters
+		productWaiters = {}
 		if transport ~= nil and type((transport :: any).Release) == "function" then
 			pcall((transport :: any).Release, transport)
 		end
@@ -1947,6 +1987,14 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			membershipConnection = nil
 		end
 		tree:Destroy()
+		for _, waiting in waiters do
+			for _, waiter in waiting do
+				if not waiter.Settled then
+					waiter.Settled = true
+					Sched.Resume(waiter.Thread, nil)
+				end
+			end
+		end
 	end
 
 	-- Exposes the same API without template-aware types.

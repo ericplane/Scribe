@@ -14,6 +14,21 @@ return function()
 		return remove
 	end
 
+	local function captureWorkers()
+		local workers = {}
+		Sched.Install({
+			Defer = function(fn, ...)
+				local args = table.pack(...)
+				local worker = coroutine.create(function()
+					fn(table.unpack(args, 1, args.n))
+				end)
+				table.insert(workers, worker)
+				return worker
+			end,
+		})
+		return workers
+	end
+
 	beforeEach(function()
 		release = false
 		Log.SetLevel("Fatal")
@@ -74,18 +89,7 @@ return function()
 
 	it("bounds slow sinks independently and counts overflow", function()
 		local calls, active, peak = 0, 0, 0
-		local workers = {}
-		Sched.Install({
-			Defer = function(fn, ...)
-				local args = table.pack(...)
-				table.insert(
-					workers,
-					coroutine.create(function()
-						fn(table.unpack(args, 1, args.n))
-					end)
-				)
-			end,
-		})
+		local workers = captureWorkers()
 		for _ = 1, 2 do
 			attach(function()
 				calls += 1
@@ -119,6 +123,8 @@ return function()
 	end)
 
 	it("preserves higher severity entries when the queue is full", function()
+		local workers = captureWorkers()
+		local dropped = Metrics.Get().LogSinkDropped or 0
 		local seen = {}
 		attach(function(entry)
 			table.insert(seen, entry.Message)
@@ -128,8 +134,13 @@ return function()
 		Log.Info("Persistence", "PROFILE_SIZE", "info")
 		Log.Error("Persistence", "PROFILE_SAVE_FAIL", "error")
 		Log.Debug("Persistence", "PROFILE_SIZE", "dropped")
-		task.wait()
+		expect(#workers).to.equal(1)
+		expect(#seen).to.equal(0)
+		-- Drain this burst without yielding to unrelated log producers.
+		assert(coroutine.resume(workers[1]))
+		expect(coroutine.status(workers[1])).to.equal("dead")
 		expect(table.concat(seen, ",")).to.equal("warning,info,error")
+		expect((Metrics.Get().LogSinkDropped or 0) - dropped).to.equal(2)
 	end)
 
 	it("clears queued entries on detach and isolates duplicate registrations", function()

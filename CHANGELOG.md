@@ -80,6 +80,9 @@ countdowns, roblox-ts support, and an optional leaderstats add-on.
 
 ### Fixed
 
+- `Client.Stop` now discards queued product-info work, prevents further retries, and
+  releases waiting info and price reads with nil. Late Marketplace responses are ignored.
+
 - Invalid recipient IDs in stored gift intents or aims now hold the receipt for repair
   with `GIFT_INVALID_RECIPIENT`, before saving a new receipt destination or attempting
   delivery. Based on the validation contributed in [#16](https://github.com/ericplane/Scribe/pull/16).
