@@ -1,20 +1,5 @@
 --!nonstrict
--- DataStore request budgets: the snapshot, and the opt-in admission it feeds.
---
--- The audit's measurement was that NOTHING in Scribe or ProfileStore had ever called
--- GetRequestBudgetForRequestType -- zero calls across a full simulation run. That
--- number is the baseline these specs pin from both directions: it must still be zero
--- with the policy absent, and must not be with it set.
---
--- The two admission specs are about WHERE the gate sits, not whether one exists. In
--- both loops the obvious placement is one line too late, and in both cases the cost
--- is invisible to a spec that only checks "did it eventually write":
---
---   * the write pacer dequeues BEFORE the natural gate point, so deferring there
---     drops the score instead of postponing it;
---   * the refresh loop advances the board's due time BEFORE the Spawn, so deferring
---     there costs a whole RefreshInterval -- a minute at the default -- rather than
---     the one-second tick the loop actually runs on.
+-- Live boards always use budget pacing; mock boards skip budget queries.
 
 return function()
 	local Root = script.Parent.Parent.Parent.Parent
@@ -163,54 +148,31 @@ return function()
 		end)
 	end)
 
-	describe("the budget is never consulted unless asked for", function()
-		it("issues zero budget queries with no BudgetPolicy", function()
-			-- The audit's measured baseline, pinned. Every save, receipt await, gift
-			-- check, version query and board write is still issued blind by default,
-			-- and this must stay true: the feature is opt-in, and a library that
-			-- quietly started pacing itself would change the timing of every game
-			-- that upgraded without asking for it.
-			local uni = newUniverse({ Options = withBoard() })
-			local queries = stubBudget(uni.Disk, function()
-				return 0
+	describe("leaderboard pacing is always active in Live mode", function()
+		for _, policy in { "Absent", "Off" } do
+			it(`paces leaderboards with BudgetPolicy {policy}`, function()
+				local uni =
+					newUniverse({ Options = withBoard(if policy == "Off" then { BudgetPolicy = "Off" } else {}) })
+				local remaining = 0
+				local queries = stubBudget(uni.Disk, function()
+					return remaining
+				end)
+				local server = uni:Server(1)
+				local player = FakePlayer.new(8801)
+				server:Join(8801, player)
+				uni:Run(30)
+				server.Bundle.Data.Get(player).Coins.Set(4242)
+				uni:Run(120)
+
+				local boardName = server.Bundle.Ctx.Leaderboards.BoardStoreName("Coins")
+				expect(uni.Disk:GetOrderedDataStore(boardName)._entries["8801"]).to.equal(nil)
+				expect((queries.ByType.SetIncrementSortedAsync or 0) > 0).to.equal(true)
+				expect((queries.ByType.GetSortedAsync or 0) > 0).to.equal(true)
+				remaining = 1000
+				uni:Run(45)
+				expect(uni.Disk:GetOrderedDataStore(boardName)._entries["8801"]).to.equal(4242)
 			end)
-			local server = uni:Server(1)
-
-			local player = FakePlayer.new(8801)
-			server:Join(8801, player)
-			uni:Run(30)
-			server.Bundle.Data.Get(player).Coins.Set(4242)
-			server:Leave(8801)
-			uni:Run(180) -- several refresh cycles and many pacer ticks
-
-			expect(queries.Count).to.equal(0)
-			-- ...and the board still wrote, so the run really did exercise the loops.
-			local boardName = server.Bundle.Ctx.Leaderboards.BoardStoreName("Coins")
-			expect(uni.Disk:GetOrderedDataStore(boardName)._entries["8801"]).never.to.equal(nil)
-		end)
-
-		it("takes only the documented value, not any truthy one", function()
-			-- An exact match rather than a truthiness check, so a value that is not
-			-- the documented one leaves the library exactly as it was. The alternative
-			-- reading -- "anything non-nil turns it on" -- would make `BudgetPolicy =
-			-- "Off"` enable the very pacing it was written to disable.
-			local uni = newUniverse({ Options = withBoard({ BudgetPolicy = "Off" }) })
-			local queries = stubBudget(uni.Disk, function()
-				return 0
-			end)
-			local server = uni:Server(1)
-
-			local player = FakePlayer.new(8806)
-			server:Join(8806, player)
-			uni:Run(30)
-			server.Bundle.Data.Get(player).Coins.Set(4242)
-			server:Leave(8806)
-			uni:Run(180)
-
-			expect(queries.Count).to.equal(0)
-			local boardName = server.Bundle.Ctx.Leaderboards.BoardStoreName("Coins")
-			expect(uni.Disk:GetOrderedDataStore(boardName)._entries["8806"]).never.to.equal(nil)
-		end)
+		end
 
 		it("stays off under a mock mode, where there is no allowance to respect", function()
 			-- Mock and NoSave never reach a real DataStore, so there is no budget to
@@ -235,7 +197,7 @@ return function()
 			expect(#server.Bundle.Data.GetLeaderboard("Coins", 10)).to.equal(1)
 		end)
 
-		it("issues them once BudgetPolicy is set", function()
+		it("also paces when BudgetPolicy is set", function()
 			-- The control for the assertion above: without it, `queries.Count == 0`
 			-- would pass just as happily if the stub were never reachable at all.
 			local uni = newUniverse({ Options = withBoard({ BudgetPolicy = "Defer" }) })
@@ -296,16 +258,7 @@ return function()
 
 	describe("a deferred write stays queued", function()
 		it("postpones the leaderboard write instead of dropping it", function()
-			-- The pacer dequeues at the top of its tick, so a gate placed at the
-			-- natural-looking spot -- just before the write -- has already taken the
-			-- item out of the queue. Deferring there does not delay the score, it
-			-- destroys it, and nothing downstream ever notices: no retry, no
-			-- LB_WRITE_DROPPED, just a board that is quietly wrong.
-			-- Exactly BUDGET_RESERVE, not zero. The reserve exists so the background
-			-- loops stop one request short of emptying the Sorted pool that the
-			-- shutdown drain also writes to and is never gated on; a reserve of zero
-			-- would let the pacer spend the last token a tick before the drain needs
-			-- it. Sitting the test right on the boundary is what pins the value.
+			-- Below-reserve budget must defer the write without dequeuing it.
 			local sortedWriteBudget = 1
 			local uni = newUniverse({ Options = withBoard({ BudgetPolicy = "Defer" }) })
 			stubBudget(uni.Disk, function(name)

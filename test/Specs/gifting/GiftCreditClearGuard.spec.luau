@@ -1,34 +1,6 @@
 --!nonstrict
--- THE THIRD ARM. F2's CONSEQUENCE SPEC for the GIFT-CREDIT CONVERSION.
---
--- handleGiftReceipt has three places that clear the buyer's PendingGifts slot after
--- a yield. Two of them re-read the slot and compare GiftIds first (the delivery
--- failure arm and the delivery success arm; the latter is pinned by
--- GiftSuccessClearGuard.spec). The THIRD -- the arm that converts a purchase into a
--- gift credit because the recipient acquired the perk before delivery -- cleared it
--- BLIND, and its guard condition yields twice before reaching the clear:
---
---     and recipientAlreadyOwns(recipientId, product.Grants)      -- GetOffline
---     and giftAlreadyDelivered(recipientId, purchaseId) == false -- GetOffline
---
--- This arm is EASIER to hit than the one already fixed. The success arm needs a
--- cross-server MessageAsync round trip to open the window; this one opens on an
--- ordinary offline profile READ, which happens on one server, for one buyer, with
--- two PromptGifts and no cross-server timing at all.
---
--- THE CONSEQUENCE, and it is money. Gift A's receipt converts to a credit and
--- deletes gift B's intent on the way out. B's own receipt then finds an empty slot,
--- falls through to the no-intent policy, and grants the perk to the BUYER --
--- who already had a credit minted for it -- while B's recipient gets nothing. No
--- log, no metric, no failed save. The buyer paid twice and one payment vanished.
---
--- The identity of an intent is its GiftId, never the slot. The guard is the same
--- one the two sibling arms already carry.
---
--- SEAM: fake.MidRead, which fires on entry to a live GetAsync -- the exact round
--- trip recipientAlreadyOwns spends when the recipient is offline. Recipient A is
--- therefore offline AND already owns the perk, which is what puts this arm on the
--- path in the first place.
+-- Gift-credit conversion must clear only the original GiftId.
+-- A legacy writer replaces the slot during the recipient ownership lookup.
 
 return function()
 	local Root = script.Parent.Parent.Parent.Parent
@@ -43,12 +15,16 @@ return function()
 	local SECOND = 83003 -- offline, owns nothing: gift B's intended recipient
 
 	local function makeHarness(extraOptions)
+		local finished = require(Root.Scribe.Internal.Signal).new()
 		local options = {
 			Products = {
 				GiftVIP = { Id = 222, Category = "Gamepass", Grants = "VIP" },
 			},
 			GiftCooldown = 0,
-			PromptProductPurchase = function() end,
+			PromptProductPurchaseFinished = finished,
+			PromptProductPurchase = function(player, productId)
+				finished:Fire(player.UserId, productId, true)
+			end,
 		}
 		for key, value in extraOptions or {} do
 			options[key] = value
@@ -138,15 +114,17 @@ return function()
 			local giftA = slot(entry, 222).GiftId
 			ownerAcquiresPerk(harness)
 
-			-- Roblox delivers the receipt well after the prompt, which is normal: the
-			-- slot is now older than giftPromptWindow, so a second prompt may take it.
+			-- Simulate a legacy writer replacing the slot during receipt delivery.
 			advance(200)
 
 			local giftB
 			local restore = onceMidRead(harness, function()
-				-- A real PromptGift, not a planted record: it is the only writer allowed
-				-- to create a slot.
-				expect(harness.Data.PromptGift(buyer, "GiftVIP", SECOND)).to.equal(true)
+				entry.Tree.Reserved.PendingGifts["222"].Set({
+					RecipientId = SECOND,
+					GiftId = "legacy-replacement",
+					Ts = Clock.Now(),
+					Product = "GiftVIP",
+				})
 				giftB = slot(entry, 222).GiftId
 				expect(giftB ~= giftA).to.equal(true)
 			end)
@@ -258,7 +236,7 @@ return function()
 		local seen = {}
 		local unsubscribe = Scribe.AddLogSink(function(logEntry)
 			seen[logEntry.Code] = (seen[logEntry.Code] or 0) + 1
-		end)
+		end, { Level = "Warn" })
 		withClock(1700000000, function(advance)
 			local harness = makeHarness()
 			local buyer, entry = harness.Join(BUYER)
@@ -267,7 +245,12 @@ return function()
 			ownerAcquiresPerk(harness)
 			advance(200)
 			local restore = onceMidRead(harness, function()
-				expect(harness.Data.PromptGift(buyer, "GiftVIP", SECOND)).to.equal(true)
+				entry.Tree.Reserved.PendingGifts["222"].Set({
+					RecipientId = SECOND,
+					GiftId = "legacy-replacement",
+					Ts = Clock.Now(),
+					Product = "GiftVIP",
+				})
 			end)
 			expect(harness.Data.HandleReceipt(receipt(BUYER, 222, "O1-log"))).to.equal(GRANTED)
 			expect(restore()).to.equal(true)

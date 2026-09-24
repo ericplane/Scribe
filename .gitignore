@@ -16,9 +16,23 @@ wally.lock
 *.rbxl
 *.rbxm
 *.rbxmx
+/Scribe-source-map.json
 node_modules/
+# Local verification logs, package archives, and generated output.
+*.log
+*.tgz
+/dist/
+/test/roblox-ts/out/
+/test/roblox-ts/include/
+/test/Helpers/RobloxTsCompiled.luau
+/test/Helpers/RobloxTsLeaderstats.luau
+/test/Specs/api/RobloxTsCompiled.spec.luau
 package-lock.json
 !/docs-site/package-lock.json
+!/package-lock.json
+
+# Deferred work kept locally for later; never committed or shipped.
+/.local-archive/
 
 # rbxm bundle build staging (deps copied out of Wally _Index in CI)
 /bundle/deps/
@@ -43,3 +57,8 @@ __pycache__/
 !CHANGELOG.md
 !CONTRIBUTING.md
 .*/
+# GitHub configuration remains visible despite the generic hidden-dir rule.
+!/.github/
+!/.github/workflows/
+!/.github/workflows/publish-npm.yml
+research/

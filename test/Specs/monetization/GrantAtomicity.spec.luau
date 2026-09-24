@@ -207,7 +207,7 @@ return function()
 				if entry.Code == "GRANT_SEEDED_ELEMENT" then
 					table.insert(seen, `{entry.Level}|{entry.Context and entry.Context.Paths}|{entry.Message}`)
 				end
-			end)
+			end, { Level = "Warn" })
 			local harness = TestCtx.make({
 				Template = slotTemplate(),
 				Options = { DevMode = devMode, Products = { GemPack = { Id = 557, Grant = grant } } },
@@ -216,6 +216,7 @@ return function()
 			setup(data)
 			local decision = harness.Data.HandleReceipt(receipt(userId, 557, `pid-seed-{userId}`))
 			-- Detached before any assertion: the sink list is a process singleton.
+			task.wait()
 			unsubscribe()
 			harness.Cleanup()
 			return seen, decision
@@ -271,7 +272,7 @@ return function()
 				if entry.Code == "GRANT_SEEDED_ELEMENT" then
 					table.insert(seen, tostring(entry.Context and entry.Context.Paths))
 				end
-			end)
+			end, { Level = "Warn" })
 			local harness = TestCtx.make({ Template = slotTemplate(), Options = { DevMode = true } })
 			local player, _e, data = harness.Join(92004)
 			data.Coins.Set(1000)
@@ -286,6 +287,7 @@ return function()
 					d.Characters[d.ActiveSlot.Get()].Gems.Increment(100)
 				end,
 			})
+			task.wait()
 			unsubscribe()
 			harness.Cleanup()
 

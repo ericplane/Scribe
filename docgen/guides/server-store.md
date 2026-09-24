@@ -20,6 +20,27 @@ return Scribe({
 
 That is the whole setup. `ServerStore` sits beside `Template`, takes the same declarators, and produces one tree for the whole server.
 
+## Types and autocomplete
+
+Scribe infers the store's fields from `ServerStore`, including a template returned by a separate module. You get autocomplete for its fields and accessors on both `Data.ServerStore` APIs. The client gets read-only accessors and cannot see `Scribe.ServerOnly` fields.
+
+If you export a named API type, pass the player template first and the store template second:
+
+```lua
+local serverStore = {
+    Wave = Scribe.Int(1),
+    Seed = Scribe.ServerOnly(0),
+}
+
+export type ServerData = Scribe.ServerData<typeof(template), typeof(serverStore)>
+export type ClientData = Scribe.ClientData<typeof(template), typeof(serverStore)>
+```
+
+Use that same `serverStore` table as the `ServerStore` option. `Scribe.Bundle` and `Scribe.ScribeOptions` accept the same two template types when you need to name those types too.
+
+!!! note "Upgrading from 2.4.0"
+    Version 2.4.0 ignored the public `ServerStore` option. Version 2.5.0 creates the store correctly. If your configuration already declares one, deploy the server and client together: those fields now form part of the compiled schema.
+
 ## Reading and writing it
 
 On the server, `Data.ServerStore` holds the roots you declared, and every accessor works exactly as it does on a player's data:

@@ -7,6 +7,7 @@ local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 
 local Internal = script.Parent.Parent.Internal
+local Types = require(script.Parent.Parent.Types)
 local Util = require(Internal.Util)
 local Node = require(Internal.Node)
 local Template = require(Internal.Template)
@@ -60,6 +61,7 @@ export type Entry = {
 	TimedLive: { [string]: number }?, -- same table, read by Timed's own store lookup
 	TimedSaves: number?, -- open save windows; saves are not serialized per profile
 	LeavingHookRan: boolean?, -- OnPlayerLeaving fires at most once per session
+	StopLeavingHookWatchdog: (() -> ())?,
 	-- Cross-server messages handed to Data.OnMessage whose FireTracked has not settled.
 	-- Nonzero at session end means a handler never returned; teardown reports it.
 	UnsettledMessages: number?,
@@ -113,7 +115,9 @@ export type Entry = {
 	LastStoreErrorAt: number?, -- monotonic
 	-- A parallel field, not a fourth State, so nothing switching on State changes
 	-- meaning. nil once Ready.
-	LoadPhase: ("Importing" | "ImportThrottled")?,
+	LoadPhase: Types.LoadPhase?,
+	SlowLoadWarned: boolean?,
+	StopLoadWatchdog: (() -> ())?,
 	-- Monetization state
 	GiftLastAt: number,
 	OwnsLast: { [string]: boolean }?, -- last reported effective ownership, for change detection
@@ -124,6 +128,7 @@ local SIZE_WARN_BYTES = 3.5 * 1024 * 1024 -- warn approaching the ~4 MB DataStor
 -- Past this a join is something the player notices. Well under LoadTimeout, where they
 -- are kicked: a warn firing only at the timeout would only ever report failures.
 local SLOW_LOAD_SECONDS = 10
+local SLOW_LEAVING_HOOK_SECONDS = 10
 -- An import is unbounded by design and holds the session lock throughout. Well past
 -- SLOW_LOAD, because waiting on budget is the point.
 local SLOW_IMPORT_SECONDS = 30
@@ -150,6 +155,20 @@ local ASSUME_DEAD_SECONDS = 630
 -- is a floor under the leaderboard flush, not a cap on it.
 local HOOK_PHASE_SHARE = 0.75
 local HOOK_JOIN_POLL = 0.05 -- seconds between checks that the parked hooks have returned
+
+local function watchdog(seconds: number, callback: () -> ()): () -> ()
+	local pending: (() -> ())? = callback
+	Clock.Delay(seconds, function()
+		local run = pending
+		pending = nil
+		if run then
+			run()
+		end
+	end)
+	return function()
+		pending = nil -- release the entry without cancelling a game callback
+	end
+end
 
 --- A copy of the exchange ledger, for comparing across a hook that writes raw.
 ---
@@ -685,14 +704,39 @@ function Persistence.new(ctx: any)
 		return self.EntriesByUserId[userId]
 	end
 
+	local function warnSlowLoad(entry: Entry)
+		if self.Stopped or entry.SlowLoadWarned or entry.State ~= "Loading" or entry.JoinedAt == nil then
+			return
+		end
+		local duration = Clock.Monotonic() - entry.JoinedAt
+		if duration < SLOW_LOAD_SECONDS then
+			return
+		end
+		entry.SlowLoadWarned = true
+		Log.Warn("Persistence", "SLOW_LOAD", "profile load exceeded 10s; inspect its phase and store errors", {
+			Player = entry.Player,
+			UserId = entry.UserId,
+			Phase = entry.LoadPhase or "Initializing",
+			Duration = duration,
+		})
+	end
+
 	local function setState(entry: Entry, state: "Loading" | "Ready" | "SessionEnded", reason: string?)
+		if state ~= "Loading" then
+			warnSlowLoad(entry)
+			if entry.StopLoadWatchdog then
+				entry.StopLoadWatchdog()
+				entry.StopLoadWatchdog = nil
+			end
+			entry.LoadPhase = nil
+		end
 		entry.State = state
 		entry.FailReason = reason
 		entry.StateChanged:Fire(state, reason)
 	end
 
 	--- Fires StateChanged so a WaitForData caller wakes on the transition.
-	local function setPhase(entry: Entry, phase: ("Importing" | "ImportThrottled")?)
+	local function setPhase(entry: Entry, phase: Types.LoadPhase?)
 		if entry.LoadPhase == phase then
 			return
 		end
@@ -1390,7 +1434,28 @@ function Persistence.new(ctx: any)
 		if entry.State ~= "Ready" or entry.Tree == nil then
 			return -- never loaded, so there is nothing coherent to hand it
 		end
+		local started = Clock.Monotonic()
+		local warned = false
+		local function warnSlowHook()
+			local duration = Clock.Monotonic() - started
+			if self.Stopped or warned or duration < SLOW_LEAVING_HOOK_SECONDS then
+				return
+			end
+			warned = true
+			Log.Warn("Lifecycle", "PLAYER_LEAVING_HOOK_SLOW", "OnPlayerLeaving exceeded 10s before the final save", {
+				Player = entry.Player,
+				UserId = entry.UserId,
+				Reason = reason,
+				Duration = duration,
+			})
+		end
+		local stopWatchdog = watchdog(SLOW_LEAVING_HOOK_SECONDS, warnSlowHook)
+		entry.StopLeavingHookWatchdog = stopWatchdog
 		local ok, err = pcall(hook, entry.Player, entry.Tree.Accessor, reason)
+		stopWatchdog()
+		entry.StopLeavingHookWatchdog = nil
+		Metrics.Observe("PlayerLeavingHookDuration", Clock.Monotonic() - started)
+		warnSlowHook()
 		if not ok then
 			Log.Error(
 				"Lifecycle",
@@ -1406,6 +1471,10 @@ function Persistence.new(ctx: any)
 			return
 		end
 		entry.TornDown = true
+		if entry.StopLeavingHookWatchdog then
+			entry.StopLeavingHookWatchdog()
+			entry.StopLeavingHookWatchdog = nil
+		end
 		-- One canonical reason reaches every consumer: the SessionEnded signal, the stored
 		-- end reason, and WaitForData's second return (see Types.LifecycleReason).
 		local canonical: string = reason or "session-ended"
@@ -1552,7 +1621,7 @@ function Persistence.new(ctx: any)
 				return debug.traceback(tostring(e), 2)
 			end, player, entry.UserId, migrationContext(entry))
 			releaseSlot()
-			setPhase(entry, nil)
+			setPhase(entry, "Initializing")
 			local importSeconds = Clock.Monotonic() - importStarted
 			if importSeconds >= SLOW_IMPORT_SECONDS then
 				-- Without this, "waiting on budget" and "hung" look identical in the log.
@@ -2116,14 +2185,6 @@ function Persistence.new(ctx: any)
 		local loadSeconds = if entry.JoinedAt then Clock.Monotonic() - entry.JoinedAt else nil
 		if loadSeconds then
 			Metrics.Observe("LoadDuration", loadSeconds)
-			if loadSeconds >= SLOW_LOAD_SECONDS then
-				Log.Warn(
-					"Persistence",
-					"SLOW_LOAD",
-					`profile took {string.format("%.1f", loadSeconds)}s to load, past the {SLOW_LOAD_SECONDS}s mark`,
-					{ Player = player }
-				)
-			end
 		end
 		Log.Info("Persistence", "PROFILE_LOADED", "profile session started", {
 			Player = player,
@@ -2211,13 +2272,17 @@ function Persistence.new(ctx: any)
 		local player = entry.Player
 
 		if mode == "NoSave" then
+			setPhase(entry, "ReadingProfile")
 			-- Snapshot of the real profile with NO session: nothing is saved, because
 			-- a view is never IsActive() and every save path checks that first.
+			local started = Clock.Monotonic()
 			local ok, profile = pcall(function()
 				return store:GetAsync(entry.Key)
 			end)
+			Metrics.Observe("ProfileLoadDuration", Clock.Monotonic() - started)
 			if ok and profile then
 				entry.Profile = profile
+				setPhase(entry, "Initializing")
 				finishLoad(entry)
 			else
 				Log.Error(
@@ -2233,6 +2298,7 @@ function Persistence.new(ctx: any)
 
 		local heldSince = Clock.Monotonic()
 		while (erasing[entry.UserId] or 0) > 0 and not entry.TornDown and not self.Stopped do
+			setPhase(entry, "WaitingForErase")
 			if Clock.Monotonic() - heldSince >= eraseJoinTimeout then
 				if player.Parent == Players then
 					player:Kick(kickText("Erasing"))
@@ -2246,10 +2312,12 @@ function Persistence.new(ctx: any)
 		local attempt = 0
 		while not self.Closing and not self.Stopped do
 			attempt += 1
+			setPhase(entry, "AcquiringSession")
 			-- Captured PER ATTEMPT. ProfileStore latches the first `true` its Cancel
 			-- returns and never asks again, so a deadline computed once outside this loop
 			-- would abort every later attempt the instant it began.
 			local deadline = Clock.Monotonic() + loadTimeout
+			local started = Clock.Monotonic()
 			local ok, profile = pcall(function()
 				return store:StartSessionAsync(entry.Key, {
 					Cancel = function()
@@ -2260,6 +2328,7 @@ function Persistence.new(ctx: any)
 					end,
 				})
 			end)
+			Metrics.Observe("ProfileLoadDuration", Clock.Monotonic() - started)
 
 			if entry.TornDown then
 				-- Torn down while the load was in flight (shutdown drain or a leave
@@ -2282,6 +2351,7 @@ function Persistence.new(ctx: any)
 			if ok and profile then
 				entry.Profile = profile
 				Health.ReportSuccess("ProfileLoad")
+				setPhase(entry, "Initializing")
 				finishLoad(entry)
 				return
 			end
@@ -2318,6 +2388,7 @@ function Persistence.new(ctx: any)
 			-- "Wait": stay in Loading and keep retrying with backoff; never fall back
 			-- to template data on a live account. Jittered so a fleet that lost the
 			-- DataStore at one instant does not come back at one instant.
+			setPhase(entry, "Retrying")
 			Clock.Wait(Rng.Jitter(math.min(5 * attempt, 60)))
 		end
 		-- Loop exited because Closing or Stopped flipped during a "Wait" backoff: tear the
@@ -2379,6 +2450,12 @@ function Persistence.new(ctx: any)
 		self.EntryCount += 1
 		syncBudgetReserves()
 		self.EntriesByUserId[entry.UserId] = entry
+		entry.StopLoadWatchdog = watchdog(SLOW_LOAD_SECONDS, function()
+			entry.StopLoadWatchdog = nil
+			if not entry.TornDown then
+				warnSlowLoad(entry)
+			end
+		end)
 		Sched.Spawn(function()
 			-- Its OWN thread, so everything the load allocates, the profile copy and the
 			-- whole accessor tree, is charged here. A memory category is per-thread and
@@ -3674,6 +3751,16 @@ function Persistence.new(ctx: any)
 		-- FIRST, before anything is disconnected: the loader reads it on its next turn,
 		-- and a flag set after the yield-heavy teardown would let another round through.
 		self.Stopped = true
+		for _, entry in self.Entries do
+			if entry.StopLoadWatchdog then
+				entry.StopLoadWatchdog()
+				entry.StopLoadWatchdog = nil
+			end
+			if entry.StopLeavingHookWatchdog then
+				entry.StopLeavingHookWatchdog()
+				entry.StopLeavingHookWatchdog = nil
+			end
+		end
 		for _, connection in connections do
 			pcall(function()
 				connection:Disconnect()

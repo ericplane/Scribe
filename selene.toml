@@ -10,5 +10,7 @@ exclude = [
 	"Packages/**",
 	"ServerPackages/**",
 	"DevPackages/**",
+	"test/roblox-ts/include/**",
+	"test/roblox-ts/out/**",
 	"src/Internal/Store/ProfileStore.luau",
 ]

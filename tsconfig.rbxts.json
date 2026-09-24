@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noLib": true,
+    "target": "ESNext",
+    "module": "commonjs",
+    "moduleDetection": "force",
+    "moduleResolution": "node",
+    "allowSyntheticDefaultImports": true,
+    "typeRoots": ["node_modules/@rbxts"],
+    "types": ["compiler-types", "types"],
+    "rootDir": "test/roblox-ts/src",
+    "outDir": "test/roblox-ts/out",
+    "skipLibCheck": true
+  },
+  "include": ["test/roblox-ts/src/runtime.ts", "test/roblox-ts/src/imports.ts", "test/roblox-ts/src/addons.ts", "test/roblox-ts/src/leaderstats.ts", "test/roblox-ts/src/leaderstats-runtime.ts"]
+}

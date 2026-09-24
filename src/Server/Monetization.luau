@@ -27,20 +27,16 @@ local Monetization = {}
 -- global callback, so a second receipt-owning bundle would silently steal it.
 local receiptsBound = false
 
-local PROCESSED_CAP = 200 -- default ceiling on the receipt-dedupe ring
 local PURCHASE_ID_TTL = 7 * 24 * 3600
+local RECEIPT_HISTORY_TTL = 30 * 24 * 3600
+local RECEIPT_HISTORY_BYTES = 1024 * 1024
+local MAX_RECEIPT_HISTORY_BYTES = 2 * 1024 * 1024
+local RECEIPT_PROFILE_BYTES = 3800000
 
--- Durable gift aims. The load sweep MOVES a stale gift intent into _Scribe.GiftAims
--- rather than deleting it, and the no-intent receipt paths consult it before granting
--- the buyer: without that record a late receipt is indistinguishable from a
--- self-purchase, so one payment produces two grants. This bounds how long the
--- recipient's identity must survive, so it is floored at purchaseIdTTL (see giftAimTTL).
-local GIFT_AIM_TTL = 7 * 24 * 3600
--- Eviction is age-only: an aim inside the receipt-retry window may be the only record
--- of a gift already paid for, so at the cap the store refuses intake instead.
+-- Unresolved destinations keep their slots until settlement or cancellation.
 local GIFT_AIM_CAP = 64
 -- Caller-supplied idempotency keys live in the Timed store under this prefix, which
--- keeps them out of the capped ProcessedPurchaseIds ring.
+-- keeps shop claims separate from receipt history.
 local PURCHASE_IDEM_PREFIX = "@pi|"
 -- Runaway guard on how many claims can be live at once, not a working limit: an
 -- eviction can let a retry apply a purchase twice (PURCHASE_CLAIM_EVICTED). A game that
@@ -66,26 +62,29 @@ function Monetization.new(ctx: any)
 	end
 
 	-- Which (userId, purchaseId) pairs are mid-grant on THIS server. An in-flight marker,
-	-- never persisted; the ProcessedPurchaseIds ring is the only durable completion record.
+	-- never persisted; ProcessedPurchaseIds holds durable completion records.
 	local receiptsInFlight: { [string]: true } = {}
 
 	local giftCooldown: number = options.GiftCooldown or 5
 	local giftMaxPending: number = options.GiftMaxPending or 20
 	local giftIntentTTL: number = options.GiftIntentTTL or 3600
 	local purchaseIdTTL: number = options.PurchaseIdTTL or PURCHASE_ID_TTL
-	local processedCap: number = options.MaxProcessedPurchaseIds or PROCESSED_CAP
-	-- Separate from PurchaseIdTTL, which governs Roblox's receipt-retry window where
-	-- shortening risks double-granting real money. A caller-supplied Data.Purchase key is
-	-- retried by the game within seconds, so it can be bounded here without touching that.
+	local receiptHistoryBytes = if options.MaxReceiptHistoryBytes ~= nil
+		then options.MaxReceiptHistoryBytes
+		else RECEIPT_HISTORY_BYTES
+	if
+		type(receiptHistoryBytes) ~= "number"
+		or receiptHistoryBytes ~= receiptHistoryBytes
+		or receiptHistoryBytes % 1 ~= 0
+		or receiptHistoryBytes < 1
+		or receiptHistoryBytes > MAX_RECEIPT_HISTORY_BYTES
+	then
+		error(`Scribe: MaxReceiptHistoryBytes must be an integer from 1 to {MAX_RECEIPT_HISTORY_BYTES}`, 0)
+	end
+	local receiptReservations: { [any]: { [string]: true } } = setmetatable({}, { __mode = "k" }) :: any
+	-- Caller-supplied purchase claims keep their own retry window.
 	local purchaseClaimTTL: number = options.PurchaseClaimTTL or purchaseIdTTL
 	local purchaseClaimCap: number = math.max(1, tonumber(options.MaxPurchaseClaims) or PURCHASE_CLAIM_CAP)
-	-- How long a same-product re-gift is blocked while a purchase could still be in flight,
-	-- so a second gift cannot overwrite a live intent and misdeliver the first purchase.
-	-- Past this a lingering intent is an abandoned prompt and may be overwritten.
-	local giftPromptWindow: number = math.min(120, giftIntentTTL)
-	-- A floor, never an alias: lengthening the receipt horizon lengthens this, and
-	-- shortening PurchaseIdTTL cannot shorten it.
-	local giftAimTTL: number = math.max(GIFT_AIM_TTL, purchaseIdTTL)
 	local giftAimCap: number = math.max(1, GIFT_AIM_CAP)
 	local allowDuplicateGifts: boolean = options.AllowDuplicateGifts == true
 	local noGiftIntentPolicy: string = options.NoGiftIntentPolicy or "GrantOrCredit"
@@ -100,6 +99,36 @@ function Monetization.new(ctx: any)
 		or function(player: Player, passId: number)
 			MarketplaceService:PromptGamePassPurchase(player, passId)
 		end
+	local promptStopped = false
+	type PurchasePrompt = { Entry: any, Connection: any?, Closed: boolean, Cancelled: boolean?, Saving: boolean? }
+	local purchasePrompts: { [Player]: PurchasePrompt } = {}
+
+	local function clearPurchasePrompt(player: Player, pending: PurchasePrompt)
+		pending.Closed = true
+		if purchasePrompts[player] == pending then
+			purchasePrompts[player] = nil
+		end
+		local connection = pending.Connection
+		pending.Connection = nil
+		if connection then
+			pcall(function()
+				connection:Disconnect()
+			end)
+		end
+	end
+
+	local function finishCancellation(player: Player)
+		local pending = purchasePrompts[player]
+		if not pending or not pending.Cancelled or pending.Saving then
+			return
+		end
+		pending.Saving = true
+		local ok, saved = pcall(ctx.Persistence.AwaitSave, pending.Entry, 10)
+		pending.Saving = false
+		if ok and saved then
+			clearPurchasePrompt(player, pending)
+		end
+	end
 
 	-- Same seam as the prompt above: patching MarketplaceService itself is illegal on a
 	-- real service Instance, so no ownership spec could run in Studio without it.
@@ -121,10 +150,12 @@ function Monetization.new(ctx: any)
 		Grant: ((data: any) -> ())?,
 		Grants: string?,
 		PaidRandom: boolean,
+		Retired: boolean,
 	}
 	local productsByName: { [string]: Product } = {}
+	local retiredByName: { [string]: Product } = {}
 	local productsById: { [number]: Product } = {}
-	for name, config in (options.Products or {}) :: { [string]: any } do
+	local function registerProduct(name: string, config: any, retired: boolean)
 		-- Name and Category are persisted as table keys and log values, so invalid UTF-8
 		-- would fail the DataStore save (error 104). Reject at registration, not at save.
 		if not Util.isUtf8(name) then
@@ -156,12 +187,22 @@ function Monetization.new(ctx: any)
 			Grant = config.Grant,
 			Grants = config.Grants,
 			PaidRandom = config.PaidRandom == true,
+			Retired = retired,
 		}
-		productsByName[name] = product
+		if productsByName[name] or retiredByName[name] then
+			error(`Scribe: duplicate active/retired product name "{name}"`, 0)
+		end
+		(if retired then retiredByName else productsByName)[name] = product
 		if productsById[config.Id] then
 			error(`Scribe: duplicate product Id {config.Id}`, 0)
 		end
 		productsById[config.Id] = product
+	end
+	for name, config in (options.Products or {}) :: { [string]: any } do
+		registerProduct(name, config, false)
+	end
+	for name, config in (options.RetiredProducts or {}) :: { [string]: any } do
+		registerProduct(name, config, true)
 	end
 
 	local passesByName: { [string]: { Id: number, Category: string? } } = {}
@@ -185,7 +226,7 @@ function Monetization.new(ctx: any)
 		end
 		-- One name, one thing. PromptPurchase resolves a name against both registries, so a
 		-- name in both would leave resolution order deciding what the player is charged for.
-		if productsByName[name] then
+		if productsByName[name] or retiredByName[name] then
 			error(
 				`Scribe: "{name}" is declared as both a product and a pass; one name cannot mean two `
 					.. "purchasable things, because a prompt resolves by name",
@@ -206,7 +247,7 @@ function Monetization.new(ctx: any)
 	end
 
 	local anyPaidRandom = false
-	for _, product in productsByName do
+	for _, product in productsById do
 		anyPaidRandom = anyPaidRandom or product.PaidRandom
 	end
 
@@ -229,7 +270,7 @@ function Monetization.new(ctx: any)
 			knownOwnsKeys[perk] = true
 		end
 	end
-	for _, product in productsByName do
+	for _, product in productsById do
 		if product.Grants then
 			knownOwnsKeys[product.Grants] = true
 			-- Otherwise a typo here only surfaces once a player buys the product: the perk
@@ -285,7 +326,17 @@ function Monetization.new(ctx: any)
 			reserved = {}
 			data[Template.RESERVED_ROOT] = reserved
 		end
-		for _, key in { "Perks", "ProcessedPurchaseIds", "PendingGifts", "GiftAims", "GiftCredits", "PurchaseLogs" } do
+		for _, key in
+			{
+				"Perks",
+				"ProcessedPurchaseIds",
+				"ReceiptReservations",
+				"PendingGifts",
+				"GiftAims",
+				"GiftCredits",
+				"PurchaseLogs",
+			}
+		do
 			if type(reserved[key]) ~= "table" then
 				reserved[key] = {}
 			end
@@ -299,21 +350,26 @@ function Monetization.new(ctx: any)
 		return reserved
 	end
 
-	-- A ring entry is `{ Id, At }`. Entries written before age-based eviction shipped are
-	-- bare strings, and both forms have to read alike.
+	-- Accept both timestamped records and older bare IDs.
 	local function processedId(item: any): string?
 		if type(item) == "string" then
 			return item
 		end
-		if type(item) == "table" then
+		if type(item) == "table" and type(item.Id) == "string" then
 			return item.Id
 		end
 		return nil
 	end
 
+	local function processedAt(item: any, now: number): number
+		local at = if type(item) == "table" then item.At else nil
+		return if type(at) == "number" and at == at and at >= 0 and at < math.huge then at else now
+	end
+
 	local function isProcessedRaw(data: { [string]: any }, purchaseId: string): boolean
+		local now = Clock.Now()
 		for _, item in reservedRaw(data).ProcessedPurchaseIds do
-			if processedId(item) == purchaseId then
+			if processedId(item) == purchaseId and now - processedAt(item, now) < RECEIPT_HISTORY_TTL then
 				return true
 			end
 		end
@@ -324,60 +380,165 @@ function Monetization.new(ctx: any)
 		return entry.LiveData ~= nil and isProcessedRaw(entry.LiveData, purchaseId)
 	end
 
-	-- The ring is the only thing between a retried receipt and a second grant. Age is the
-	-- primary rule: past PurchaseIdTTL a receipt is beyond any retry. The count backstop is
-	-- for a player buying faster than the TTL drains, and it is the one eviction that can
-	-- lose a live entry, so it says so. A legacy bare string is stamped with `now` rather
-	-- than treated as expired; guessing old is precisely the guess that double-grants.
-	local function pruneProcessed(list: { any }, player: any?): { any }
+	-- Unknown-age IDs get a full window when migrated.
+	local function compactProcessed(list: { any }, preserveUnknown: boolean?): ({ any }, boolean)
+		local kept: { any } = {}
+		local seen: { [string]: number } = {}
 		local now = Clock.Now()
-		local kept = {}
+		local changed = false
 		for _, item in list do
 			local id = processedId(item)
-			if id == nil then
-				continue -- unreadable entry; nothing can match it, so it only takes space
+			local at = processedAt(item, now)
+			local unknown = type(item) ~= "table" or item.At ~= at
+			if id == nil or now - at >= RECEIPT_HISTORY_TTL then
+				changed = true
+			elseif seen[id] then
+				local index = seen[id]
+				if at > processedAt(kept[index], now) then
+					kept[index] = if preserveUnknown and unknown then id else { Id = id, At = at }
+				end
+				changed = true
+			else
+				local record = if preserveUnknown and unknown then id else { Id = id, At = at }
+				table.insert(kept, record)
+				seen[id] = #kept
+				if unknown and (not preserveUnknown or type(item) ~= "string") then
+					changed = true
+				end
 			end
-			local at = if type(item) == "table" then tonumber(item.At) else nil
-			if at == nil then
-				table.insert(kept, { Id = id, At = now }) -- legacy: stamp, never assume old
-			elseif now - at <= purchaseIdTTL then
-				table.insert(kept, item)
-			end
 		end
-		-- `while`, not `if`: a stored ring larger than the current cap must shrink back
-		-- under it rather than stay frozen at its old size.
-		local dropped = 0
-		while #kept >= processedCap and #kept > 0 do
-			table.remove(kept, 1)
-			dropped += 1
-		end
-		if dropped > 0 then
-			Log.Warn(
-				"Monetization",
-				"PURCHASE_ID_EVICTED",
-				`dropped {dropped} un-expired purchase id(s) to stay under MaxProcessedPurchaseIds ({processedCap}); `
-					.. `a receipt Roblox retries for one of them would be granted twice; raise the cap`,
-				{ Player = player, Dropped = dropped, Cap = processedCap }
-			)
-			Metrics.Add("PurchaseIdsEvicted", dropped)
-		end
-		return kept
+		return kept, changed
 	end
 
-	local function markProcessedRaw(data: { [string]: any }, purchaseId: string, player: any?)
+	local function historyForProfile(data: { [string]: any }): ({ any }, boolean)
+		local previous = reservedRaw(data).ProcessedPurchaseIds
+		local kept, changed = compactProcessed(previous)
+		if changed then
+			-- Leave migration pending if timestamps would overflow the profile.
+			local growth = Util.approxSize(kept) - Util.approxSize(previous)
+			if growth > 0 and Util.approxSize(data) + growth > RECEIPT_PROFILE_BYTES then
+				return compactProcessed(previous, true)
+			end
+		end
+		return kept, changed
+	end
+
+	local function pruneProcessed(entry: any)
+		local kept, changed = historyForProfile(entry.LiveData)
+		if changed then
+			reservedAcc(entry).ProcessedPurchaseIds.Set(kept)
+		end
+	end
+
+	local function pruneProcessedRaw(data: { [string]: any })
 		local reserved = reservedRaw(data)
-		local kept = pruneProcessed(reserved.ProcessedPurchaseIds, player)
-		table.insert(kept, { Id = purchaseId, At = Clock.Now() })
+		reserved.ProcessedPurchaseIds = historyForProfile(data)
+	end
+
+	local function canRecordReceipt(
+		data: { [string]: any },
+		purchaseId: string,
+		entry: any?,
+		userId: number?,
+		route: any?
+	): boolean
+		if isProcessedRaw(data, purchaseId) then
+			return true
+		end
+		local reserved = reservedRaw(data)
+		local existing = reserved.ReceiptReservations[purchaseId]
+		if existing and (route == nil or type(existing) == "table") then
+			return true -- finishing a durable reservation releases its capacity
+		end
+		local ids = compactProcessed(reserved.ProcessedPurchaseIds)
+		local completedBytes = Util.approxSize(ids)
+		local seen = {}
+		for _, record in ids do
+			seen[record.Id] = true
+		end
+		local function include(id: string)
+			if not seen[id] then
+				seen[id] = true
+				table.insert(ids, { Id = id, At = Clock.Now() })
+			end
+		end
+		for id in reserved.ReceiptReservations do
+			include(id)
+		end
+		for id in (entry and receiptReservations[entry]) or {} do
+			include(id)
+		end
+		include(purchaseId)
+		local bytes = Util.approxSize(ids)
+		local profileBytes = Util.approxSize(data) - Util.approxSize(reserved.ProcessedPurchaseIds) + bytes
+		if route then
+			profileBytes += Util.approxSize({ [purchaseId] = route }) - Util.approxSize(
+				if existing ~= nil then { [purchaseId] = existing } else {}
+			)
+		end
+		if (existing or bytes <= receiptHistoryBytes) and profileBytes <= RECEIPT_PROFILE_BYTES then
+			return true
+		end
+		Log.Error(
+			"Monetization",
+			"RECEIPT_HISTORY_FULL",
+			"receipt history is full; grant deferred without dropping unexpired IDs",
+			{
+				Player = entry and entry.Player,
+				UserId = if entry then entry.UserId else userId,
+				PurchaseId = purchaseId,
+				Bytes = bytes,
+				Limit = receiptHistoryBytes,
+				ProfileBytes = profileBytes,
+				CompletedBytes = completedBytes,
+			}
+		)
+		Metrics.Add("ReceiptHistoryRefusals")
+		return false
+	end
+
+	local function reserveReceipt(entry: any, purchaseId: string): ((() -> ())?, boolean)
+		local pending = receiptReservations[entry]
+		if pending and pending[purchaseId] then
+			return nil, false
+		end
+		if not canRecordReceipt(entry.LiveData, purchaseId, entry) then
+			return nil, true
+		end
+		if not pending then
+			pending = {}
+			receiptReservations[entry] = pending
+		end
+		pending[purchaseId] = true
+		return function()
+			pending[purchaseId] = nil
+			if next(pending) == nil then
+				receiptReservations[entry] = nil
+			end
+		end,
+			false
+	end
+
+	local function markProcessedRaw(data: { [string]: any }, purchaseId: string)
+		local reserved = reservedRaw(data)
+		local kept = historyForProfile(data)
+		if not isProcessedRaw(data, purchaseId) then
+			table.insert(kept, { Id = purchaseId, At = Clock.Now() })
+		end
 		reserved.ProcessedPurchaseIds = kept
+		reserved.ReceiptReservations[purchaseId] = nil
 	end
 
 	local function markProcessed(entry: any, purchaseId: string)
 		local accessor = reservedAcc(entry).ProcessedPurchaseIds
-		local kept = pruneProcessed(accessor.Get(), entry.Player)
-		table.insert(kept, { Id = purchaseId, At = Clock.Now() })
-		-- One Set rather than a Remove loop plus an Insert: pruning rewrites the whole
-		-- list, and a single op is what a surrounding Transaction rolls back cleanly.
+		local kept = historyForProfile(entry.LiveData)
+		if not isProcessed(entry, purchaseId) then
+			table.insert(kept, { Id = purchaseId, At = Clock.Now() })
+		end
 		accessor.Set(kept)
+		if reservedRaw(entry.LiveData).ReceiptReservations[purchaseId] then
+			reservedAcc(entry).ReceiptReservations[purchaseId].Set(nil)
+		end
 	end
 
 	-- Gift records: the live intent and the archived aim -------------------------
@@ -390,6 +551,38 @@ function Monetization.new(ctx: any)
 
 	local function giftRecordKey(fromAim: boolean): string
 		return if fromAim then GIFT_AIMS else PENDING_GIFTS
+	end
+
+	-- Receipt-bound routes outlive replaceable product intents and aims.
+	local function readReceiptRoute(reserved: any, purchaseId: string, product: Product): (any?, boolean)
+		local route = reserved.ReceiptReservations[purchaseId]
+		if route == nil or route == true then
+			return nil, false
+		end
+		if
+			type(route) ~= "table"
+			or route.Product ~= product.Name
+			or route.ProductId ~= product.Id
+			or type(route.RecipientId) ~= "number"
+			or route.RecipientId <= 0
+			or route.RecipientId % 1 ~= 0
+			or type(route.GiftId) ~= "string"
+			or route.GiftId == ""
+			or type(route.FromAim) ~= "boolean"
+		then
+			return nil, true
+		end
+		return route, false
+	end
+
+	local function giftReceiptRoute(product: Product, record: any, fromAim: boolean): any
+		return {
+			Product = product.Name,
+			ProductId = product.Id,
+			RecipientId = tonumber(record.RecipientId) or 0,
+			GiftId = tostring(record.GiftId),
+			FromAim = fromAim,
+		}
 	end
 
 	--- The stored record for this product, or nil unless it is complete and belongs to
@@ -413,36 +606,92 @@ function Monetization.new(ctx: any)
 		if (tonumber(record.RecipientId) or 0) <= 0 or record.GiftId == nil then
 			return nil
 		end
-		-- No age check here on purpose: the horizon bounds what a record may be PRESUMED
-		-- to mean, not whether it may be read. A record past it can still prove a delivery.
+		-- Age does not release an unresolved destination.
 		return record
 	end
 
-	--- Clear a gift record, and only if it is still ours. Every caller has yielded by the
-	--- time it gets here, and a second PromptGift past giftPromptWindow can take the slot
-	--- over: a blind clear would strand that gift, whose receipt then grants the perk to
-	--- the buyer. Identity is the GiftId, never the slot.
-	local function clearGiftRecord(entry: any, fromAim: boolean, productIdStr: string, giftId: string)
-		local key = giftRecordKey(fromAim)
-		local live = reservedRaw(entry.LiveData)[key][productIdStr]
-		if type(live) == "table" and tostring(live.GiftId) == giftId then
-			reservedAcc(entry)[key][productIdStr].Set(nil)
+	-- Clear only this gift: a saved receipt route may outlive its product slot.
+	local function clearGiftRecord(entry: any, productIdStr: string, giftId: string): boolean
+		local cleared = false
+		for _, key in { PENDING_GIFTS, GIFT_AIMS } do
+			local live = reservedRaw(entry.LiveData)[key][productIdStr]
+			if type(live) == "table" and tostring(live.GiftId) == giftId then
+				reservedAcc(entry)[key][productIdStr].Set(nil)
+				cleared = true
+			end
 		end
+		return cleared
+	end
+
+	local function hasPendingGift(entry: any, productId: number): boolean
+		local reserved = reservedRaw(entry.LiveData)
+		local key = tostring(productId)
+		return reserved.PendingGifts[key] ~= nil or reserved.GiftAims[key] ~= nil
+	end
+
+	local function hasConflictingGiftRecords(reserved: any, productId: number): boolean
+		local key = tostring(productId)
+		local pending, aim = reserved.PendingGifts[key], reserved.GiftAims[key]
+		if pending == nil or aim == nil then
+			return false
+		end
+		return type(pending) ~= "table"
+			or type(aim) ~= "table"
+			or pending.GiftId ~= aim.GiftId
+			or pending.RecipientId ~= aim.RecipientId
+			or pending.Product ~= aim.Product
+	end
+
+	local function giftHasReceipt(reserved: any, giftId: string): boolean
+		for _, route in reserved.ReceiptReservations do
+			if route == true or (type(route) == "table" and route.GiftId == giftId) then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function cancelGiftRecord(entry: any, productIdStr: string, giftId: string): boolean
+		if entry.State ~= "Ready" or entry.TornDown or ctx.Persistence.EntryFor(entry.Player) ~= entry then
+			return false
+		end
+		-- A close event cannot cancel a receipt already being settled.
+		if giftHasReceipt(reservedRaw(entry.LiveData), giftId) then
+			return false
+		end
+		return clearGiftRecord(entry, productIdStr, giftId)
 	end
 
 	--- The offline mirror, for use INSIDE an UpdateOffline transform where the slot
 	--- has to be re-read against the compare-and-set's own draft.
-	local function clearGiftRecordRaw(
-		reserved: { [string]: any },
-		fromAim: boolean,
-		productIdStr: string,
-		giftId: string
-	)
-		local container = reserved[giftRecordKey(fromAim)]
-		local live = container[productIdStr]
-		if type(live) == "table" and tostring(live.GiftId) == giftId then
-			container[productIdStr] = nil
+	local function clearGiftRecordRaw(reserved: { [string]: any }, productIdStr: string, giftId: string)
+		for _, key in { PENDING_GIFTS, GIFT_AIMS } do
+			local container = reserved[key]
+			local live = container[productIdStr]
+			if type(live) == "table" and tostring(live.GiftId) == giftId then
+				container[productIdStr] = nil
+			end
 		end
+	end
+
+	local function cancelUnopenedGift(entry: any, productIdStr: string, giftId: string, pending: PurchasePrompt?)
+		if entry.State == "Ready" and not entry.TornDown and ctx.Persistence.EntryFor(entry.Player) == entry then
+			local cleared = cancelGiftRecord(entry, productIdStr, giftId)
+			if cleared and pending and purchasePrompts[entry.Player] == pending and not pending.Closed then
+				pending.Cancelled = true
+				finishCancellation(entry.Player)
+			elseif cleared and promptStopped then
+				ctx.Persistence.AwaitSave(entry, 10)
+			end
+			return
+		end
+		-- The buyer may have left while the intent save was yielding.
+		ctx.Persistence.UpdateOffline(entry.UserId, function(data)
+			local reserved = reservedRaw(data)
+			if not giftHasReceipt(reserved, giftId) then
+				clearGiftRecordRaw(reserved, productIdStr, giftId)
+			end
+		end)
 	end
 
 	--- Keep a record alive while its purchase is still retrying. Same ownership guard as
@@ -455,69 +704,31 @@ function Monetization.new(ctx: any)
 		end
 	end
 
-	--- Reclaim room in the aim store, and say what it cost. Returns how many went.
-	---
-	--- Only aims past the presumption horizon are dropped; inside it an aim may be the last
-	--- durable record of a gift already paid for, so at the cap the store refuses intake.
-	--- Called on intake, not on load: an aim nobody competes for costs nothing to keep, and
-	--- keeping it is what lets it still prove a delivery.
-	local function reclaimGiftAims(entry: any): number
-		local aims = reservedRaw(entry.LiveData).GiftAims
-		local now = Clock.Now()
-		local dropped = 0
-		for productIdStr, aim in aims do
-			if type(aim) == "table" and now - (tonumber(aim.Ts) or 0) <= giftAimTTL then
-				continue
-			end
-			if type(aim) == "table" then
-				Log.Warn(
-					"Gifting",
-					"GIFT_AIM_EXPIRED",
-					"a gift aim past the receipt-retry horizon was dropped to make room; if Roblox ever retries "
-						.. "its receipt it will now be granted to the buyer instead of the recipient",
-					{
-						Player = entry.Player,
-						Product = tostring(aim.Product),
-						RecipientId = tonumber(aim.RecipientId),
-					}
-				)
-				Metrics.Add("GiftAimsExpired")
-			end
-			reservedAcc(entry).GiftAims[productIdStr].Set(nil)
-			dropped += 1
-		end
-		return dropped
-	end
-
-	--- Move a stale intent into the aim store, called by the OnLoad sweep. Deleting it
-	--- instead is what made a late receipt indistinguishable from a self-purchase. The cap
-	--- refuses INTAKE, not eviction: a stored aim may be the only surviving record of a
-	--- gift already paid for, so the NEW aim is refused and says so.
-	local function archiveGiftAim(entry: any, productIdStr: string, intent: any)
+	-- Archive only when the destination fits; otherwise keep the pending intent.
+	local function archiveGiftAim(entry: any, productIdStr: string, intent: any): boolean
 		if type(intent) ~= "table" or (tonumber(intent.RecipientId) or 0) <= 0 or intent.GiftId == nil then
-			return -- nothing to route a receipt with; the sweep just drops it
+			return true -- Preserve the existing malformed-intent cleanup.
 		end
-		local function aimStoreIsFull(): boolean
-			local aims = reservedRaw(entry.LiveData).GiftAims
-			return aims[productIdStr] == nil and Util.count(aims) >= giftAimCap
+		local aims = reservedRaw(entry.LiveData).GiftAims
+		local existing = aims[productIdStr]
+		if existing ~= nil then
+			return type(existing) == "table"
+				and existing.GiftId == intent.GiftId
+				and existing.RecipientId == intent.RecipientId
+				and existing.Product == intent.Product
 		end
-		if aimStoreIsFull() then
-			reclaimGiftAims(entry) -- past-horizon aims only; re-read after it
-		end
-		if aimStoreIsFull() then
+		if Util.count(aims) >= giftAimCap then
 			Log.Warn(
 				"Gifting",
 				"GIFT_AIM_CAP_REACHED",
-				`the gift aim store is at its cap ({giftAimCap}); this gift's recipient was not recorded, so a `
-					.. "receipt Roblox retries for it will be granted to the buyer",
+				`the gift aim store is at its cap ({giftAimCap}); keeping the pending gift until it settles`,
 				{
 					Player = entry.Player,
 					Product = tostring(intent.Product),
 					RecipientId = tonumber(intent.RecipientId),
 				}
 			)
-			Metrics.Add("GiftAimsDropped")
-			return
+			return false
 		end
 		reservedAcc(entry).GiftAims[productIdStr].Set({
 			RecipientId = tonumber(intent.RecipientId),
@@ -525,6 +736,7 @@ function Monetization.new(ctx: any)
 			Ts = tonumber(intent.Ts) or Clock.Now(),
 			Product = intent.Product,
 		})
+		return true
 	end
 
 	local function checkCategory(category: string?)
@@ -1026,7 +1238,7 @@ function Monetization.new(ctx: any)
 	-- is confirmed saved, and callers reporting PurchaseGranted must require `durable`.
 	-- `refundable` means the delivery PROVABLY did not happen, and is false by default:
 	-- every other failure is ambiguous, and refunding one that did happen grants twice.
-	local function deliverGiftLocal(
+	local function deliverGiftLocalCore(
 		recipientEntry: any,
 		product: Product,
 		purchaseId: string,
@@ -1079,6 +1291,30 @@ function Monetization.new(ctx: any)
 		-- local for the same reason as the isProcessed exit above.
 		local durable = ctx.Persistence.AwaitSave(recipientEntry, 10)
 		return true, durable, false
+	end
+
+	local function deliverGiftLocal(
+		recipientEntry: any,
+		product: Product,
+		purchaseId: string,
+		giftId: string,
+		fromUserId: number
+	): (boolean, boolean, boolean)
+		pruneProcessed(recipientEntry)
+		if isProcessed(recipientEntry, purchaseId) then
+			return deliverGiftLocalCore(recipientEntry, product, purchaseId, giftId, fromUserId)
+		end
+		local release, clean = reserveReceipt(recipientEntry, purchaseId)
+		if not release then
+			return false, false, clean
+		end
+		local ok, applied, durable, refundable =
+			pcall(deliverGiftLocalCore, recipientEntry, product, purchaseId, giftId, fromUserId)
+		release()
+		if not ok then
+			error(applied, 0)
+		end
+		return applied, durable, refundable
 	end
 
 	-- Durable delivery to any recipient: same server applies directly, another server or
@@ -1150,7 +1386,7 @@ function Monetization.new(ctx: any)
 			)
 			-- Refundable only where the store says the whole call is clean. A refund after a
 			-- commit hands back a credit whose retry mints a fresh giftId the recipient's
-			-- dedupe ring has never seen, so one credit grants twice. Not "was this the first
+			-- receipt history has never seen, so one credit grants twice. Not "was this the first
 			-- attempt?" either: a throttled request never reaches storage, so a full inbox
 			-- behind one is as clean as a full inbox behind nothing.
 			return false, false, provablyClean == true
@@ -1182,12 +1418,13 @@ function Monetization.new(ctx: any)
 		if type(message) ~= "table" or message.ScribeGift ~= true then
 			return -- not ours; leave it for other handlers
 		end
+		pruneProcessed(entry)
 		local purchaseId = tostring(message.PurchaseId)
 		if isProcessed(entry, purchaseId) then
 			processed()
 			return
 		end
-		local product = productsByName[tostring(message.Product)]
+		local product = productsByName[tostring(message.Product)] or retiredByName[tostring(message.Product)]
 		if not product then
 			Log.Error(
 				"Gifting",
@@ -1203,11 +1440,7 @@ function Monetization.new(ctx: any)
 		-- only surviving durable copy of the paid gift, and processed() removes it for good.
 		-- Ack-ing a merely in-memory grant loses the gift on a crash.
 		--
-		-- Re-delivery is dedupe-safe for PurchaseIdTTL and NOT after: the recipient's
-		-- ProcessedPurchaseIds ring expires and is capped, while the GlobalUpdates queue
-		-- that re-delivers has no horizon at all. Closing that has a storage or correctness
-		-- cost and is written up for the owner. Widening the TTL moves the boundary rather
-		-- than removing it.
+		-- Completion records deduplicate redelivery within the retention window.
 		local _, durable =
 			deliverGiftLocal(entry, product, purchaseId, tostring(message.GiftId), tonumber(message.FromUserId) or 0)
 		if durable then
@@ -1219,6 +1452,22 @@ function Monetization.new(ctx: any)
 
 	local NOT_PROCESSED = Enum.ProductPurchaseDecision.NotProcessedYet
 	local GRANTED = Enum.ProductPurchaseDecision.PurchaseGranted
+
+	local function canInferGift(receiptInfo: any): boolean
+		local channel = receiptInfo.ProductPurchaseChannel
+		-- Legacy receipts omit the channel; other channels cannot select an in-game gift.
+		return channel == nil or channel == Enum.ProductPurchaseChannel.InExperience
+	end
+
+	local function retryGiftRoute(userId: number, product: Product, purchaseId: string): Enum.ProductPurchaseDecision
+		Metrics.Add("ReceiptsRetried")
+		Log.Warn("Monetization", "RECEIPT_RETRY", "gift route or recipient proof unavailable; letting Roblox retry", {
+			UserId = userId,
+			Product = product.Name,
+			PurchaseId = purchaseId,
+		})
+		return NOT_PROCESSED
+	end
 
 	local function recipientAlreadyOwns(recipientUserId: number, perkKey: string): boolean
 		local recipientEntry = ctx.Persistence.EntryForUserId(recipientUserId)
@@ -1290,15 +1539,6 @@ function Monetization.new(ctx: any)
 			})
 			return nil
 		end
-		if Clock.Now() - (tonumber(intent.Ts) or 0) > giftIntentTTL then
-			-- Stale intent (abandoned prompt); the receipt follows the no-intent policy.
-			reservedAcc(entry).PendingGifts[tostring(product.Id)].Set(nil)
-			Log.Warn("Gifting", "GIFT_INTENT_EXPIRED", "stale gift intent expired", {
-				Player = entry.Player,
-				Product = product.Name,
-			})
-			return nil
-		end
 		return intent
 	end
 
@@ -1314,6 +1554,23 @@ function Monetization.new(ctx: any)
 		fromAim: boolean
 	): Enum.ProductPurchaseDecision
 		local purchaseId = tostring(receiptInfo.PurchaseId)
+		local route, invalid = readReceiptRoute(reservedRaw(entry.LiveData), purchaseId, product)
+		if invalid then
+			return retryGiftRoute(entry.UserId, product, purchaseId)
+		end
+		if route == nil then
+			route = giftReceiptRoute(product, intent, fromAim)
+			if not canRecordReceipt(entry.LiveData, purchaseId, entry, nil, route) then
+				return NOT_PROCESSED
+			end
+			reservedAcc(entry).ReceiptReservations[purchaseId].Set(route)
+		end
+		-- Pin the receipt's destination before another profile receives value.
+		if not ctx.Persistence.AwaitSave(entry, 10) then
+			Metrics.Add("ReceiptsRetried")
+			return NOT_PROCESSED
+		end
+		intent, fromAim = route, route.FromAim
 		local recipientId = tonumber(intent.RecipientId) or 0
 		local giftId = tostring(intent.GiftId)
 		local productIdStr = tostring(product.Id)
@@ -1322,20 +1579,24 @@ function Monetization.new(ctx: any)
 		-- delivering would be a no-op grant that burns the buyer's Robux; convert to a gift
 		-- credit instead. Only if this purchase was not already delivered on a prior attempt
 		-- whose buyer-commit failed, or one payment yields both a gift and a credit.
+		local convertToCredit = false
 		if
 			product.Grants
 			and not product.Grant
 			and not allowDuplicateGifts
 			and recipientAlreadyOwns(recipientId, product.Grants)
-			and giftAlreadyDelivered(recipientId, purchaseId) == false
 		then
+			local delivered = giftAlreadyDelivered(recipientId, purchaseId)
+			if delivered == nil then
+				return retryGiftRoute(entry.UserId, product, purchaseId)
+			end
+			convertToCredit = not delivered
+		end
+		if convertToCredit then
 			local creditsAccessor = reservedAcc(entry).GiftCredits[product.Name]
 			creditsAccessor.Set((tonumber(creditsAccessor.Get()) or 0) + 1)
-			-- Clear OUR intent, and only ours: both legs of the condition above yield on the
-			-- recipient's profile, and a second PromptGift past giftPromptWindow can take the
-			-- one-per-product slot over inside that window. Identity is the GiftId, never the
-			-- slot.
-			clearGiftRecord(entry, fromAim, productIdStr, giftId)
+			-- Receipt retries may outlive their original product slot.
+			clearGiftRecord(entry, productIdStr, giftId)
 			robuxLog(entry, {
 				PurchaseId = purchaseId,
 				Product = product.Name,
@@ -1365,20 +1626,14 @@ function Monetization.new(ctx: any)
 
 		local _, durable = deliverGift(product, recipientId, purchaseId, giftId, entry.UserId)
 		if not durable then
-			-- Not confirmed durable; the intent persists, the receipt retries and the retry
-			-- dedupes on the recipient. Refresh the Ts so giftPromptWindow keeps refusing a
-			-- second same-product gift while this paid purchase is still retrying, since an
-			-- overwrite would route its value to the second recipient. deliverGift YIELDS, so
-			-- the refresh re-checks the intent is still ours rather than materializing a
-			-- phantom delivered to userId 0.
+			-- Refresh only our record; delivery may have yielded past a replacement.
 			refreshGiftRecordTs(entry, fromAim, productIdStr, giftId)
 			Metrics.Add("ReceiptsRetried")
 			return NOT_PROCESSED
 		end
 
-		-- Clear OUR intent, and only ours: deliverGift yielded above, so a second PromptGift
-		-- past giftPromptWindow may hold the slot by now. Identity is the GiftId, never the slot.
-		clearGiftRecord(entry, fromAim, productIdStr, giftId)
+		-- A retry must never clear another gift's product slot.
+		clearGiftRecord(entry, productIdStr, giftId)
 		robuxLog(entry, {
 			PurchaseId = purchaseId,
 			Product = product.Name,
@@ -1414,22 +1669,37 @@ function Monetization.new(ctx: any)
 		-- No duplicate check here, deliberately: handleReceipt does it and there is no yield
 		-- between the two, so a copy here could never see anything new.
 
-		-- Read the slot BEFORE intentFor, which clears it when it expires one. What is in
-		-- it decides which of the two questions below may be asked.
-		local staleIntent = readGiftRecord(reservedRaw(entry.LiveData), false, product)
+		local reserved = reservedRaw(entry.LiveData)
+		local route, invalid = readReceiptRoute(reserved, purchaseId, product)
+		if invalid then
+			return retryGiftRoute(entry.UserId, product, purchaseId)
+		end
+		if route then
+			return handleGiftReceipt(entry, product, route, receiptInfo, route.FromAim)
+		end
+		-- Older builds could leave two destinations for one product. Never guess.
+		if
+			hasConflictingGiftRecords(reserved, product.Id)
+			and (canInferGift(receiptInfo) or reserved.ReceiptReservations[purchaseId] == true)
+		then
+			return retryGiftRoute(entry.UserId, product, purchaseId)
+		end
+		local staleIntent = readGiftRecord(reserved, false, product)
+		if reserved.ReceiptReservations[purchaseId] == true then
+			local legacyRecord = staleIntent or readGiftRecord(reserved, true, product)
+			if legacyRecord == nil then
+				return retryGiftRoute(entry.UserId, product, purchaseId)
+			end
+			return handleGiftReceipt(entry, product, legacyRecord, receiptInfo, staleIntent == nil)
+		end
 
-		local intent = intentFor(entry, product)
+		local inferGift = canInferGift(receiptInfo)
+		local intent = if inferGift then intentFor(entry, product) else nil
 		if intent then
 			return handleGiftReceipt(entry, product, intent, receiptInfo, false)
 		end
 
-		-- NO LIVE INTENT. Two questions before the no-intent policy may grant this to the
-		-- buyer. (1) PROOF: was THIS PurchaseId already delivered to the named recipient? A
-		-- self-purchase's id never appears in another ring, so a hit is one payment and two
-		-- grants. (2) PRESUMPTION: a record says a gift of this product was aimed and never
-		-- settled. A guess, bounded to an ARCHIVED aim inside giftAimTTL. Past the horizon
-		-- it falls through to the no-intent policy: value to the wrong player rather than a
-		-- receipt refused forever. The proof leg still works past it.
+		-- Retained aims still own in-experience receipts, regardless of age.
 		local record, fromAim = staleIntent, false
 		if record == nil then
 			record = readGiftRecord(reservedRaw(entry.LiveData), true, product)
@@ -1437,9 +1707,12 @@ function Monetization.new(ctx: any)
 		end
 		if record then
 			local aimedAt = tonumber(record.RecipientId) or 0
-			local presumable = fromAim and Clock.Now() - (tonumber(record.Ts) or 0) <= giftAimTTL
-			-- `or` short-circuits: a presumable aim spends no round trip on the recipient.
-			if presumable or giftAlreadyDelivered(aimedAt, purchaseId) == true then
+			local presumable = inferGift and fromAim
+			local delivered = if presumable then true else giftAlreadyDelivered(aimedAt, purchaseId)
+			if delivered == nil then
+				return retryGiftRoute(entry.UserId, product, purchaseId)
+			end
+			if delivered then
 				if fromAim then
 					Log.Warn(
 						"Gifting",
@@ -1457,15 +1730,15 @@ function Monetization.new(ctx: any)
 				end
 				return handleGiftReceipt(entry, product, record, receiptInfo, fromAim)
 			end
+			if inferGift and not fromAim then
+				clearGiftRecord(entry, tostring(product.Id), tostring(record.GiftId))
+			end
 		end
 
 		-- No matching intent: NoGiftIntentPolicy. A product with a consumable Grant still
 		-- delivers real value, so the credit path only covers pure perk products.
 		if product.Grants and not product.Grant and self.Owns(entry.Player, product.Grants) then
-			-- An unused gift credit means a previous purchase already converted to re-aimable
-			-- value, so this money could only stack a second credit. Decline; Roblox retries
-			-- and refunds a never-processed purchase, and a credit spent meanwhile lets the
-			-- retry process normally.
+			-- Hold further credits until the existing paid credit is spent. Roblox may retry later.
 			if (tonumber(reservedRaw(entry.LiveData).GiftCredits[product.Name]) or 0) > 0 then
 				Log.Warn(
 					"Gifting",
@@ -1587,19 +1860,54 @@ function Monetization.new(ctx: any)
 		fromAim: boolean
 	): Enum.ProductPurchaseDecision
 		local purchaseId = tostring(receiptInfo.PurchaseId)
+		local productIdStr = tostring(product.Id)
+
+		-- Persist the route and capacity before another profile receives value.
+		local completed = false
+		local reservedOk = ctx.Persistence.UpdateOffline(userId, function(offlineData)
+			pruneProcessedRaw(offlineData)
+			if isProcessedRaw(offlineData, purchaseId) then
+				completed = true
+				return
+			end
+			local route, invalid = readReceiptRoute(reservedRaw(offlineData), purchaseId, product)
+			if invalid then
+				error("gift receipt route does not match this product", 0)
+			end
+			if route == nil then
+				route = giftReceiptRoute(product, record, fromAim)
+			end
+			if not canRecordReceipt(offlineData, purchaseId, nil, userId, route) then
+				error("receipt history full", 0)
+			end
+			reservedRaw(offlineData).ReceiptReservations[purchaseId] = route
+			record, fromAim = route, route.FromAim
+		end)
+		if not reservedOk then
+			return NOT_PROCESSED
+		end
+		if completed then
+			return GRANTED
+		end
 		local recipientId = tonumber(record.RecipientId) or 0
 		local giftId = tostring(record.GiftId)
-		local productIdStr = tostring(product.Id)
 
 		-- Same recipient re-check as the online intent path: a no-op delivery burns the
 		-- buyer's Robux, so convert to a credit, but only if this exact purchase is undelivered.
+		local convertToCredit = false
 		if
 			product.Grants
 			and not product.Grant
 			and not allowDuplicateGifts
 			and recipientAlreadyOwns(recipientId, product.Grants)
-			and giftAlreadyDelivered(recipientId, purchaseId) == false
 		then
+			local delivered = giftAlreadyDelivered(recipientId, purchaseId)
+			if delivered == nil then
+				return retryGiftRoute(userId, product, purchaseId)
+			end
+			convertToCredit = not delivered
+		end
+		if convertToCredit then
 			local ok = ctx.Persistence.UpdateOffline(userId, function(offlineData)
 				-- The dedupe marker, re-read INSIDE the transaction: the decision above was
 				-- made against a GetOffline snapshot, so a cycle that committed in between is
@@ -1616,7 +1924,7 @@ function Monetization.new(ctx: any)
 				-- snapshot taken before two round trips, and a second gift of the same
 				-- product can hold the slot by now with the key unlocked, so nothing refuses.
 				-- Identity is the GiftId, never the slot.
-				clearGiftRecordRaw(offlineReserved, fromAim, productIdStr, giftId)
+				clearGiftRecordRaw(offlineReserved, productIdStr, giftId)
 				offlineReserved.GiftCredits[product.Name] = (tonumber(offlineReserved.GiftCredits[product.Name]) or 0)
 					+ 1
 				robuxLogRaw(offlineData, {
@@ -1646,11 +1954,7 @@ function Monetization.new(ctx: any)
 
 		local _, durable = deliverGift(product, recipientId, purchaseId, giftId, userId)
 		if not durable then
-			-- The record's age is wall time and keeps running while Roblox retries, so without
-			-- this refresh an offline buyer's retries outlive giftIntentTTL and the next attempt
-			-- grants the perk to the BUYER. Through an UpdateOffline transform, never a bare
-			-- write on the GetOffline snapshot: deliverGift YIELDED, so the slot may now belong
-			-- to a second gift. Best effort; the answer stays NotProcessedYet.
+			-- Keep retry activity current without modifying a replacement record.
 			ctx.Persistence.UpdateOffline(userId, function(offlineData)
 				local offlineReserved = reservedRaw(offlineData)
 				local live = offlineReserved[giftRecordKey(fromAim)][productIdStr]
@@ -1662,6 +1966,7 @@ function Monetization.new(ctx: any)
 		end
 		local ok = ctx.Persistence.UpdateOffline(userId, function(offlineData)
 			-- The dedupe marker, re-read INSIDE the transaction; see the credit arm above.
+			pruneProcessedRaw(offlineData)
 			if isProcessedRaw(offlineData, purchaseId) then
 				return
 			end
@@ -1670,7 +1975,7 @@ function Monetization.new(ctx: any)
 			-- made from a snapshot taken before deliverGift's cross-server round trip, and a
 			-- second gift of the same product can hold the slot by now. Identity is the
 			-- GiftId, never the slot.
-			clearGiftRecordRaw(offlineReserved, fromAim, productIdStr, giftId)
+			clearGiftRecordRaw(offlineReserved, productIdStr, giftId)
 			robuxLogRaw(offlineData, {
 				PurchaseId = purchaseId,
 				Product = product.Name,
@@ -1716,7 +2021,29 @@ function Monetization.new(ctx: any)
 		end
 
 		local reserved = reservedRaw(data)
-		local intent = reserved.PendingGifts[tostring(product.Id)]
+		local route, invalid = readReceiptRoute(reserved, purchaseId, product)
+		if invalid then
+			return retryGiftRoute(userId, product, purchaseId)
+		end
+		if route then
+			return settleOfflineGift(userId, product, receiptInfo, route, route.FromAim)
+		end
+		if
+			hasConflictingGiftRecords(reserved, product.Id)
+			and (canInferGift(receiptInfo) or reserved.ReceiptReservations[purchaseId] == true)
+		then
+			return retryGiftRoute(userId, product, purchaseId)
+		end
+		if reserved.ReceiptReservations[purchaseId] == true then
+			local legacyIntent = readGiftRecord(reserved, false, product)
+			local legacyRecord = legacyIntent or readGiftRecord(reserved, true, product)
+			if legacyRecord == nil then
+				return retryGiftRoute(userId, product, purchaseId)
+			end
+			return settleOfflineGift(userId, product, receiptInfo, legacyRecord, legacyIntent == nil)
+		end
+		local inferGift = canInferGift(receiptInfo)
+		local intent = if inferGift then reserved.PendingGifts[tostring(product.Id)] else nil
 		-- Mirror intentFor's reused-Id guard: an intent whose stored Product name differs
 		-- belongs to a retired product that reused this Id. Treat as no-intent.
 		if type(intent) == "table" and intent.Product ~= nil and intent.Product ~= product.Name then
@@ -1731,7 +2058,7 @@ function Monetization.new(ctx: any)
 			)
 			intent = nil
 		end
-		if type(intent) == "table" and Clock.Now() - (tonumber(intent.Ts) or 0) <= giftIntentTTL then
+		if type(intent) == "table" then
 			return settleOfflineGift(userId, product, receiptInfo, intent, false)
 		end
 
@@ -1745,8 +2072,12 @@ function Monetization.new(ctx: any)
 		end
 		if record then
 			local aimedAt = tonumber(record.RecipientId) or 0
-			local presumable = fromAim and Clock.Now() - (tonumber(record.Ts) or 0) <= giftAimTTL
-			if presumable or giftAlreadyDelivered(aimedAt, purchaseId) == true then
+			local presumable = inferGift and fromAim
+			local delivered = if presumable then true else giftAlreadyDelivered(aimedAt, purchaseId)
+			if delivered == nil then
+				return retryGiftRoute(userId, product, purchaseId)
+			end
+			if delivered then
 				if fromAim then
 					Log.Warn(
 						"Gifting",
@@ -1793,8 +2124,12 @@ function Monetization.new(ctx: any)
 			end
 			local ok = ctx.Persistence.UpdateOffline(userId, function(offlineData)
 				-- The dedupe marker, re-read INSIDE the transaction; see settleOfflineGift.
+				pruneProcessedRaw(offlineData)
 				if isProcessedRaw(offlineData, purchaseId) then
 					return
+				end
+				if not canRecordReceipt(offlineData, purchaseId, nil, userId) then
+					error("receipt history full", 0)
 				end
 				local offlineReserved = reservedRaw(offlineData)
 				-- ownsPerk is pass-aware and resolved before the transaction; the in-txn
@@ -1831,35 +2166,36 @@ function Monetization.new(ctx: any)
 		return NOT_PROCESSED
 	end
 
-	-- Shared receipt path. `strict` decides what an UNREGISTERED product means:
-	--  * true (Scribe owns ProcessReceipt): a configuration mistake. Log it and return
-	--    NotProcessedYet, so Roblox retries and the Robux are never eaten.
-	--  * false (an external router owns it): not ours. Return nil with no log so the
-	--    caller falls through; NotProcessedYet would stall their purchase in a retry loop.
-	local function handleReceipt(receiptInfo: any, strict: boolean): Enum.ProductPurchaseDecision?
-		local userId = tonumber(receiptInfo.PlayerId) or 0
-		local productId = tonumber(receiptInfo.ProductId) or 0
-		local product = productsById[productId]
-
-		if not product then
-			if not strict then
-				return nil
-			end
-			Metrics.Add("ReceiptsReceived")
-			Log.Error(
-				"Monetization",
-				"RECEIPT_UNKNOWN_PRODUCT",
-				`receipt for unregistered product {productId}: register it in Products`,
-				{
-					UserId = userId,
-					ProductId = productId,
-				}
-			)
+	local function processReceipt(userId: number, product: Product, receiptInfo: any): Enum.ProductPurchaseDecision
+		if promptStopped or ctx.Persistence.Stopped or ctx.Persistence.Closing then
+			Metrics.Add("ReceiptsRetried")
 			return NOT_PROCESSED
 		end
-		Metrics.Add("ReceiptsReceived")
-
+		local productId = product.Id
 		local entry: { [string]: any }? = ctx.Persistence.EntryForUserId(userId)
+		local player = if entry then entry.Player else Players:GetPlayerByUserId(userId)
+		if player and (not entry or entry.State ~= "Ready") then
+			-- Join receipts can arrive before Scribe starts or finishes loading.
+			local timeout = math.max(60, tonumber(options.LoadTimeout) or 120)
+			local data = ctx.Persistence.WaitForData(player, timeout)
+			entry = ctx.Persistence.EntryForUserId(userId)
+			if
+				promptStopped
+				or ctx.Persistence.Stopped
+				or ctx.Persistence.Closing
+				or not data
+				or not entry
+				or entry.Player ~= player
+				or entry.State ~= "Ready"
+				or entry.TornDown
+			then
+				Metrics.Add("ReceiptsRetried")
+				return NOT_PROCESSED
+			end
+		end
+		if entry and entry.State == "Ready" then
+			pruneProcessed(entry)
+		end
 		if
 			product.PaidRandom
 			and entry
@@ -1868,7 +2204,7 @@ function Monetization.new(ctx: any)
 			and entry.Policy.Restricted
 			and not isProcessed(entry, tostring(receiptInfo.PurchaseId))
 		then
-			-- Only a prompt made outside Scribe reaches here. The money has moved, so grant.
+			-- External sales bypass prompt checks; the buyer has already paid.
 			Log.Warn(
 				"Monetization",
 				"PAID_RANDOM_RECEIPT",
@@ -1902,13 +2238,43 @@ function Monetization.new(ctx: any)
 			return NOT_PROCESSED
 		end
 
-		-- The in-flight guard sits here because all three delivery paths dispatch from the
-		-- two lines below. The persisted ring is a COMPLETION record, written only after the
-		-- grant commits, so between the duplicate check above and that write a second
-		-- delivery of the same receipt sees "not yet granted", and every yield inside widens
-		-- the window. It does NOT wait for the other invocation: that would park one
-		-- ProcessReceipt callback across another's AwaitSave, and on the gift path could wait
-		-- on the offline lock it is queued behind. Roblox retries a NotProcessedYet instead.
+		if entry and entry.State == "Ready" then
+			local release = reserveReceipt(entry, tostring(receiptInfo.PurchaseId))
+			if not release then
+				Metrics.Add("ReceiptsRetried")
+				return NOT_PROCESSED
+			end
+			local ok, result = pcall(handleOnlineReceipt, entry, product, receiptInfo)
+			release()
+			if not ok then
+				error(result, 0)
+			end
+			return result
+		end
+		return handleOfflineReceipt(userId, product, receiptInfo)
+	end
+
+	-- Unknown products fall through only when an external receipt router owns them.
+	local function handleReceipt(receiptInfo: any, strict: boolean): Enum.ProductPurchaseDecision?
+		local userId = tonumber(receiptInfo.PlayerId) or 0
+		local productId = tonumber(receiptInfo.ProductId) or 0
+		local product = productsById[productId]
+		if not product then
+			if not strict then
+				return nil
+			end
+			Metrics.Add("ReceiptsReceived")
+			Log.Error(
+				"Monetization",
+				"RECEIPT_UNKNOWN_PRODUCT",
+				`receipt for unregistered product {productId}: register it in Products`,
+				{ UserId = userId, ProductId = productId }
+			)
+			return NOT_PROCESSED
+		end
+		Metrics.Add("ReceiptsReceived")
+
+		-- Claim before waiting so duplicate callbacks cannot queue another grant.
 		local flightKey = `{userId}|{tostring(receiptInfo.PurchaseId)}`
 		if receiptsInFlight[flightKey] then
 			Metrics.Add("ReceiptsRetried")
@@ -1921,15 +2287,8 @@ function Monetization.new(ctx: any)
 			return NOT_PROCESSED
 		end
 		receiptsInFlight[flightKey] = true
-		-- pcall because applyProductGrant calls Tree:RunTransaction unguarded and assertAlive
-		-- raises on a torn-down tree, the receipt-vs-departure race. Releasing only on a
-		-- normal return would leak this key and refuse the receipt for the rest of the session.
-		local dispatchOk, decision = pcall(function()
-			if entry and entry.State == "Ready" then
-				return handleOnlineReceipt(entry, product, receiptInfo)
-			end
-			return handleOfflineReceipt(userId, product, receiptInfo)
-		end)
+		-- Release the claim even if loading or granting throws.
+		local dispatchOk, decision = pcall(processReceipt, userId, product, receiptInfo)
 		receiptsInFlight[flightKey] = nil
 		if not dispatchOk then
 			error(decision, 0)
@@ -1997,13 +2356,23 @@ function Monetization.new(ctx: any)
 		end)
 	end
 
+	-- Client requests and direct server calls share the same eligibility gate and
+	-- active dialog. A request carries a registry name, never an arbitrary asset ID.
 	function self.PromptPurchase(player: Player, name: string): (boolean, string?)
 		local product = productsByName[name]
 		local pass = passesByName[name]
 		if not product and not pass then
 			return false, `unknown product or pass "{name}"`
 		end
-		local state = productState(ctx.Persistence.EntryFor(player), name, product, pass)
+		local entry = ctx.Persistence.EntryFor(player)
+		if promptStopped or not entry or entry.State ~= "Ready" or entry.TornDown then
+			return false, "not-loaded"
+		end
+		finishCancellation(player)
+		if promptStopped or entry.State ~= "Ready" or entry.TornDown or ctx.Persistence.EntryFor(player) ~= entry then
+			return false, "not-loaded"
+		end
+		local state = productState(entry, name, product, pass)
 		if state ~= "purchasable" then
 			if state == "paid-random-restricted" or state == "policy-pending" then
 				Metrics.Add("PaidRandomRefused")
@@ -2011,32 +2380,70 @@ function Monetization.new(ctx: any)
 			return false, state
 		end
 
-		local promptId: number
-		local prompt: (player: Player, id: number) -> ()
-		if pass then
-			promptId, prompt = pass.Id, promptGamePassPurchase
-		else
-			promptId, prompt = (product :: any).Id, promptProductPurchase
+		if purchasePrompts[player] or (product and hasPendingGift(entry, product.Id)) then
+			return false, "purchase prompt already open"
 		end
+		local promptId = if pass then pass.Id else (product :: Product).Id
+		local prompt = if pass then promptGamePassPurchase else promptProductPurchase
+		local pending: PurchasePrompt = { Entry = entry, Closed = false }
+		purchasePrompts[player] = pending
+		local prompted = false
 
+		-- Subscribe before prompting: even a prompt which closes immediately releases
+		-- its guard. The listener exists only while this player's dialog is active.
 		local ok, err = pcall(function()
+			local finished = if pass
+				then options.PromptGamePassPurchaseFinished or MarketplaceService.PromptGamePassPurchaseFinished
+				else options.PromptProductPurchaseFinished or MarketplaceService.PromptProductPurchaseFinished
+			local connection = finished:Connect(function(target: any, finishedId: number)
+				local matchingPlayer = if pass then target == player else target == entry.UserId
+				if matchingPlayer and finishedId == promptId and ctx.Persistence.EntryFor(player) == entry then
+					clearPurchasePrompt(player, pending)
+				end
+			end)
+			pending.Connection = connection
+			-- A test seam may yield or run teardown from Connect. Never leave its late
+			-- connection attached, nor prompt for a session that ended in that gap.
+			if
+				pending.Closed
+				or promptStopped
+				or entry.State ~= "Ready"
+				or entry.TornDown
+				or ctx.Persistence.EntryFor(player) ~= entry
+			then
+				clearPurchasePrompt(player, pending)
+				return
+			end
 			prompt(player, promptId)
+			prompted = true
 		end)
 		if not ok then
+			clearPurchasePrompt(player, pending)
 			return false, `purchase prompt failed: {err}`
+		end
+		if not prompted then
+			return false, "not-loaded"
 		end
 		Metrics.Add("PurchasePrompts")
 		return true, nil
 	end
 
-	function self.PromptGift(buyer: Player, productName: string, recipientUserId: number): (boolean, string?)
-		local product = productsByName[productName]
+	local function promptGift(
+		buyer: Player,
+		productName: string,
+		recipientUserId: number,
+		pending: PurchasePrompt?
+	): (boolean, string?)
+		local product = productsByName[productName] or retiredByName[productName]
 		if not product then
 			return false, `unknown product "{productName}"`
 		end
 		local entry = ctx.Persistence.EntryFor(buyer)
-		if not entry or entry.State ~= "Ready" then
+		if promptStopped or not entry or entry.State ~= "Ready" or entry.TornDown then
 			return false, "buyer data not loaded"
+		end
+		if product.Retired and (tonumber(reservedRaw(entry.LiveData).GiftCredits[productName]) or 0) <= 0 then
+			return false, "product retired"
 		end
 		if type(recipientUserId) ~= "number" or recipientUserId <= 0 or recipientUserId % 1 ~= 0 then
 			return false, "invalid recipient"
@@ -2069,30 +2476,22 @@ function Monetization.new(ctx: any)
 		if Util.count(reservedRaw(entry.LiveData).PendingGifts) >= giftMaxPending then
 			return false, "too many pending gifts"
 		end
-		-- The aim store's cap, enforced at INTAKE before money moves: if this prompt goes
-		-- stale while the buyer is away the load sweep has to be able to archive where it was
-		-- aimed, and refusing an unpaid prompt is the cheap end of that trade. It RESERVES
-		-- rather than measures, because every pending intent is a slot this store already
-		-- owes. A product whose slot is already taken is free, since the record overwrites it.
+		-- Reserve archive capacity before opening a paid prompt.
 		local productIdStr = tostring(product.Id)
-		-- Counts the STORE alone, unlike PromptGift's reservation: by now the intent is
-		-- being spent into a slot, and counting it too would charge the same gift twice.
+		-- Count each product once across active and archived intents.
 		local function aimStoreIsFull(): boolean
 			local live = reservedRaw(entry.LiveData)
-			local aims, pending = live.GiftAims, live.PendingGifts
-			if aims[productIdStr] ~= nil or pending[productIdStr] ~= nil then
+			local aims, intents = live.GiftAims, live.PendingGifts
+			if aims[productIdStr] ~= nil or intents[productIdStr] ~= nil then
 				return false
 			end
 			local reservedSlots = Util.count(aims)
-			for pendingIdStr in pending do
+			for pendingIdStr in intents do
 				if aims[pendingIdStr] == nil then
 					reservedSlots += 1
 				end
 			end
 			return reservedSlots >= giftAimCap
-		end
-		if aimStoreIsFull() then
-			reclaimGiftAims(entry) -- past-horizon aims only; re-read after it
 		end
 		if aimStoreIsFull() then
 			Log.Warn(
@@ -2131,7 +2530,7 @@ function Monetization.new(ctx: any)
 		-- State, not entry.Tree.Dead: teardown sets SessionEnded before it destroys the tree,
 		-- so State is the strictly earlier signal and also covers the window where the
 		-- session is going away but the tree is still alive.
-		if entry.State ~= "Ready" then
+		if promptStopped or entry.State ~= "Ready" or entry.TornDown or ctx.Persistence.EntryFor(buyer) ~= entry then
 			return false, "buyer data not loaded"
 		end
 
@@ -2178,7 +2577,7 @@ function Monetization.new(ctx: any)
 			end
 			-- ONE RULE AT TWO GATES: prefer a bounded value loss over a double grant. This
 			-- spend has no id a retry could reuse, so a credit handed back can buy a SECOND
-			-- grant under a purchaseId the recipient's dedupe ring has never seen.
+			-- grant under a purchaseId the recipient's receipt history has never seen.
 			-- First gate, on `applied` not `durable`: a same-server grant is marked processed
 			-- under this giftId and persists on the next save. Second gate, on `refundable`:
 			-- MessageAsync can commit and lose its answer. A raise out of deliverGift would
@@ -2233,13 +2632,12 @@ function Monetization.new(ctx: any)
 			return true, nil
 		end
 
-		-- Step 3: durable intent BEFORE money moves. Refuse a second gift of the same product
-		-- only while a purchase could still be in flight: a receipt carries only the product
-		-- Id, never the recipient, so intents are keyed by it and overwriting a live one
-		-- would deliver the first purchase to the second recipient. Past giftPromptWindow no
-		-- receipt ever came and the slot is safe to overwrite.
-		local pendingIntent = intentFor(entry, product)
-		if pendingIntent ~= nil and Clock.Now() - (tonumber(pendingIntent.Ts) or 0) < giftPromptWindow then
+		if product.Retired then
+			return false, "product retired"
+		end
+
+		-- Recheck after recipient lookups: no yield may replace an unresolved destination.
+		if not pending or pending.Closed or purchasePrompts[buyer] ~= pending or hasPendingGift(entry, product.Id) then
 			return false, "a gift of this item is already pending; try again shortly"
 		end
 		local giftId = Util.guid()
@@ -2250,14 +2648,9 @@ function Monetization.new(ctx: any)
 			Ts = Clock.Now(),
 			Product = productName,
 		})
-		-- Both rollbacks below clear through clearGiftRecord and neither reuses
-		-- `intentAccessor`: that accessor is a PATH captured before the AwaitSave yields, so
-		-- Set(nil) on it would delete whatever occupies the slot when the rollback runs, and
-		-- inside a ten-second save a second PromptGift can legally have taken it over. A
-		-- GiftId comparison rather than an existence test, because in the hazard the slot IS
-		-- occupied, just by someone else.
+		-- Roll back only this attempt, never a replacement written during the save.
 		if not ctx.Persistence.AwaitSave(entry, 10) then
-			clearGiftRecord(entry, false, productIdStr, giftId)
+			cancelUnopenedGift(entry, productIdStr, giftId, pending)
 			Log.Error("Gifting", "GIFT_INTENT_WRITE_FAIL", "could not durably record gift intent; refusing prompt", {
 				Player = buyer,
 				Product = productName,
@@ -2265,16 +2658,88 @@ function Monetization.new(ctx: any)
 			return false, "could not record gift intent; try again later"
 		end
 
-		-- Step 4: prompt the purchase.
+		local function stillCurrent(): boolean
+			local live = reservedRaw(entry.LiveData).PendingGifts[productIdStr]
+			return not promptStopped
+				and not pending.Closed
+				and purchasePrompts[buyer] == pending
+				and entry.State == "Ready"
+				and not entry.TornDown
+				and ctx.Persistence.EntryFor(buyer) == entry
+				and type(live) == "table"
+				and live.GiftId == giftId
+		end
+		if not stillCurrent() then
+			cancelUnopenedGift(entry, productIdStr, giftId, pending)
+			return false, "buyer data not loaded"
+		end
+
+		local opened = false
 		local ok, err = pcall(function()
+			local finished = options.PromptProductPurchaseFinished or MarketplaceService.PromptProductPurchaseFinished
+			local connection = finished:Connect(function(userId: number, finishedId: number, purchased: boolean)
+				if not opened or pending.Closed or pending.Cancelled or purchasePrompts[buyer] ~= pending then
+					return
+				end
+				if userId ~= entry.UserId or finishedId ~= product.Id or ctx.Persistence.EntryFor(buyer) ~= entry then
+					return
+				end
+				if purchased == false and cancelGiftRecord(entry, productIdStr, giftId) then
+					-- Save cancellation before another receipt can be prompted.
+					pending.Cancelled = true
+					finishCancellation(buyer)
+					return
+				end
+				clearPurchasePrompt(buyer, pending)
+			end)
+			pending.Connection = connection
+			if not stillCurrent() then
+				clearPurchasePrompt(buyer, pending)
+				return
+			end
+			opened = true
 			promptProductPurchase(buyer, product.Id)
 		end)
 		if not ok then
-			clearGiftRecord(entry, false, productIdStr, giftId)
+			cancelUnopenedGift(entry, productIdStr, giftId, pending)
 			return false, `purchase prompt failed: {err}`
+		end
+		if not opened then
+			cancelUnopenedGift(entry, productIdStr, giftId, pending)
+			return false, "buyer data not loaded"
 		end
 		Metrics.Add("GiftPrompts")
 		return true, nil
+	end
+
+	function self.PromptGift(buyer: Player, productName: string, recipientUserId: number): (boolean, string?)
+		finishCancellation(buyer)
+		local entry = ctx.Persistence.EntryFor(buyer)
+		local product = productsByName[productName] or retiredByName[productName]
+		if not product or product.Retired or promptStopped or not entry or entry.State ~= "Ready" or entry.TornDown then
+			return promptGift(buyer, productName, recipientUserId, nil)
+		end
+		-- Credits create no purchase dialog or unbound receipt.
+		if (tonumber(reservedRaw(entry.LiveData).GiftCredits[productName]) or 0) > 0 then
+			return promptGift(buyer, productName, recipientUserId, nil)
+		end
+		if purchasePrompts[buyer] or hasPendingGift(entry, product.Id) then
+			return false, "a gift of this item is already pending; try again shortly"
+		end
+		local pending: PurchasePrompt = { Entry = entry, Closed = false }
+		purchasePrompts[buyer] = pending
+		local ok, prompted, reason = pcall(promptGift, buyer, productName, recipientUserId, pending)
+		if (not ok or not prompted) and not pending.Cancelled then
+			clearPurchasePrompt(buyer, pending)
+		end
+		if not ok then
+			error(prompted, 0)
+		end
+		-- A credit could have arrived during the recipient lookup.
+		if pending.Connection == nil and not pending.Cancelled then
+			clearPurchasePrompt(buyer, pending)
+		end
+		return prompted, reason
 	end
 
 	function self.GetGiftCredits(player: Player): { [string]: number }
@@ -2354,8 +2819,7 @@ function Monetization.new(ctx: any)
 			end
 		end
 		-- Optional caller-supplied idempotency key. Deliberately NOT stored in
-		-- _Scribe.ProcessedPurchaseIds: pushing ordinary shop traffic through that capped
-		-- ring would flush real receipt ids.
+		-- _Scribe.ProcessedPurchaseIds: ordinary shop claims should expire independently.
 		local idemKey = spec.IdempotencyKey
 		if idemKey ~= nil then
 			-- Wire's cap, read at the use site rather than aliased: a local literal is how
@@ -2519,25 +2983,26 @@ function Monetization.new(ctx: any)
 	-- Lifecycle -----------------------------------------------------------------------------
 
 	function self.OnLoad(entry: any)
-		-- Expire stale gift intents, but ARCHIVE what they aimed at first. Deleting the
-		-- recipient outright leaves a late receipt indistinguishable from a self-purchase, so
-		-- the buyer is granted a gift they already paid to send. The intent itself still
-		-- goes, or the buyer loses gift capacity for good.
+		pruneProcessed(entry)
+		-- Archive stale intents without discarding unresolved destinations.
 		local reserved = reservedRaw(entry.LiveData)
 		local now = Clock.Now()
 		for productIdStr, intent in reserved.PendingGifts do
 			if type(intent) ~= "table" or now - (tonumber(intent.Ts) or 0) > giftIntentTTL then
-				archiveGiftAim(entry, productIdStr, intent)
-				reservedAcc(entry).PendingGifts[productIdStr].Set(nil)
+				if archiveGiftAim(entry, productIdStr, intent) then
+					reservedAcc(entry).PendingGifts[productIdStr].Set(nil)
+				end
 			end
 		end
-		-- No prune here on purpose. An aim past the horizon can no longer CLAIM a receipt but
-		-- can still PROVE one was delivered, and that proof is free to keep: the store is
-		-- bounded by its cap and reclaims on intake, where something competes for the room.
+		-- Time alone cannot prove an unresolved gift was cancelled.
 		-- Gift credits are durable paid value keyed by product NAME, so a renamed or removed
 		-- product silently strands them. Surface it, never delete: the credit is player money.
 		for creditName, count in reserved.GiftCredits do
-			if productsByName[creditName] == nil and (tonumber(count) or 0) > 0 then
+			if
+				productsByName[creditName] == nil
+				and retiredByName[creditName] == nil
+				and (tonumber(count) or 0) > 0
+			then
 				Log.Warn(
 					"Gifting",
 					"GIFT_CREDIT_UNKNOWN_PRODUCT",
@@ -2560,6 +3025,10 @@ function Monetization.new(ctx: any)
 	end
 
 	function self.OnUnload(entry: any)
+		local pending = purchasePrompts[entry.Player]
+		if pending and pending.Entry == entry then
+			clearPurchasePrompt(entry.Player, pending)
+		end
 		local watchers = entry.OwnsWatchers
 		if watchers then
 			entry.OwnsWatchers = nil
@@ -2620,6 +3089,10 @@ function Monetization.new(ctx: any)
 	-- guard is module-global, so leaving it set would make a later bundle in the same
 	-- process throw even though nothing owns the handler.
 	function self.Stop()
+		promptStopped = true
+		for player, pending in purchasePrompts do
+			clearPurchasePrompt(player, pending)
+		end
 		for _, connection in connections do
 			pcall(function()
 				connection:Disconnect()

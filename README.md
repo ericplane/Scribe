@@ -1,6 +1,6 @@
 # Scribe
 
-**Persistent, fully-typed, automatically-replicated player data for Roblox Luau, built on [ProfileStore](https://madstudioroblox.github.io/ProfileStore/).**
+**Persistent, fully-typed, automatically-replicated player data for Roblox Luau and roblox-ts, built on [ProfileStore](https://madstudioroblox.github.io/ProfileStore/).**
 
 📖 **[Full documentation → ericplane.github.io/Scribe](https://ericplane.github.io/Scribe/)**
 🔌 **[Studio plugin → Scribe Studio](https://create.roblox.com/store/asset/113609038046646/Scribe-Studio)**
@@ -8,8 +8,12 @@
 ```toml
 # wally.toml
 [dependencies]
-Scribe = "ericplane/scribe@2.4.0"
+Scribe = "ericplane/scribe@2.5.0"
 ```
+
+roblox-ts support is prepared as `@rbxts/scribe`, with inferred schema and API types
+over the same Luau runtime. npm publication requires the initial registry setup;
+see the [roblox-ts guide](docgen/guides/roblox-ts.md) for installation and examples.
 
 - **Fully typed.** A type-solver-generated accessor tree types your data end to end (`data.Coins.Increment(50)`, nested containers, arrays, and datatype fields), checked at compile time.
 - **Schemas all the way down.** `Scribe.ArrayOf` and `Scribe.DictOf` give array and dictionary *entries* a schema, so `data.Plots[1].Origin` is a typed `CFrame` that packs to 13 bytes, with per-element bounds and size caps.
@@ -61,9 +65,18 @@ end)
 
 For declarators, replication + visibility, monetization, leaderboards, migrations, diagnostics, and the full API, see the **[documentation](https://ericplane.github.io/Scribe/)**.
 
-Optional add-ons live in [`addons/`](addons/README.md): copy-in UI bridges for Vide, React and Fusion, and `ScribeTelemetry`, which posts Scribe's health, failures and summaries to Discord webhooks from the server.
+Optional add-ons live in [`addons/`](addons/README.md): copy-in UI bridges for Vide, React and Fusion;
+`ScribeTelemetry`, which posts Scribe's health, failures and summaries to Discord webhooks;
+and `ScribeLeaderstats`, which keeps Roblox's player list synced with selected data paths.
+
+For roblox-ts, each addon is a separate optional package: `@rbxts/scribe-react`,
+`@rbxts/scribe-vide`, `@rbxts/scribe-fusion`, `@rbxts/scribe-telemetry`, and
+`@rbxts/scribe-leaderstats`. The core package includes no addons or UI dependencies.
 
 ## Development
+
+Package builds and `npm test` also need Python 3.10+. See [release packaging](bundle/README.md)
+for staged sources and the source-line maps included with published packages.
 
 ```bash
 rokit install              # wally + rojo + selene + luau-lsp + lune + stylua toolchain
@@ -71,11 +84,13 @@ wally install              # dependencies
 selene src test lune addons       # lint
 stylua --check src test lune addons  # formatting (drop --check to apply)
 lune run lune/run-tests    # run the test suite (headless, ~2s)
+npm ci                    # install pinned roblox-ts development tools
+npm test                  # check declarations, packages, and compiled Luau consumers
 ```
 
 The same lint, format, test, and type-check (luau-lsp) checks run in CI on every
 pull request (`.github/workflows/ci.yml`), and releases are gated on a green run.
-Mark the `test`, `lint`, `format`, `analyze`, and `version-check` checks as
+Mark the `test`, `lint`, `format`, `analyze`, `roblox-ts`, and `version-check` checks as
 required in the repository's branch-protection settings to enforce them on merge.
 
 Docs are built with [Astro Starlight](https://starlight.astro.build/) from the doc-comments in `src/` and the guides in `docgen/guides/`. The site lives in `docs-site/`; see [docgen/README.md](docgen/README.md) for preview and check commands.

@@ -82,7 +82,7 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | `Transport` | `(ScribeTransport \| "Default")?` | `"Default"` | Picks the server-to-client replication channel. Supply an adapter table only to route replication through your own networking layer. See [Custom Transports](./transports). |
 | `Migrations` | `{ [number]: (data) -> () }?` | `{}` | Maps each data version from 2 upward to a function that upgrades stored data to it. See [Offline Profiles](./profiles#migrations). |
 | `MigrationShadow` | `boolean?` | off | Re-runs your migration chain a second time against the raw pre-reconcile data and warns where the two disagree. |
-| `ServerStore` | `{ [string]: any }?` | none | Declares a second tree owned by the server rather than by any player: one table for the whole server, never saved, replicated to everyone. See [The Server Store](./server-store). |
+| `ServerStore` | store template? | none | One tree for the whole server, never saved, replicated to everyone by default. Fields and accessors are inferred from this template. See [The Server Store](./server-store). |
 | `Economy` | `EconomyConfig?` | none | Per-currency labels, custom field declarations, and resolvers for Roblox's economy dashboard. See [Economy Analytics](./economy). |
 | `ImportLegacyData` | `((player, userId, migration) -> table?)?` | none | Adopts data from another library, once, before reconcile and before migrations. The third argument is a [`MigrationContext`](/api/types#migrationcontext): `migration.AwaitBudget(requestType, count?, timeout?)` paces reads on the DataStore budget and returns `(granted, release)`. See [Migrating to Scribe](./migrating). |
 | `OnPlayerInit` | `((player, rawData, isNewProfile, migration) -> ())?` | none | Runs once per player right after their profile loads, against the raw data table. The fourth argument is the same [`MigrationContext`](/api/types#migrationcontext), so `AwaitBudget` is available here too, for a game already on Scribe with stores left to move. See [Session Lifecycle](./lifecycle#onplayerinit). |
@@ -197,9 +197,10 @@ Perks  = { "VIP" },
     | `SigFigs` | 12 | `Scribe.Big` stats only, 1 through 15. Trades exponent range for resolution. |
     | `Replicate` | `false` | Streams the board to clients. Refused on a `Scribe.Big`. |
     | `RefreshInterval` | 60 | Approximate seconds between reads, floored at 60 and jittered by up to a quarter. |
+    | `WriteInterval` | 30 | Minimum seconds between changed-score writes per player/store. Must be positive and finite; values below 1 are clamped to 1. Ignored for `Scope = "Server"`. |
     | `StoreName` | `"LB_<name>"` | A `Scribe.Big` board is `"LB_<name>_big<SigFigs>"`, because the two key layouts must never share a store. |
 
-    A `Stat` that is missing, or that descends through a leaf, errors at startup. So does a set of boards whose combined refresh rate would read the OrderedDataStore too often. Use `RefreshInterval` to read a board **less** often, which is how you buy room for more boards.
+    A `Stat` that is missing, or that descends through a leaf, errors at startup. So does a set of boards exceeding the combined refresh guard. Use `RefreshInterval` to reduce reads and `WriteInterval` to reduce writes. Background requests also share automatic budget pacing across bundles; a configured interval is not a guarantee that a busy server can meet it.
 
 ??? note "A live in-server scoreboard is a different tool, and it has a cost"
     A [`Scribe.Shared`](./visibility) root updates instantly at no DataStore cost, which makes it tempting for a scoreboard. Read it as a decision rather than a shortcut, because `Shared` broadcasts the value to **every** client in the server.
@@ -216,18 +217,26 @@ These bound how many gifts are in flight and how long Scribe remembers a settled
 | --- | --- | --- | --- |
 | `GiftCooldown` | `number?` | 5 | Seconds a sender waits between gift prompts. A call inside the window is refused with `"gift cooldown"`. |
 | `GiftMaxPending` | `number?` | 20 | Unresolved gift intents one sender may hold. Past it, `PromptGift` refuses with `"too many pending gifts"`. |
-| `GiftIntentTTL` | `number?` | 3600 | Seconds a recorded intent stays valid. After that the receipt falls to `NoGiftIntentPolicy`. |
-| `AllowDuplicateGifts` | `boolean?` | `false` | When off, gifting a perk the recipient already owns is blocked at prompt time and becomes a re-aimable credit. |
-| `NoGiftIntentPolicy` | `("GrantOrCredit" \| "Hold")?` | `"GrantOrCredit"` | What to do with a gift receipt that has no matching intent. `"Hold"` declines it so Roblox refunds. |
-| `PurchaseIdTTL` | `number?` | 604800 | Seconds a processed receipt's `PurchaseId` is remembered, for de-duplication. |
-| `MaxProcessedPurchaseIds` | `number?` | 200 | Hard ceiling on that de-duplication ring. |
+| `GiftIntentTTL` | `number?` | 3600 | Age at which a profile load archives an initial gift intent. Unresolved destinations remain protected; this does not cancel a gift or allow another paid prompt for the same product. |
+| `AllowDuplicateGifts` | `boolean?` | `false` | Refuses the prompt if the recipient already owns the perk. If they acquire it after payment, the gift becomes a re-aimable credit. |
+| `NoGiftIntentPolicy` | `("GrantOrCredit" \| "Hold")?` | `"GrantOrCredit"` | For a perk-only product the buyer already owns, with no recoverable gift destination: issue a credit or keep the receipt pending. `"Hold"` does not issue a refund. |
+| `PurchaseIdTTL` | `number?` | 604800 | Legacy setting supplying the default `PurchaseClaimTTL`. Does not change the fixed 30-day receipt-history window or expire unresolved gift aims. |
+| `MaxProcessedPurchaseIds` | `number?` | — | Legacy setting, ignored. Completed receipt IDs are never removed to meet a count cap. |
+| `MaxReceiptHistoryBytes` | `number?` | 1048576 | Receipt-history admission budget in bytes, including reserved IDs. Integer from 1 to 2097152. New grants wait when full; duplicates still in history can be acknowledged. |
+| `RetiredProducts` | product dictionary | none | Historical product names, IDs and grant handlers. Processes paid receipts and gifts without offering new sales. |
 | `PurchaseClaimTTL` | `number?` | `PurchaseIdTTL` | Seconds a `Data.Purchase` `IdempotencyKey` claim is remembered. |
 | `MaxPurchaseClaims` | `number?` | 1000 | Ceiling on live claims per profile. |
 
 ??? note "Two idempotency stores, and which knob belongs to which"
     These are two separate mechanisms and it is easy to tune the wrong one.
 
-    **The receipt ring** dedupes **Roblox receipts**. Its window is Roblox's retry window, which is not yours to shorten, so leave `PurchaseIdTTL` at a week unless you know better. `MaxProcessedPurchaseIds` is the hard ceiling: when entries have not yet aged out and the ring is full, the oldest is dropped and `PURCHASE_ID_EVICTED` is logged. That is the only eviction that drops an entry Roblox could still retry a receipt for, so raise the ceiling if you ever see it. The age prune is the other way an entry leaves the ring, and it is silent by design: past the window no receipt retry can still reach it.
+    **Receipt history** remembers completed Roblox purchases and delivered gifts as `{ Id, At }` records for a fixed **30 days**. Scribe removes expired records during profile loads and receipt operations; it does not run a timer or sweep offline profiles. Pending `ReceiptReservations` keep their gift routes until settlement and are not age-pruned.
+
+    `MaxReceiptHistoryBytes` stops a new grant before its completion record would exceed the budget. Scribe logs `RECEIPT_HISTORY_FULL` and leaves the purchase pending; it does not evict recent records to make room. The default 1 MiB is a limit, not preallocated space. Raising it requires room in the profile. There is no external receipt archive.
+
+    **After a completion record expires, an unresolved retry can grant again.** Returning `PurchaseGranted` does not prove Roblox recorded the acknowledgement, and the 30-day window is Scribe's retention policy, not a Roblox retry cutoff.
+
+    Existing timestamped records retain their original age. Legacy string IDs have no timestamp, so their window starts when safely migrated on a profile load/write. If timestamps would push the profile past Scribe's size guard, those strings remain protected until space allows migration; expired dated records can still be removed. Keep history during migrations; IDs an older version already evicted cannot be reconstructed.
 
     **The claim store** dedupes **your own** `Data.Purchase` calls, which your code retries in seconds rather than days. Lowering `PurchaseClaimTTL` is the right way to bound what a heavy shop accumulates. `MaxPurchaseClaims` is a runaway guard rather than a working limit: claims expire on their own, so reaching 1000 means a player buys faster than the TTL drains. The claim nearest to expiring is dropped and `PURCHASE_CLAIM_EVICTED` is logged. Prefer shortening the TTL to raising the cap.
 
@@ -307,7 +316,7 @@ The full list of shapes Scribe refuses to start on, and why each one is unsafe t
 
     A custom transport is also free to refuse a payload outright. Before fragmentation existed that left the client re-`Hello`ing forever without loading, so declare [`MaxFrameBytes`](./transports) on your adapter if that is your channel.
 
-    Roblox does not document a payload ceiling to set this against, so the default sits far below any plausible one while leaving ordinary traffic unsplit. A diff is bytes to a few kilobytes. The `Init` snapshot of a 1,000-record inventory measures 29,811 bytes, pinned by a spec so the figure and the encoder cannot drift apart.
+    Roblox does not document a payload ceiling to set this against, so the default sits far below any plausible one while leaving ordinary traffic unsplit. A diff is bytes to a few kilobytes. The `Init` snapshot of a 1,000-record inventory measures 29,813 bytes, pinned by a spec so the figure and the encoder cannot drift apart.
 
 ??? note "Keep the frame rate limit well above the command limit"
     `MaxInboundFrameRate` is the only limit covering every frame whatever its type, size or validity, and an oversized frame counts against no other budget. Unlike `CommandRateLimit` it drops **silently** rather than replying. A client that trips it is stranded until its `RequestTimeout` instead of being told it was rate-limited, so keep the two well apart.
@@ -320,7 +329,7 @@ The full list of shapes Scribe refuses to start on, and why each one is unsafe t
 | `WipeGuardPolicy` | `("Warn" \| "Block")?` | `"Warn"` | What the wipe guard does when a save looks like accidental loss. `"Block"` also holds the save and rewrites the last good snapshot. |
 | `WipeGuardShrinkRatio` | `number?` | 0.6 | The fractional size drop that trips the guard. Clamped to 0.05 through 0.95. |
 | `SchemaPolicy` | `("Warn" \| "Reject")?` | follows `DevMode` | Checks stored data against the template on load. See below. |
-| `BudgetPolicy` | `"Defer"?` | off | Paces the leaderboard background loops on the DataStore request budget. |
+| `BudgetPolicy` | `"Defer"?` | off | Enables faster draining of a leaderboard write backlog when allowance permits, and budget waits during leaderboard erasure. Background leaderboard reads and writes always use budget pacing. |
 
 ### Checking stored data against the template
 
@@ -365,12 +374,12 @@ Absent, the policy follows [`DevMode`](#diagnostics): `"Warn"` while you develop
 
     The ratio is clamped to 0.05 through 0.95 and warns `WIPE_GUARD_RATIO_CLAMPED` outside that, because both ends are traps. At or below zero every shrink trips the guard, and under `"Block"` it then keeps tripping, since the unblock check is the same comparison, so the session's live data never persists again. At or above one the comparison can never be true and the guard is silently off.
 
-??? note "What `BudgetPolicy = \"Defer\"` paces, and what it never touches"
-    It paces the two leaderboard **background** loops, the write queue and the refresh cycle, holding a request back while the relevant DataStore pool is down to its last slot. Nothing is dropped: a write stays queued and a refresh stays due, each retrying next tick, so the only effect is that boards update more slowly under pressure and log `LB_BUDGET_DEFERRED`.
+??? note "Automatic leaderboard pacing and `BudgetPolicy = \"Defer\"`"
+    Global leaderboard background reads and writes always share budget pacing across bundles on the same server. Scribe aims below Roblox's default server allowance and keeps headroom in the reported budget. A deferred write stays queued and a deferred refresh stays due; `LB_BUDGET_DEFERRED` explains a delay. This protection does not coordinate experience-wide traffic or reserve capacity against other scripts.
 
-    It works the other way too. When the write queue has genuinely backed up and the ordered-write allowance has room, the pacer drains several queued scores per tick instead of one, bounded by the reported allowance and a hard ceiling. With no backlog it behaves exactly as it does without the policy, so the dedup window that collapses a burst of score changes into a single write is untouched.
+    `BudgetPolicy = "Defer"` additionally lets a backed-up write queue drain several eligible scores per tick when allowance permits, instead of one. It still obeys each board's `WriteInterval` and the shared budget gate. The option also makes leaderboard erasure wait for `OrderedRemove` allowance.
 
-    It deliberately touches **no save path**. Receipts, session-end saves and the shutdown drain are all durability-critical and are never deferred. It is inert under a mock mode and inert whenever the engine cannot answer the budget query. Read the raw numbers yourself with [`Scribe.GetBudgetSnapshot`](/api/Scribe#GetBudgetSnapshot).
+    These settings do not change profile saves or receipts. A departing player's changed leaderboard score skips `WriteInterval` but still uses background budget pacing. The shutdown drain and explicit debug refresh bypass that pacing so they can attempt their work immediately. Mock modes make no real DataStore requests. Read the reported numbers with [`Scribe.GetBudgetSnapshot`](/api/Scribe#GetBudgetSnapshot).
 
 ## Diagnostics
 
@@ -378,7 +387,8 @@ Absent, the policy follows [`DevMode`](#diagnostics): `"Warn"` while you develop
 | --- | --- | --- | --- |
 | `DevMode` | `boolean?` | `true` in Studio | Turns on the developer guards: the warnings that catch a typo instead of letting it fail quietly later. |
 | `IsRunning` | `boolean?` | `RunService:IsRunning()` | A test seam. `false` builds only the edit-mode client half, which is how a storybook or the command bar gets a tree with no server. Leave it unset in a real place. |
-| `LogLevel` | `("Debug" \| "Info" \| "Warn" \| "Error" \| "Fatal")?` | `"Warn"` live, `"Debug"` in Studio | The minimum severity printed to the console. Everything still enters the ring. |
+| `LogLevel` | `("Debug" \| "Info" \| "Warn" \| "Error" \| "Fatal")?` | `"Warn"` live, `"Debug"` in Studio | Minimum severity for the console and sinks without an explicit `Level`. |
+| `LogRingLevel` | `Scribe.LogLevel?` | `"Warn"` live, `"Debug"` in Studio | Minimum severity retained by `GetRecentLogs`, independently of `LogLevel`. |
 | `LogRingSize` | `number?` | 512 | How many entries [`Scribe.GetRecentLogs`](/api/Scribe#GetRecentLogs) retains. |
 | `StatusThresholds` | `{ FailWindow, FailCount, RecoverStreak }?` | `{ 60, 3, 5 }` | Tunes the health machine that moves the service between Healthy, Degraded and Outage. |
 | `Banner` | `boolean?` | `true` | Prints one "Running Scribe vX.Y.Z" line when the bundle loads. |
@@ -389,8 +399,8 @@ Absent, the policy follows [`DevMode`](#diagnostics): `"Warn"` while you develop
 
     Set it `true` in a headless or CI run, where the Studio default is `false` and every one of those warnings is otherwise absent. Set it `false` to quiet them inside Studio. It is independent of the `UNKNOWN_OPTION` scan, which is Studio-only either way, and of `StudioHook`, which is what gates the debug hooks [Scribe Studio](./studio-plugin) reads.
 
-??? note "`LogRingSize` is the only knob a bug report depends on"
-    `LogLevel` controls what reaches the console. Every entry enters the ring whatever its level, and past `LogRingSize` the oldest is overwritten. So the ring is the only thing that decides what a bug report can still see.
+??? note "Choosing the logs a bug report retains"
+    `LogRingLevel` controls which entries enter the ring. Once it reaches `LogRingSize`, the oldest entry is overwritten. Set `LogRingLevel = "Debug"` explicitly if production investigations need debug history.
 
     Raise it when you are diagnosing something that unfolds over a long session, because 512 entries is a few minutes on a busy server. Leave it alone otherwise: the ring is a **process singleton shared by every bundle**, so the last value applied wins and the memory is paid for the whole server's life. Resizing keeps what it can and drops the oldest that no longer fit, so setting it is a configuration change rather than a request to forget.
 

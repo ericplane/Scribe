@@ -1,0 +1,20 @@
+name: Assemble Scribe Wally package
+description: Stage concise sources and verify the Wally archive without publishing.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: "3.12"
+    - name: Test and stage Wally sources
+      shell: bash
+      run: |
+        python3 -m unittest discover -s bundle -p 'test_*.py'
+        VER="$(python3 -c 'import tomllib; print(tomllib.load(open("wally.toml", "rb"))["package"]["version"])')"
+        python3 bundle/stage.py --version "$VER" --target wally
+        lune run bundle/verify --staging dist/wally --sources-only
+    - name: Build and verify Wally archive
+      shell: bash
+      run: |
+        wally package --project-path dist/wally --output dist/Scribe-wally.zip
+        python3 bundle/check_wally.py dist/Scribe-wally.zip

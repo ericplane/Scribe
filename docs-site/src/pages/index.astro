@@ -1,6 +1,7 @@
 ---
 import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
 import Icon from '../components/BrandIcon.astro';
+import SiteCredit from '../components/SiteCredit.astro';
 import manifest from '../../../wally.toml?raw';
 const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
 const href = (path: string) => `${base}${path}/`;
@@ -11,6 +12,10 @@ const cards = [
     { icon: 'layers', label: 'Build something', title: 'From idea to game feature', text: 'Inventories, shops, rewards, and leaderboards. Pick the feature you need and follow a focused recipe.', path: 'recipes', cta: 'Find a recipe' },
     { icon: 'code', label: 'Reference', title: 'The answer, one lookup away', text: 'Find arguments, return values, and examples. Generated from the same source as the library.', path: 'reference', cta: 'Explore the API' },
     { icon: 'lifebuoy', label: 'Get unstuck', title: 'Something not quite right?', text: 'Start with what you see. Find help for data that will not load, changes that will not save, and more.', path: 'troubleshooting', cta: 'Solve a problem' },
+] as const;
+const games = [
+    { name: 'Eurotunnel, Border Roleplay', genre: 'Border roleplay', image: 'eurotunnel.png', url: 'https://www.roblox.com/games/18352872370/Eurotunnel-Border-Roleplay' },
+    { name: 'Project Flight', genre: 'Flight simulation', image: 'project-flight.png', url: 'https://www.roblox.com/games/6349094071/Project-Flight' },
 ] as const;
 ---
 <StarlightPage frontmatter={{ title: 'Player data, without the plumbing', description: 'Typed player data for Roblox. Save profiles, define your rules, and keep the client in sync with Scribe.', template: 'splash', tableOfContents: false, editUrl: false, lastUpdated: false, prev: false, next: false }}>
@@ -55,6 +60,23 @@ const cards = [
             <span><Icon name="layers" size={19} /> Optional game features</span>
         </div>
 
+        <section class="games-section" aria-labelledby="games-using-scribe">
+            <div class="games-heading" data-reveal>
+                <h2 id="games-using-scribe">Used by established Roblox games</h2>
+                <p>A selection of games confirmed to use Scribe in production.</p>
+            </div>
+            <div class="games-grid">
+                {games.map((game) => <a class="game-card" href={game.url}>
+                    <img src={`${base}assets/games/${game.image}`} width="256" height="256" alt="" loading="lazy" decoding="async" />
+                    <div class="game-copy">
+                        <p class="game-genre">{game.genre}</p>
+                        <h3>{game.name}</h3>
+                        <span class="game-link">View on Roblox <span class="game-arrow"><Icon name="arrow" size={15} /></span></span>
+                    </div>
+                </a>)}
+            </div>
+        </section>
+
         <section class="start-section" aria-labelledby="choose-a-path">
             <span id="what-would-you-like-to-do"></span>
             <div class="section-heading" data-reveal><div><p class="eyebrow">MAKE YOURSELF AT HOME</p><h2 id="choose-a-path">A clear next step.</h2></div><p>Start small, or go straight to what you need.<br />You do not have to learn everything at once.</p></div>
@@ -79,7 +101,7 @@ const cards = [
             <p>Bringing an existing game? <a href={href('migrating')}>Read the migration guide <Icon name="arrow" size={15} /></a></p>
             <a href={href('cost')}>Understand performance <Icon name="arrow" size={15} /></a>
         </div>
-        <footer id="get-scribe" class="scribe-home-footer"><a class="footer-brand" href={base}><img src={`${base}assets/logo.svg`} width="27" height="27" alt="" />Scribe</a><p>Made for the games you want to build.</p><div><a href="https://wally.run/package/ericplane/scribe">Wally</a><a href={`${href('getting-started')}#install`}>Install in Studio</a><a href="https://github.com/ericplane/Scribe">GitHub</a><span>MIT License</span></div></footer>
+        <footer id="get-scribe" class="scribe-home-footer"><a class="footer-brand" href={base}><img src={`${base}assets/logo.svg`} width="27" height="27" alt="" />Scribe</a><p>Made for the games you want to build.</p><div><a href="https://wally.run/package/ericplane/scribe">Wally</a><a href={`${href('getting-started')}#install`}>Install in Studio</a><a href="https://github.com/ericplane/Scribe">GitHub</a><span>MIT License</span></div><SiteCredit /></footer>
     </div>
 </StarlightPage>
 <script>

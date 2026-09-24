@@ -91,7 +91,7 @@ function Commands.new(ctx: any)
 	local COMMAND_NAME_FLOOR = 64
 	local maxNameBytes = COMMAND_NAME_FLOOR
 
-	function self.Register(name: string, specOrHandler: any, handler: Handler?)
+	local function register(name: string, specOrHandler: any, handler: Handler?)
 		if type(name) ~= "string" or name == "" then
 			error("Scribe: command name must be a non-empty string", 2)
 		end
@@ -196,6 +196,19 @@ function Commands.new(ctx: any)
 			ErrorMetric = `CommandErrors:{name}`,
 		}
 	end
+
+	function self.Register(name: string, specOrHandler: any, handler: Handler?)
+		if name == Wire.PURCHASE_PROMPT_COMMAND then
+			error(`Scribe: command "{name}" is reserved for purchase prompts`, 2)
+		end
+		register(name, specOrHandler, handler)
+	end
+
+	-- An ordinary rate-limited, typed command, bound to the sender supplied by the
+	-- transport. Only its registration is internal; it never grants a purchase.
+	register(Wire.PURCHASE_PROMPT_COMMAND, { Args = { "string" } }, function(player: Player, name: string)
+		return ctx.Monetization.PromptPurchase(player, name)
+	end)
 
 	local function encodeReply(correlation: number, ok: boolean, results: { any }): buffer
 		local w = Wire.NewWriter(64)

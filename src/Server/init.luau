@@ -6,6 +6,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
 local Internal = script.Parent.Internal
+local Types = require(script.Parent.Types)
 local Template = require(Internal.Template)
 local TransportModule = require(Internal.Transport)
 local Version = require(Internal.Version)
@@ -65,6 +66,9 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 	if options.LogLevel then
 		Log.SetLevel(options.LogLevel)
+	end
+	if options.LogRingLevel then
+		Log.SetRingLevel(options.LogRingLevel)
 	end
 	if options.LogRingSize ~= nil then
 		Log.SetRingSize(options.LogRingSize)
@@ -228,6 +232,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		`still-loading` and `timeout` were one value until 2.0, so handle both if you
 		branch on `timeout` today. [Session Lifecycle](../lifecycle.md) says why.
 	]=]
+	-- Waits for a Ready profile, returning nil and a reason on failure.
 	function Data.WaitForData(player: Player, timeout: number?)
 		return ctx.Persistence.WaitForData(player, timeout)
 	end
@@ -237,14 +242,14 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@server
 		@param player Player
 		@return "Loading" | "Ready" | "SessionEnded"
-		@return ("Importing" | "ImportThrottled")?
+		@return LoadPhase?
 		The player's session state, without yielding.
 
-		The second return says where a **Loading** player actually is, and is nil at every
-		other time. `"Importing"` means `ImportLegacyData` is running; `"ImportThrottled"`
-		means it is queued on the DataStore request budget. Relay it to your loading screen
-		over your own remote: Scribe cannot replicate to a client that has no data yet.
+		The second return identifies the loading phase and is nil outside Loading.
+		`AcquiringSession` includes waiting for a previous server's session to release.
+		Relay it through your own remote if needed before data replication starts.
 	]=]
+	-- Reads session state and loading phase without yielding.
 	function Data.GetState(player: Player)
 		return ctx.Persistence.GetState(player)
 	end
@@ -257,6 +262,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		The player's accessor tree. Errors if the profile is not Ready. Prefer
 		[Server.WaitForData] on join. `Data[player]` is shorthand for this.
 	]=]
+	-- Returns the player's accessor tree; errors unless the profile is Ready.
 	function Data.Get(player: Player)
 		return entryOrError(player, "Data.Get").Tree.Accessor
 	end
@@ -288,6 +294,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		-- state.Index.Changed fires once, with its own old and new
 		```
 	]=]
+	-- Groups writes into one replication flush and container notification pass.
 	function Data.Batch(player: Player, fn: () -> ())
 		local entry = entryOrError(player, "Data.Batch")
 		entry.Tree:RunBatch(fn)
@@ -318,6 +325,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		There is no cross-player or cross-key transaction. For one-sided value, use the
 		durable outbox in [Cross-Key Transactions](../transactions.md) instead.
 ]=]
+	-- Rolls back all writes if the callback throws or yields.
 	function Data.Transaction(player: Player, fn: () -> ()): (boolean, string?)
 		local entry = entryOrError(player, "Data.Transaction")
 		return entry.Tree:RunTransaction(fn)
@@ -360,6 +368,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		game that flushes on a timer or a checkpoint; it never applies right after a
 		grant, since a grant leaves the profile dirty by definition.
 	]=]
+	-- Waits for pending changes to save; requires a Ready profile.
 	function Data.Flush(player: Player, opts: { Force: boolean?, Timeout: number? }?)
 		checkOptions(opts, "Data.Flush", { Force = true, Timeout = true })
 		return ctx.Persistence.Flush(player, opts)
@@ -375,6 +384,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		`Size` is the approximate byte size of the last successful save (nil before
 		the first), useful for spotting a profile growing toward the ~4 MB ceiling.
 	]=]
+	-- Reads the player's last save result and pending-change state.
 	function Data.GetSaveInfo(player: Player)
 		return ctx.Persistence.GetSaveInfo(player)
 	end
@@ -393,6 +403,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		failed. Check the `OFFLINE_READ_FAIL` log before treating `nil` as proof
 		that no profile exists. Use [Server.UpdateOffline] to save an offline edit.
 	]=]
+	-- Clones local Ready data or reads the last persisted snapshot.
 	function Data.GetOffline(userId: number)
 		return ctx.Persistence.GetOffline(userId)
 	end
@@ -462,6 +473,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		profile out forever. [Offline Profiles](../profiles.md) covers the threshold
 		and the custom-store caveat.
 	]=]
+	-- Updates an offline profile, with optional template validation.
 	function Data.UpdateOffline(userId: number, fn: (data: any) -> (), opts: { Validate: boolean? }?)
 		checkOptions(opts, "Data.UpdateOffline", { Validate = true })
 		return ctx.Persistence.UpdateOffline(userId, fn, opts)
@@ -476,6 +488,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@return { { VersionId: string, CreatedAt: number, Size: number? } }
 		Lists a profile's DataStore version history, for support/rollback tools.
 	]=]
+	-- Lists saved profile versions for support tools.
 	function Data.ListVersions(userId: number, limit: number?)
 		return ctx.Persistence.ListVersions(userId, limit)
 	end
@@ -489,6 +502,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@return { [string]: any }?
 		Reads the raw data of a specific historical version.
 	]=]
+	-- Reads a specific historical profile snapshot.
 	function Data.GetVersion(userId: number, versionId: string)
 		return ctx.Persistence.GetVersion(userId, versionId)
 	end
@@ -517,6 +531,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		`_Scribe` that is itself corrupt, and nothing else: see the danger note in
 		[Offline Profiles](../profiles.md).
 	]=]
+	-- Restores an existing offline profile while preserving reserved data by default.
 	function Data.RestoreVersion(userId: number, versionId: string, opts: { RollBackReserved: boolean? }?)
 		checkOptions(opts, "Data.RestoreVersion", { RollBackReserved = true })
 		return ctx.Persistence.RestoreVersion(userId, versionId, opts)
@@ -546,6 +561,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		The profile's erase marker keeps joins blocked until cleanup completes.
 		See [Offline Profiles](../profiles.md) for retry and recovery details.
 	]=]
+	-- Deletes the profile and leaderboard records while blocking this user's joins.
 	function Data.Erase(userId: number)
 		return ctx.Persistence.Erase(userId)
 	end
@@ -559,6 +575,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		GDPR data export: the profile as a JSON string (buffers base64-encoded),
 		or `nil` if it doesn't exist.
 	]=]
+	-- Serializes a profile to JSON, or returns nil when absent.
 	function Data.Export(userId: number)
 		return ctx.Persistence.Export(userId)
 	end
@@ -603,6 +620,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 		[Commands & Requests](../commands.md) covers `Args` and every refusal reason.
 	]=]
+	-- Registers a validated, rate-limited command for Ready players.
 	function Data.Command(name: string, specOrHandler: any, handler: any?)
 		ctx.Commands.Register(name, specOrHandler, handler)
 	end
@@ -730,18 +748,23 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		cannot name several destinations without collapsing them onto each other.
 	]=]
 	Data.Exchange = {
+		-- Trades both baskets between players loaded on this server.
 		Attempt = function(playerA: Player, basketA: { any }, playerB: Player, basketB: { any })
 			return ctx.Exchanges.Attempt(playerA, basketA, playerB, basketB)
 		end,
+		-- Lists the player's unfinished exchanges and held value.
 		Open = function(player: Player)
 			return ctx.Exchanges.Open(player)
 		end,
+		-- Drops an unstaked claim only when no verdict exists.
 		Discard = function(exchangeId: string)
 			return ctx.Exchanges.Discard(exchangeId)
 		end,
+		-- Applies an explicit recovery verdict to a stalled exchange.
 		Settle = function(exchangeId: string, verdict: string)
 			return ctx.Exchanges.Settle(exchangeId, verdict)
 		end,
+		-- Moves a parked delivery to another key in the same container.
 		Redirect = function(exchangeId: string, userId: number, newKey: string)
 			return ctx.Exchanges.Redirect(exchangeId, userId, newKey)
 		end,
@@ -762,6 +785,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		periodic board reads once just after it rolls over. A lifetime or server board
 		has no previous period and answers an empty list for it.
 	]=]
+	-- Reads cached board results without a live DataStore request.
 	function Data.GetLeaderboard(name: string, limit: number?, offset: number?)
 		return ctx.Leaderboards.GetLeaderboard(name, limit, offset)
 	end
@@ -774,6 +798,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@return number?
 		The player's current rank on a board, or `nil` if unranked.
 	]=]
+	-- Reads the player's rank from the leaderboard cache.
 	function Data.GetMyRank(player: Player, name: string)
 		return ctx.Leaderboards.GetMyRank(player, name)
 	end
@@ -788,8 +813,23 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		board, and until the refresh loop has scheduled its first cycle, a few seconds
 		after boot.
 	]=]
+	-- Reads the next scheduled refresh delay; nil until scheduled.
 	function Data.GetLeaderboardRefreshIn(name: string): number?
 		return ctx.Leaderboards.GetRefreshIn(name)
+	end
+	--[=[
+		@within Server
+		@tag Leaderboards
+		@server
+		@param name string
+		@return LeaderboardStatusInfo?
+		Read and write health for one board, without making a DataStore request.
+		Includes pending writes, rejected scores and the age of the cached results.
+		This is independent of Scribe.GetStatus, which protects profile persistence.
+	]=]
+	-- Reads board health without a DataStore request.
+	function Data.GetLeaderboardStatus(name: string): Types.LeaderboardStatusInfo?
+		return ctx.Leaderboards.GetStatus(name)
 	end
 	--[=[
 		@within Server
@@ -802,6 +842,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		period has begun. `nil` for a board with no `Period`, and for a name that is not
 		a board.
 	]=]
+	-- Reads the time remaining in a periodic board's current period.
 	function Data.GetLeaderboardResetIn(name: string): number?
 		return ctx.Leaderboards.GetResetIn(name)
 	end
@@ -832,7 +873,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		**Refuses something the player already owns**, so a caller does not have to pair
 		every prompt with its own [Server.Owns] check. A pass is its own ownership key. A
 		product is checked against its `Grants` perk, and a product with no `Grants` is a
-		consumable, has nothing to own, and always prompts.
+		consumable that can be bought repeatedly.
 
 		Ownership is read from Scribe's cache rather than a live Marketplace call, because
 		this is a UI gate: for a product the receipt path is what actually prevents a
@@ -844,9 +885,14 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		Returns `(false, reason)`, where `reason` is the [Scribe.ProductState] the prompt
 		refused on: `"not-loaded"`, `"owned"`, `"paid-random-restricted"` or
 		`"policy-pending"`. [Server.GetProductState] answers the same state without
-		prompting. Two reasons sit outside that set: an unknown name, and a prompt the
-		engine refused, which is what an unpublished product looks like. None of those
-		raise.
+		prompting. An unknown name, `"purchase prompt already open"`, and a prompt the
+		engine refused return diagnostic text outside that set. None of those raise.
+
+		One `PromptPurchase` dialog can be active per player in this Scribe bundle. The guard
+		covers both this call and [Client.PromptPurchase], and clears when that dialog
+		finishes or is cancelled, prompting fails, or the player's data unloads.
+		[Client.PromptPurchase] forwards to this server path; successful prompt calls
+		increment the server's `PurchasePrompts` metric.
 
 		Prompting is all it does. The grant happens on the receipt, through the same path
 		every purchase takes, so a player who buys and then leaves is still granted on
@@ -854,6 +900,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 		See [Monetization](../monetization.md).
 	]=]
+	-- Validates a named product or pass before opening its purchase prompt.
 	function Data.PromptPurchase(player: Player, name: string)
 		return ctx.Monetization.PromptPurchase(player, name)
 	end
@@ -875,6 +922,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		end
 		```
 	]=]
+	-- Reads the ownership and policy state used by purchase prompts.
 	function Data.GetProductState(player: Player, name: string): string
 		return ctx.Monetization.GetProductState(player, name)
 	end
@@ -892,6 +940,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		Returns `(false, reason)` if the gift can't proceed. `reason` is a [Scribe.GiftReason]
 		sentence; every member but `InvalidRecipient` can be shown to the buyer as it is.
 	]=]
+	-- Uses a gift credit or saves the recipient before opening a paid prompt.
 	function Data.PromptGift(buyer: Player, productName: string, recipientUserId: number)
 		return ctx.Monetization.PromptGift(buyer, productName, recipientUserId)
 	end
@@ -903,6 +952,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@return { [string]: number }
 		The player's unassigned gift credits by product name.
 	]=]
+	-- Reads the player's unassigned gift credits.
 	function Data.GetGiftCredits(player: Player)
 		return ctx.Monetization.GetGiftCredits(player)
 	end
@@ -916,7 +966,12 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		automatically unless `OwnReceipts = false`, in which case call this from
 		your own handler. Idempotent by `PurchaseId` and fail-closed. Robux are
 		never eaten.
+
+		If the buyer is joining, waits up to `LoadTimeout` (default 120 seconds,
+		minimum 60) for their data before granting. A failed wait returns
+		`NotProcessedYet` without cancelling the profile load.
 	]=]
+	-- Processes a Scribe receipt with persisted deduplication.
 	function Data.HandleReceipt(receiptInfo: any)
 		return ctx.Monetization.HandleReceipt(receiptInfo)
 	end
@@ -946,6 +1001,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		a permanent retry loop when routed through an external handler. This variant
 		also logs nothing for an unknown product, since there it is normal.
 	]=]
+	-- Processes known products and returns nil for another receipt handler.
 	function Data.TryHandleReceipt(receiptInfo: any)
 		return ctx.Monetization.TryHandleReceipt(receiptInfo)
 	end
@@ -963,6 +1019,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		after a player joins. For a gate that must be correct at that instant, use
 		[Server.OwnsAsync].
 	]=]
+	-- Reads cached pass, perk, or Roblox Plus ownership without yielding.
 	function Data.Owns(player: Player, key: string)
 		return ctx.Monetization.Owns(player, key)
 	end
@@ -984,6 +1041,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		must never gate a grant. (`timeout` applies only to the client version, which
 		waits on a replicated flag.)
 	]=]
+	-- Verifies uncached pass ownership with Roblox before returning.
 	function Data.OwnsAsync(player: Player, key: string, timeout: number?)
 		return ctx.Monetization.OwnsAsync(player, key, timeout)
 	end
@@ -1000,6 +1058,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		[Client.ObserveOwned]. To react to any key without subscribing per key, use
 		[Server.OnOwnershipChanged].
 	]=]
+	-- Reports current ownership and later changes; returns a disconnect.
 	function Data.ObserveOwned(player: Player, key: string, callback: (owned: boolean) -> ())
 		return ctx.Monetization.ObserveOwned(player, key, callback)
 	end
@@ -1011,6 +1070,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param key string
 		Grants a perk directly (admin/reward flows).
 	]=]
+	-- Grants a perk through Scribe's ownership state.
 	function Data.GrantPerk(player: Player, key: string)
 		return ctx.Monetization.GrantPerk(player, key)
 	end
@@ -1022,6 +1082,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param key string
 		Revokes a granted perk.
 	]=]
+	-- Removes a granted perk from Scribe's ownership state.
 	function Data.RevokePerk(player: Player, key: string)
 		return ctx.Monetization.RevokePerk(player, key)
 	end
@@ -1056,6 +1117,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		and the two paid-random members can be shown to the player; the four `Cost`
 		refusals mean the call is wrong, and belong in a log.
 	]=]
+	-- Debits, grants, and logs atomically; failures roll back the purchase.
 	function Data.Purchase(player: Player, spec: any)
 		return ctx.Monetization.Purchase(player, spec)
 	end
@@ -1067,6 +1129,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param entry table
 		Appends an entry to the player's in-game purchase log (your own records).
 	]=]
+	-- Adds a game-defined entry to the in-game purchase log.
 	function Data.RecordPurchase(player: Player, entry: any)
 		return ctx.Monetization.RecordPurchase(player, entry)
 	end
@@ -1084,6 +1147,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		ItemId: string?, Since: number?, Limit: number? }`, exported as
 		`Scribe.PurchaseFilter`.
 	]=]
+	-- Reads filtered purchase history, newest first.
 	function Data.GetPurchases(player: Player, filter: any?)
 		checkOptions(filter, "Data.GetPurchases", {
 			Kind = true,
@@ -1122,6 +1186,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		the first rather than leaving two running, and [Server.ClearCooldown] and
 		[Server.PeekCooldown] cover both without needing to know which was used.
 	]=]
+	-- Checks the cooldown and arms it only when inactive.
 	function Data.OnCooldown(
 		player: Player,
 		key: string,
@@ -1142,6 +1207,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@return (onCooldown: boolean, remaining: number)
 		Read-only cooldown check. Never arms it. Safe for UI.
 	]=]
+	-- Reads cooldown state without starting or extending it.
 	function Data.PeekCooldown(player: Player, key: string): (boolean, number)
 		local entry = entryOrError(player, "Data.PeekCooldown")
 		return ctx.Timed.PeekCooldown(entry, key)
@@ -1155,6 +1221,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param key string
 		Clears a cooldown (support/testing resets).
 	]=]
+	-- Clears a stored cooldown.
 	function Data.ClearCooldown(player: Player, key: string)
 		local entry = entryOrError(player, "Data.ClearCooldown")
 		ctx.Timed.ClearCooldown(entry, key)
@@ -1169,6 +1236,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Fires after each save attempt, including failures.
 	Data.OnSave = ctx.Signals.OnSave
 	--[=[
 		@within Server
@@ -1180,6 +1248,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Fires when a player's session ends.
 	Data.SessionEnded = ctx.Signals.SessionEnded
 	--[=[
 		@within Server
@@ -1191,6 +1260,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Fires when data validation or integrity checks detect an anomaly.
 	Data.OnAnomaly = ctx.Signals.OnAnomaly
 	--[=[
 		@within Server
@@ -1217,6 +1287,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Fires when effective ownership changes after load.
 	Data.OnOwnershipChanged = ctx.Signals.OnOwnershipChanged
 	--[=[
 		@within Server
@@ -1265,8 +1336,11 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Fires when cached board contents change.
 	Data.OnLeaderboard = ctx.Signals.OnLeaderboard
+	-- Fires when a cooldown expires during an active session.
 	Data.OnCooldownEnded = ctx.Signals.OnCooldownEnded
+	-- Fires when a player receives a gift.
 	Data.OnGiftReceived = ctx.Signals.OnGiftReceived
 	--[=[
 		@within Server
@@ -1277,6 +1351,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Fires when a player receives an unassigned gift credit.
 	Data.OnGiftCredit = ctx.Signals.OnGiftCredit
 	--[=[
 		@within Server
@@ -1301,6 +1376,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Delivers durable messages; handlers must be idempotent.
 	Data.OnMessage = ctx.Signals.OnMessage
 
 	--[=[
@@ -1337,6 +1413,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		happened; the return value cannot. Retrying is still the right response, and
 		that is what the idempotent payload above is for.
 	]=]
+	-- Queues a durable message; receiving handlers must tolerate repeats.
 	function Data.SendMessage(userId: number, message: any): boolean
 		if ctx.Persistence.Mode == "NoSave" then
 			ctx.Persistence.RefuseNoSave("SendMessage")
@@ -1412,10 +1489,11 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		so treat it as read-mostly and never mutate an active-session profile through
 		it. Most games never need this; prefer the typed API and [Server.SendMessage].
 	]=]
+	-- Exposes the underlying store, bypassing Scribe's data guarantees.
 	Data.ProfileStore = ctx.Persistence.Store
 
 	-- Dev-mode misuse guard: a template key shadowed by an accessor method, at any depth,
-	-- is silently unreachable through the typed API. The root-level half runs at the very
+	-- needs explicit Child(name) lookup. The root-level half runs at the very
 	-- end of build; see the comment on it for why.
 	if ctx.DevMode then
 		local function warnCollision(node: any)
@@ -1429,7 +1507,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 				Log.Warn(
 					"Lifecycle",
 					"API_NAME_COLLISION",
-					`template field "{name}" collides with an accessor method and is unreachable via the typed API`,
+					`template field "{name}" collides with an accessor method; use Child("{name}") to reach it`,
 					{ Path = table.concat(node.Path :: { any }, ".") }
 				)
 			end
@@ -1482,6 +1560,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		The same `Data` object without the typed accessor tree: the untyped escape
 		hatch if the type solver ever trips on your template.
 	]=]
+	-- Exposes the same API without template-aware types.
 	Data.Raw = Data
 
 	Metrics.Set("SchemaNodes", compiled.NodeCount)
@@ -1512,6 +1591,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		Idempotent, and does NOT save: call `Data.Flush` first if the data matters.
 		Loaded sessions are left alone; drop the bundle and they go with it.
 	]=]
+	-- Stops this bundle's workers and releases its listeners.
 	function Data.Stop()
 		if stopped then
 			return
@@ -1558,10 +1638,11 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		Nothing in it is saved, and the same shape appears on the client, where it
 		is read-only. See [Server-owned state](../server-store.md).
 	]=]
+	-- Exposes server-owned roots without a player argument.
 	if ctx.ServerStore ~= nil then
 		local proxy = {}
 		for _, key in compiled.Views.Store.RootOrder do
-			proxy[key] = ctx.ServerStore.Accessor[key]
+			proxy[key] = ctx.ServerStore.Accessor.Child(key)
 		end
 		Data.ServerStore = table.freeze(proxy)
 	end

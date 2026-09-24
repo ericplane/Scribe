@@ -118,6 +118,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	if options.LogLevel then
 		Log.SetLevel(options.LogLevel)
 	end
+	if options.LogRingLevel then
+		Log.SetRingLevel(options.LogRingLevel)
+	end
 	if options.LogRingSize ~= nil then
 		Log.SetRingSize(options.LogRingSize)
 	end
@@ -126,6 +129,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	local loaded = editMode
 	local stopped = false
 	local loadedSignal = Signal.new()
+	-- Suppress overlapping button requests; the server tracks the open dialog.
+	local purchaseRequestPending = false
 
 	local tree = Node.NewTree({
 		Compiled = compiled,
@@ -137,7 +142,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		BoundsPolicy = options.BoundsPolicy or "Clamp",
 		DevMode = devMode,
 		TimedHooks = {
-			-- Timed internals are server-only; the client sees the value.
+			-- Clients read deadlines; only the server can change them.
 			SetTimed = function()
 				error("Scribe: SetTimed is server-only", 3)
 			end,
@@ -145,8 +150,18 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				error("Scribe: ExtendTimed is server-only", 3)
 			end,
 			Active = function(accessor: any): (boolean, number?)
-				local value = accessor.Get()
-				return value ~= nil and value ~= false, nil
+				local schema = Node.SchemaOf(accessor)
+				if editMode or not schema or schema.Visibility == "ServerOnly" then
+					return false, nil
+				end
+				local session = mirror[Template.SESSION_ROOT]
+				local timers = if session then session.Timed else nil
+				local expiry = if timers then timers[tostring(schema.Id)] else nil
+				if type(expiry) ~= "number" or expiry ~= expiry or math.abs(expiry) == math.huge then
+					return false, nil
+				end
+				local remaining = expiry - Clock.ServerNow()
+				return remaining > 0, if remaining > 0 then remaining else nil
 			end,
 		},
 		OnEconomy = nil,
@@ -376,8 +391,24 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			end
 			local startedAt = Clock.Monotonic()
 			local ops = Wire.DecodeOps(reader, compiled)
-			-- One frame, one batch: a Server.Batch that coalesced into this frame
-			-- must not fan back out into one container fire per op.
+			-- Apply deadlines before values, keeping the whole frame in one batch.
+			local ordered: { Wire.Op }? = nil
+			for _, op in ops do
+				if op.Path[1] == Template.SESSION_ROOT and op.Path[2] == "Timed" then
+					if ordered == nil then
+						ordered = table.create(#ops)
+					end
+					table.insert(ordered, op)
+				end
+			end
+			if ordered ~= nil then
+				for _, op in ops do
+					if op.Path[1] ~= Template.SESSION_ROOT or op.Path[2] ~= "Timed" then
+						table.insert(ordered, op)
+					end
+				end
+				ops = ordered
+			end
 			tree:ApplyOps(ops)
 			Metrics.Add("DiffsApplied")
 			Metrics.Observe("DiffApplyDuration", Clock.Monotonic() - startedAt)
@@ -531,6 +562,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Whether the first Init snapshot has arrived (non-yielding). Before this is
 		true, accessor reads return template defaults. Always `true` in edit mode.
 	]=]
+	-- Reads snapshot readiness without yielding.
 	function Data.IsReady(): boolean
 		return loaded
 	end
@@ -552,6 +584,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		end
 		```
 	]=]
+	-- Waits for the first snapshot, returning false on timeout.
 	function Data.WaitForData(timeout: number?): boolean
 		if loaded then
 			return true
@@ -681,6 +714,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		[Client.RequestOnce] when that is not safe. See
 		[Commands & Requests](../commands.md#what-the-caller-gets-back-on-failure).
 	]=]
+	-- Sends a command to the server and waits for its reply.
 	function Data.Request(name: string, ...: any): ...any
 		return dispatchRequest(name, nil, table.pack(...), 3)
 	end
@@ -706,6 +740,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		not. See
 		[Running a command at most once](../commands.md#running-a-command-at-most-once).
 	]=]
+	-- Sends a keyed command so retries reuse the server's original result.
 	function Data.RequestOnce(name: string, key: string, ...: any): ...any
 		-- Rejected here rather than at the server: an unusable key is a caller mistake,
 		-- and a round trip would return it looking like a genuine handler refusal.
@@ -729,6 +764,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		The cached top-N of a **replicated** board (`Replicate = true`), streamed
 		to clients at handshake and on change. Empty for server-only boards.
 	]=]
+	-- Reads the replicated leaderboard cache without requesting a refresh.
 	function Data.GetLeaderboard(name: string, limit: number?): { any }
 		if editMode then
 			local mocked = mockLeaderboards[name]
@@ -753,6 +789,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@return number?
 		The local player's rank on a replicated board, or `nil` if unranked.
 	]=]
+	-- Finds the local player's rank in the replicated board.
 	function Data.GetMyRank(name: string): number?
 		local cache = leaderboardCache[name]
 		return if cache then cache.MyRank else nil
@@ -767,6 +804,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Fires when a replicated leaderboard changes.
 	Data.OnLeaderboard = OnLeaderboard
 
 	--[=[
@@ -777,6 +815,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		The replicated data-service health. Show players a "progress may save
 		late" notice during a `"Degraded"`/`"Outage"`.
 	]=]
+	-- Reads the replicated data-service health.
 	function Data.GetServiceStatus(): string
 		return Health.GetStatus()
 	end
@@ -790,6 +829,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Fires when the replicated service health changes.
 	Data.OnServiceStatus = OnServiceStatus
 
 	--[=[
@@ -805,6 +845,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		player's Shared data to everyone except that player, so `nil` there is
 		permanent rather than pending. Read your own through the ordinary accessor.
 	]=]
+	-- Reads another player's replicated Shared roots.
 	function Data.GetShared(playerOrUserId: Player | number): { [string]: any }?
 		local userId = if typeof(playerOrUserId) == "Instance"
 			then (playerOrUserId :: Player).UserId
@@ -824,6 +865,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Fires when another player's Shared data changes.
 	Data.OnSharedChanged = OnSharedChanged
 	--[=[
 		@within Client
@@ -837,6 +879,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
+	-- Fires for ownership changes after the initial baseline.
 	Data.OnOwnershipChanged = OnOwnershipChanged
 
 	-- Ownership: reads the replicated mirror.
@@ -871,6 +914,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Whether the local player owns a perk or pass, from the replicated mirror.
 		Yields until data has loaded.
 	]=]
+	-- Reads mirrored ownership after the profile loads.
 	function Data.Owns(key: string): boolean
 		assertOwnsKey(key, "Owns")
 		if not editMode then
@@ -898,6 +942,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		the window right after join. Perks/gifts are already synced at load. Falls
 		back to the current mirror value after `timeout` seconds (default 10).
 	]=]
+	-- Waits for the server's initial ownership sync before reading the mirror.
 	function Data.OwnsAsync(key: string, timeout: number?): boolean
 		assertOwnsKey(key, "OwnsAsync")
 		if editMode then
@@ -998,6 +1043,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Calls `callback` with the current ownership and again whenever it changes.
 		Returns a disconnect function. Ideal for reactively toggling "buy" buttons.
 	]=]
+	-- Reports current ownership and later changes; returns a disconnect.
 	function Data.ObserveOwned(key: string, callback: (owned: boolean) -> ()): () -> ()
 		assertOwnsKey(key, "ObserveOwned")
 		if not editMode then
@@ -1326,6 +1372,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Client-only by necessity: a live server has no player in context and reads the
 		base catalog price, which is not what a discounted player pays.
 	]=]
+	-- Reads cached player-specific marketplace info, fetching on demand.
 	function Data.GetProductInfo(name: string): { [string]: any }?
 		productAsset(name, "GetProductInfo")
 		watchMembership()
@@ -1342,6 +1389,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Shorthand for the `PriceInRobux` of [Client.GetProductInfo]: the Robux this
 		player pays. nil until the first read lands, and starts that read.
 	]=]
+	-- Reads the local player's cached Robux price, or nil while loading.
 	function Data.GetPrice(name: string): number?
 		local info = Data.GetProductInfo(name)
 		local price = if info ~= nil then info.PriceInRobux else nil
@@ -1358,6 +1406,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Like [Client.GetProductInfo], but yields until the read lands. Returns nil if it
 		times out (default 10s), or if Marketplace refused every attempt.
 	]=]
+	-- Waits for marketplace info, returning nil on timeout or failure.
 	function Data.GetProductInfoAsync(name: string, timeout: number?): { [string]: any }?
 		productAsset(name, "GetProductInfoAsync")
 		watchMembership()
@@ -1398,6 +1447,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Shorthand for the `PriceInRobux` of [Client.GetProductInfoAsync]: the Robux this
 		player pays. nil if the read times out (default 10s) or was refused.
 	]=]
+	-- Waits for the local player's Robux price.
 	function Data.GetPriceAsync(name: string, timeout: number?): number?
 		local info = Data.GetProductInfoAsync(name, timeout)
 		local price = if info ~= nil then info.PriceInRobux else nil
@@ -1415,6 +1465,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		does, and again if the price changes. Returns a disconnect function. The
 		reactive way to price a shop button.
 	]=]
+	-- Reports cached product info and updates; returns a disconnect.
 	function Data.ObserveProductInfo(name: string, callback: ({ [string]: any }?) -> ()): () -> ()
 		productAsset(name, "ObserveProductInfo")
 		watchMembership()
@@ -1460,6 +1511,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		a shop with many items, because one burst costs one request where the same reads
 		trickling in frame by frame cost one each.
 	]=]
+	-- Warms selected product info in one batch.
 	function Data.PrefetchProductInfo(names: { string }?)
 		watchMembership()
 		if anyPaidRandom() then
@@ -1489,6 +1541,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		again. Scribe already does this the first time the local player's
 		`HasRobloxSubscription` flips; use this for any later move.
 	]=]
+	-- Invalidates cached marketplace info and starts fresh reads.
 	function Data.RefreshProductInfo(name: string?)
 		if name ~= nil then
 			productAsset(name, "RefreshProductInfo")
@@ -1509,9 +1562,68 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		player's own policy, so a shop can grey a button without a round trip. Raises
 		for a name that is not declared.
 	]=]
+	-- Reads the mirrored ownership and policy state for shop UI.
 	function Data.GetProductState(name: string): string
 		productAsset(name, "GetProductState")
 		return productStateFor(name)
+	end
+
+	--[=[
+		@within Client
+		@tag Monetization
+		@client
+		@yields
+		@param name string
+		@return boolean
+		@return string?
+		@return table?
+		Calls [Server.PromptPurchase] for the requesting player and returns its result.
+		The server resolves the name, checks ownership and paid-random policy, and
+		opens Roblox's purchase prompt. No custom command is needed.
+
+		`true` means the prompt call succeeded, not that the player bought anything.
+		Receipts and grants stay on the server. Refusals match [Server.PromptPurchase];
+		request failures additionally return [Scribe.RequestFailed] in the third slot.
+		Overlapping requests are refused, and the server blocks a second prompt while
+		one is open. Busy calls return `false, "purchase prompt already open"`.
+		Edit mode returns `false, "edit-mode", Scribe.RequestFailed` without prompting.
+
+		A timeout means the result is unknown: the server may already have opened the
+		prompt even though its reply did not arrive. This call never retries itself.
+		[Client.Stop] cannot cancel a request that has already been sent.
+
+		```lua
+		local opened, reason, failed = Data.PromptPurchase("CoinBag")
+		if not opened then
+		    warn(reason)
+		end
+		```
+	]=]
+	-- Asks the server to validate and open the purchase prompt.
+	function Data.PromptPurchase(name: string): (boolean, string?, {}?)
+		if type(name) ~= "string" then
+			error("Scribe.PromptPurchase: name must be a string", 2)
+		end
+		if stopped then
+			return false, "not-loaded"
+		end
+		if editMode then
+			return false, "edit-mode", Types.RequestFailed
+		end
+		if not loaded then
+			return false, "not-loaded"
+		end
+		if purchaseRequestPending then
+			return false, "purchase prompt already open"
+		end
+		purchaseRequestPending = true
+		local requested, prompted, reason, failed =
+			pcall(dispatchRequest, Wire.PURCHASE_PROMPT_COMMAND, nil, table.pack(name), 3)
+		purchaseRequestPending = false
+		if not requested then
+			return false, `purchase prompt failed: {prompted}`
+		end
+		return prompted, reason, failed
 	end
 
 	--[=[
@@ -1525,6 +1637,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		it changes: the profile loading, the policy landing, ownership changing.
 		Returns a disconnect.
 	]=]
+	-- Reports the current shop state and later changes.
 	function Data.ObserveProductState(name: string, callback: (state: string) -> ()): () -> ()
 		productAsset(name, "ObserveProductState")
 		local last: string? = nil
@@ -1562,6 +1675,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		for "Saving… / Saved ✓" UI. `Size` is the approximate byte size of the last
 		successful save (nil before the first).
 	]=]
+	-- Reads the owner's replicated save status.
 	function Data.GetSaveInfo(): { [string]: any }
 		if not editMode then
 			waitForLoaded()
@@ -1578,6 +1692,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@return { [string]: number }
 		The local player's unassigned gift credits by product name.
 	]=]
+	-- Reads unassigned gift credits from the local mirror.
 	function Data.GetGiftCredits(): { [string]: number }
 		if not editMode then
 			waitForLoaded()
@@ -1600,6 +1715,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		ItemId: string?, Since: number?, Limit: number? }`, exported as
 		`Scribe.PurchaseFilter`.
 	]=]
+	-- Reads purchase history only when its replication is enabled.
 	function Data.GetPurchases(filter: { [string]: any }?): { { [string]: any } }
 		if not editMode then
 			waitForLoaded()
@@ -1679,6 +1795,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		so you only pass the fields your component reads. `scribeState` seeds the
 		monetization and leaderboard state those APIs read.
 	]=]
+	-- Seeds local mirror data in edit mode only.
 	function Data.Mock(values: { [string]: any }?, scribeState: { [string]: any }?)
 		assertEditMode("Data.Mock")
 		-- Batch the whole-root Sets through ReplayFire so a nested observer registered
@@ -1729,6 +1846,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Registers a fake handler so [Client.Request] resolves in edit mode without
 		a server. **Errors outside edit mode.**
 	]=]
+	-- Registers an edit-mode command handler without a server.
 	function Data.MockCommand(name: string, handler: (...any) -> ...any)
 		assertEditMode("Data.MockCommand")
 		mockCommands[name] = handler
@@ -1770,7 +1888,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	if compiled.Views.Store ~= nil then
 		local proxy = {}
 		for _, key in compiled.Views.Store.RootOrder do
-			proxy[key] = tree.Accessor[key]
+			proxy[key] = tree.Accessor.Child(key)
 		end
 		Data.ServerStore = table.freeze(proxy)
 	end
@@ -1797,6 +1915,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		-- Data.Inventory.Changed fires ONCE
 		```
 	]=]
+	-- Coalesces local container notifications; writes stay on this client.
 	function Data.Batch(fn: () -> ())
 		tree:RunBatch(fn)
 	end
@@ -1812,6 +1931,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		A game never needs it. A storybook that remounts a bundle per story, or a test
 		suite that builds many, otherwise stacks a listener per build. Idempotent.
 	]=]
+	-- Releases this bundle's listeners, retry loop, and mirror.
 	function Data.Stop()
 		if stopped then
 			return
@@ -1829,6 +1949,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		tree:Destroy()
 	end
 
+	-- Exposes the same API without template-aware types.
 	Data.Raw = Data
 
 	-- One line confirming the bundle initialized (Banner = false to silence).

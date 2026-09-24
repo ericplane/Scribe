@@ -66,6 +66,63 @@ return function()
 		)
 	end)
 
+	it("previews board degradation and recovery without changing live monitoring or mentioning", function()
+		local h = two()
+		local monitor = h.Telemetry.leaderboards
+		local state, observed = monitor.State, monitor.ObservedAt
+		expect(h.Telemetry:Preview("Alerts", "Leaderboards")).to.equal(true)
+		h.Telemetry:Flush(60)
+		local requests = h.Http.For(H.URL_A)
+		expect(#requests).to.equal(2)
+		expect(requests[1].Payload.embeds[1].title).to.equal("PREVIEW: Leaderboard degraded: TopCoins (bundle 1)")
+		expect(requests[2].Payload.embeds[1].title).to.equal("PREVIEW: Leaderboard recovered: TopCoins (bundle 1)")
+		for _, request in requests do
+			expect(request.Payload.content).to.equal(nil)
+			expect(request.Payload.allowed_mentions.roles).to.equal(nil)
+			expect(string.find(request.Payload.embeds[1].description, "Profile-saving health", 1, true) ~= nil).to.equal(
+				true
+			)
+		end
+		expect(monitor.State).to.equal(state)
+		expect(monitor.ObservedAt).to.equal(observed)
+		expect(#monitor.Entries).to.equal(0)
+		expect(h.Scribe.Status).to.equal("Healthy")
+		expect(h.Telemetry:GetStats().Reports).to.equal(0)
+		h.Telemetry:Stop()
+	end)
+
+	it("previews the new runtime diagnostics and a complete summary through their real builders", function()
+		local h = two()
+		local samples = {
+			{ "SlowLoad", "PREVIEW: Warn: SLOW_LOAD" },
+			{ "SlowLeavingHook", "PREVIEW: Warn: PLAYER_LEAVING_HOOK_SLOW" },
+			{ "ReceiptCapacity", "PREVIEW: Error: RECEIPT_HISTORY_FULL" },
+			{ "ReceiptRoutingRetry", "PREVIEW: Warn: RECEIPT_RETRY" },
+		}
+		for _, sample in samples do
+			expect(h.Telemetry:Preview("Alerts", sample[1])).to.equal(true)
+			h.Telemetry:Flush(60)
+			expect(h.Http.Requests[#h.Http.Requests].Payload.embeds[1].title).to.equal(sample[2])
+		end
+		expect(h.Telemetry:Preview("Alerts", "Summary")).to.equal(true)
+		h.Telemetry:Flush(60)
+		local summary = h.Http.Requests[#h.Http.Requests].Payload.embeds[1]
+		local values = {}
+		for _, field in summary.fields do
+			values[field.name] = field.value
+		end
+		expect(values["Profile health"]).to.equal("Healthy")
+		expect(values["Leaderboard health"] ~= nil).to.equal(true)
+		expect(values.Receipts).to.equal("1 history-capacity refusals")
+		expect(values["Log delivery"]).to.equal("12 dropped · 2 sink errors")
+		expect(string.find(values["Leaderboard requests"], "240 writes", 1, true) ~= nil).to.equal(true)
+		for _, name in { "Profile acquisition (rolling)", "Player load (rolling)", "Player leaving hook (rolling)" } do
+			expect(values[name] ~= nil).to.equal(true)
+		end
+		expect(#summary.fields <= 25).to.equal(true)
+		h.Telemetry:Stop()
+	end)
+
 	it("refuses an unknown kind, an unknown or disabled destination, a stopped add-on and Studio", function()
 		local h = H.start({
 			Webhooks = {
@@ -171,7 +228,7 @@ return function()
 				run.Reason
 			)} writes={writes} titles={titles} after={tostring(after)}`
 		).to.equal(
-			`state=Running destinations=Alerts,Other kinds={1 + 7 + #Preview.SCENARIOS}:All/Health run=true:nil writes=true titles=PREVIEW: Outage (was Degraded) after=nil`
+			`state=Running destinations=Alerts,Other kinds={#Preview.KINDS}:All/Health run=true:nil writes=true titles=PREVIEW: Outage (was Degraded) after=nil`
 		)
 	end)
 

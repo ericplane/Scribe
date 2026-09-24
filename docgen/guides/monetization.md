@@ -7,6 +7,7 @@ Choose the task you need; you do not need every feature to build a shop:
 | Task | Start here |
 | --- | --- |
 | Sell coins or another repeatable Robux product | [Selling a coin pack](#selling-a-coin-pack) |
+| Deliver a product bought outside the game | [External purchases](#external-purchases) |
 | Show a purchase dialog | [Prompting the sale](#prompting-the-sale) |
 | Spend coins earned in your game | [Soft-currency purchases](#soft-currency-purchases) |
 | Check a pass or saved perk | [Checking what a player owns](#checking-what-a-player-owns) |
@@ -36,26 +37,79 @@ Products = {
 Passes = { VIP = { Id = 987654321 } },
 ```
 
-That is the entire setup. When a server script first requires the shared module, Scribe takes over `MarketplaceService.ProcessReceipt` and runs every Robux purchase through it: it grants the coins, writes a Robux purchase-log entry, and waits for the save to confirm before answering `PurchaseGranted`. If anything fails, it answers `NotProcessedYet` and Roblox retries later.
+That is the entire setup. When a server script first requires the shared module, Scribe takes over `MarketplaceService.ProcessReceipt`: it grants the coins, writes a Robux purchase-log entry, and waits for the save to confirm before answering `PurchaseGranted`. If it cannot finish, it answers `NotProcessedYet` and leaves the receipt pending. Roblox can retry when the buyer rejoins or starts another developer-product purchase; there is no timed retry loop. See [Roblox's receipt documentation](https://create.roblox.com/docs/reference/engine/classes/MarketplaceService#ProcessReceipt).
+
+### External purchases
+
+Products bought outside your game arrive through the same receipt handler. Register the product in `Products`, keep old handlers in `RetiredProducts`, and start Scribe in every place the buyer can join. If you [keep your own receipt handler](#if-your-game-already-handles-receipts), route these receipts to Scribe too.
+
+If a receipt arrives while the buyer is joining or loading, Scribe waits for their data, then grants and saves normally. The wait uses `LoadTimeout` (120 seconds by default, with a 60-second minimum). Leaving, a failed load, stopping the bundle, or reaching the timeout leaves the receipt pending. A receipt timeout does not cancel the profile load.
+
+**External sales bypass `PromptPurchase` and its eligibility checks.** Only list products that can be delivered without an in-game selection or situation, such as a fixed coin pack. Do not list paid random items or products restricted by a round, location, quantity, or player role. Enable and test external sales through [Roblox's external purchase settings](https://create.roblox.com/docs/production/monetization/developer-products#outside-your-game).
+
+A receipt marked as coming from outside the experience does not consume an unrelated pending gift for the same product. A gift destination already saved for that exact purchase ID still applies. See [gifting](./gifting#external-purchases-and-pending-gifts).
 
 ## Prompting the sale
 
-Ask by the name you declared, not the numeric Id. The same call handles both tables:
+Ask by the name you declared, not the numeric Id. From a client shop button, use the
+client API without a player argument:
+
+```lua
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Scribe = require(ReplicatedStorage.Packages.Scribe)
+local Data = require(ReplicatedStorage.GameData).Client
+
+buyButton.Activated:Connect(function()
+    local prompted, reason, requestFailed = Data.PromptPurchase("CoinPack500")
+    if requestFailed == Scribe.RequestFailed then
+        warn(`Purchase prompt request failed: {reason}`)
+    elseif not prompted then
+        warn(`Purchase prompt refused: {reason}`)
+    end
+end)
+```
+
+The client asks the server to prompt a purchase for the local player. The server checks
+the registered name, loaded data, ownership, and paid-random policy, then calls Roblox
+to open the dialog. The client yields for the result; you do not need to register a
+command or write a RemoteEvent handler.
+
+Server scripts can still prompt a chosen player with the existing form, using
+`require(ReplicatedStorage.GameData).Server`:
 
 ```lua
 Data.PromptPurchase(player, "CoinPack500")   -- a product
 Data.PromptPurchase(player, "VIP")           -- a pass
 ```
 
-Scribe resolves the name against `Products` and `Passes` and makes the matching engine call, so a shop button does not have to know which table an item lives in. The Id stays in one place, and a re-published product leaves no stale number in a shop script.
+Both forms resolve the name against `Products` and `Passes`, so a shop button does not
+need to know which table an item lives in. The Id stays in one place.
 
 A name declared in **both** tables is a startup error. Resolution is by name, so otherwise the order of two tables would decide what the player is charged for.
 
-**It refuses something the player already owns.** A pass is its own ownership key. A product is checked against its `Grants` perk, and one with no `Grants` is a consumable, has nothing to own, and always prompts. So you do not have to pair every prompt with its own [`Owns`](/api/Server#Owns) check.
+**It refuses something the player already owns.** A pass is its own ownership key. A product is checked against its `Grants` perk, and one with no `Grants` is a consumable that can be bought repeatedly. So you do not have to pair every prompt with its own [`Owns`](/api/Server#Owns) check.
 
-The reason is one of the `Scribe.ProductState` strings (`"not-loaded"`, `"owned"`, `"paid-random-restricted"`, `"policy-pending"`), plus two outside that set: an unknown name, and a prompt the engine itself refused, which is what an unpublished product looks like. None of those raise, so a shop handler needs no `pcall` of its own. [Paid random items](#paid-random-items) covers the query that answers the same thing before you prompt.
+An eligibility refusal returns a `Scribe.ProductState` string: `"not-loaded"`, `"owned"`,
+`"paid-random-restricted"`, or `"policy-pending"`. Unknown names and engine prompt errors
+return diagnostic text. Repeated clicks while the client request is pending return
+`"purchase prompt already open"`. The server uses the same refusal while this bundle
+has a purchase or gift dialog open for that player, or an unresolved paid gift for the
+requested product. This also applies to calls from server code. These refusals do not
+raise. See [unresolved gifts](./gifting#one-unresolved-gift-per-product) for cancellation
+and receipt-ordering limits.
 
-Prompting is all it does. The grant happens on the receipt through the same path every purchase takes, so a player who buys and then leaves is still granted on their next load.
+On the client, a third result equal to `Scribe.RequestFailed` means the request itself
+failed, for example with `"timeout"`, `"rate-limited"`, or `"edit-mode"`. Handle that
+separately from a shop refusal. See [commands](./commands) for the request failure
+codes and [paid random items](#paid-random-items) for checking eligibility before a click.
+
+If the reply times out or is lost, the server may already have opened the prompt.
+Scribe does not retry automatically. Calling client `Data.Stop()` cannot cancel a
+request already sent to the server.
+
+**`true` means Roblox's prompt call succeeded, not that a purchase succeeded.** Grants,
+receipt handling, and the `PurchasePrompts` metric remain on the server. Never grant
+an item from this return value or from a client prompt-finished event.
 
 !!! note "You can still prompt it yourself"
     `MarketplaceService:PromptProductPurchase` and `PromptGamePassPurchase` keep working, and Scribe still handles what follows. `Data.PromptPurchase` is the shorter route with name resolution and the ownership check attached.
@@ -81,7 +135,7 @@ The meta table on `Increment` is optional. It makes the grant show up in Roblox'
 
 ## Paid random items
 
-Roblox restricts paid random items for some players and leaves the check to the game. The engine reports the answer per player as `PolicyService:GetPolicyInfoForPlayerAsync(player).ArePaidRandomItemsRestricted`, and the rule covers an item bought with Robux **or with an in-experience currency that Robux can buy**. Declare the entry, and Scribe enforces it on every path:
+Roblox restricts paid random items for some players and leaves the check to the game. The engine reports the answer per player as `PolicyService:GetPolicyInfoForPlayerAsync(player).ArePaidRandomItemsRestricted`, and the rule covers an item bought with Robux **or with an in-experience currency that Robux can buy**. Declare the entry so Scribe can check eligibility before its purchase and gift prompts:
 
 ```lua
 Products = {
@@ -97,13 +151,15 @@ Products = {
 
 A pass cannot carry the flag: it grants a fixed perk, so declaring `PaidRandom` on one is a startup error.
 
-`Data.PromptPurchase` refuses a flagged entry for a restricted player, and while the player's policy is not yet known. `Data.Purchase` does the same for a spec carrying `PaidRandom = true`, which is the in-experience currency half of the rule. `Data.PromptGift` refuses a restricted buyer, and a recipient who is not on this server, because a policy can only be read for a Player who is here; an unflagged gift needs nobody present, as before. A receipt for a flagged product from a restricted player, which only a prompt made outside Scribe can produce, is still granted and logged `PAID_RANDOM_RECEIPT`, because the money has moved and a refused receipt would sit in a retry loop granting nothing.
+`Data.PromptPurchase` refuses a flagged entry for a restricted player, and while the player's policy is not yet known. `Data.Purchase` does the same for a spec carrying `PaidRandom = true`, which is the in-experience currency half of the rule. `Data.PromptGift` refuses a restricted buyer, and a recipient who is not on this server, because a policy can only be read for a Player who is here; an unflagged gift needs nobody present, as before.
+
+A receipt for a flagged product from a restricted player is still granted and logged `PAID_RANDOM_RECEIPT`: the player has already paid, and deferring it does not refund them. Prompts outside Scribe and external sales bypass its pre-purchase checks. Keep paid random products off external listings.
 
 **The policy is read once per player**, off the join path, and only when the bundle declares a flagged entry. Until it lands the entry reads `policy-pending` and the prompt refuses: selling a loot box to a player whose restriction could not be read is the failure the rule exists to prevent. A read that fails is retried three times with backoff, logged `POLICY_READ_FAIL` once, and re-armed at most every 30 seconds by the next check. Unflagged entries never consult it, so an outage cannot refuse an ordinary coin pack.
 
 ### Asking before you prompt
 
-`Data.GetProductState(player, name)` answers with one of five strings, and every string but `"purchasable"` is exactly the reason `PromptPurchase` refuses with, so a button greyed on the state and the prompt behind it cannot disagree. The names are on `Scribe.ProductState`.
+`Data.GetProductState(player, name)` answers with one of five strings from `Scribe.ProductState`. Use it to update your shop buttons. `PromptPurchase` checks the state again when called, so still handle its result: ownership or policy may have changed, and opening a prompt can fail.
 
 | `Scribe.ProductState` member | The string | When |
 | --- | --- | --- |
@@ -122,7 +178,11 @@ Data.ObserveProductState("LootBox", function(state)
 end)
 ```
 
-The client is the hint and the server is the gate: if the client's read fails it shows `policy-pending`, and the server still refuses. Two reasons sit outside the table. An unknown name raises from `GetProductState` and is refused without raising by `PromptPurchase`, and a prompt the engine refused, which is what an unpublished product looks like, is something no query can predict.
+The client state helps you draw the button; the server checks eligibility again when
+the client calls `PromptPurchase`. If the client's policy read fails it shows
+`policy-pending`. An unknown name raises from `GetProductState` and is refused without
+raising by `PromptPurchase`. Request failures, an already-open dialog, and an engine
+prompt error are separate from eligibility, so `GetProductState` does not predict them.
 
 ??? note "Testing it"
     `GetPolicyInfoAsync` in the options is a seam for the policy read on both realms, in the shape of `GetProductInfoAsync`. Hand it a function returning `{ ArePaidRandomItemsRestricted = true }` to render the restricted button in a storybook or a headless test.
@@ -378,7 +438,7 @@ The claim is persisted, so it survives a rejoin, and it is taken inside the tran
 ??? note "What the claims cost, and the two knobs that bound it"
     Two options under [Configuration](./configuration) govern how long the bookkeeping lives.
 
-    `PurchaseClaimTTL` is how long a claim is remembered. It defaults to `PurchaseIdTTL`, seven days, which is generous: that figure is sized for Roblox's receipt retry window, while your own retry window is usually seconds. Shorten it if you make a lot of keyed purchases.
+    `PurchaseClaimTTL` is how long your game's claim is remembered. Its default is seven days (or the legacy `PurchaseIdTTL` setting). Choose a duration covering your own retry window. Completed Roblox receipt IDs are retained separately for a fixed 30 days.
 
     `MaxPurchaseClaims` caps live claims per profile at 1000. Claims expire on their own, so this only matters for a player buying faster than the TTL drains. Reaching it drops the claim nearest to expiring and logs `PURCHASE_CLAIM_EVICTED`, because a dropped claim means a retry can apply that purchase a second time. If you see it, shorten the TTL rather than raising the cap.
 
@@ -454,7 +514,7 @@ The filter accepts `Kind`, `Category`, `ItemId`, `Since` and `Limit`, and it is 
 ## If your game already handles receipts
 
 !!! warning "Roblox allows exactly one `ProcessReceipt` callback"
-    Scribe installs its own the moment a server script requires the shared module, whenever you have declared any `Products`. That **silently overrides a receipt handler your game already had**. A pass-only or data-only game is left alone, and a second Scribe bundle errors loudly at startup instead. Assignment order is not a safe fix either: a handler your game assigns afterwards silently wins, and every Scribe product goes dark with no warning.
+    Scribe installs its own the moment a server script requires the shared module, whenever you have declared any `Products` or `RetiredProducts`. That **silently overrides a receipt handler your game already had**. A pass-only or data-only game is left alone, and a second Scribe bundle errors loudly at startup instead. Assignment order is not a safe fix either: a handler your game assigns afterwards silently wins, and every Scribe product goes dark with no warning.
 
 You have two ways out, and the first is usually better.
 
@@ -475,16 +535,50 @@ end
 If you set `OwnReceipts = false` and then never route receipts to Scribe, everything on the receipt path goes dark: developer-product grants, gift delivery, and receipt-driven Robux log entries. Perks, pass ownership and soft-currency `Purchase` keep working, because none of those touch receipts.
 
 ??? note "When to use `HandleReceipt` instead"
-    [`HandleReceipt`](/api/Server#HandleReceipt) is the stricter variant. It answers `NotProcessedYet` for an unknown product rather than `nil`, which is right when Scribe owns the callback but would stall one of *your* purchases in a permanent retry loop if you routed everything through it.
+    [`HandleReceipt`](/api/Server#HandleReceipt) is the stricter variant. It answers `NotProcessedYet` for an unknown product rather than `nil`, which is right when Scribe owns the callback but would leave one of *your* purchases pending if you routed everything through it.
 
     Call it yourself only when Scribe is the **last** handler in your chain. That is exactly what the second-bundle startup error asks for: set `OwnReceipts = false` on the secondary bundle and route its receipts through `HandleReceipt`.
 
 ??? note "Why a receipt sometimes waits for the player's next session"
-    Receipts are idempotent by `PurchaseId` and fail-closed. `PurchaseGranted` is returned only after the grant is durably committed, and `NotProcessedYet` otherwise, so Roblox retries.
+    Scribe checks `PurchaseId` against its [retained receipt history](#receipt-history-and-capacity). `PurchaseGranted` is returned only after the grant is durably committed, and `NotProcessedYet` otherwise. Roblox retries on another purchase or a rejoin, not on a timer.
 
-    That same rule handles a buyer who left between paying and the receipt arriving, and the product's shape decides how fast delivery is. A perk-only product (`Grants` with no `Grant`) commits against the offline profile and delivers straight away. A `Grant` callback needs a live accessor tree, so for an offline buyer Scribe answers `NotProcessedYet` and waits for Roblox to retry, which may not be until that player's next session.
+    A buyer still loading on this server gets the bounded wait described under [external purchases](#external-purchases). If the buyer is already absent when handling starts, a perk-only product (`Grants` with no `Grant`) can commit against the offline profile. A `Grant` callback needs a live accessor tree, so for an offline buyer Scribe answers `NotProcessedYet` and waits for Roblox to retry, which may not be until that player's next session.
 
     Nothing is lost either way. Prefer a perk when delivery timing matters.
+
+## Retiring a product safely
+
+Move a discontinued product from `Products` to `RetiredProducts`, keeping its original name, ID and grant behavior:
+
+```lua
+RetiredProducts = {
+    OldCoinPack = {
+        Id = 1234567890, -- the original developer-product ID
+        Grant = function(data)
+            data.Coins.Increment(500)
+        end,
+    },
+},
+```
+
+Scribe can still finish paid receipts and queued gifts for that product. It is omitted from the client catalog and cannot start a new purchase. Existing paid gift credits remain redeemable through `PromptGift`; without a credit, a retired product is refused. Active and retired products cannot share names or IDs.
+
+Deleting every handler for a paid product leaves its gifts waiting for a later compatible deployment. One unknown gift does not stop other messages, but many retained messages can fill the player's shared inbox. Do not discard those messages just to clear the queue.
+
+## Receipt history and capacity
+
+Scribe keeps completed purchase and gift IDs as `{ Id, At }` records for **30 days**. If Roblox repeats an ID still in history, Scribe confirms the existing grant is saved and returns `PurchaseGranted` again without granting twice.
+
+!!! warning "Protection ends when the record expires"
+    Returning `PurchaseGranted` does not prove Roblox recorded the acknowledgement. An unresolved receipt can arrive again, and a retry after its completion record expires can grant twice. This also applies to gifts: a saved destination does not prevent redelivery after the recipient's completion record expires. The 30-day window is Scribe's retention policy, not a Roblox retry cutoff.
+
+Expired records are removed during profile loads and receipt operations. There is no background timer or offline sweep. Existing timestamped records keep their original age; legacy string IDs receive a timestamp when safely migrated on a profile load/write. If the extra timestamp data would exceed Scribe's internal 3.8 MB profile guard, unknown-age strings stay protected until space allows migration. Expired dated records can still be removed.
+
+Before delivering a paid gift, Scribe also saves that receipt's exact recipient on the buyer's profile. If delivery succeeds but the final buyer save fails, a retry still targets the same recipient even after the original gift intent expires or is replaced. These pending `ReceiptReservations` are not age-pruned. The first online delivery needs one additional buyer save; ordinary self-purchases use their existing save path.
+
+The default `MaxReceiptHistoryBytes` is **1 MiB**, a ceiling rather than preallocated space. Admission includes concurrent and reserved grants and checks the current profile size. When full, new grants remain pending with `RECEIPT_HISTORY_FULL`; records within the 30-day window are not evicted to make room. Duplicates still in history remain safe to acknowledge. Raising the limit within available storage can restore admission.
+
+There is no automatic external receipt archive. `PurchaseIdTTL` does not change the fixed 30-day window, and `MaxProcessedPurchaseIds` is ignored. Previously evicted IDs cannot be recovered by this update. Upgrade every place and server that handles these profiles; older servers can still prune history using their earlier policy.
 
 ## Where to next
 

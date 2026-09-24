@@ -158,7 +158,7 @@ return function()
 			if entry.Code == "GIFT_UNKNOWN_PRODUCT" then
 				table.insert(codes, entry.Code)
 			end
-		end)
+		end, { Level = "Warn" })
 
 		local harness = makeHarness()
 		local received = {}
@@ -290,7 +290,7 @@ return function()
 				table.insert(codes, entry.Code)
 				table.insert(lines, entry)
 			end
-		end)
+		end, { Level = "Warn" })
 
 		local harness = makeHarness()
 		harness.Fake.SetConstant("MAX_MESSAGE_QUEUE", 1)

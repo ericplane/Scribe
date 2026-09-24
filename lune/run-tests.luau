@@ -543,6 +543,7 @@ services.Players = {
 services.MarketplaceService = {
 	ProcessReceipt = nil,
 	PromptGamePassPurchaseFinished = FakeSignal.new(),
+	PromptProductPurchaseFinished = FakeSignal.new(),
 	-- Test-controllable gamepass ownership. OwnedGamePasses[passId] = true marks a
 	-- pass owned; OwnsYield makes the check yield once (to exercise the async
 	-- cold-cache path). Both default to "nobody owns anything, resolve synchronously".
@@ -927,6 +928,7 @@ addChild(root, buildTree("Test", "test"))
 local addons = newInstance("Addons", "Folder")
 addChild(addons, buildTree("UI", "addons/ui"))
 addChild(addons, buildTree("Telemetry", "addons/telemetry"))
+addChild(addons, buildTree("Leaderstats", "addons/leaderstats"))
 addChild(root, addons)
 
 -- The escape hatch a simulation needs, and the ONLY one.

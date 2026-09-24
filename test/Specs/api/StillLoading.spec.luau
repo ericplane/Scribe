@@ -123,6 +123,8 @@ return function()
 		local Persistence = server.Bundle.Ctx.Persistence
 
 		local player = FakePlayer.new(66003) -- deliberately never joined
+		-- Present in this server, but never passed to Scribe's OnPlayerAdded.
+		player.Parent = server.Bundle.Players
 		local waited = waitInBackground(uni, Persistence, player, 5)
 		uni:Run(10)
 

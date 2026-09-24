@@ -88,7 +88,8 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `PROFILE_RESTORE_FAIL` | Warn | A restore did not complete, so the stored profile is unchanged. The version was not found, a live session held the key, the live key no longer exists, or the commit failed. |
 | `RESTORE_RESERVED_PRESERVED` | Warn | A restore rolled the profile back, and the library-owned `_Scribe` root was kept as it was live rather than rolled back with it. That root records events that already happened in the real world, such as settled receipts and spent cooldowns. |
 | `SLOW_IMPORT` | Warn | An `ImportLegacyData` hook ran for longer than thirty seconds. The hook is unbounded on purpose and holds the session lock throughout, so this separates one patiently waiting on the DataStore budget from one that has hung. |
-| `SLOW_LOAD` | Warn | A profile took longer than ten seconds to load. Measured from the JOIN, not from the DataStore call, so it covers the queue, the retries and any migration: it is what the player waited through. Read the `LoadDuration` percentiles alongside it, because one slow join is weather and a moved p99 is a problem. |
+| `SLOW_LOAD` | Warn | A join is still loading after ten seconds. Reported once with the user, elapsed time and current phase, including session acquisition, import or initialization. `LoadDuration` measures completed joins; `ProfileLoadDuration` measures store attempts. |
+| `PLAYER_LEAVING_HOOK_SLOW` | Warn | `OnPlayerLeaving` is still running after ten seconds, delaying that player's final save and session release. The callback is not cancelled. Keep it short; read `PlayerLeavingHookDuration` for completed callbacks. |
 | `PROFILE_SIZE` | Warn | The profile passed the size-warning threshold and is approaching the 4 MB per-key ceiling. Measured before each save attempt, so it still fires when that save then fails. It stays latched until the size drops back. Also fires `OnAnomaly`. |
 | `PROFILE_STORE_ERROR` | Warn | ProfileStore reported a DataStore error against this bundle's store. `Context.Class` is `Throttled`, `Failed`, `Unresolved` or `Rejected`, and `Context.Code` is the numeric prefix Roblox sent. A nil code means the message did not carry one. |
 | `PROFILE_STORE_SIGNAL_MISSING` | Warn | ProfileStore's error or critical-state signal could not be connected, so save-failure observability for this bundle is off. |
@@ -217,7 +218,8 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `RECEIPT_OFFLINE_RETRY` | Warn | An offline receipt could not read the buyer's saved profile, so the purchase is deferred for Roblox to retry. Repeated hits suggest DataStore read problems. |
 | `RECEIPT_RETRY` | Warn | A grant was applied in memory but the save did not confirm within the timeout, so the receipt returns `NotProcessedYet`. This is safe because the grant is idempotent. Persistent hits point at save latency. |
 | `PURCHASE_CLAIM_EVICTED` | Warn | A profile held `MaxPurchaseClaims` live `Data.Purchase` claims, so the one nearest to expiring was dropped. A retry under that key would apply the purchase a second time. |
-| `PURCHASE_ID_EVICTED` | Warn | The receipt dedupe ring was full of ids that have not yet passed `PurchaseIdTTL`, so the oldest were dropped. If Roblox retries a receipt whose id was dropped, it is granted a second time. Raise `MaxProcessedPurchaseIds`. |
+| `PURCHASE_ID_EVICTED` | Warn | Historical code from v2.4.0 and earlier: completed IDs were dropped to meet the count cap. Fixed builds retain them and no longer emit this code. IDs already removed by an older build cannot be reconstructed automatically. |
+| `RECEIPT_HISTORY_FULL` | Error | A new receipt or gift cannot fit its completion record within the history/profile budget. Its grant is deferred without evicting IDs within the 30-day window. Investigate profile size and `MaxReceiptHistoryBytes`; duplicates still in history can be acknowledged. |
 | `UNDECLARED_CATEGORY` | Warn | In DevMode, a purchase-log entry used a category string that is not in the declared set. Usually a typo. |
 | `UNDECLARED_PERK` | Warn | In DevMode, a perk key was granted or referenced that is not in the `Perks` registry. Usually a typo. |
 | `UNKNOWN_OWNS_KEY` | Warn | In DevMode, `Owns` or `OwnsAsync` was called with a key that is not a registered pass, a declared perk, a product grant, or `RobloxPlus`, so it will always return false. Warned once per key. |
@@ -248,19 +250,19 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | --- | --- | --- |
 | `GIFT_CREDIT_REFUND_FAIL` | Error | A gift delivery failed AFTER the buyer's paid credit had been spent, and the buyer had already left, so the refund had to go to their stored profile -- and that write failed too. The credit is lost and needs restoring by hand; the code names the user and the product. |
 | `GIFT_INTENT_WRITE_FAIL` | Error | The durable save of a pending gift intent failed right before prompting, so the prompt is refused and no Robux is charged. |
-| `GIFT_UNKNOWN_PRODUCT` | Error | A cross-server gift message referenced a product name this server does not have, which is a deploy mismatch. The message is kept so a later deploy can process it, and delivery is stalled until then. |
-| `GIFT_AIM_CAP_REACHED` | Warn | The buyer's durable gift-aim store is at its cap. Either a prompt was refused before any Robux moved, or a stale intent could not be archived at load and its recipient was forgotten. |
-| `GIFT_AIM_EXPIRED` | Warn | A durable gift aim passed the receipt-retry horizon with its purchase unsettled and was dropped. It names the recipient and product so the gift can be compensated by hand. A receipt arriving after this is granted to the buyer. |
+| `GIFT_UNKNOWN_PRODUCT` | Error | A paid gift names a product absent from both `Products` and `RetiredProducts`. This message remains queued, while other messages can still deliver. Restore the historical name/ID/grant handler in `RetiredProducts`; a large backlog can fill the shared inbox. |
+| `GIFT_AIM_CAP_REACHED` | Warn | The buyer's durable gift-aim store is full. New paid gifts are refused. An intent that cannot be archived stays in the pending store so its destination is preserved. |
+| `GIFT_AIM_EXPIRED` | Warn | Historical: earlier versions dropped an old gift aim to make room, potentially losing an unobserved receipt's destination. Version 2.5.0 preserves unresolved aims and no longer emits this code. |
 | `GIFT_AIM_SETTLED` | Warn | A receipt arrived after its gift intent had been swept as stale and was settled from the durable aim, so it reached the recipient it was paid for rather than the buyer. |
 | `GIFT_CREDIT_ISSUED` | Warn | A giftable perk was bought with no gift intent while the buyer already owns it, under `NoGiftIntentPolicy = "GrantOrCredit"`, so a re-aimable credit was written instead of a no-op grant. Also fires `OnGiftCredit`. |
 | `GIFT_CREDIT_UNCONFIRMED` | Warn | A gift bought with a paid credit could neither be confirmed delivered nor proved undelivered, so the credit was deliberately NOT refunded: the gift may already be queued, and handing the credit back would let one payment grant twice under a fresh id. It names the buyer, the product and the recipient so the rare genuine loss can be compensated by hand. |
 | `GIFT_DELIVERY_RETRY` | Warn | Cross-server gift delivery failed, so the receipt returns `NotProcessedYet` and Roblox will retry. Repeated hits point at a DataStore messaging problem. |
-| `GIFT_INTENT_EXPIRED` | Warn | A stored gift intent outlived the intent TTL, which is an abandoned prompt. It is cleared and any incoming receipt falls through to the no-intent policy. Normal cleanup. |
+| `GIFT_INTENT_EXPIRED` | Warn | A stored intent names a different product using the same Roblox product ID. It cannot route this product's receipt and is ignored or cleared. Restore the historical product identity rather than reusing IDs; age alone no longer invalidates an unresolved intent. |
 | `GIFT_NO_INTENT` | Warn | A giftable perk was bought with no matching intent and the buyer does not already own it, so the perk was granted to the buyer. An expected fallback. |
 | `GIFT_RECIPIENT_ALREADY_OWNS` | Warn | Between prompt and receipt the recipient acquired the perk anyway, so the purchase became a re-aimable credit for the buyer rather than a wasted grant. Also fires `OnGiftCredit`. |
-| `RECEIPT_DECLINED_PENDING_CREDIT` | Warn | A no-intent perk purchase arrived while the buyer already owns the perk and still holds an unused credit, so the purchase was declined and Roblox refunds it. |
+| `RECEIPT_DECLINED_PENDING_CREDIT` | Warn | A no-intent perk purchase arrived while the buyer already owns the perk and still holds an unused credit. The receipt stays pending; spending the credit allows a later retry to proceed. This does not issue a refund. |
 | `RECEIPT_HELD` | Warn | A no-intent perk purchase arrived while the buyer already owns the perk under `NoGiftIntentPolicy = "Hold"`, so the receipt is held for retry instead of auto-crediting. |
-| `GIFT_CREDIT_UNKNOWN_PRODUCT` | Warn | A player holds gift credits keyed by a product name that is no longer in `Products`. The paid credits are unspendable until the product returns or a migration renames the key. They are never deleted automatically. |
+| `GIFT_CREDIT_UNKNOWN_PRODUCT` | Warn | A player holds credits for a name absent from both product registries. Restore its historical handler in `RetiredProducts` to allow redemption. Paid credits are never deleted automatically. |
 | `GIFT_CREDIT_USED` | Info | A buyer redeemed an existing credit to deliver a gift, so no new purchase was charged. |
 | `GIFT_RECEIPT_GRANTED` | Info | A gift purchase was durably delivered to the intended recipient and logged as sent. |
 
@@ -269,13 +271,13 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | Code | Level | Meaning |
 | --- | --- | --- |
 | `LB_ERASE_FAIL` | Error | A board removal failed during user erasure, so the player's score may still sit on at least one board and the erase must be retried. One entry per erase, with `Context.Boards` listing every board that failed. |
-| `LB_INTERVAL_CLAMPED` | Warn | A board's `RefreshInterval` was below the 60 second floor and was raised to it. A sub-minute board is almost always an in-server scoreboard, which belongs in [`Scribe.Shared`](./visibility) at no DataStore cost. |
+| `LB_INTERVAL_CLAMPED` | Warn | A board's requested interval was below its minimum and was raised to it. `RefreshInterval` has a 60 second minimum for global boards and 1 second for server boards. `WriteInterval` has a 1 second minimum. |
 | `LB_QUEUE_OVERFLOW` | Warn | The write queue hit its cap, so the oldest pending score write was dropped. Score updates are arriving faster than the pacer can persist them. |
 | `LB_READ_FAIL` | Warn | A board refresh failed, so its rankings could not be updated this cycle. Store failures are throttled to one line per code every 30 seconds, and the line carries how many it suppressed; the counters keep counting every attempt. Studio with API access off is reported once for the whole session instead, because it is a setting rather than an outage. |
-| `LB_BUDGET_DEFERRED` | Warn | Under `BudgetPolicy = "Defer"`, a background request was postponed because the DataStore budget was down to the reserve. Nothing is dropped, and boards update more slowly until the allowance recovers. Logged at most once per 30 seconds. |
-| `LB_WRITE_DROPPED` | Warn | A score write was abandoned after three failed retries with no newer value superseding it, so that update was lost. Throttled the same way as `LB_READ_FAIL`. |
+| `LB_BUDGET_DEFERRED` | Warn | Automatic shared pacing or low DataStore allowance postponed a background request. The write remains queued or the refresh remains due, so boards update more slowly. This can occur without `BudgetPolicy = "Defer"`. Logged at most once per 30 seconds. |
+| `LB_WRITE_DROPPED` | Warn | Roblox permanently rejected this score write. Automatic retries pause until its value changes; inspect the error/configuration. Transient failures keep retrying with backoff. Throttled like `LB_READ_FAIL`. |
 | `LB_SCORE_OUT_OF_RANGE` | Warn | The score fell outside what an ordered key can hold, so the write was dropped rather than queued, since it would be rejected on every attempt. Lower `Scale`, or bound the stat. |
-| `LB_WRITE_FAIL` | Warn | One score write attempt failed. It may still be retried up to the retry limit. Throttled the same way as `LB_READ_FAIL`. |
+| `LB_WRITE_FAIL` | Warn | One score write failed. Transient failures retain the latest value and retry with capped backoff through the shared request budget. Throttled like `LB_READ_FAIL`; the log interval is not the request rate. |
 | `LB_STAT_RESOLVE_FAIL` | Warn | A board's `Stat` path failed to resolve for one player at load, so that board is not tracking them this session. The other boards are unaffected. |
 | `LB_UNKNOWN_BOARD` | Warn | In DevMode, a board name was requested that is not declared in the `Leaderboards` option. Board names are case sensitive, so `"toplevel"` does not match `TopLevel`. Warned once per name. |
 | `LB_SHUTDOWN_FLUSH` | Info | The write queue was drained during shutdown, reporting how many writes landed and how many remained. |
@@ -286,7 +288,7 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 
     `LB_SCORE_OUT_OF_RANGE` fires for two different reasons and the message says which. On a plain numeric stat, the score multiplied by the board's `Scale` passed the exact-integer range an ordered key can hold without losing its low digits. On a [`Scribe.Big`](./leaderboards) stat, the score was negative, because the packing has no sign bit, or its exponent passed the board's cap for its configured significant figures. `Scale` does not apply to a big board.
 
-    A sustained `LB_BUDGET_DEFERRED` means the server produces score changes faster than its ordered-write allowance can carry them. Raise `RefreshInterval`, or write fewer distinct stats.
+    Sustained `LB_BUDGET_DEFERRED` means scheduled board traffic exceeds the available allowance. Check the request type in the log: raise `WriteInterval` to reduce score writes, or `RefreshInterval` to reduce sorted reads. Fewer global boards reduce both; `Scope = "Server"` avoids DataStore requests entirely.
 
 ## Exchange
 

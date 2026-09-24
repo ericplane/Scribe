@@ -357,6 +357,9 @@ function Scheduler.ClockImpl(self: Scheduler)
 		Now = function()
 			return math.floor(self.Now)
 		end,
+		ServerNow = function()
+			return self.Now
+		end,
 		Monotonic = function()
 			return self.Now
 		end,

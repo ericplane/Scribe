@@ -61,7 +61,7 @@ return function()
 				"Routes.Issues is an empty list; use false to disable the category"
 			)
 			expect(refusal(base({ Routes = { Everything = "Alerts" } }))).to.equal(
-				"Routes.Everything is not a report category; use Health, Issues, Warnings, Performance, Summaries"
+				"Routes.Everything is not a report category; use Health, Issues, Warnings, Performance, Summaries, Leaderboards"
 			)
 		end)
 

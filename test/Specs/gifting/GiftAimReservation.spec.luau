@@ -1,56 +1,5 @@
 --!nonstrict
--- D2's NET: THE GIFT-AIM CAP'S ACCOUNTING, AND THE PAID GIFT IT CAN LOSE.
---
--- WHAT THE CODE PROMISES. src/Server/Monetization.luau:80-88, on the cap:
---
---   "at the cap it refuses INTAKE instead, at PromptGift, before any money moves
---    (the same fail-closed move the Outage check makes two lines above it). A
---    refused prompt costs a gift that was never paid for; an evicted aim would cost
---    a gift that was."
---
--- WHAT IT ACTUALLY COUNTS. src/Server/Monetization.luau:610-613:
---
---     local function aimStoreIsFull(): boolean
---         local aims = reservedRaw(entry.LiveData).GiftAims
---         return aims[tostring(product.Id)] == nil and Util.count(aims) >= giftAimCap
---     end
---
--- ARCHIVED aims only. It never counts the live `PendingGifts` intents, every one of
--- which will need an aim slot of its own at the next load sweep. So the intake it
--- refuses is not the intake it is about to receive: with 60 aims stored -- four free
--- slots -- a buyer may arm twenty more prompts in one session, pay for all twenty,
--- and have sixteen of the aims dropped by `archiveGiftAim` at the next load.
---
--- WHY THAT IS F1-C REOPENED. A dropped aim is the record of WHO the gift was for.
--- Without it a receipt Roblox retries on the next session has nothing to
--- distinguish it from a self-purchase, so it falls to the no-intent policy and the
--- perk is granted to the BUYER. The recipient gets nothing, and the buyer silently
--- keeps what they paid to give away. That is exactly the failure the aim store was
--- built to close, arriving through the cap instead of through the sweep.
---
--- THE SECOND EFFECT, same root, lower severity: an aim is created by ANY prompt that
--- goes stale, paid or not. Sixty-four dismissed dialogs -- no money moved at all --
--- fill the store and deny the buyer gifting.
---
--- WHAT EACH BLOCK IS.
---   * DEFECT, MUST FLIP: the measured 65-product case, end to end, in money.
---   * DEFECT, MUST FLIP: the same bug stated at the prompt, without money -- four
---     free slots accept twenty prompts.
---   * CONTROLS the accounting change must not break, and they are the reason this
---     file is longer than the two defects:
---       - a genuinely full store still refuses, and the refusal still costs nothing
---         paid and nothing prompted;
---       - an aim already in the store is NEVER evicted to make room. This is the
---         property that stops the cap becoming a double-grant source, and the
---         accounting change reaches the same function that enforces it;
---       - ordinary gifting under the cap is untouched -- a normal catalogue armed
---         in one session gains no refusals;
---       - the dismissed-dialog store, pinned as it stands today so the fix's effect
---         on it is visible rather than inferred.
---
--- SCOPE. Nothing here proposes redesigning the aim store, changing its cap, its TTL,
--- or what it evicts. GiftAimHorizon.spec owns the mechanism; this file owns the two
--- numbers the mechanism is driven by.
+-- Pending intents reserve archive capacity without replacing unsettled gifts.
 
 return function()
 	local Root = script.Parent.Parent.Parent.Parent
@@ -81,10 +30,14 @@ return function()
 	end
 
 	local function makeHarness(productCount: number, extraOptions)
+		local finished = require(Root.Scribe.Internal.Signal).new()
 		local options = {
 			Products = manyProducts(productCount),
 			GiftCooldown = 0,
-			PromptProductPurchase = function() end,
+			PromptProductPurchaseFinished = finished,
+			PromptProductPurchase = function(player, productId)
+				finished:Fire(player.UserId, productId, true)
+			end,
 		}
 		for key, value in extraOptions or {} do
 			options[key] = value
@@ -391,36 +344,23 @@ return function()
 	end)
 
 	it("CONTROL: an aim already in the store is never evicted to make room", function()
-		-- THE PROPERTY THAT STOPS THE CAP BECOMING A DOUBLE-GRANT SOURCE, and the one
-		-- the accounting change reaches directly -- both `aimStoreIsFull` bodies live
-		-- one function away from `archiveGiftAim`'s write. An aim inside the horizon
-		-- may be the last durable record of a gift ALREADY PAID FOR; dropping it to
-		-- seat a newer one is the receipt-dedupe ring's documented count-eviction flaw
-		-- rebuilt in a container that routes real money.
-		--
-		-- Three pressures in one block: a refused new product, a re-arm of a product
-		-- that already holds an aim (which needs no new room and must still work), and
-		-- the SWEEP that follows it -- the write that would do the evicting.
+		-- Refused prompts and later loads must preserve every recipient and GiftId.
 		withClock(T0, function(advance)
 			local harness = makeHarness(AIM_CAP + 1)
 			local buyer = storeWith(harness, advance, AIM_CAP)
 			local before = aimCensus(harness)
 
 			local refusedNew = not harness.Data.PromptGift(buyer, "P" .. (AIM_CAP + 1), RECIPIENT)
-			-- Re-aimed at someone else, so its aim is DISTINGUISHABLE after the sweep.
 			local reArmed = harness.Data.PromptGift(buyer, "P1", OTHER_RECIPIENT)
 			harness.Data.Flush(buyer)
 			harness.Leave(buyer)
 			advance(INTENT_TTL + 1)
-			local rejoined = harness.Join(BUYER) -- the sweep: P1's new intent archives
+			local rejoined = harness.Join(BUYER)
 			harness.Data.Flush(rejoined)
 
 			local after = aimCensus(harness)
 			local survived, lost = 0, 0
 			for productIdStr, value in before do
-				if productIdStr == "1001" then
-					continue -- P1, deliberately replaced by its own re-arm
-				end
 				if after[productIdStr] == value then
 					survived += 1
 				else
@@ -437,28 +377,21 @@ return function()
 					lost,
 					tostring(after["1001"] ~= nil and after["1001"] ~= before["1001"])
 				)
-			).to.equal("refusedNew=true reArmed=true aims=64 survived=63 lost=0 p1Rewritten=true")
+			).to.equal("refusedNew=true reArmed=false aims=64 survived=64 lost=0 p1Rewritten=false")
+
+			expect(harness.Data.HandleReceipt(receipt(1, "original-recipient"))).to.equal(GRANTED)
+			harness.Data.Flush(rejoined)
+			expect(mailbox(harness, RECIPIENT)).to.equal(1)
+			expect(mailbox(harness, OTHER_RECIPIENT)).to.equal(0)
+			expect(ownsPerk(harness, 1)).to.equal(false)
+			expect(aimFor(harness, 1)).to.equal(nil)
+			expect(harness.Data.PromptGift(rejoined, "P1", OTHER_RECIPIENT)).to.equal(true)
 
 			harness.Cleanup()
 		end)
 	end)
 
-	it("CONTROL: the SWEEP hitting the cap refuses the new aim -- it never evicts a stored one", function()
-		-- The other door onto the same property, and the one the prompt-side block
-		-- above cannot reach: `archiveGiftAim` has its OWN `aimStoreIsFull`, and it is
-		-- the function that actually WRITES to the store. A full store at the prompt
-		-- means no intent is ever armed, so the sweep's cap branch is never entered
-		-- from there. It is entered from exactly the D2 shape -- more pending intents
-		-- than free slots -- which is why this control has to be driven through the
-		-- defect's own setup.
-		--
-		-- The pin is deliberately written to hold on BOTH sides of the accounting fix.
-		-- Today five intents compete for four slots and four are archived; after the
-		-- fix only four are ever armed and the same four are archived. Either way the
-		-- sixty aims already in the store are untouched, which is the whole assertion:
-		-- an aim inside the horizon may be the last durable record of a gift already
-		-- paid for, and seating a newer one on top of it is the receipt-dedupe ring's
-		-- count-eviction flaw rebuilt where it routes money.
+	it("archives reserved intents without replacing existing aims", function()
 		withClock(T0, function(advance)
 			local harness = makeHarness(AIM_CAP + 1)
 			local buyer = storeWith(harness, advance, AIM_CAP - 4) -- 60 aims
@@ -502,6 +435,58 @@ return function()
 			harness.Cleanup()
 		end)
 	end)
+
+	for _, offline in { false, true } do
+		it(
+			"retains overflow intents at a full archive and delivers " .. (if offline then "offline" else "online"),
+			function()
+				withClock(T0, function(advance)
+					local harness = makeHarness(AIM_CAP + 1)
+					local buyer = storeWith(harness, advance, AIM_CAP)
+					local before = aimCensus(harness)
+					harness.Leave(buyer)
+
+					-- Simulate an older deployment that admitted one extra paid gift.
+					local loaded, entry = harness.Join(BUYER)
+					entry.Tree.Reserved.PendingGifts["1065"].Set({
+						RecipientId = OTHER_RECIPIENT,
+						GiftId = "legacy-overflow",
+						Product = "P65",
+						Ts = Clock.Now(),
+					})
+					harness.Data.Flush(loaded)
+					harness.Leave(loaded)
+					advance(INTENT_TTL + 1)
+
+					local rejoined = harness.Join(BUYER)
+					harness.Data.Flush(rejoined)
+					local reserved = storedReserved(harness, BUYER)
+					expect(countOf(reserved.GiftAims)).to.equal(AIM_CAP)
+					expect(countOf(reserved.PendingGifts)).to.equal(1)
+					expect(reserved.PendingGifts["1065"].GiftId).to.equal("legacy-overflow")
+					expect(reserved.PendingGifts["1065"].RecipientId).to.equal(OTHER_RECIPIENT)
+					local after = aimCensus(harness)
+					for productId, aim in before do
+						expect(after[productId]).to.equal(aim)
+					end
+
+					if offline then
+						harness.Leave(rejoined)
+					end
+					expect(harness.Data.HandleReceipt(receipt(65, "legacy-overflow-receipt"))).to.equal(GRANTED)
+					if not offline then
+						harness.Data.Flush(rejoined)
+					end
+					expect(mailbox(harness, OTHER_RECIPIENT)).to.equal(1)
+					expect(mailbox(harness, RECIPIENT)).to.equal(0)
+					expect(ownsPerk(harness, 65)).to.equal(false)
+					expect(countOf(storedReserved(harness, BUYER).GiftAims)).to.equal(AIM_CAP)
+					expect(countOf(storedReserved(harness, BUYER).PendingGifts)).to.equal(0)
+					harness.Cleanup()
+				end)
+			end
+		)
+	end
 
 	it("CONTROL: ordinary gifting under the cap gains no refusals, and every gift reaches its recipient", function()
 		-- The regression a reservation change buys its safety with if it is written
@@ -548,28 +533,12 @@ return function()
 		end)
 	end)
 
-	it("CONTROL: sixty-four DISMISSED dialogs -- no money moved -- fill the store and deny gifting", function()
-		-- THE SECOND EFFECT, pinned as it stands so the accounting fix's effect on it
-		-- is visible rather than argued. Every aim here came from a prompt that was
-		-- armed and abandoned: not one receipt was ever processed, the Robux ledger is
-		-- empty, and the store is nonetheless full and the buyer cannot gift a product
-		-- it does not already hold an aim for.
-		--
-		-- WHAT THE D2 FIX DOES TO THIS BLOCK: nothing. Reserving against pending
-		-- intents changes WHEN a prompt is refused, not whether an abandoned prompt
-		-- becomes an aim; these 64 are archived across sessions, four at most in flight
-		-- at a time, so every prompt above is still accepted and the store still fills.
-		-- Closing this one needs the intent DROPPED when the dialog is dismissed
-		-- (PromptProductPurchaseFinished with isPurchased=false), which is a different
-		-- change and out of scope here. If this block flips, the fix did more than the
-		-- accounting.
+	it("confirmed dialogs without receipts retain all 64 reservations", function()
 		withClock(T0, function(advance)
 			local harness = makeHarness(AIM_CAP + 1)
 			local buyer = storeWith(harness, advance, AIM_CAP)
 
 			local refusedNew = select(2, harness.Data.PromptGift(buyer, "P" .. (AIM_CAP + 1), RECIPIENT))
-			-- The one gift still available to them: a product whose aim they already
-			-- hold. Proof the denial is the cap and not a broken buyer.
 			local reArmOk = harness.Data.PromptGift(buyer, "P2", RECIPIENT)
 			harness.Data.Flush(buyer)
 
@@ -583,7 +552,7 @@ return function()
 					tostring(reArmOk)
 				)
 			).to.equal(
-				"aims=64 robuxLines=0 processed=0 refusedNew=too many unsettled gift purchases; try again later reArmOk=true"
+				"aims=64 robuxLines=0 processed=0 refusedNew=too many unsettled gift purchases; try again later reArmOk=false"
 			)
 
 			harness.Cleanup()

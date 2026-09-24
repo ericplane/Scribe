@@ -248,6 +248,27 @@ html:not([data-has-sidebar]) .main-frame .content-panel:has(.scribe-home) .sl-co
 .foundation-strip { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 1rem; padding: 1.3rem .3rem; border-block: 1px solid var(--scribe-border-soft); color: var(--scribe-muted); font-size: .75rem; }
 .foundation-strip > span { display: flex; align-items: center; gap: .55rem; }
 .foundation-strip svg { color: var(--scribe-mint-text); opacity: .85; }
+.games-section { padding-top: 3rem; }
+.games-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: .65rem 2rem; margin-bottom: 1.25rem; }
+.scribe-home .games-heading h2 { font-size: 1.45rem; letter-spacing: -.035em; }
+.games-heading p { color: var(--scribe-muted); font-size: .78rem; }
+.games-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .85rem; }
+.game-card { display: flex; align-items: center; gap: 1.2rem; min-width: 0; padding: 1.15rem; border: 1px solid var(--scribe-border); border-radius: .7rem; background: var(--scribe-surface); color: var(--scribe-ink); transition: background-color 160ms, border-color 160ms; }
+.game-card:hover, .game-card:focus-visible { border-color: var(--sl-color-accent); background: var(--scribe-surface-raised); }
+.sl-markdown-content .scribe-home a.game-card[href]::after { display: none; }
+.game-card > img { flex: 0 0 5.5rem; width: 5.5rem; height: 5.5rem; border-radius: .45rem; object-fit: cover; background: var(--scribe-code); }
+.game-copy { min-width: 0; }
+.game-genre { color: var(--scribe-muted); font-size: .66rem; line-height: 1.5; }
+.game-copy h3 { margin-top: .3rem; font-size: 1rem; font-weight: 600; letter-spacing: -.025em; line-height: 1.4; }
+.game-link { display: inline-flex; align-items: center; gap: .35rem; margin-top: .65rem; color: var(--scribe-mint-text); font-size: .72rem; font-weight: 530; }
+.game-card:hover .game-link, .game-card:focus-visible .game-link { text-decoration: underline; text-underline-offset: .2em; }
+.game-arrow { display: flex; transform: rotate(-45deg); }
+@media (max-width: 45rem) { .games-grid { grid-template-columns: 1fr; } }
+@media (max-width: 35rem) {
+    .games-section { padding-top: 2.5rem; }
+    .game-card { gap: 1rem; padding: 1rem; }
+    .game-card > img { flex-basis: 4.5rem; width: 4.5rem; height: 4.5rem; }
+}
 .start-section { padding: 4.5rem 0; }
 .section-heading { display: flex; justify-content: space-between; align-items: end; gap: 2rem; margin-bottom: 1.8rem; }
 .eyebrow { color: var(--scribe-mint-text); font-size: .62rem; font-weight: 600; letter-spacing: .14em; line-height: 1.5; }
@@ -283,6 +304,7 @@ html:not([data-has-sidebar]) .main-frame .content-panel:has(.scribe-home) .sl-co
 .scribe-home-footer > div a { color: var(--scribe-muted); }
 .scribe-home-footer > div a:hover { color: var(--scribe-mint-text); }
 .scribe-home-footer > div span { color: var(--scribe-muted); opacity: .8; }
+.scribe-home-footer > .scribe-site-credit { flex-basis: 100%; }
 
 @media (min-width: 80rem) { .hero-break { display: none; } }
 @media (max-width: 72rem) {

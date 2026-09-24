@@ -546,6 +546,10 @@ function Exchanges.new(ctx: any)
 			if verdict == nil then
 				return false, "no verdict could be established"
 			end
+			local matches, whyNot = ExchangeVerdict.Matches(verdict, record.Digest, userIdA, userIdB)
+			if not matches then
+				return false, `verdict does not govern this exchange: {tostring(whyNot)}`
+			end
 			for _, side in sides do
 				pcall(ExchangeLeg.Settle, side.Ctx, exchangeId, verdict)
 				pcall(ExchangeLeg.Deliver, side.Ctx, exchangeId)
@@ -685,7 +689,7 @@ function Exchanges.new(ctx: any)
 		watch(entryB)
 
 		return Exchange.Attempt({
-			ExchangeId = `{entryA.UserId}-{entryB.UserId}-{HttpService:GenerateGUID(false)}`,
+			ExchangeId = HttpService:GenerateGUID(false),
 			VerdictStore = store,
 			InFlight = inFlight,
 			Options = ctx.Options.Exchange,

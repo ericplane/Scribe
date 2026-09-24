@@ -5,7 +5,7 @@ local Config = {}
 
 local Transport = require(script.Parent.Transport)
 
-export type Category = "Health" | "Issues" | "Warnings" | "Performance" | "Summaries"
+export type Category = "Health" | "Issues" | "Warnings" | "Performance" | "Summaries" | "Leaderboards"
 export type MentionKind = "Fatal" | "Error" | "Outage" | "Degraded" | "Recovery" | "Performance"
 -- One name, several, or false for nowhere.
 export type Route = string | { string } | false
@@ -22,6 +22,7 @@ export type WarningOptions = { Include: { string }?, Categories: { string }? }
 export type IssueOptions = { ExcludeCodes: { string }?, ExcludeCategories: { string }? }
 export type GroupingOptions = { Interval: number?, Expiry: number?, MaxGroups: number? }
 export type SummaryOptions = { Enabled: boolean?, Interval: number? }
+export type LeaderboardOptions = { Enabled: boolean?, Interval: number?, MaxBoards: number? }
 export type PerformanceOptions = { Interval: number?, Checks: number?, Rules: RuleSetOptions? }
 export type LimitOptions = {
 	MaxQueued: number?,
@@ -36,11 +37,19 @@ export type LimitOptions = {
 export type Options = {
 	Webhooks: { [string]: WebhookOptions },
 	Default: string?,
-	Routes: { Health: Route?, Issues: Route?, Warnings: Route?, Performance: Route?, Summaries: Route? }?,
+	Routes: {
+		Health: Route?,
+		Issues: Route?,
+		Warnings: Route?,
+		Performance: Route?,
+		Summaries: Route?,
+		Leaderboards: Route?,
+	}?,
 	Warnings: WarningOptions?,
 	Issues: IssueOptions?,
 	Grouping: GroupingOptions?,
 	Summaries: SummaryOptions?,
+	Leaderboards: LeaderboardOptions?,
 	Performance: PerformanceOptions?,
 	Limits: LimitOptions?,
 	IncludePlayerIds: boolean?,
@@ -85,6 +94,9 @@ export type Resolved = {
 	MaxGroups: number,
 	SummaryInterval: number,
 	SummariesEnabled: boolean,
+	LeaderboardsEnabled: boolean,
+	LeaderboardInterval: number,
+	MaxBoards: number,
 	PerformanceInterval: number,
 	PerformanceChecks: number,
 	Rules: { SlowSaves: Rule, SaveFailures: Rule, Traffic: Rule },
@@ -103,7 +115,7 @@ export type Resolved = {
 	Urls: { string }, -- every configured URL, longest first, for redaction
 }
 
-Config.CATEGORIES = { "Health", "Issues", "Warnings", "Performance", "Summaries" }
+Config.CATEGORIES = { "Health", "Issues", "Warnings", "Performance", "Summaries", "Leaderboards" }
 
 -- Fixed, like the name beside it: every message is visibly Scribe's.
 Config.LOGO_URL = "https://raw.githubusercontent.com/ericplane/Scribe/main/docgen/theme/assets/favicon.png"
@@ -113,6 +125,7 @@ Config.BRAND_NAME = "Scribe Telemetry"
 Config.DEFAULT_WARNING_CODES = {
 	"PROFILE_SIZE",
 	"SLOW_LOAD",
+	"PLAYER_LEAVING_HOOK_SLOW",
 	"WIPE_GUARD_BLOCKED",
 	"WIPE_GUARD_FORCED",
 	"PURCHASE_ID_EVICTED",
@@ -120,6 +133,11 @@ Config.DEFAULT_WARNING_CODES = {
 	"GIFT_CREDIT_UNCONFIRMED",
 	"PASS_PURCHASE_UNCONFIRMED",
 	"LB_WRITE_DROPPED",
+	"LB_READ_FAIL",
+	"LB_WRITE_FAIL",
+	"LB_QUEUE_OVERFLOW",
+	"LB_BUDGET_DEFERRED",
+	"RECEIPT_RETRY",
 }
 
 local MENTION_KINDS =
@@ -306,15 +324,33 @@ function Config.Resolve(options: Options): Resolved
 	end
 	local grouping: GroupingOptions = options.Grouping or {}
 	local summaries: SummaryOptions = options.Summaries or {}
+	if options.Leaderboards ~= nil and type(options.Leaderboards) ~= "table" then
+		fail("Leaderboards must be a table")
+	end
+	local leaderboards: LeaderboardOptions = options.Leaderboards or {}
 	local performance: PerformanceOptions = options.Performance or {}
 	local rules: RuleSetOptions = performance.Rules or {}
 	local limits: LimitOptions = options.Limits or {}
-	local tables: { [string]: any } =
-		{ Grouping = grouping, Summaries = summaries, Performance = performance, Limits = limits, Rules = rules }
+	local tables: { [string]: any } = {
+		Grouping = grouping,
+		Summaries = summaries,
+		Leaderboards = leaderboards,
+		Performance = performance,
+		Limits = limits,
+		Rules = rules,
+	}
 	for field, value in tables do
 		if type(value) ~= "table" then
 			fail(`{field} must be a table`)
 		end
+	end
+	local boardInterval = number(leaderboards.Interval, "Leaderboards.Interval", 30, 5)
+	if boardInterval == math.huge then
+		fail("Leaderboards.Interval must be finite")
+	end
+	local maxBoards = number(leaderboards.MaxBoards, "Leaderboards.MaxBoards", 64, 1)
+	if maxBoards > 1024 or maxBoards % 1 ~= 0 then
+		fail("Leaderboards.MaxBoards must be an integer from 1 to 1024")
 	end
 
 	local environment = options.Environment
@@ -349,6 +385,9 @@ function Config.Resolve(options: Options): Resolved
 		MaxGroups = number(grouping.MaxGroups, "Grouping.MaxGroups", 128, 1),
 		SummariesEnabled = boolean(summaries.Enabled, "Summaries.Enabled", false),
 		SummaryInterval = number(summaries.Interval, "Summaries.Interval", 1800, 60),
+		LeaderboardsEnabled = boolean(leaderboards.Enabled, "Leaderboards.Enabled", true),
+		LeaderboardInterval = boardInterval,
+		MaxBoards = maxBoards,
 		PerformanceInterval = number(performance.Interval, "Performance.Interval", 60, 5),
 		PerformanceChecks = number(performance.Checks, "Performance.Checks", 3, 1),
 		Rules = {

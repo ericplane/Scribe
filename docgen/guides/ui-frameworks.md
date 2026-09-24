@@ -2,12 +2,41 @@
 
 Scribe's client accessors already have the shape a reactive UI framework wants: a value you can read, and a subscription that tells you when it moved. Bridging one takes about five lines, and the repo ships those five lines for [Vide](https://github.com/centau/vide), [React](https://github.com/jsdotlua/react-lua) and [Fusion](https://github.com/dphfox/Fusion) so you do not have to write them.
 
-They live in [`addons/ui/`](https://github.com/ericplane/Scribe/tree/main/addons/ui) and are **not part of the package**. Wally installs `src` only, so copy the file you want into your game and name it whatever suits your project, or insert `ScribeUIAdapters-Addon.rbxm` from the [release page](https://github.com/ericplane/Scribe/releases), a folder holding all three; the snippets below call it `ScribeVide`, `ScribeReact` and `ScribeFusion` to keep it distinct from the framework itself. Each one takes your framework as an argument, because the framework sits at a path in your project that Scribe cannot know:
+They live in [`addons/ui/`](https://github.com/ericplane/Scribe/tree/main/addons/ui). **Wally installs `src` only**, so copy the file you want into your game and name it whatever suits your project, or insert `ScribeUIAdapters-Addon.rbxm` from the [release page](https://github.com/ericplane/Scribe/releases), a folder holding all three. The snippets below call the modules `ScribeVide`, `ScribeReact` and `ScribeFusion` to keep them distinct from the framework itself. Each one takes your framework as an argument, because the framework sits at a path in your project that Scribe cannot know:
 
 ```lua
 local useScribe = require(ReplicatedStorage.Shared.ScribeVide)(vide)
 local coins = useScribe(Data.Coins)
 ```
+
+## roblox-ts
+
+The adapters are separate optional packages: `@rbxts/scribe-react`,
+`@rbxts/scribe-vide`, and `@rbxts/scribe-fusion`. Install only the adapter and
+framework your game uses. The core package includes none of these dependencies.
+See [roblox-ts](roblox-ts.md) for publication status and all three installation examples.
+
+```ts
+import React from "@rbxts/react";
+import ScribeReact from "@rbxts/scribe-react";
+import { Data } from "shared/data";
+
+const { useScribeBinding } = ScribeReact(React);
+
+function CoinLabel() {
+    const coins = useScribeBinding(Data.Client.Coins); // React.Binding<number>
+    return React.createElement("TextLabel", {
+        Text: coins.map((value) => `${value} coins`),
+    });
+}
+```
+
+React hooks retain the accessor's value type, including `undefined` for an absent
+entry. Vide returns a typed source and disconnect through a `LuaTuple`, so use
+`const [value, disconnect] = useScribe(accessor)`. Fusion returns a Value and
+disconnect in the same way. Its scoped 0.3 overload accepts your typed framework
+implementation and preserves its additional Value members; it does not require
+installing the 0.2 framework. Cleanup behavior is the same as in the Luau examples.
 
 ## Vide
 

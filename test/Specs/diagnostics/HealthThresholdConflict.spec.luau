@@ -21,13 +21,12 @@ return function()
 	local Health = require(Root.Scribe.Internal.Health)
 	local Log = require(Root.Scribe.Internal.Log)
 
-	--- Capture every log line emitted while `body` runs. Sinks are Sched.Spawn'd,
-	--- so the caller has to let a frame pass before reading.
+	-- Let the deferred sink drain before checking captured warnings.
 	local function capturing(body)
 		local seen = {}
 		local detach = Log.AddSink(function(entry)
 			table.insert(seen, entry)
-		end)
+		end, { Level = "Warn" })
 		body()
 		task.wait()
 		detach()

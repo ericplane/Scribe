@@ -29,6 +29,7 @@ export default defineConfig({
     components: {
       SiteTitle: './src/components/SiteTitle.astro',
       PageTitle: './src/components/PageTitle.astro',
+      Footer: './src/components/Footer.astro',
     },
     social: [{ icon: 'github', label: 'Scribe on GitHub', href: 'https://github.com/ericplane/Scribe' }],
     tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },
@@ -36,6 +37,7 @@ export default defineConfig({
     sidebar: [
       { label: 'Start here', items: [
         { label: 'Your first player data', slug: 'getting-started' },
+        { label: 'Use roblox-ts', slug: 'roblox-ts' },
         { label: 'Declare your template', slug: 'templates' },
         { label: 'Read and write values', slug: 'values' },
         { label: 'Test modes and real saving', slug: 'testing' },
@@ -45,7 +47,7 @@ export default defineConfig({
         { label: 'Find a recipe', slug: 'recipes' },
         'containers', 'datatypes', 'big-numbers', 'time', 'derived', 'server-store',
         'commands', 'ui-frameworks', 'monetization', 'gifting', 'exchange', 'economy',
-        'leaderboards', 'telemetry',
+        'leaderboards', 'leaderstats', 'telemetry',
       ] },
       { label: 'Understand Scribe', collapsed: true, items: [
         'lifecycle', 'visibility', 'transactions', 'transports', 'security', 'cost',

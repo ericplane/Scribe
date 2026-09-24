@@ -32,6 +32,7 @@ export type ScribeTransport = {
 }
 
 export type LogLevel = "Debug" | "Info" | "Warn" | "Error" | "Fatal"
+export type LogSinkOptions = { Level: LogLevel?, MaxQueued: number? }
 export type LogCategory =
 	"Persistence"
 	| "Replication"
@@ -149,6 +150,7 @@ export type LogCode =
 	| "GRANT_PARTIAL"
 	| "GRANT_SEEDED_ELEMENT"
 	| "RECEIPT_IN_FLIGHT"
+	| "RECEIPT_HISTORY_FULL"
 	| "OWNERSHIP_CHECK_FAIL"
 	| "PASS_PURCHASE_UNCONFIRMED"
 	| "PERK_GRANTED"
@@ -226,6 +228,7 @@ export type LogCode =
 	| "DYNAMIC_DEFAULT_FAILED"
 	| "LISTENER_ERROR"
 	| "ON_PLAYER_INIT_ERROR"
+	| "PLAYER_LEAVING_HOOK_SLOW"
 	| "SANDBOXED"
 	| "SERVER_STARTED"
 	| "SIM_STATUS"
@@ -244,6 +247,14 @@ export type LogEntry = {
 export type Status = "Healthy" | "Degraded" | "Outage"
 
 export type SessionState = "Loading" | "Ready" | "SessionEnded"
+export type LoadPhase =
+	"WaitingForErase"
+	| "AcquiringSession"
+	| "ReadingProfile"
+	| "Retrying"
+	| "Initializing"
+	| "Importing"
+	| "ImportThrottled"
 
 -- Why a data session ended, or why waiting for data did not produce a tree.
 -- `WaitForData`'s second return, the `SessionEnded` signal and `GetState`'s stored
@@ -305,6 +316,7 @@ export type GiftReason =
 	| "invalid recipient"
 	| "cannot gift yourself"
 	| "gift cooldown"
+	| "product retired"
 	| "too many pending gifts"
 	| "data services are experiencing issues; try again later"
 	| "recipient already owns this"
@@ -343,6 +355,20 @@ export type LeaderboardEntry = {
 	-- so this is not always a number.
 	Score: number | BigScore,
 }
+
+export type LeaderboardStatus = "Starting" | "Healthy" | "Degraded"
+export type LeaderboardStatusInfo = {
+	Status: LeaderboardStatus,
+	PendingWrites: number,
+	RetryingWrites: number,
+	RejectedWrites: number,
+	LastReadAt: number?,
+	ReadAge: number?,
+	LastWriteAt: number?,
+	LastReadError: string?,
+	LastWriteError: string?,
+}
+export type LeaderboardSnapshotEntry = LeaderboardStatusInfo & { BundleId: number, Name: string }
 
 export type LeaderboardConfig = {
 	Stat: string,

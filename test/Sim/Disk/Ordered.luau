@@ -17,7 +17,7 @@
 --     than an empty stand-in;
 --   * only page one of a sorted query is modelled, because Leaderboards reads
 --     GetCurrentPage once and never advances;
---   * the documented budget for OrderedList reads is zero.
+--   * GetSortedAsync spends OrderedList, separately from ordinary ordered reads.
 
 local Errors = require(script.Parent.Errors)
 
@@ -108,7 +108,7 @@ function Ordered.GetSortedAsync(self, ascending: boolean, pageSize: number)
 	end
 
 	local disk = self._disk
-	disk:Admit(self._jobId or disk._defaultJob, "OrderedList", "GetAsync")
+	disk:Admit(self._jobId or disk._defaultJob, "OrderedList", "GetSortedAsync")
 	disk:Wait(disk.Latency:Draw("Read"))
 
 	local rows = {}

@@ -460,7 +460,7 @@ return function()
 		harness.Cleanup()
 	end)
 
-	describe("dedupe ring eviction", function()
+	describe("durable receipt history", function()
 		it("still dedupes a receipt whose id was stored as a bare legacy string", function()
 			local harness = makeHarness()
 			local _, entry, data = harness.Join(6300)
@@ -476,7 +476,7 @@ return function()
 			harness.Cleanup()
 		end)
 
-		it("stamps a legacy entry rather than assuming it is old enough to drop", function()
+		it("adds a retention timestamp to legacy IDs", function()
 			local harness = makeHarness()
 			local _, entry, data = harness.Join(6301)
 			entry.LiveData._Scribe.ProcessedPurchaseIds = { "legacy-1" }
@@ -491,7 +491,7 @@ return function()
 			harness.Cleanup()
 		end)
 
-		it("drops entries past PurchaseIdTTL and keeps the ones still inside it", function()
+		it("keeps IDs past the former PurchaseIdTTL", function()
 			local harness = makeHarness({ PurchaseIdTTL = 100 })
 			local _, entry, data = harness.Join(6302)
 			local now = os.time()
@@ -503,16 +503,14 @@ return function()
 			harness.Data.HandleReceipt(receipt(6302, 111, "new-1"))
 
 			local ids = processedIds(data._Scribe.ProcessedPurchaseIds.Get())
-			expect(table.find(ids, "expired")).to.equal(nil)
+			expect(table.find(ids, "expired")).never.to.equal(nil)
 			expect(table.find(ids, "fresh")).never.to.equal(nil)
 			expect(table.find(ids, "new-1")).never.to.equal(nil)
 
 			harness.Cleanup()
 		end)
 
-		it("warns when the count backstop evicts an un-expired id", function()
-			-- A cap of 3 with a long TTL: nothing ages out, so the backstop is the
-			-- only thing that can make room -- the one eviction that can double-grant.
+		it("retains every ID beyond the former count cap", function()
 			local harness = makeHarness({ MaxProcessedPurchaseIds = 3, PurchaseIdTTL = 999999 })
 			local _, entry, data = harness.Join(6303)
 			local now = os.time()
@@ -526,10 +524,9 @@ return function()
 			harness.Data.HandleReceipt(receipt(6303, 111, "new-1"))
 
 			local ids = processedIds(data._Scribe.ProcessedPurchaseIds.Get())
-			expect(table.find(ids, "a")).to.equal(nil) -- oldest dropped
+			expect(table.find(ids, "a")).never.to.equal(nil)
 			expect(table.find(ids, "new-1")).never.to.equal(nil)
-			-- Silence here was the actual defect: the dangerous eviction now reports.
-			expect((Scribe.GetMetrics().PurchaseIdsEvicted or 0) - before).to.equal(1)
+			expect((Scribe.GetMetrics().PurchaseIdsEvicted or 0) - before).to.equal(0)
 
 			harness.Cleanup()
 		end)
@@ -546,20 +543,21 @@ return function()
 		harness.Cleanup()
 	end)
 
-	it("expires stale gift intents; the purchase follows the no-intent policy", function()
+	it("keeps the original recipient when a receipt arrives after the intent TTL", function()
 		local harness = makeHarness({ GiftIntentTTL = 60 })
+		harness.Leave(harness.Join(555555))
 		local buyer, entry = harness.Join()
 
 		expect(harness.Data.PromptGift(buyer, "GiftVIP", 555555)).to.equal(true)
-		-- Abandoned prompt: backdate the intent past the TTL.
+		-- A delayed receipt does not prove the prompt was abandoned.
 		entry.LiveData._Scribe.PendingGifts["222"].Ts = os.time() - 120
 
 		expect(harness.Data.HandleReceipt(receipt(entry.UserId, 222, "stale-1"))).to.equal(GRANTED)
-		-- Fell back to grant-to-buyer; the stale recipient got nothing.
-		expect(harness.Data.Owns(buyer, "VIP")).to.equal(true)
+		expect(harness.Data.Owns(buyer, "VIP")).to.equal(false)
 		expect(entry.LiveData._Scribe.PendingGifts["222"]).to.equal(nil)
-		local logs = Scribe.GetRecentLogs({ Code = "GIFT_INTENT_EXPIRED", Limit = 3 })
-		expect(#logs > 0).to.equal(true)
+		local recipient = harness.Join(555555)
+		expect(harness.Data.Owns(recipient, "VIP")).to.equal(true)
+		expect(harness.Data.HandleReceipt(receipt(entry.UserId, 222, "stale-1"))).to.equal(GRANTED)
 
 		harness.Cleanup()
 	end)

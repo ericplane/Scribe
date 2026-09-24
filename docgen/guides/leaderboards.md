@@ -21,7 +21,7 @@ Leaderboards = {
 },
 ```
 
-That is all of it. Scribe watches `Level` on every loaded player, queues a write whenever it changes, and re-reads the top 100 in the background. On the server, read the board back like this:
+Scribe watches `Level` on every loaded player, keeps the latest changed score queued, and re-reads the top 100 in the background. By default, repeated changes from one player are written at most once every 30 seconds. On the server, read the board back like this:
 
 ```lua
 for _, entry in Data.GetLeaderboard("TopLevel", 10) do
@@ -79,6 +79,25 @@ Every read hits a cache, never a live store, so a board is empty until its own f
 
     OrderedDataStore has no exact-rank primitive. Resolving a deep rank would mean paging through 100,000 or more entries on every query, so Scribe does not do it. To show something for players off the board, track a separate stat such as a personal best.
 
+## Write cadence
+
+`WriteInterval` controls how often one player's changed score may be written to a global board. It defaults to **30 seconds**. The first score is eligible promptly; later changes replace the queued value until the interval has elapsed.
+
+```lua
+Leaderboards = {
+    TopLevel = { Stat = "Level" }, -- default: 30 seconds between changed-score writes
+    TopCoins = { Stat = "Coins", WriteInterval = 60, RefreshInterval = 300 },
+},
+```
+
+In this example, `TopCoins` writes a player's latest changed score at most once a minute during play and reads the top scores about every five minutes. These are separate costs: raising `RefreshInterval` does **not** reduce writes.
+
+Scribe also skips a score that matches the last successfully written integer. Spending below an unchanged daily peak, or changing a fractional stat without changing its rounded score, needs no new write. This comparison is local to the player's tracked session and store; it does not read the store to find out what another server wrote.
+
+Leaving makes a pending changed score eligible without waiting for `WriteInterval`, though it still waits for the request budget. Shutdown attempts to drain remaining scores immediately. Neither path writes an unchanged score again, and neither can guarantee delivery if Roblox rejects the request or the server runs out of shutdown time. Player profile saves follow their own schedule.
+
+`WriteInterval` must be a positive, finite number. Values below one second are clamped to one. It has no effect on `Scope = "Server"`, which writes nothing to a DataStore.
+
 ## Refresh cadence
 
 Each board re-reads its store every 60 seconds by default. Set `RefreshInterval` per board to go **slower**, which is what most games want:
@@ -94,7 +113,15 @@ A top-100 all-time board rarely needs minute-freshness, and every refresh spends
 
 `Data.GetLeaderboardRefreshIn(name)` is the seconds until a board next reads, for a "refreshes in" label. It is `0` while a due refresh waits on the request budget, and `nil` until the loop has scheduled its first cycle a few seconds after boot. It is server-side; a client label reads it through a `Scribe.Shared` field or a Command.
 
-Scribe also refuses at startup if your boards would collectively read too often. The ceiling is **12 reads per minute**, summed as `60 / RefreshInterval` across every board, so twelve boards at the default exactly fit and the thirteenth will not boot. `TopCoins` above costs 0.1 reads per minute instead of 1, which is how you buy room for more boards.
+The startup guard allows at most **12 scheduled current-board reads per minute**, summed as `60 / RefreshInterval` across global boards. Twelve boards at the default fit this guard; the thirteenth will not boot. `TopCoins` above costs 0.1 reads per minute instead of 1. This is a configuration guard, not a promise that a small server has enough allowance to meet that schedule.
+
+Global boards automatically share a request allowance across Scribe bundles on the same server. Scribe paces background reads and writes below Roblox's default server limits and leaves headroom in the reported budget. A read stays due when it cannot proceed, including each extra read for a previous period. Boards may therefore update more slowly on small or busy servers.
+
+This pacing does not coordinate every server in your experience or reserve capacity against other scripts. Watch [`LbBudgetDeferred` and `LbQueueDepth`](./diagnostics#subsystem-counters) when choosing how many global boards to run. A larger `WriteInterval` reduces score traffic; a larger `RefreshInterval` reduces ranking reads.
+
+Transient write failures keep the latest score queued. After three failures, retries use exponential backoff with jitter, capped at five minutes, through the same request-budget checks. A stat does not need to change again for recovery. Permanently rejected scores wait for a changed value. The queue is bounded and held in memory, so a server shutdown or queue overflow can still leave a score stale.
+
+Use `Data.GetLeaderboardStatus("TopCoins")` on the server to inspect a board's `Status`, `ReadAge`, `PendingWrites`, `RetryingWrites`, `RejectedWrites`, and latest errors. `Starting` means no successful refresh yet. `Degraded` includes failed operations and a cache older than twice its refresh interval. This is separate from `Scribe.GetStatus()`.
 
 ??? tip "If you wanted a live in-server scoreboard, declare `Scope = \"Server\"`"
     Going faster than a minute is nearly always a sign that what you want is the players on *this* server, not a global board. That is [a server-scoped board](#a-board-for-this-server), which reads nothing from a store and refreshes every five seconds by default.
@@ -130,6 +157,8 @@ The baseline is saved in the profile. Rejoining within the same period keeps it;
 
     Old period stores remain. They use storage and add work to a user's [erasure](#erasure). If you need to remove old stores in bulk, use the Creator Hub's Data Stores Manager rather than expecting a rollover to clean them up.
 
+    One daily board creates about 365 stores a year. More than 100 stores disables per-store size/key-count metrics in the [Data Stores Manager](https://create.roblox.com/docs/cloud-services/data-stores/data-stores-manager); it is not a 100-store storage limit. Set a retention policy for your game before adding many daily boards. Review previous-period reads, erasure records and historical rewards before manually deleting old stores; Scribe does not delete them automatically.
+
 ### The reset clock
 
 One clock per bundle, because a game has one audience:
@@ -159,7 +188,11 @@ Scribe reads that period at the first refresh after rollover and once more at th
 
 ### Cost
 
-Writes scale with the number of boards on a stat, but the pacer's dedup window already collapses a burst into one write per board, so three boards on `Wins` is three writes per player per settle, not three per increment. Reads are one more `GetSortedAsync` per periodic board per `RefreshInterval`, and the startup guard above counts them. Nothing runs per frame, the pacer parks while its queue is empty, and a bundle with only server boards never starts it.
+Each global board needs its own writes, even when several rank the same stat. Three boards on `Wins` can therefore cost three writes per player per write interval. Only the latest changed score is kept for each player/store, and a score that is already stored successfully is skipped.
+
+A periodic board normally reads its current period once per refresh. Its first two refreshes also read the previous period, adding two requests per rollover or server start. Each read passes the budget check separately. The startup guard counts the regular current-period schedule; these extra reads can delay a refresh when allowance is low.
+
+Nothing runs per frame, the pacer parks while its queue is empty, and a bundle with only server boards never starts it.
 
 !!! warning "Upgrading to 2.4.0 changes the schema hash"
     The baseline lives under the reserved `_Scribe` root, and a new child there changes the hash both realms compare at handshake. Deploy your server and client together, as with any template change, even if you declare no periodic board.

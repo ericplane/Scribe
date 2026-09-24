@@ -1,7 +1,7 @@
 # Discord Telemetry
 
-`ScribeTelemetry` sends Scribe's health reports, errors and selected warnings to
-Discord. You can also enable performance alerts and regular summaries.
+`ScribeTelemetry` sends profile and leaderboard health reports, errors and selected
+warnings to Discord. You can also enable performance alerts and regular summaries.
 
 It is an optional add-on, **not part of the Scribe package**. Scribe sends nothing
 to Discord unless you install and start it.
@@ -15,6 +15,50 @@ Before you begin:
    [release page](https://github.com/ericplane/Scribe/releases) there.
 3. Enable **HTTP Requests** in Experience Settings.
 4. Create a Discord webhook for the channel that should receive reports.
+
+## roblox-ts
+
+Telemetry has its own optional `@rbxts/scribe-telemetry` package; installing the
+core does not include it. See [roblox-ts](roblox-ts.md) for publication status.
+After publication:
+
+```sh
+npm install @rbxts/scribe @rbxts/scribe-telemetry
+```
+
+Keep this configuration in a server script:
+
+```ts
+import Scribe from "@rbxts/scribe";
+import ScribeTelemetry from "@rbxts/scribe-telemetry";
+
+const telemetry = ScribeTelemetry.Start(Scribe, {
+    Webhooks: {
+        Alerts: { Url: "https://<proxy host>/api/webhooks/<id>/<token>" },
+    },
+    Default: "Alerts",
+    Routes: { Leaderboards: "Alerts" },
+    Leaderboards: { Enabled: true, Interval: 15, MaxBoards: 20 },
+});
+
+const monitor = telemetry.GetStats().Leaderboards;
+if (monitor.State === "Available") {
+    print(monitor.Monitored, monitor.Omitted, monitor.SnapshotAge);
+}
+```
+
+Destination names are inferred from `Webhooks`, so a misspelled route or
+`telemetry.Test(...)` destination is a type error. Options, preview kinds, and
+statistics are typed, including `Leaderboards`, `SlowLoad`, `SlowLeavingHook`,
+`ReceiptCapacity`, `ReceiptRoutingRetry`, `LeaderboardDegraded`, and
+`LeaderboardRecovery` previews. Calls that return success and a reason use a
+`LuaTuple`: `const [queued, reason] = telemetry.Preview("Alerts", "LeaderboardDegraded")`.
+
+Handle methods use ordinary TypeScript syntax such as `telemetry.Stop()`; roblox-ts
+emits the required Luau method call. `SnapshotAge` and `LastError` may be `undefined`.
+Monitor availability (`Available`, `Unavailable`, `Disabled`, `DisabledInStudio`,
+or `Stopped`) describes the monitor itself, rather than a particular board's health.
+All routing, privacy, Studio, and delivery behavior below also applies to TypeScript.
 
 ## One webhook
 
@@ -37,8 +81,8 @@ local telemetry = ScribeTelemetry.Start(Scribe, {
 Put this script beside your Scribe server setup. Replace `<id>` and `<token>` with
 your webhook's values. All enabled report categories go to `Alerts`.
 
-By default, you receive health reports, errors, fatal errors and selected warnings.
-Performance alerts and regular summaries need extra configuration below.
+By default, you receive profile and leaderboard health reports, errors, fatal errors
+and selected warnings. Performance alerts and regular summaries need extra configuration below.
 
 !!! warning "Keep the webhook URL private"
     Anyone with the URL can post to your channel. Store it in a server script or
@@ -78,7 +122,7 @@ for these separate tasks:
 | `telemetry:Preview("Alerts", "All")` | Queue synthetic examples of every report; returns `(ok, reason)`. |
 | `telemetry:Flush(5)` | Wait up to five seconds for the queues to drain. |
 | `telemetry:GetStats()` | Read queue, delivery and destination state, without URLs. |
-| `telemetry:Stop()` | Remove the log sink and status connection. Calling it again is safe. |
+| `telemetry:Stop()` | Stop monitoring and remove listeners. Calling it again is safe. |
 
 `Start` checks the configuration before connecting listeners. It errors for:
 
@@ -117,8 +161,9 @@ limits and configured `Limits` still apply. They appear in
 | Kind | Scenarios |
 | --- | --- |
 | `Health` | `HealthyStartup`, `Degraded`, `Outage`, `PartialRecovery`, `Recovery`, `IncidentUnderway` |
-| `Issues` | `Error`, `Fatal` |
-| `Warnings` | `Warning` |
+| `Leaderboards` | `LeaderboardDegraded`, `LeaderboardRecovery` |
+| `Issues` | `Error`, `Fatal`, `ReceiptCapacity` |
+| `Warnings` | `Warning`, `SlowLoad`, `SlowLeavingHook`, `ReceiptRoutingRetry` |
 | `Grouping` | `Repeat`, `UpstreamSuppressed` |
 | `Performance` | `SlowSaves`, `SaveFailures`, `Traffic`, each with a `Cleared` counterpart |
 | `Summaries` | `Summary`, `SummaryNoSamples`, `SummaryNoBudget` |
@@ -140,8 +185,8 @@ started add-on reports `Running`; otherwise, its tooltip explains what is missin
 ## Separate channels
 
 Give each webhook a name, then use `Routes` to choose which reports it receives.
-In this example, health reports and summaries have their own channels, while
-performance alerts go to two channels.
+In this example, profile health, leaderboard health and summaries have their own
+channels, while performance alerts go to two channels.
 
 Use this configuration in place of the one-webhook example; do not start both.
 
@@ -156,11 +201,13 @@ ScribeTelemetry.Start(Scribe, {
             Mention = { RoleId = "123456789012345678" },
         },
         Health = { Url = "https://discord.com/api/webhooks/<id>/<token>" },
+        Boards = { Url = "https://discord.com/api/webhooks/<id>/<token>" },
         Summaries = { Url = "https://discord.com/api/webhooks/<id>/<token>" },
     },
     Default = "Alerts",
     Routes = {
         Health = "Health",
+        Leaderboards = "Boards",
         Summaries = "Summaries",
         Performance = { "Alerts", "Health" },
         Warnings = false,
@@ -182,11 +229,12 @@ to change the interval.
 
 If two destination names use the same URL, each report is delivered there once.
 
-## The five categories
+## Report categories
 
 | Category | What it reports | Default |
 | --- | --- | --- |
-| `Health` | Degraded service, outages and recovery. | On |
+| `Health` | Profile-service degradation, outages and recovery. | On |
+| `Leaderboards` | A board is degraded, or recovers. | On |
 | `Issues` | `Error` and `Fatal` log entries. | On |
 | `Warnings` | Selected `Warn` entries. | On, selected codes only |
 | `Performance` | A configured threshold is exceeded, or the condition clears. | Off until a rule has a threshold |
@@ -210,8 +258,41 @@ its start time.
 `Warnings` includes a warning when its code is in `Warnings.Include` or its
 category is in `Warnings.Categories`. The default code list is available as
 `ScribeTelemetry.DefaultWarningCodes`. It focuses on warnings you may need to
-act on: profiles nearing the 4 MB limit, slow loads, held or forced saves, dropped receipt IDs or
-purchase claims, unconfirmed gifts or passes, and lost leaderboard writes.
+act on: large profiles, slow joins or leaving callbacks, held saves, purchase claims,
+unconfirmed gifts or passes, receipt retries, and leaderboard failures or budget delays.
+
+The defaults include `LB_READ_FAIL`, `LB_WRITE_FAIL`, `LB_QUEUE_OVERFLOW`,
+`LB_BUDGET_DEFERRED`, `PLAYER_LEAVING_HOOK_SLOW` and `RECEIPT_RETRY`.
+`RECEIPT_HISTORY_FULL` is an error, so it uses `Issues` without a warning opt-in.
+
+### Leaderboard health
+
+The add-on checks [`Scribe.GetLeaderboardSnapshot()`](/api/Scribe#GetLeaderboardSnapshot)
+every 30 seconds by default. This reads cached status from all active bundles using
+that Scribe module; it makes **no DataStore requests**. Each board is identified by
+its numeric `BundleId` and name, so two bundles can both have a `Coins` board.
+
+A board already degraded at the first check sends an alert. Later changes to
+`Degraded` or back to `Healthy` send another report. `Starting` is quiet. A board
+that disappears, for example when its bundle stops, is forgotten without a recovery
+claim. Detection follows the polling interval.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `Leaderboards.Enabled` | `true` | Enable board monitoring. |
+| `Leaderboards.Interval` | `30` | Seconds between checks; minimum 5. |
+| `Leaderboards.MaxBoards` | `64` | Bound the number of boards tracked. |
+
+`Routes.Leaderboards` follows the same `Default` fallback as other categories;
+set it to `false` to stop transition alerts while keeping monitoring and summaries.
+`Leaderboards.Enabled = false` stops snapshot polling and marks the summary disabled.
+When there are more than `MaxBoards`, the first boards by bundle ID and name are
+tracked; summaries show how many were monitored and omitted. Omitted boards are
+not monitored. Board health is separate from profile health: a healthy profile
+service does not mean every leaderboard is updating.
+
+Older Scribe versions without the snapshot API still work. Board reports are
+unavailable, and summaries say so rather than assuming the boards are healthy.
 
 ### Performance rules and summaries
 
@@ -225,10 +306,23 @@ clears. Each enabled rule needs a `Threshold`.
 | `SaveFailures` | Save failures per minute. |
 | `Traffic` | `BytesOut` per second. |
 
-Summaries run every `Summaries.Interval` seconds. They include health, sessions,
-loads and saves during the interval, and outgoing bytes per second. Save-duration
-and profile-size percentiles show the time windows they cover. The DataStore
-budget is included when the server can read it.
+Summaries run every `Summaries.Interval` seconds. **Profile health** labels the
+profile-service status separately from the leaderboard section. Reports include:
+
+- Sessions, load/save counts and outgoing bytes per second.
+- Leaderboard read/write activity, failures, skipped writes, queue overflows,
+  budget deferrals and the last reported queue depth. That queue gauge comes from
+  the last reporting bundle; it is not a server-wide total.
+- A bounded list of monitored boards, including pending writes and cache
+  age. Disabled or unavailable monitoring and omitted boards are identified.
+- Receipt-history refusals and dropped or failed log-sink deliveries.
+- Save, profile-load, total join and leaving-callback duration percentiles, plus
+  profile size. Each distribution includes its sample window.
+
+Use per-board pending counts for each board's backlog. The DataStore budget is
+included when the server can read it. An empty sample window is reported as such;
+it is not a zero-duration measurement. Older Scribe versions may omit measurements
+they do not provide.
 
 ### Repeated reports
 
@@ -276,6 +370,9 @@ With the default setting:
 Context tables are limited to twelve keys and two levels. Functions, threads and
 unsupported Roblox values are dropped. Non-player instances are reduced to their
 class and name. Text is shortened at a valid UTF-8 boundary to fit Discord's limits.
+Strings over **4 KiB (4096 bytes)** are replaced with `[oversized text omitted]`
+before redaction. This bounds processing work and avoids exposing part of a secret
+by cutting it before redaction.
 
 ## Delivery
 
@@ -340,7 +437,8 @@ the script.
 
 ??? note "Implementation and type checks"
     The add-on uses only Scribe's public diagnostics API: one log sink, one status
-    connection and the metric readers. A game script can access the same signals.
+    connection, metric readers and cached leaderboard snapshots. A game script can
+    access the same signals.
 
     `test/TypeCheck.luau` checks the exported types, and `test/TypeCheckErrors.luau`
     checks that invalid shapes are rejected.

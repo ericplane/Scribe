@@ -76,6 +76,13 @@ function Server.new(config)
 
 	self.Bundle = Bundle.new({
 		JobId = config.JobId,
+		GetPlayers = function()
+			local players = {}
+			for _, player in self._players do
+				table.insert(players, player)
+			end
+			return players
+		end,
 		-- A stream of the client realm's own, for the reason the jitter one below
 		-- gives: the client's Hello retry draws from it, and sharing the server's
 		-- would renumber every save-retry draw behind it.
@@ -191,6 +198,7 @@ function Server.Join(self, userId: number, player: any): thread
 	if self.Dead then
 		error(`sim: server {self.JobId} is dead and cannot accept joins`, 0)
 	end
+	player.Parent = self.Bundle.Players
 	self._players[userId] = player
 	self._playerCount += 1
 	return self._sched:Spawn(function()

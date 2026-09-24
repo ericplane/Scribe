@@ -1078,6 +1078,7 @@ local function buildInternalRoots(state: any, root: SchemaNode, config: CompileC
 		PendingGifts = {},
 		Perks = {},
 		ProcessedPurchaseIds = {},
+		ReceiptReservations = {},
 		PurchaseLogs = {
 			InGame = {},
 			Robux = {},
@@ -1124,6 +1125,7 @@ local function buildInternalRoots(state: any, root: SchemaNode, config: CompileC
 		OwnsCache = {},
 		SaveInfo = {},
 		OwnsSynced = false,
+		Timed = {},
 	}
 	local sessionNode = buildNode(state, SESSION_ROOT, sessionTemplate, { SESSION_ROOT }, "Replicated", false, root)
 

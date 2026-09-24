@@ -120,6 +120,16 @@ Put the `@within` doc block on the **`Data.<name>` wrapper only**, and use a pla
 same `Class.member` would emit a duplicate API entry and a duplicate table-of-
 contents line.
 
+Add a short plain `--` summary below an API block when it helps explain the
+declaration. Usually one line is enough; keep important yielding or persistence
+details. Skip standalone documentation-only blocks and obvious declarations.
+The generator skips plain comments when finding the declaration.
+
+RBXM, Wally, and npm release staging removes the API blocks and keeps these short comments,
+types, and directives. Edit the originals in `src/`, never the staged copies.
+The repository keeps the full documentation. Packaging needs Python 3.10+. See
+[bundle/README.md](../bundle/README.md) for building and mapping release line numbers.
+
 `gen.py` enforces this: it **fails the build** (and thus the `docs-check` CI) if any
 `Class.member` is documented by more than one block, naming both source locations.
 

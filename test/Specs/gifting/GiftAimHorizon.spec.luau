@@ -1,33 +1,5 @@
 --!nonstrict
--- THE DURABLE GIFT AIM: its own contract, measured.
---
--- GiftIntentHorizon.spec is the net for the DEFECT (F1: one payment, two grants,
--- because the load sweep deleted the only record of who a gift was aimed at). This
--- file is the net for the MECHANISM that closed it, and everything the mechanism
--- must not become. Nothing here is a characterisation of a defect: every block is
--- behaviour that must stay true.
---
--- THE SHAPE, in one paragraph. A stale intent is no longer deleted at load; it is
--- MOVED into `_Scribe.GiftAims`, keyed by product Id, carrying the recipient, the
--- GiftId, the product name and the ORIGINAL prompt timestamp. When a receipt lands
--- with no live intent, two questions are asked before the buyer can be granted:
---
---   PROOF       -- is this exact PurchaseId already in the recipient's dedupe ring?
---                  A self-purchase's id can never be, so a hit is not a guess. NO
---                  CLOCK: it holds at any age, and it is what stops the double
---                  grant coming back on day eight.
---   PRESUMPTION -- no proof, but an ARCHIVED aim says a gift of this product was
---                  aimed somewhere and never settled, so this receipt is presumed
---                  to be it. A guess, so it is bounded: archived aims only, and
---                  only inside giftAimTTL.
---
--- THE THREE THINGS MOST WORTH BREAKING, and each has a block below:
---   1. the presumption escaping its bounds -- onto a STALE SLOT still in hand
---      (which this library has always called an abandoned prompt), or past the
---      horizon. Both would misroute ordinary self-purchases.
---   2. the proof acquiring a clock, which puts F1-A back for a late retry.
---   3. the store evicting a LIVE aim to make room, which is the receipt ring's
---      documented count-eviction flaw rebuilt in a new container.
+-- Unsettled gifts retain their recipient until settlement or confirmed cancellation.
 
 return function()
 	local Root = script.Parent.Parent.Parent.Parent
@@ -44,13 +16,11 @@ return function()
 	local T0 = 1700000000
 
 	local INTENT_TTL = 3600 -- the default, unchanged by this work
-	-- The aim's presumption horizon: max(7 days, PurchaseIdTTL), and PurchaseIdTTL
-	-- defaults to 7 days. Spelled out rather than imported so a silent change to
-	-- either constant fails here instead of passing quietly.
-	local AIM_TTL = 7 * 24 * 3600
+	local OLD_AIM_TTL = 7 * 24 * 3600
 	local AIM_CAP = 64
 
 	local function makeHarness(extraOptions, products)
+		local finished = require(Root.Scribe.Internal.Signal).new()
 		local options = {
 			Products = products or {
 				Coins1000 = {
@@ -64,7 +34,10 @@ return function()
 				GiftPRO = { Id = 333, Category = "Gamepass", Grants = "PRO" },
 			},
 			GiftCooldown = 0,
-			PromptProductPurchase = function() end,
+			PromptProductPurchaseFinished = finished,
+			PromptProductPurchase = function(player, productId)
+				finished:Fire(player.UserId, productId, true)
+			end,
 		}
 		for key, value in extraOptions or {} do
 			options[key] = value
@@ -181,9 +154,7 @@ return function()
 	end
 
 	--------------------------------------------------------------------------------
-	-- THE THREE F1 TIMELINES AS FUNCTIONS OF AGE.
-	-- The whole point of the fix is that these stop depending on the age at all
-	-- (inside the horizon), so they are written once and called at several ages.
+	-- Retry and deferred-delivery scenarios at different ages.
 	--------------------------------------------------------------------------------
 
 	--- F1-A: the ONLINE retry. Delivery committed, the buyer's commit did not, the
@@ -260,6 +231,7 @@ return function()
 		local out
 		withClock(T0, function(advance)
 			local harness = makeHarness()
+			recipientCollects(harness) -- a readable profile can disprove prior delivery
 			armGiftAndLeave(harness, "GiftVIP")
 
 			advance(age)
@@ -306,8 +278,7 @@ return function()
 		end)
 
 		it("delivers a clean deferred receipt identically on both sides, and ON the boundary", function()
-			-- The exact second is included because `>` and `>=` are one keystroke
-			-- apart in both the sweep and the horizon comparison.
+			-- Include the exact sweep boundary.
 			local inside = deferredReceiptAfter(INTENT_TTL - 1)
 			local exact = deferredReceiptAfter(INTENT_TTL)
 			local past = deferredReceiptAfter(INTENT_TTL + 1)
@@ -317,10 +288,10 @@ return function()
 	end)
 
 	--------------------------------------------------------------------------------
-	-- 2. THE PRESUMPTION HORIZON, and which way it fails past it.
+	-- 2. Late receipts retain their original recipient.
 	--------------------------------------------------------------------------------
 
-	describe("the presumption horizon", function()
+	describe("late first receipts", function()
 		it("still delivers a deferred receipt a day, and six days, after the prompt", function()
 			expect(("%s | %s"):format(deferredReceiptAfter(86400), deferredReceiptAfter(6 * 86400))).to.equal(
 				"d=GRANTED buyerVIP=false queued=1 ledger=[GiftSent] aims=[] "
@@ -328,27 +299,18 @@ return function()
 			)
 		end)
 
-		it("holds to the last second of the horizon and lapses on the next one", function()
-			-- THE NEW BOUNDARY, pinned as sharply as the old one. Past it the receipt
-			-- is GRANTED to the buyer -- never refused. Refusing would be a permanent
-			-- NotProcessedYet, which eats the player's Robux, and this module's
-			-- standing rule is that value may go to the wrong player but is never
-			-- destroyed. The aim is left behind rather than deleted, still naming the
-			-- recipient, because it can still PROVE a delivery (see below) and because
-			-- it is what an operator compensates from.
-			expect(("%s | %s"):format(deferredReceiptAfter(AIM_TTL), deferredReceiptAfter(AIM_TTL + 1))).to.equal(
+		it("preserves the recipient across the former seven-day boundary", function()
+			expect(("%s | %s"):format(deferredReceiptAfter(OLD_AIM_TTL), deferredReceiptAfter(OLD_AIM_TTL + 1))).to.equal(
 				"d=GRANTED buyerVIP=false queued=1 ledger=[GiftSent] aims=[] "
-					.. "| d=GRANTED buyerVIP=true queued=0 ledger=[Purchase] aims=[222->94202]"
+					.. "| d=GRANTED buyerVIP=false queued=1 ledger=[GiftSent] aims=[]"
+			)
+			expect(deferredReceiptAfter(90 * 86400)).to.equal(
+				"d=GRANTED buyerVIP=false queued=1 ledger=[GiftSent] aims=[]"
 			)
 		end)
 
 		it("PROOF carries no horizon at all, so the double grant cannot come back on day eight", function()
-			-- The sharpest asymmetry in the design, and the one a "tidying" change
-			-- would flatten first. Presumption is a GUESS about which purchase a
-			-- receipt belongs to, so it expires. Proof is a PurchaseId match in the
-			-- recipient's own dedupe ring, which no self-purchase can forge, so it
-			-- does not. Give proof the horizon too and this line reads
-			-- `buyerCoins=1000 ... total=2000` again -- F1-A, eight days late.
+			-- A saved recipient grant must not grant again to the buyer.
 			expect(onlineRetryAfter(8 * 86400)).to.equal(
 				"d=GRANTED buyerCoins=0 rcpCoins=1000 total=1000 ledger=[GiftSent]"
 			)
@@ -357,17 +319,11 @@ return function()
 	end)
 
 	--------------------------------------------------------------------------------
-	-- 3. WHAT THE PRESUMPTION MAY NOT DO.
+	-- 3. Routing stays scoped to the original product and gift.
 	--------------------------------------------------------------------------------
 
-	describe("the presumption stays inside its bounds", function()
-		it("a STALE SLOT still in hand is an abandoned prompt, not an aim -- online", function()
-			-- The rule this library has always applied, and which Receipts.spec,
-			-- GiftArmParity row 2 and GiftIntentNet all pin from their own angles: a
-			-- buyer who sat through the whole intent TTL, online, with no receipt has
-			-- abandoned the prompt, and the receipt that arrives afterwards is a new
-			-- purchase. Nothing is archived here -- no load ever happened -- so there
-			-- is no aim, and the slot in hand does not earn one.
+	describe("recipient routing", function()
+		it("preserves a live pending intent past GiftIntentTTL", function()
 			withClock(T0, function(advance)
 				local harness = makeHarness()
 				local buyer = harness.Join(BUYER)
@@ -375,7 +331,8 @@ return function()
 				harness.Data.Flush(buyer)
 
 				advance(INTENT_TTL + 1)
-				local decision = harness.Data.HandleReceipt(receipt(222, "abandoned-online"))
+				recipientCollects(harness)
+				local decision = harness.Data.HandleReceipt(receipt(222, "late-online"))
 				harness.Data.Flush(buyer)
 
 				local reserved = storedReserved(harness, BUYER)
@@ -387,22 +344,20 @@ return function()
 						ledger(reserved),
 						aimsOf(reserved)
 					)
-				).to.equal("d=GRANTED buyerVIP=true queued=0 ledger=[Purchase] aims=[]")
+				).to.equal("d=GRANTED buyerVIP=false queued=1 ledger=[GiftSent] aims=[]")
 
 				harness.Cleanup()
 			end)
 		end)
 
-		it("a STALE SLOT still in hand is an abandoned prompt, not an aim -- offline", function()
-			-- Arm parity. The arm a receipt takes is decided by whether the buyer
-			-- happens to still be on this server, which is not a fact about the
-			-- purchase, so the two must answer alike.
+		it("preserves an offline pending intent past GiftIntentTTL", function()
 			withClock(T0, function(advance)
 				local harness = makeHarness()
 				armGiftAndLeave(harness, "GiftVIP")
 
 				advance(INTENT_TTL + 1)
-				local decision = harness.Data.HandleReceipt(receipt(222, "abandoned-offline"))
+				recipientCollects(harness)
+				local decision = harness.Data.HandleReceipt(receipt(222, "late-offline"))
 
 				local reserved = storedReserved(harness, BUYER)
 				expect(
@@ -413,7 +368,7 @@ return function()
 						ledger(reserved),
 						aimsOf(reserved)
 					)
-				).to.equal("d=GRANTED buyerVIP=true queued=0 ledger=[Purchase] aims=[]")
+				).to.equal("d=GRANTED buyerVIP=false queued=1 ledger=[GiftSent] aims=[]")
 
 				harness.Cleanup()
 			end)
@@ -444,10 +399,7 @@ return function()
 		end)
 
 		it("an aim is spent by the receipt that claims it, so the NEXT purchase is the buyer's", function()
-			-- One aim, one receipt. Without the clear, every later self-purchase of
-			-- that product would be routed to the same stale recipient for as long as
-			-- the horizon lasts -- an aim that fires once is a bounded misroute, an aim
-			-- that fires forever is a broken product.
+			-- Settled aims must not claim a later self-purchase.
 			withClock(T0, function(advance)
 				local harness = makeHarness()
 				armGiftAndLeave(harness, "GiftVIP")
@@ -578,15 +530,7 @@ return function()
 	--------------------------------------------------------------------------------
 
 	it("PROOF settles a stale slot the buyer is STILL ONLINE for, with no aim involved", function()
-		-- The arm nothing else reaches, and it is a real timeline rather than a
-		-- constructed one: the intent is FRESH at load (so the sweep leaves it alone
-		-- and no aim is ever created) and crosses the TTL later in the same session,
-		-- with the gift already delivered and the buyer's own commit lost. The slot in
-		-- hand cannot be PRESUMED on -- that is the abandoned-prompt rule -- so what
-		-- has to save this receipt is the proof leg reading the recipient's ring.
-		--
-		-- Read the slot BEFORE intentFor rather than after and this goes red: intentFor
-		-- clears the slot as it expires it, and the recipient's identity leaves with it.
+		-- Recipient delivery survives a failed buyer save and a later receipt retry.
 		withClock(T0, function(advance)
 			local harness = makeHarness()
 			local buyer = harness.Join(BUYER)
@@ -629,14 +573,7 @@ return function()
 		end)
 	end)
 
-	it("a failed delivery refreshes the AIM's stamp, so retries cannot run it past the horizon", function()
-		-- The aim inherits the problem the intent had (F3): its age is measured on WALL
-		-- time, which keeps running while Roblox retries. Without the refresh a gift
-		-- that is actively retrying crosses the horizon mid-flight, the presumption
-		-- lapses, and the next attempt hands the perk to the buyer and answers
-		-- PurchaseGranted -- so Roblox stops retrying and the paid gift is gone. The
-		-- refresh is guarded on the GiftId and writes into the AIM's container, not the
-		-- intent slot the aim no longer occupies.
+	it("retries an online failed delivery without changing its recipient", function()
 		withClock(T0, function(advance)
 			local harness = makeHarness()
 			armGiftAndLeave(harness, "GiftVIP")
@@ -648,9 +585,7 @@ return function()
 			expect(harness.Data.HandleReceipt(receipt(222, "retrying"))).to.equal(NOT_PROCESSED)
 			harness.Fake.FailMessages = false
 
-			-- Just inside the horizon measured from the REFRESH, and past it measured
-			-- from the prompt.
-			advance(AIM_TTL - 10)
+			advance(OLD_AIM_TTL + 1)
 			local decision = harness.Data.HandleReceipt(receipt(222, "retrying"))
 			harness.Data.Flush(rejoined)
 
@@ -668,10 +603,7 @@ return function()
 		end)
 	end)
 
-	it("the OFFLINE arm refreshes the aim's stamp too, through its compare-and-set", function()
-		-- Arm parity for the refresh. Offline there is no accessor tree to raise on a
-		-- write into the wrong container or into an absent slot, so this is the arm
-		-- where getting it wrong is silent.
+	it("retries an offline failed delivery without changing its recipient", function()
 		withClock(T0, function(advance)
 			local harness = makeHarness()
 			armGiftAndLeave(harness, "GiftVIP")
@@ -685,7 +617,7 @@ return function()
 			expect(harness.Data.HandleReceipt(receipt(222, "retrying-offline"))).to.equal(NOT_PROCESSED)
 			harness.Fake.FailMessages = false
 
-			advance(AIM_TTL - 10)
+			advance(OLD_AIM_TTL + 1)
 			local decision = harness.Data.HandleReceipt(receipt(222, "retrying-offline"))
 
 			local reserved = storedReserved(harness, BUYER)
@@ -738,9 +670,7 @@ return function()
 	end)
 
 	it("the sweep archives the aim without costing the buyer gift capacity", function()
-		-- The slot still has to be reclaimed. GiftMaxPending counts PendingGifts and
-		-- must not start counting aims, or a player who abandons prompts loses the
-		-- ability to gift for the whole horizon rather than the intent TTL.
+		-- Archived aims use the archive cap, freeing GiftMaxPending slots.
 		withClock(T0, function(advance)
 			local harness = makeHarness({ GiftMaxPending = 1 })
 			armGiftAndLeave(harness, "GiftVIP")
@@ -848,13 +778,7 @@ return function()
 		end
 
 		it("refuses the PROMPT at the cap -- before any money moves -- rather than evicting a live aim", function()
-			-- CONSTRAINT (c) of the fix brief, from the other side. The receipt-dedupe
-			-- ring's count backstop drops its OLDEST entry and its own comment says a
-			-- retry for that entry would be granted twice. This store must never
-			-- inherit that: an aim inside the horizon may be the last durable record of
-			-- a gift already paid for, so at the cap the answer is to refuse INTAKE at
-			-- the prompt -- the same fail-closed move the Outage check makes, and the
-			-- one point where refusing costs nothing because nothing has been charged.
+			-- Reject new payments before opening their dialog.
 			withClock(T0, function(advance)
 				local harness = makeHarness({ GiftMaxPending = 200 }, manyProducts(AIM_CAP + 6))
 				local refusedAt, reason = fillAims(harness, advance, AIM_CAP + 6)
@@ -873,7 +797,7 @@ return function()
 			end)
 		end)
 
-		it("re-arming a product that already HOLDS an aim is never refused: it needs no new room", function()
+		it("refuses to replace an unresolved aim for the same product", function()
 			withClock(T0, function(advance)
 				local harness = makeHarness({ GiftMaxPending = 200 }, manyProducts(AIM_CAP))
 				fillAims(harness, advance, AIM_CAP)
@@ -887,24 +811,19 @@ return function()
 						tostring(reason),
 						aimCount(storedReserved(harness, BUYER))
 					)
-				).to.equal("ok=true reason=nil stored=64")
+				).to.equal("ok=false reason=a gift of this item is already pending; try again shortly stored=64")
 
 				harness.Cleanup()
 			end)
 		end)
 
-		it("reclaims PAST-HORIZON aims to make room, loudly, and only those", function()
-			-- The one eviction that exists. It cannot double-grant because what it
-			-- drops has already lost the right to claim a receipt on its own say-so;
-			-- and it says which recipient and which product went, because that line is
-			-- all an operator has left to compensate from.
+		it("keeps old unresolved aims when the archive is full", function()
 			withClock(T0, function(advance)
 				local harness = makeHarness({ GiftMaxPending = 200 }, manyProducts(AIM_CAP + 1))
 				fillAims(harness, advance, AIM_CAP)
 
 				local expiredBefore = Metrics.Get().GiftAimsExpired or 0
-				-- Every stored aim is now well past the horizon, so the cap yields.
-				advance(AIM_TTL)
+				advance(90 * 86400)
 				local buyer = harness.Join(BUYER)
 				local ok, reason = harness.Data.PromptGift(buyer, "P" .. (AIM_CAP + 1), RECIPIENT)
 				harness.Data.Flush(buyer)
@@ -919,29 +838,20 @@ return function()
 						(Metrics.Get().GiftAimsExpired or 0) - expiredBefore,
 						tostring(#logs > 0)
 					)
-				).to.equal("ok=true reason=nil stored=0 dropped=64 logged=true")
+				).to.equal(
+					"ok=false reason=too many unsettled gift purchases; try again later stored=64 dropped=0 logged=false"
+				)
 
 				harness.Cleanup()
 			end)
 		end)
 
-		it("the SWEEP holds the cap too, when a whole session's intents go stale at once", function()
-			-- The prompt-time refusal is not the only door, and this is the other one.
-			-- PromptGift checks the store as it stands NOW; a buyer who arms many gifts
-			-- in ONE session passes that check every time (the store is still empty) and
-			-- then has all of them swept together at the next load. The sweep has to
-			-- hold the line itself, and it holds it the same way: it refuses to record
-			-- the overflow rather than evicting an aim already in the store, and it says
-			-- which recipient it could not record.
+		it("reserves archive capacity before a whole session's intents go stale", function()
 			withClock(T0, function(advance)
 				local count = AIM_CAP + 6
 				local harness = makeHarness({ GiftMaxPending = 500 }, manyProducts(count))
 				local buyer = harness.Join(BUYER)
-				-- The prompt now refuses past the cap, so only the first AIM_CAP are armed
-				-- and the overflow never reaches the sweep. The sweep's own cap check stays
-				-- exercised by GiftAimReservation's sweep-side control, and what this block
-				-- still proves is the outcome: the store lands exactly full, no intent is
-				-- left stranded, and the cap is reported.
+				-- Pending intents reserve the slots they will need on the next load.
 				local accepted, refused = 0, 0
 				for i = 1, count do
 					if harness.Data.PromptGift(buyer, "P" .. i, RECIPIENT) then
@@ -995,37 +905,20 @@ return function()
 	end)
 
 	--------------------------------------------------------------------------------
-	-- 6. THE COST OF THE PRESUMPTION, recorded rather than hidden.
+	-- 6. Ordinary prompts cannot replace unresolved gift routing.
 	--------------------------------------------------------------------------------
 
-	it("KNOWN COST: an abandoned prompt the buyer LEFT behind can misroute one later self-purchase", function()
-		-- Recorded deliberately, because it is the price of closing F1-C and it should
-		-- be visible to whoever reads this file rather than discovered in production.
-		--
-		-- The buyer arms a gift, never completes the Robux dialog, leaves, and comes
-		-- back; the sweep archives the aim because from the outside this is
-		-- indistinguishable from a purchase Roblox has not delivered yet. If they then
-		-- buy the SAME product for themselves inside the horizon, that purchase is
-		-- presumed to be the gift and goes to the stale recipient.
-		--
-		-- WHAT BOUNDS IT: one product, one receipt (the aim is spent), inside the
-		-- horizon, and only for a buyer who left between the prompt and the purchase.
-		-- It is also LOUD -- GIFT_AIM_SETTLED names the recipient and the PurchaseId.
-		-- The same buyer staying online is unaffected (the abandoned-prompt blocks
-		-- above).
-		--
-		-- THE CLEAN CLOSE, deliberately NOT taken here because it is a scope call:
-		-- MarketplaceService.PromptProductPurchaseFinished reports isPurchased=false
-		-- when the dialog is dismissed, which would let the intent be dropped at that
-		-- moment and never archived at all. Scribe already connects the game-pass
-		-- twin of that signal in Monetization.Start.
+	it("blocks a self-purchase prompt until the archived gift settles", function()
 		withClock(T0, function(advance)
 			local harness = makeHarness()
-			armGiftAndLeave(harness, "GiftVIP") -- prompt armed, never paid
+			armGiftAndLeave(harness, "GiftVIP")
 
 			advance(INTENT_TTL + 1)
 			local rejoined = harness.Join(BUYER)
-			local decision = harness.Data.HandleReceipt(receipt(222, "self-buy-later"))
+			local prompted, reason = harness.Data.PromptPurchase(rejoined, "GiftVIP")
+			expect(prompted).to.equal(false)
+			expect(reason).to.equal("purchase prompt already open")
+			local decision = harness.Data.HandleReceipt(receipt(222, "late-gift"))
 			harness.Data.Flush(rejoined)
 			task.wait()
 
@@ -1038,6 +931,7 @@ return function()
 					tostring(#logs > 0)
 				)
 			).to.equal("d=GRANTED buyerVIP=false queued=1 loud=true")
+			expect(harness.Data.PromptPurchase(rejoined, "GiftVIP")).to.equal(true)
 
 			harness.Cleanup()
 		end)

@@ -7,6 +7,7 @@ local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
 
 local Internal = script.Parent.Parent.Internal
+local Types = require(script.Parent.Parent.Types)
 local Util = require(Internal.Util)
 local Wire = require(Internal.Wire)
 local Template = require(Internal.Template)
@@ -19,10 +20,14 @@ local Sched = require(Internal.Sched)
 local Budget = require(Internal.Budget)
 local Rng = require(Internal.Rng)
 local Failure = require(Internal.Failure)
+local Diagnostics = require(Internal.LeaderboardDiagnostics)
 
 local Leaderboards = {}
 
 local WRITE_INTERVAL = 1.5
+local SCORE_WRITE_INTERVAL = 30
+local RETRY_BASE = 30
+local RETRY_MAX = 300
 -- Ceiling on what one tick may drain once the queue has backed up. Every write
 -- yields, so an unbounded drain turns the pacer into the unpaced flush it prevents.
 local MAX_WRITES_PER_TICK = 8
@@ -46,9 +51,6 @@ local ERASE_HEARTBEAT = 30
 -- at 60s cost more than one at 15s, and the flat floor above permits exactly that.
 local MAX_REFRESH_PER_MINUTE = 12
 local QUEUE_CAP = 1000
--- Requests left in reserve when BudgetPolicy defers. Not zero: the ungated shutdown
--- drain writes to the same Sorted pool, so the loops stop one short of emptying it.
-local BUDGET_RESERVE = 1
 -- Seconds between LB_BUDGET_DEFERRED warns. Deferral is normal and self-correcting,
 -- so only a sustained one should be visible.
 local BUDGET_LOG_INTERVAL = 30
@@ -97,6 +99,7 @@ type Board = {
 	BigMantissaScale: number,
 	BigMaxExponent: number,
 	RefreshInterval: number,
+	WriteInterval: number,
 	Replicate: boolean, -- default false: server-only, no client mirror
 	-- The prefix; a periodic board appends the period index at write time.
 	StoreName: string,
@@ -115,6 +118,11 @@ type Board = {
 	-- `any`, not `number`: a big board's score is the Big itself, not the packed key.
 	MyScores: { [number]: any },
 	SentState: { [number]: { Sig: string, Rank: number?, Score: any } },
+	LastReadAt: number?,
+	LastReadMono: number?,
+	LastWriteAt: number?,
+	LastReadError: string?,
+	LastWriteError: string?,
 }
 
 -- In-memory OrderedDataStore shim for UseMock/DontSave testing.
@@ -162,11 +170,35 @@ function Leaderboards.new(ctx: any)
 	local mockStores: { [string]: any } = {}
 
 	local stopped = false
+	local started = false
+	local unregisterDiagnostics: (() -> ())? = nil
 	local pacerThread: thread? = nil
 	local refreshThread: thread? = nil
-	type QueueItem = { Board: Board, UserId: number, Score: number, Attempts: number, StoreName: string }
+	type WriteState = {
+		Board: Board,
+		UserId: number,
+		StoreName: string,
+		LastScore: number?,
+		LastAttempt: number?,
+		InFlight: boolean,
+		Failures: number?,
+		RetryAt: number?,
+		RejectedScore: number?,
+	}
+	type QueueItem = {
+		Board: Board,
+		UserId: number,
+		Score: number,
+		StoreName: string,
+		State: WriteState,
+		Urgent: boolean,
+	}
 	local writeQueue: { QueueItem } = {}
 	local writeQueueMap: { [string]: QueueItem } = {}
+	local writeStates: { [number]: { [string]: WriteState } } = {}
+	local activeUsers: { [number]: number } = {}
+	local activeWrites = 0
+	local budgetReleases: { [() -> ()]: boolean } = {}
 	local pacerParked = false
 	local function wakePacer()
 		if pacerParked and pacerThread ~= nil and not stopped then
@@ -178,8 +210,7 @@ function Leaderboards.new(ctx: any)
 	-- out-of-queue player, enough to roll the log ring. The counter still counts drops.
 	local lastOverflowLog: number? = nil
 	local overflowSinceLog = 0
-	-- Budget-aware admission for the two background loops, opt-in. Mock modes never
-	-- touch a real DataStore, so asking would stall the loops on nothing.
+	-- Defer enables burst draining and paced erasure; background admission is always gated.
 	local budgetPolicy: boolean = options.BudgetPolicy == "Defer" and not useMock
 	local lastBudgetLog: number? = nil
 
@@ -541,7 +572,47 @@ function Leaderboards.new(ctx: any)
 			error(`Scribe: leaderboard "{name}" Mode needs a Period; a lifetime board has nothing to gain over`, 0)
 		end
 		local isServer = scope == "Server"
+		local storeName = if config.StoreName ~= nil
+			then config.StoreName
+			elseif isBig then `LB_{name}_big{sigFigs}`
+			else `LB_{name}`
+		if not isServer then
+			if type(storeName) ~= "string" or #storeName == 0 then
+				error(`Scribe: leaderboard "{name}" StoreName must be a non-empty string`, 0)
+			end
+			local longest = storeName
+			if period then
+				for offset = -1, 1 do
+					local candidate =
+						`{storeName}_{if period == "Daily" then "d" else "w"}{currentPeriod(period) + offset}`
+					if #candidate > #longest then
+						longest = candidate
+					end
+				end
+			end
+			if #longest > 50 then
+				error(`Scribe: leaderboard "{name}" generated store name exceeds 50 bytes; shorten StoreName`, 0)
+			end
+		end
 		local refreshInterval = if isServer then SERVER_REFRESH_INTERVAL else REFRESH_INTERVAL
+		local writeInterval = if config.WriteInterval == nil then SCORE_WRITE_INTERVAL else config.WriteInterval
+		if
+			type(writeInterval) ~= "number"
+			or writeInterval ~= writeInterval
+			or writeInterval <= 0
+			or writeInterval == math.huge
+		then
+			error(`Scribe: leaderboard "{name}" WriteInterval must be a finite positive number of seconds`, 0)
+		end
+		if writeInterval < 1 then
+			Log.Warn(
+				"Leaderboards",
+				"LB_INTERVAL_CLAMPED",
+				`leaderboard "{name}" WriteInterval was clamped to 1s`,
+				{ Board = name, Requested = writeInterval, Applied = 1 }
+			)
+			writeInterval = 1
+		end
 		local minInterval = if isServer then MIN_SERVER_REFRESH_INTERVAL else MIN_REFRESH_INTERVAL
 		if config.RefreshInterval ~= nil then
 			local requested = config.RefreshInterval
@@ -562,6 +633,7 @@ function Leaderboards.new(ctx: any)
 		boards[name] = {
 			Name = name,
 			RefreshInterval = refreshInterval,
+			WriteInterval = writeInterval,
 			StatPath = Util.parsePath(config.Stat),
 			Limit = math.clamp(config.Limit or 100, 1, 100),
 			Scale = config.Scale or 1,
@@ -585,10 +657,7 @@ function Leaderboards.new(ctx: any)
 			-- sharing `LB_<name>` would silently reinterpret every key already written
 			-- when a stat is retyped or its SigFigs change, with no repair pass able to
 			-- separate the two formats afterwards. An explicit StoreName still wins.
-			StoreName = if type(config.StoreName) == "string"
-				then config.StoreName
-				elseif isBig then `LB_{name}_big{sigFigs}`
-				else `LB_{name}`,
+			StoreName = storeName,
 			Cache = { Entries = {}, At = 0 },
 			Signature = "",
 			MyRanks = {},
@@ -624,6 +693,9 @@ function Leaderboards.new(ctx: any)
 	end
 
 	local function orderedStore(name: string): any
+		if #name == 0 or #name > 50 then
+			error("101: leaderboard store name must be between 1 and 50 bytes", 0)
+		end
 		if useMock then
 			local mock = mockStores[name]
 			if not mock then
@@ -707,7 +779,60 @@ function Leaderboards.new(ctx: any)
 
 	-- Write queue ------------------------------------------------------------------
 
-	function self.Enqueue(board: Board, entry: any, value: any, old: any?)
+	local function writeKey(board: Board, userId: number, storeName: string): string
+		return `{board.Name}|{userId}|{storeName}`
+	end
+
+	local function releaseWriteState(state: WriteState)
+		local key = writeKey(state.Board, state.UserId, state.StoreName)
+		if state.InFlight or writeQueueMap[key] ~= nil then
+			return
+		end
+		local currentStore =
+			storeNameFor(state.Board, if state.Board.Period then currentPeriod(state.Board.Period) else nil)
+		if not stopped and (activeUsers[state.UserId] or 0) > 0 and state.StoreName == currentStore then
+			return
+		end
+		local states = writeStates[state.UserId]
+		if states and states[key] == state then
+			states[key] = nil
+			if next(states) == nil then
+				writeStates[state.UserId] = nil
+			end
+		end
+	end
+
+	local function queueWrite(item: QueueItem)
+		while #writeQueue >= QUEUE_CAP do
+			local dropped = table.remove(writeQueue, 1)
+			if dropped then
+				writeQueueMap[writeKey(dropped.Board, dropped.UserId, dropped.StoreName)] = nil
+				releaseWriteState(dropped.State)
+			end
+			Metrics.Add("LbQueueOverflow")
+			overflowSinceLog += 1
+		end
+		if overflowSinceLog > 0 then
+			local now = Clock.Monotonic()
+			if lastOverflowLog == nil or now - lastOverflowLog >= OVERFLOW_LOG_INTERVAL then
+				lastOverflowLog = now
+				Log.Warn(
+					"Leaderboards",
+					"LB_QUEUE_OVERFLOW",
+					`write queue overflow; dropped the oldest entry ({overflowSinceLog} drop(s) since the last of these). `
+						.. "Scores are being produced faster than the write pacer drains them",
+					{ Dropped = overflowSinceLog, Depth = #writeQueue }
+				)
+				overflowSinceLog = 0
+			end
+		end
+		table.insert(writeQueue, item)
+		writeQueueMap[writeKey(item.Board, item.UserId, item.StoreName)] = item
+		Metrics.Set("LbQueueDepth", #writeQueue)
+		wakePacer()
+	end
+
+	function self.Enqueue(board: Board, entry: any, value: any, old: any?, urgent: boolean?)
 		local userId: number = entry.UserId
 		if isErased(userId) then
 			return -- within the GDPR tombstone window; do not re-add
@@ -753,72 +878,93 @@ function Leaderboards.new(ctx: any)
 		-- Resolved now and in the dedup key: a score drains to the period it was computed
 		-- for, and a new period's score never overwrites an old one.
 		local storeName = storeNameFor(board, if board.Period then currentPeriod(board.Period) else nil)
-		local key = `{board.Name}|{userId}|{storeName}`
+		local key = writeKey(board, userId, storeName)
+		local states = writeStates[userId]
+		if board.Period ~= nil and states ~= nil and states[key] == nil then
+			-- Drop finished history from older periods.
+			for _, state in states do
+				if state.Board == board then
+					releaseWriteState(state)
+				end
+			end
+		end
+		states = writeStates[userId]
+		if states == nil then
+			states = {}
+			writeStates[userId] = states
+		end
+		local state: WriteState = states[key]
+			or { Board = board, UserId = userId, StoreName = storeName, InFlight = false }
+		states[key] = state
+		if state.RejectedScore ~= nil then
+			if state.RejectedScore == scaled then
+				return
+			end
+			state.RejectedScore, state.Failures, state.RetryAt = nil, nil, nil
+		end
 		local existing = writeQueueMap[key]
 		if existing then
 			-- Dedup by (board, userId), keeping only the latest value.
 			existing.Score = scaled
+			existing.Urgent = existing.Urgent or urgent == true
 			return
 		end
-		if #writeQueue >= QUEUE_CAP then
-			local dropped = table.remove(writeQueue, 1)
-			if dropped then
-				writeQueueMap[`{dropped.Board.Name}|{dropped.UserId}|{dropped.StoreName}`] = nil
-			end
-			Metrics.Add("LbQueueOverflow")
-			overflowSinceLog += 1
-			local now = Clock.Monotonic()
-			if lastOverflowLog == nil or now - lastOverflowLog >= OVERFLOW_LOG_INTERVAL then
-				lastOverflowLog = now
-				Log.Warn(
-					"Leaderboards",
-					"LB_QUEUE_OVERFLOW",
-					`write queue overflow; dropped the oldest entry ({overflowSinceLog} drop(s) since the last of these). `
-						.. "Scores are being produced faster than the write pacer drains them",
-					{ Dropped = overflowSinceLog, Depth = #writeQueue }
-				)
-				overflowSinceLog = 0
-			end
+		-- Keep changes queued until the in-flight write settles.
+		if not state.InFlight and state.LastScore == scaled then
+			Metrics.Add("LbWritesSkipped")
+			releaseWriteState(state)
+			return
 		end
-		local item = { Board = board, UserId = userId, Score = scaled, Attempts = 0, StoreName = storeName }
-		table.insert(writeQueue, item)
-		writeQueueMap[key] = item
-		Metrics.Set("LbQueueDepth", #writeQueue)
-		wakePacer()
+		local item: QueueItem = {
+			Board = board,
+			UserId = userId,
+			Score = scaled,
+			StoreName = storeName,
+			State = state,
+			Urgent = urgent == true,
+		}
+		queueWrite(item)
 	end
 
-	local function performWrite(item: QueueItem): boolean
+	local function performWrite(item: QueueItem): (boolean, boolean)
 		local board = item.Board
 		local ok, err = pcall(function()
 			orderedStore(item.StoreName):SetAsync(tostring(item.UserId), item.Score)
 		end)
 		if ok then
 			Metrics.Add("LbWrites")
+			board.LastWriteAt = Clock.Now()
+			board.LastWriteError = nil
 		else
 			-- Deliberately not Health.ReportFailure: board writes are routinely throttled
 			-- under load, and the shared health budget would flip global status to Outage
 			-- and block Robux receipts. LbWriteFailures and LB_WRITE_FAIL signal instead.
 			Metrics.Add("LbWriteFailures")
+			board.LastWriteError = tostring(err)
 			reportStoreFailure("LB_WRITE_FAIL", err, {
 				Board = board.Name,
 				UserId = item.UserId,
 				Score = item.Score,
 			})
 		end
-		return ok
+		return ok, not ok and (Failure.Classify(err) == "Rejected" or isStudioApiDisabled(tostring(err)))
 	end
 
-	-- Should a deferrable background request wait for allowance? Returns the reading
-	-- alongside the verdict, since two queries in one tick can disagree. A `nil` from
-	-- Budget.Remaining means the engine could not be asked, not an empty allowance;
-	-- reading it as exhausted would park both loops for the life of the process.
-	local function shouldDefer(requestType: string, what: string): (boolean, number?)
-		if not budgetPolicy then
-			return false, nil
+	local function claimBackground(requestType: string): (boolean, () -> ())
+		if useMock then
+			return true, function() end
 		end
-		local remaining = Budget.Remaining(requestType)
-		if remaining == nil or remaining > BUDGET_RESERVE then
-			return false, remaining
+		local granted, free = Budget.TryBackground(requestType)
+		if granted then
+			local release: () -> ()
+			release = function()
+				if budgetReleases[release] then
+					budgetReleases[release] = nil
+					free()
+				end
+			end
+			budgetReleases[release] = true
+			return true, release
 		end
 		Metrics.Add("LbBudgetDeferred")
 		local now = Clock.Monotonic()
@@ -827,38 +973,96 @@ function Leaderboards.new(ctx: any)
 			Log.Warn(
 				"Leaderboards",
 				"LB_BUDGET_DEFERRED",
-				`{what} is waiting on the {requestType} request budget ({remaining} left). `
-					.. "Nothing is dropped -- writes stay queued and refreshes retry on the next tick -- but "
-					.. "boards update more slowly while this lasts",
-				{ RequestType = requestType, Remaining = remaining }
+				`leaderboard work is waiting for its share of the {requestType} request budget; boards update more slowly while this lasts`,
+				{ RequestType = requestType }
 			)
 		end
-		return true, remaining
+		return false, free
 	end
 
-	-- How many queued writes one tick may drain: one, unless the queue has backed up and
-	-- the engine reports allowance to spare. With no backlog the pacer keeps its dedup
-	-- window, which collapses a burst of score changes into a single write.
-	local function drainAllowance(remaining: number?): number
-		-- nil is "could not ask" and infinity is "no meaningful limit"; neither is licence
-		-- to drain faster. A simulation with budgets disabled answers infinity.
-		if remaining == nil or remaining == math.huge then
-			return 1
+	-- Skip cooling or in-flight keys so other scores can progress.
+	local function nextWrite(ignoreInterval: boolean, attempted: { [WriteState]: boolean }?): (number?, QueueItem?)
+		local now = Clock.Monotonic()
+		for index, item in writeQueue do
+			local state = item.State
+			if
+				not state.InFlight
+				and not (attempted and attempted[state])
+				and (ignoreInterval or state.RetryAt == nil or now >= state.RetryAt)
+				and (
+					ignoreInterval
+					or item.Urgent
+					or state.LastScore == item.Score
+					or state.LastAttempt == nil
+					or now - state.LastAttempt >= item.Board.WriteInterval
+				)
+			then
+				return index, item
+			end
 		end
-		local spare = math.floor(remaining) - BUDGET_RESERVE
-		if spare <= 1 then
-			return 1
+		return nil, nil
+	end
+
+	local function dequeue(index: number, item: QueueItem)
+		table.remove(writeQueue, index)
+		writeQueueMap[writeKey(item.Board, item.UserId, item.StoreName)] = nil
+		Metrics.Set("LbQueueDepth", #writeQueue)
+	end
+
+	local function writeItem(item: QueueItem)
+		local state = item.State
+		state.InFlight = true
+		state.LastAttempt = Clock.Monotonic()
+		activeWrites += 1
+		local wrote, rejected = performWrite(item)
+		if wrote then
+			state.Failures, state.RetryAt, state.RejectedScore = nil, nil, nil
+		else
+			state.Failures = math.min((state.Failures or 0) + 1, 32)
+			if rejected then
+				state.RejectedScore = item.Score
+			elseif state.Failures >= 3 then
+				local delay = math.min(RETRY_MAX, RETRY_BASE * 2 ^ math.min(state.Failures - 3, 4))
+				state.RetryAt = Clock.Monotonic() + math.min(RETRY_MAX, Rng.Jitter(delay))
+			end
 		end
-		-- Bounding by the current queue length keeps a failed write's retries spaced: a
-		-- failure re-inserts at the tail, behind everything this tick would drain anyway.
-		-- Without it one tick burns all three attempts and abandons the item.
-		return math.min(MAX_WRITES_PER_TICK, spare, #writeQueue)
+		-- Failed responses may follow committed writes; invalidate the cached score.
+		state.LastScore = if wrote then item.Score else nil
+		-- SetAsync yields. An erase during it must not resurrect the score.
+		if wrote and isErased(item.UserId) then
+			state.LastScore = nil
+			pcall(function()
+				orderedStore(item.StoreName):RemoveAsync(tostring(item.UserId))
+			end)
+		end
+		state.InFlight = false
+		activeWrites -= 1
+		local key = writeKey(item.Board, item.UserId, item.StoreName)
+		if not wrote and not stopped and not isErased(item.UserId) then
+			local newer = writeQueueMap[key]
+			if rejected and (newer == nil or newer.Score == item.Score) then
+				if newer then
+					local index = table.find(writeQueue, newer)
+					if index then
+						dequeue(index, newer)
+					end
+				end
+				reportStoreFailure("LB_WRITE_DROPPED", "leaderboard score rejected; waiting for a changed score", {
+					Board = item.Board.Name,
+					UserId = item.UserId,
+					Score = item.Score,
+				})
+			elseif newer == nil then
+				queueWrite(item)
+			elseif rejected then
+				state.RejectedScore, state.Failures, state.RetryAt = nil, nil, nil
+			end
+		end
+		Metrics.Set("LbQueueDepth", #writeQueue)
+		releaseWriteState(state)
 	end
 
 	local function writePacerLoop()
-		-- Its own long-lived thread, so what it allocates is attributable. Scribe's own
-		-- background work only: an accessor write runs on the game's calling thread and
-		-- stays under the game's category.
 		Profile.MemoryCategory("Scribe")
 		while not stopped do
 			if #writeQueue == 0 then
@@ -869,57 +1073,33 @@ function Leaderboards.new(ctx: any)
 					break
 				end
 			end
-			-- Jittered above the gate and the dequeue, so it only moves when the tick
-			-- happens, never whether a queued write survives it.
 			Clock.Wait(Rng.Jitter(WRITE_INTERVAL))
-			-- Gated before the dequeue: below the table.remove the item is already out
-			-- of the queue, so deferring there would drop the write, not postpone it.
-			local defer, remaining = shouldDefer("SetIncrementSortedAsync", "the leaderboard write queue")
-			if defer then
-				continue
-			end
-			-- Bounded drain rather than a fixed one per tick, so `continue` below skips
-			-- one item rather than a whole tick.
-			for _ = 1, drainAllowance(remaining) do
+			local attempted: { [WriteState]: boolean } = {}
+			-- Claim shared budget before dequeuing, including Defer batches.
+			for _ = 1, math.min(if budgetPolicy then MAX_WRITES_PER_TICK else 1, #writeQueue) do
 				if stopped then
 					break
 				end
-				local item = table.remove(writeQueue, 1)
-				if item == nil then
+				local index, item = nextWrite(false, attempted)
+				if index == nil or item == nil then
 					break
 				end
-				local key = `{item.Board.Name}|{item.UserId}|{item.StoreName}`
-				writeQueueMap[key] = nil
-				Metrics.Set("LbQueueDepth", #writeQueue)
-				-- A user erased since this item was dequeued must not be written back into
-				-- the OrderedDataStore we just RemoveAsync'd.
-				if isErased(item.UserId) then
-					continue
-				end
-				local wrote = performWrite(item)
-				-- SetAsync yields, so an EraseUser during it would have been resurrected
-				-- by this write. Undo just this board's write so the erase holds.
-				if wrote and isErased(item.UserId) then
-					pcall(function()
-						orderedStore(item.StoreName):RemoveAsync(tostring(item.UserId))
-					end)
-					continue
-				end
-				if not wrote then
-					item.Attempts += 1
-					-- Only requeue if no newer value for this key arrived during
-					-- the SetAsync yield (dedup) and the user was not erased.
-					if item.Attempts < 3 and writeQueueMap[key] == nil and not isErased(item.UserId) then
-						table.insert(writeQueue, item)
-						writeQueueMap[key] = item
-					elseif item.Attempts >= 3 and writeQueueMap[key] == nil then
-						reportStoreFailure("LB_WRITE_DROPPED", "leaderboard write abandoned after retries", {
-							Board = item.Board.Name,
-							UserId = item.UserId,
-							Score = item.Score,
-						})
+				if isErased(item.UserId) or item.State.LastScore == item.Score then
+					dequeue(index, item)
+					if not isErased(item.UserId) then
+						Metrics.Add("LbWritesSkipped")
 					end
+					releaseWriteState(item.State)
+					continue
 				end
+				local granted, release = claimBackground("SetIncrementSortedAsync")
+				if not granted then
+					break
+				end
+				dequeue(index, item)
+				attempted[item.State] = true
+				writeItem(item)
+				release()
 			end
 		end
 	end
@@ -1070,6 +1250,7 @@ function Leaderboards.new(ctx: any)
 			end
 		end
 		board.Cache = { Entries = entries, At = Clock.Monotonic() }
+		board.LastReadAt, board.LastReadMono, board.LastReadError = Clock.Now(), Clock.Monotonic(), nil
 		local previousSignature = board.Signature
 		board.Signature = table.concat(signatureParts, "|")
 		if board.Signature ~= previousSignature then
@@ -1108,10 +1289,21 @@ function Leaderboards.new(ctx: any)
 	end
 
 	-- Reads one period's store into an entry list, or nil on failure.
-	local function readStore(board: Board, storeName: string): { any }?
+	local function readStore(board: Board, storeName: string, background: boolean?): { any }?
+		local release: (() -> ())? = nil
+		if background then
+			local granted, free = claimBackground("GetSortedAsync")
+			if not granted then
+				return nil
+			end
+			release = free
+		end
 		local ok, page = pcall(function()
 			return orderedStore(storeName):GetSortedAsync(false, board.Limit)
 		end)
+		if release then
+			release()
+		end
 		if not ok then
 			Metrics.Add("LbReadFailures")
 			reportStoreFailure("LB_READ_FAIL", page, { Board = board.Name })
@@ -1120,16 +1312,28 @@ function Leaderboards.new(ctx: any)
 		return pageEntries(board, page)
 	end
 
-	local function refreshPeriodicBoard(board: Board)
+	local function refreshPeriodicBoard(board: Board, background: boolean?, reserved: (() -> ())?): boolean
+		-- Reserve the live-board read before spending budget on history.
+		local release = reserved
+		if background and release == nil then
+			local granted, free = claimBackground("GetSortedAsync")
+			if not granted then
+				return false
+			end
+			release = free
+		end
 		local period: number? = if board.Period then currentPeriod(board.Period) else nil
 		if period ~= nil and period ~= board.CachePeriod then
 			board.CachePeriod = period
 			board.PreviousReads = 0
 		end
 		if period ~= nil and board.PreviousReads < PREVIOUS_READS then
-			local previous = readStore(board, storeNameFor(board, period - 1))
+			local previous = readStore(board, storeNameFor(board, period - 1), background)
 			if stopped then
-				return
+				if release then
+					release()
+				end
+				return true
 			end
 			if previous ~= nil then
 				board.PreviousReads += 1
@@ -1139,16 +1343,20 @@ function Leaderboards.new(ctx: any)
 		local ok, page = pcall(function()
 			return orderedStore(storeNameFor(board, period)):GetSortedAsync(false, board.Limit)
 		end)
+		if release then
+			release()
+		end
 		if not ok then
 			-- As in performWrite: a throttled read must not drive the global health gate.
 			Metrics.Add("LbReadFailures")
+			board.LastReadError = tostring(page)
 			reportStoreFailure("LB_READ_FAIL", page, { Board = board.Name })
-			return
+			return true
 		end
 
 		local entries = pageEntries(board, page)
 		if stopped then
-			return
+			return true
 		end
 		local rankByUserId: { [number]: number } = {}
 		local signatureParts = {}
@@ -1157,6 +1365,7 @@ function Leaderboards.new(ctx: any)
 			table.insert(signatureParts, `{item.UserId}:{item.Score}`)
 		end
 		board.Cache = { Entries = entries, At = Clock.Monotonic() }
+		board.LastReadAt, board.LastReadMono, board.LastReadError = Clock.Now(), Clock.Monotonic(), nil
 		local previousSignature = board.Signature
 		board.Signature = table.concat(signatureParts, "|")
 
@@ -1181,6 +1390,7 @@ function Leaderboards.new(ctx: any)
 		end
 
 		broadcastBoard(board)
+		return true
 	end
 
 	local function wakeRefreshWaiters(board: Board)
@@ -1197,10 +1407,10 @@ function Leaderboards.new(ctx: any)
 		coroutine.yield()
 	end
 
-	local function refreshBoard(board: Board)
+	local function refreshBoard(board: Board, background: boolean?, reserved: (() -> ())?): boolean
 		if board.Scope == "Server" then
 			refreshServerBoard(board)
-			return
+			return true
 		end
 		-- One refresh per board at a time and at most one waiting: later callers ride on
 		-- the pending one, and nothing waiting starts after Stop.
@@ -1209,7 +1419,10 @@ function Leaderboards.new(ctx: any)
 				repeat
 					awaitRefresh(board)
 				until stopped or not (board.Refreshing or board.RefreshPending)
-				return
+				if reserved then
+					reserved()
+				end
+				return true
 			end
 			board.RefreshPending = true
 			repeat
@@ -1218,15 +1431,22 @@ function Leaderboards.new(ctx: any)
 			board.RefreshPending = false
 		end
 		if stopped then
-			return
+			if reserved then
+				reserved()
+			end
+			return true
 		end
 		board.Refreshing = true
-		local ok, err = pcall(refreshPeriodicBoard, board)
+		local ok, result = pcall(refreshPeriodicBoard, board, background, reserved)
+		if reserved then
+			reserved()
+		end
 		board.Refreshing = false
 		wakeRefreshWaiters(board)
 		if not ok then
-			error(err, 0)
+			error(result, 0)
 		end
+		return result
 	end
 
 	-- Due-time scheduler: each board on its own cadence, with the initial due times
@@ -1236,21 +1456,32 @@ function Leaderboards.new(ctx: any)
 
 	local function refreshTick()
 		local now = Clock.Monotonic()
+		local dueBoards: { Board } = {}
 		for boardName, board in boards do
 			local due = dueAt[boardName]
 			if due == nil or now >= due then
-				-- Gated before dueAt is advanced: below that line a deferral costs a
-				-- whole RefreshInterval instead of one tick. A server board reads nothing.
-				if board.Scope ~= "Server" and shouldDefer("GetSortedAsync", `refreshing board "{boardName}"`) then
-					continue
-				end
-				dueAt[boardName] = now + board.RefreshInterval
-				-- Dropped, not queued: on a store slower than the interval a queue only grows.
-				if board.Refreshing or board.RefreshPending then
-					continue
-				end
-				Sched.Spawn(refreshBoard, board)
+				table.insert(dueBoards, board)
 			end
+		end
+		-- Claim budget for the oldest due board before spawning; keep denied boards overdue.
+		table.sort(dueBoards, function(a, b)
+			local left, right = dueAt[a.Name] or 0, dueAt[b.Name] or 0
+			return if left == right then a.Name < b.Name else left < right
+		end)
+		for _, board in dueBoards do
+			if board.Refreshing or board.RefreshPending then
+				continue
+			end
+			local release: (() -> ())? = nil
+			if board.Scope ~= "Server" then
+				local granted, free = claimBackground("GetSortedAsync")
+				if not granted then
+					continue
+				end
+				release = free
+			end
+			dueAt[board.Name] = now + board.RefreshInterval
+			Sched.Spawn(refreshBoard, board, true, release)
 		end
 	end
 
@@ -1281,9 +1512,77 @@ function Leaderboards.new(ctx: any)
 		end
 	end
 
+	type Counts = { Pending: number, Retrying: number, Rejected: number }
+	local function writeCounts(onlyBoard: Board?): { [Board]: Counts }
+		local counts: { [Board]: Counts } = {}
+		for _, states in writeStates do
+			for key, state in states do
+				local board = state.Board
+				if onlyBoard ~= nil and board ~= onlyBoard then
+					continue
+				end
+				local count = counts[board]
+				if count == nil then
+					count = { Pending = 0, Retrying = 0, Rejected = 0 }
+					counts[board] = count
+				end
+				local waiting = state.InFlight or writeQueueMap[key] ~= nil
+				if waiting or state.RejectedScore ~= nil then
+					count.Pending += 1
+				end
+				if state.RejectedScore ~= nil then
+					count.Rejected += 1
+				elseif waiting and (state.Failures or 0) > 0 then
+					count.Retrying += 1
+				end
+			end
+		end
+		return counts
+	end
+
+	local function boardStatus(board: Board, count: Counts?, now: number): Types.LeaderboardStatusInfo
+		local pending = if count then count.Pending else 0
+		local retrying = if count then count.Retrying else 0
+		local rejected = if count then count.Rejected else 0
+		local age = if board.LastReadMono ~= nil then math.max(0, now - board.LastReadMono) else nil
+		local stale = age ~= nil and age > 2 * board.RefreshInterval
+		local status: Types.LeaderboardStatus = if retrying > 0
+				or rejected > 0
+				or board.LastReadError ~= nil
+				or board.LastWriteError ~= nil
+				or stale
+			then "Degraded"
+			elseif age == nil then "Starting"
+			else "Healthy"
+		return {
+			Status = status,
+			PendingWrites = pending,
+			RetryingWrites = retrying,
+			RejectedWrites = rejected,
+			LastReadAt = board.LastReadAt,
+			ReadAge = age,
+			LastWriteAt = board.LastWriteAt,
+			LastReadError = board.LastReadError,
+			LastWriteError = board.LastWriteError,
+		}
+	end
+
+	local function diagnosticSnapshot(): { [string]: Types.LeaderboardStatusInfo }
+		local counts, now = writeCounts(nil), Clock.Monotonic()
+		local snapshot: { [string]: Types.LeaderboardStatusInfo } = {}
+		for name, board in boards do
+			snapshot[name] = boardStatus(board, counts[board], now)
+		end
+		return snapshot
+	end
+
 	-- Called by Server.build once the full ctx is assembled, so neither loop ever runs
 	-- against a half-constructed context.
 	function self.Start()
+		if started or stopped then
+			return
+		end
+		started = true
 		local any, global = false, false
 		for _, board in boards do
 			any = true
@@ -1295,6 +1594,7 @@ function Leaderboards.new(ctx: any)
 			pacerThread = Sched.Spawn(writePacerLoop)
 		end
 		if any then
+			unregisterDiagnostics = Diagnostics.Register(diagnosticSnapshot)
 			refreshThread = Sched.Spawn(refreshLoop)
 		end
 	end
@@ -1304,6 +1604,17 @@ function Leaderboards.new(ctx: any)
 		return { Pacer = pacerThread ~= nil, Refresh = refreshThread ~= nil, PacerParked = pacerParked }
 	end
 
+	-- Test seam: count retained score states.
+	function self.WriteStateCount(): number
+		local count = 0
+		for _, states in writeStates do
+			for _ in states do
+				count += 1
+			end
+		end
+		return count
+	end
+
 	-- Release both loops. Cancelled as well as flagged, because a parked loop would
 	-- otherwise keep a thread alive per bundle until its next wake.
 	function self.Stop()
@@ -1311,10 +1622,19 @@ function Leaderboards.new(ctx: any)
 			return
 		end
 		stopped = true
+		if unregisterDiagnostics then
+			unregisterDiagnostics()
+			unregisterDiagnostics = nil
+		end
 		for _, thread in { pacerThread, refreshThread } do
 			pcall(task.cancel, thread)
 		end
 		pacerThread, refreshThread = nil, nil
+		for release in budgetReleases do
+			release()
+		end
+		table.clear(writeStates)
+		table.clear(activeUsers)
 		for _, board in boards do
 			wakeRefreshWaiters(board)
 		end
@@ -1413,6 +1733,7 @@ function Leaderboards.new(ctx: any)
 	-- Player lifecycle ------------------------------------------------------------------
 
 	function self.OnLoad(entry: any)
+		activeUsers[entry.UserId] = (activeUsers[entry.UserId] or 0) + 1
 		local disconnects = {}
 		for _, board in boards do
 			-- Per-board isolation: one board's path failing at runtime must not kill
@@ -1476,8 +1797,22 @@ function Leaderboards.new(ctx: any)
 			for _, board in boards do
 				local value: any = readStat(entry, board)
 				if board.IsBig or type(value) == "number" then
-					self.Enqueue(board, entry, value)
+					self.Enqueue(board, entry, value, nil, true)
 				end
+			end
+		end
+		if disconnects then
+			local remaining = (activeUsers[entry.UserId] or 1) - 1
+			activeUsers[entry.UserId] = if remaining > 0 then remaining else nil
+		end
+		local states = writeStates[entry.UserId]
+		if states then
+			for key, state in states do
+				local queued = writeQueueMap[key]
+				if queued then
+					queued.Urgent = true
+				end
+				releaseWriteState(state)
 			end
 		end
 	end
@@ -1524,6 +1859,15 @@ function Leaderboards.new(ctx: any)
 		return out
 	end
 
+	function self.GetStatus(name: string): Types.LeaderboardStatusInfo?
+		local board = boards[name]
+		if not board then
+			checkBoardName(name, "GetLeaderboardStatus")
+			return nil
+		end
+		return boardStatus(board, writeCounts(board)[board], Clock.Monotonic())
+	end
+
 	function self.GetRefreshIn(name: string): number?
 		if not boards[name] then
 			checkBoardName(name, "GetLeaderboardRefreshIn")
@@ -1561,24 +1905,30 @@ function Leaderboards.new(ctx: any)
 	function self.FlushAllBlocking(budget: number)
 		local deadline = Clock.Monotonic() + budget
 		local flushed = 0
+		local attempts: { [WriteState]: number } = {}
+		local exhausted: { [WriteState]: boolean } = {}
 		while Clock.Monotonic() < deadline do
-			local item = table.remove(writeQueue, 1)
-			if not item then
+			local index, item = nextWrite(true, exhausted)
+			if index == nil or item == nil then
+				if activeWrites > 0 then
+					Clock.Wait(math.min(0.05, math.max(0, deadline - Clock.Monotonic())))
+					continue
+				end
 				break
 			end
-			writeQueueMap[`{item.Board.Name}|{item.UserId}|{item.StoreName}`] = nil
-			flushed += 1
-			-- Mirror the pacer's GDPR guard: skip an erased user, and undo a write whose
-			-- SetAsync yield raced a concurrent EraseUser.
-			if isErased(item.UserId) then
+			dequeue(index, item)
+			if isErased(item.UserId) or item.State.LastScore == item.Score then
+				if not isErased(item.UserId) then
+					Metrics.Add("LbWritesSkipped")
+				end
+				releaseWriteState(item.State)
 				continue
 			end
-			local wrote = performWrite(item)
-			if wrote and isErased(item.UserId) then
-				pcall(function()
-					orderedStore(item.StoreName):RemoveAsync(tostring(item.UserId))
-				end)
-			end
+			flushed += 1
+			local count = (attempts[item.State] or 0) + 1
+			attempts[item.State] = count
+			exhausted[item.State] = count >= 3
+			writeItem(item)
 		end
 		Log.Info("Leaderboards", "LB_SHUTDOWN_FLUSH", "leaderboard queue drained on shutdown", {
 			Flushed = flushed,
@@ -1633,6 +1983,7 @@ function Leaderboards.new(ctx: any)
 		-- Tombstone first, so an already-dequeued pacer write cannot resurrect the score
 		-- after RemoveAsync. Held long enough to outlive that write plus its retries.
 		erasedUsers[userId] = Clock.Monotonic() + 300
+		writeStates[userId] = nil
 
 		-- Drop any still-queued writes for this user, or the pacer would
 		-- SetAsync their score back into a board we just RemoveAsync'd.

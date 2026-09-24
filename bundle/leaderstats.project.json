@@ -1,0 +1,6 @@
+{
+  "name": "ScribeLeaderstats",
+  "tree": {
+    "$path": "../addons/leaderstats/ScribeLeaderstats.luau"
+  }
+}

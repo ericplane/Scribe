@@ -54,23 +54,11 @@ return function()
 	local JUST_INSIDE = TTL - 1 -- 3599
 	local JUST_PAST = TTL + 1 -- 3601
 
-	--- THE CAP THIS NET PINS for a durable gift record. Two numbers, and they are
-	--- separate on purpose:
-	---
-	---   * NO CONTAINER on the buyer's key may exceed 200 entries. That is the same
-	---     ceiling the receipt-dedupe ring already lives under, and it is what stops a
-	---     heavy gifter's profile from growing without bound. A record keyed by
-	---     purchaseId is ~80 bytes; 200 of them is ~16 KB, which a profile can carry.
-	---   * DOUBLING the purchases adds no nodes at all, and the whole reserved root
-	---     stays under a 3000-node ceiling -- so the fix cannot satisfy the
-	---     per-container rule by adding several capped containers instead of one.
-	---
-	--- Both hold today and both must still hold after the fix; neither is a
-	--- characterisation. See the storage spec for what the budget is measured against.
-	local MAX_CONTAINER_ENTRIES = 200
+	-- Six hundred recent gifts fit without accumulating completed route records.
 	local MAX_RESERVED_NODES = 3000
 
 	local function makeHarness(extraOptions)
+		local finished = require(Root.Scribe.Internal.Signal).new()
 		local options = {
 			Products = {
 				-- A consumable: real value, no perk. This is the one that shows the
@@ -91,7 +79,10 @@ return function()
 				GiftPRO = { Id = 333, Category = "Gamepass", Grants = "PRO" },
 			},
 			GiftCooldown = 0,
-			PromptProductPurchase = function() end,
+			PromptProductPurchaseFinished = finished,
+			PromptProductPurchase = function(player, productId)
+				finished:Fire(player.UserId, productId, true)
+			end,
 		}
 		for key, value in extraOptions or {} do
 			options[key] = value
@@ -743,15 +734,7 @@ return function()
 		end)
 	end)
 
-	it("the ring's COUNT eviction can still double-grant, which is why F1's record cannot live in it", function()
-		-- CONSTRAINT (c), measured rather than asserted in prose. The ring evicts by age
-		-- first, but its count backstop drops the OLDEST un-expired entry, and a receipt
-		-- Roblox retries for that entry is granted a second time. Parking a durable gift
-		-- record inside this structure would inherit exactly the flaw F1 is closing.
-		--
-		-- Loud, at least: PurchaseIdsEvicted counts it. That is what makes it a
-		-- documented backstop rather than a silent corruption -- and still not somewhere
-		-- to store the identity of a paid gift.
+	it("retains completion IDs beyond the former count cap", function()
 		withClock(T0, function()
 			local harness = makeHarness({ MaxProcessedPurchaseIds = 3 })
 			local buyer = harness.Join(BUYER)
@@ -762,16 +745,14 @@ return function()
 			end
 			expect((Metrics.Get().PurchaseIdsEvicted or 0) - evictedBefore).to.equal(0)
 
-			-- One more purchase pushes the first id out while it is still well inside
-			-- PurchaseIdTTL, and says so.
+			-- Cross the old cap, then replay the first receipt.
 			expect(harness.Data.HandleReceipt(receipt(111, "ring-4"))).to.equal(GRANTED)
 			local evicted = (Metrics.Get().PurchaseIdsEvicted or 0) - evictedBefore
 
-			-- Roblox retries the forgotten one. It is granted AGAIN.
 			expect(harness.Data.HandleReceipt(receipt(111, "ring-1"))).to.equal(GRANTED)
 			harness.Data.Flush(buyer)
 
-			expect(("evicted=%d coins=%d"):format(evicted, coinsOf(harness, BUYER))).to.equal("evicted=1 coins=5000")
+			expect(("evicted=%d coins=%d"):format(evicted, coinsOf(harness, BUYER))).to.equal("evicted=0 coins=4000")
 
 			harness.Cleanup()
 		end)
@@ -781,32 +762,7 @@ return function()
 	-- STORAGE. The buyer's key must not grow without bound.
 	----------------------------------------------------------------------------------
 
-	it("the buyer's key does not grow with the number of gift purchases", function()
-		-- THE STORAGE RULE THIS NET PINS, and it holds before and after the fix:
-		--   * no single container under the buyer's reserved root exceeds 200 entries
-		--   * doubling the number of purchases does not add a single node
-		--   * the whole reserved root stays under a 3000-node ceiling
-		--
-		-- The middle one is the real assertion, and it is the one a magic byte budget
-		-- cannot make: 300 settled gift purchases and 600 settled gift purchases must
-		-- leave the profile the SAME SIZE. A record that is merely small still fails it
-		-- if it is uncapped, which is exactly the failure mode worth catching -- the
-		-- profile of a whale who gifts every day is where it would surface, months after
-		-- the fix shipped and nowhere near the change.
-		--
-		-- The 3000 ceiling exists so the per-container rule cannot be satisfied by adding
-		-- several capped containers instead of one. It is sized from what is there today
-		-- (1602 nodes: a 199-entry dedupe ring at ~3 nodes each, a 100-entry Robux ledger
-		-- at ~10) plus room for ONE 200-entry gift record carrying a recipient, a giftId,
-		-- a product, a delivered flag and a timestamp (~1200).
-		--
-		-- WHY A COUNT CAP AND NOT A TTL ALONE, for the record F1 introduces: it must
-		-- outlive the intent by the whole Roblox receipt-retry window, and that window is
-		-- not knowable from this repo. If Roblox only re-invokes ProcessReceipt on rejoin,
-		-- the record has to survive until the buyer's next session, which may be months --
-		-- so it cannot be sized by time alone. A count cap with age pruning underneath it
-		-- (the shape the dedupe ring already uses) bounds the bytes without putting a
-		-- clock on the recipient's identity.
+	it("stores every gift receipt compactly beyond the old 200-entry limit", function()
 		withClock(T0, function(advance)
 			local harness = makeHarness()
 			local buyer = harness.Join(BUYER)
@@ -841,26 +797,25 @@ return function()
 				for i = from, to do
 					expect(harness.Data.PromptGift(buyer, "GiftVIP", 950000 + i)).to.equal(true)
 					expect(harness.Data.HandleReceipt(receipt(222, `bulk-{i}`))).to.equal(GRANTED)
-					advance(1) -- distinct timestamps; still far inside PurchaseIdTTL
+					advance(1) -- distinct timestamps inside the thirty-day window
 				end
 				harness.Data.Flush(buyer)
 			end
 
-			-- 300 is already past every cap in play (the 200-entry dedupe ring, the
-			-- 100-entry ledger), so the first census is a STEADY STATE, not a ramp.
 			gift(1, 300)
 			local firstBiggest, firstNodes = select(2, census()), select(3, census())
 			gift(301, 600)
 			local biggestName, biggest, nodes = census()
 
 			expect(
-				("biggest=%s over=%s grew=%s underCeiling=%s"):format(
+				("biggest=%s count=%d before=%d grewBy=%d underCeiling=%s"):format(
 					biggestName,
-					tostring(biggest > MAX_CONTAINER_ENTRIES or firstBiggest > MAX_CONTAINER_ENTRIES),
-					tostring(nodes ~= firstNodes),
+					biggest,
+					firstBiggest,
+					nodes - firstNodes,
 					tostring(nodes <= MAX_RESERVED_NODES)
 				)
-			).to.equal("biggest=ProcessedPurchaseIds over=false grew=false underCeiling=true")
+			).to.equal("biggest=ProcessedPurchaseIds count=600 before=300 grewBy=900 underCeiling=true")
 
 			harness.Cleanup()
 		end)

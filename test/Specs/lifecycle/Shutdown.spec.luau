@@ -11,6 +11,7 @@ return function()
 	it("drains sessions and the leaderboard queue on shutdown", function()
 		local harness = TestCtx.make({
 			Options = {
+				LogRingLevel = "Info",
 				Leaderboards = {
 					TopCoins = { Stat = "Coins", Limit = 10 },
 				},

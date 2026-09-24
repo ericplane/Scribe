@@ -641,22 +641,8 @@ return function()
 			harness.Cleanup()
 		end)
 
-		it("THE LIMIT ON THAT CONTRAST: count eviction drops a LIVE credit marker", function()
-			-- WHY A STABLE giftId IS NOT ENOUGH ON ITS OWN, measured rather than
-			-- argued. The spec above shows a reused `credit:{giftId}` being caught, and
-			-- that is the whole basis for "persist the giftId so a retry reuses it".
-			-- The catch depends entirely on the recipient's ring STILL HOLDING the id,
-			-- and the ring's count backstop drops the oldest un-expired entry to stay
-			-- under MaxProcessedPurchaseIds -- the one eviction pruneProcessed's own
-			-- comment admits can double-grant. Once it has run, the identical
-			-- purchaseId grants a SECOND time.
-			--
-			-- The cap is lowered to 3 to reach the backstop in a test; at the default
-			-- 200 the same rollover needs a busier recipient and more time. Time is
-			-- exactly what a credit retry has: a receipt retry is machine-paced inside
-			-- Roblox's window, while a buyer re-pressing a gift button is human-paced
-			-- and bounded by nothing. That is the difference that makes the credit path
-			-- MORE exposed to this hole than the receipt path it would be copying.
+		it("retains a credit marker beyond the former count cap", function()
+			-- A mailbox replay must not grant again after ordinary purchases.
 			local harness = makeHarness(nil, { MaxProcessedPurchaseIds = 3 })
 			local buyer = buyerWith(harness, BUYER, "CoinsGift", 1)
 			-- Offline, so the spend commits a FIXED `credit:{giftId}` to the mailbox:
@@ -678,10 +664,7 @@ return function()
 			expect(recipientData.Coins.Get()).to.equal(1000)
 			expect(#creditIds(liveRing(recipientEntry))).to.equal(1)
 
-			-- The recipient keeps buying. Three ordinary receipts, three fresh ids, and
-			-- the gift's marker is pushed out of a three-entry ring while it is still
-			-- inside its TTL -- un-expired, still live, still the only thing standing
-			-- between a retry and a second grant.
+			-- Three fresh receipts cross the old three-entry cap.
 			for index = 1, 3 do
 				expect(harness.Data.HandleReceipt({
 					PlayerId = RECIPIENT,
@@ -692,7 +675,7 @@ return function()
 					PlaceIdWherePurchased = 0,
 				})).to.equal(GRANTED)
 			end
-			expect(#creditIds(liveRing(recipientEntry))).to.equal(0)
+			expect(#creditIds(liveRing(recipientEntry))).to.equal(1)
 			local coinsBefore = recipientData.Coins.Get()
 
 			-- The same purchaseId a second time, which is precisely what a perfectly
@@ -700,8 +683,7 @@ return function()
 			harness.Fake.Mailboxes[`Default/{harness.Ctx.Persistence.KeyFor(RECIPIENT)}`] = { message }
 			expect(harness.Data.Flush(recipient, { Force = true })).to.equal(true)
 
-			-- Granted again. One payment, two grants, with the id held perfectly fixed.
-			expect(recipientData.Coins.Get()).to.equal(coinsBefore + 1000)
+			expect(recipientData.Coins.Get()).to.equal(coinsBefore)
 
 			harness.Cleanup()
 		end)
@@ -1086,7 +1068,7 @@ return function()
 				if logEntry.Code == "GIFT_CREDIT_UNCONFIRMED" then
 					table.insert(entries, logEntry)
 				end
-			end)
+			end, { Level = "Warn" })
 
 			local harness = makeHarness()
 			local buyer = buyerWith(harness, BUYER, "CoinsGift", 1)

@@ -2729,8 +2729,8 @@ end
 
 	!!! warning "Reserved names"
 	    Because method names live on the node, a template field named `Get`, `Set`,
-	    `Count`, `Remove`, etc. is unreachable through the typed accessor. Scribe
-	    warns about this in Studio.
+	    `Count`, `Remove`, etc. shadows direct child indexing. Reach it through
+	    `node.Child("Get")` instead. Scribe warns about these names in Studio.
 
 	!!! warning "Scribe's own `_Scribe` root is read-only to game code"
 	    Every mutator is refused on a path inside the reserved `_Scribe` root, and a
@@ -2743,6 +2743,29 @@ end
 	    and `data.Coins(fn)` updates. The generated accessor type does not carry it, so
 	    every such call site is a type error, and nothing tests it. Treat it as an
 	    implementation detail and call `Get`, `Set` and `Update` by name.
+]=]
+
+--[=[
+	@function Child
+	@within Value
+	@tag Core
+	@param key string | number
+	@return Value
+	Returns the child accessor for `key`, including a name such as `Get` or `Child`
+	that ordinary indexing reserves for a method. Uses the same schema, validation
+	and cached accessor as bracket indexing; it does not create a stored entry.
+
+	Array positions are **1-based**. Integer map keys are used exactly as passed,
+	without shifting or converting them to strings. A leaf has no children and errors.
+
+	```lua
+	data.Inventory.Child("Get").Qty.Increment(1)
+	data.RecentRuns.Child(1).Score.Get()
+	```
+
+	Luau infers homogeneous container children exactly. On a static record with
+	multiple fields the return is `any` to stay within the type solver's budget;
+	ordinary named property access remains fully typed.
 ]=]
 
 --[=[
@@ -3261,6 +3284,7 @@ end
 	@function SetTimed
 	@within Value
 	@tag Timed
+	@server
 	@param value T
 	@param seconds number
 	@param replicate boolean?
@@ -3277,13 +3301,15 @@ end
 	@function ExtendTimed
 	@within Value
 	@tag Timed
+	@server
 	@param seconds number
+	@param replicate boolean?
 	`Scribe.Timed` fields only. Adds time to a running timer.
 
 	With no timer running it **arms a fresh one** from now, so a field that was
 	never `SetTimed` starts counting down and will revert to its declared default.
-	Check `Active()` first if that is not what you want. The value itself is never
-	written, so unlike `SetTimed` there is nothing here to replicate.
+	Check `Active()` first if that is not what you want. Replicates the updated
+	deadline without changing the value. Pass `false` to suppress that update.
 ]=]
 
 --[=[
@@ -3292,7 +3318,9 @@ end
 	@tag Timed
 	@return (boolean, number?)
 	`Scribe.Timed` fields only. Whether the timer is active, and the seconds
-	remaining.
+	remaining, or `false, nil` when inactive. On the client, reads the replicated
+	deadline using synchronized server time. This is an estimate for UI; expiry
+	and rewards are still decided on the server. Reading does not send a request.
 ]=]
 
 type Accessor = any
@@ -4345,8 +4373,8 @@ for name in MUTATOR_METHODS do
 	MUTATOR_CACHE_KEY[name] = {}
 end
 
-local function accessorIndex(accessor: Accessor, key: any): any
-	local factory = METHOD_FACTORIES[key]
+local function accessorIndex(accessor: Accessor, key: any, childOnly: boolean?): any
+	local factory = if childOnly then nil else METHOD_FACTORIES[key]
 	if factory then
 		if MUTATOR_METHODS[key] then
 			-- A write to a DIFFERENT player's tree is refused while a transaction is open: it
@@ -4459,6 +4487,15 @@ local function accessorIndex(accessor: Accessor, key: any): any
 	return child
 end
 
+-- An explicit child lookup shares every indexing guard, schema lookup and cache,
+-- but bypasses method lookup. In particular, dictionaries may store keys such as
+-- "Get", "Remove" or "Child" without hiding either the method or the entry.
+METHOD_FACTORIES.Child = function(accessor)
+	return function(key: string | number)
+		return accessorIndex(accessor, key, true)
+	end
+end
+
 -- Callable shorthand: node() gets, node(value) sets, node(fn) updates.
 local function accessorCall(accessor: Accessor, ...: any): any
 	local n = select("#", ...)
@@ -4514,6 +4551,11 @@ Node.AssertSameTreeWrite = assertSameTreeWrite
 --- module-private identities no other module can name.
 function Node.PathKeyOf(accessor: any): string
 	return rawget(accessor, F_KEY) :: any
+end
+
+--- The declared schema behind an accessor.
+function Node.SchemaOf(accessor: any): SchemaNode?
+	return rawget(accessor, F_SCHEMA) :: any
 end
 
 -- Deep-clone a value while unpacking every declared datatype descendant. Exposed for

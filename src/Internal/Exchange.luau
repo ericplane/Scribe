@@ -164,6 +164,9 @@ function Exchange.Attempt(deps: any, sideA: Side, sideB: Side): (string?, string
 	if type(exchangeId) ~= "string" or #exchangeId == 0 then
 		fail("Attempt needs an exchange id")
 	end
+	if #exchangeId > 50 or not Util.isUtf8(exchangeId) then
+		return nil, "exchange id must be valid UTF-8 and at most 50 bytes"
+	end
 
 	local admitted, why = admit(sideA, sideB, deps.Options, deps.InFlight)
 	if not admitted then

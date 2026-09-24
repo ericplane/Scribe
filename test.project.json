@@ -25,6 +25,9 @@
           },
           "Telemetry": {
             "$path": "addons/telemetry"
+          },
+          "Leaderstats": {
+            "$path": "addons/leaderstats"
           }
         },
         "DevPackages": {

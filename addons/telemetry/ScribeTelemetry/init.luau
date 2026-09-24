@@ -5,7 +5,9 @@
 local RunService = game:GetService("RunService")
 
 local Config = require(script.Config)
+local Diagnostics = require(script.Diagnostics)
 local Format = require(script.Format)
+local LeaderboardMonitor = require(script.LeaderboardMonitor)
 local Preview = require(script.Preview)
 local Router = require(script.Router)
 local Sanitize = require(script.Sanitize)
@@ -22,6 +24,7 @@ export type Stats = Transport.Stats & {
 	Groups: number,
 	EncodeFailures: number,
 	LastTickError: string?,
+	Leaderboards: { State: string, Monitored: number, Omitted: number, SnapshotAge: number?, LastError: string? },
 }
 export type Handle = {
 	Test: (self: Handle, destination: string) -> (boolean, string?),
@@ -41,12 +44,13 @@ export type LogEntry = {
 --- The slice of the Scribe module the add-on reads; the real module satisfies it.
 export type ScribeModule = {
 	Version: string?,
-	AddLogSink: (sink: (entry: LogEntry) -> ()) -> () -> (),
+	AddLogSink: (sink: (entry: LogEntry) -> (), options: { Level: string? }?) -> () -> (),
 	OnStatusChanged: { Connect: (self: any, fn: (new: string, old: string?) -> ()) -> any },
 	GetStatus: () -> string,
 	GetMetrics: () -> { [string]: any },
 	GetPercentiles: () -> { [string]: any },
 	GetBudgetSnapshot: (() -> { [string]: any })?,
+	GetLeaderboardSnapshot: (() -> { LeaderboardMonitor.Entry })?,
 	GetProfileKeyPrefix: (() -> string)?,
 	RegisterAddon: ((name: string, actions: { [string]: { Run: (args: any) -> any, Writes: boolean? } }) -> () -> ())?,
 }
@@ -56,7 +60,7 @@ ScribeTelemetry.Version = "1.0.0"
 ScribeTelemetry.LogoUrl = Config.LOGO_URL
 ScribeTelemetry.DefaultWarningCodes = table.freeze(table.clone(Config.DEFAULT_WARNING_CODES))
 
-local PRIORITY = { Health = 3, Issues = 3, Warnings = 2, Performance = 2, Summaries = 1, Test = 1 }
+local PRIORITY = { Health = 3, Issues = 3, Warnings = 2, Leaderboards = 2, Performance = 2, Summaries = 1, Test = 1 }
 local TICK = 1
 local MESSAGE_MAX = 1500
 
@@ -270,7 +274,7 @@ function ScribeTelemetry.Start(Scribe: ScribeModule, options: Options): Handle
 		if self.running then
 			self:onLog(entry)
 		end
-	end)
+	end, { Level = "Warn" })
 
 	self.lastSummary = { At = self.deps.Clock.Monotonic(), Metrics = Scribe.GetMetrics() }
 	self.lastPerformance = { At = self.deps.Clock.Monotonic(), Metrics = self.lastSummary.Metrics }
@@ -285,6 +289,15 @@ function ScribeTelemetry.Start(Scribe: ScribeModule, options: Options): Handle
 	}
 	self.summaryDue = self.deps.Clock.Monotonic() + config.SummaryInterval
 	self.performanceDue = self.deps.Clock.Monotonic() + config.PerformanceInterval
+	self.leaderboards = LeaderboardMonitor.new(
+		Scribe,
+		config,
+		self.deps.Clock.Monotonic,
+		function(entry, previous, observedFor)
+			self:reportLeaderboard(entry, previous, observedFor)
+		end
+	)
+	self.leaderboards:Poll()
 	self.deps.Scheduler.Spawn(function()
 		while self.running do
 			self.deps.Scheduler.Wait(TICK)
@@ -529,6 +542,117 @@ function Handle.reportHealth(self: any, previous: string?, current: string, obse
 	}, nil, preview)
 end
 
+function Handle.reportLeaderboard(
+	self: any,
+	entry: LeaderboardMonitor.Entry,
+	previous: string?,
+	observedFor: number?,
+	preview: any?
+)
+	local safe = self:recordFrom("Leaderboards", "Warn", "LEADERBOARD_HEALTH", "Leaderboards", entry.Name, {
+		LastReadError = entry.LastReadError,
+		LastWriteError = entry.LastWriteError,
+	}, 0)
+	local recovered = entry.Status == "Healthy"
+	local label = `{Sanitize.Truncate(safe.Message, 96)} (bundle {entry.BundleId})`
+	local fields: { Format.Field } = {
+		{ Name = "Board", Value = label, Inline = false },
+		{ Name = "Status", Value = `{previous or "unknown"} → {entry.Status}`, Inline = true },
+		{
+			Name = "Cache age",
+			Value = if entry.ReadAge then duration(entry.ReadAge) else "no successful refresh",
+			Inline = true,
+		},
+		{ Name = "Pending writes", Value = tostring(entry.PendingWrites), Inline = true },
+		{ Name = "Retrying writes", Value = tostring(entry.RetryingWrites), Inline = true },
+		{ Name = "Rejected writes", Value = tostring(entry.RejectedWrites), Inline = true },
+		{
+			Name = "Observed",
+			Value = if observedFor
+				then `{duration(observedFor)} since the previous state was observed`
+				else "already degraded when first observed",
+			Inline = false,
+		},
+	}
+	for _, field in contextFields(safe.Context) do
+		table.insert(fields, field)
+	end
+	self:report({
+		Category = "Leaderboards",
+		Kind = "Health",
+		Severity = if recovered then "Recovery" else "Degraded",
+		Title = `{if recovered then "Leaderboard recovered" else "Leaderboard degraded"}: {label}`,
+		Description = "Cached leaderboard health on this server. Profile-saving health is reported separately.",
+		Fields = fields,
+		MentionKind = if recovered then "Recovery" else "Degraded",
+	}, nil, preview)
+end
+
+function Handle.leaderboardFields(self: any): { Format.Field }
+	local monitor = self.leaderboards
+	if monitor == nil or monitor.State ~= "Available" then
+		return {
+			{
+				Name = "Leaderboard health",
+				Value = if monitor
+					then `{monitor.State}{if monitor.LastError then `: {monitor.LastError}` else ""}`
+					else "Unavailable",
+				Inline = false,
+			},
+		}
+	end
+	local healthy, degraded, starting, pending, retrying, rejected = 0, 0, 0, 0, 0, 0
+	for _, entry in monitor.Entries do
+		healthy += if entry.Status == "Healthy" then 1 else 0
+		degraded += if entry.Status == "Degraded" then 1 else 0
+		starting += if entry.Status == "Starting" then 1 else 0
+		pending += entry.PendingWrites
+		retrying += entry.RetryingWrites
+		rejected += entry.RejectedWrites
+	end
+	local overview = if #monitor.Entries == 0
+		then "No active leaderboards"
+		else `{healthy} healthy · {degraded} degraded · {starting} starting\n{pending} pending · {retrying} retrying · {rejected} rejected writes`
+	if monitor.Omitted > 0 then
+		overview ..= `\n{monitor.Omitted} boards omitted by MaxBoards; counts cover monitored boards only`
+	end
+	if monitor.ObservedAt ~= nil then
+		overview ..= `\nSnapshot {duration(math.max(0, self.deps.Clock.Monotonic() - monitor.ObservedAt))} ago`
+	end
+	local fields: { Format.Field } = { { Name = "Leaderboard health", Value = overview, Inline = false } }
+	local entries: { LeaderboardMonitor.Entry } = table.clone(monitor.Entries)
+	local rank: { [string]: number } = { Degraded = 1, Starting = 2, Healthy = 3 }
+	table.sort(entries, function(a: LeaderboardMonitor.Entry, b: LeaderboardMonitor.Entry)
+		if rank[a.Status] ~= rank[b.Status] then
+			return rank[a.Status] < rank[b.Status]
+		end
+		if a.PendingWrites ~= b.PendingWrites then
+			return a.PendingWrites > b.PendingWrites
+		end
+		if a.BundleId ~= b.BundleId then
+			return a.BundleId < b.BundleId
+		end
+		return a.Name < b.Name
+	end)
+	local lines: { string } = {}
+	for i = 1, math.min(5, #entries) do
+		local entry = entries[i]
+		local safe = self:recordFrom("Leaderboards", "Info", "LEADERBOARD_HEALTH", "Leaderboards", entry.Name, nil, 0)
+		local age = if entry.ReadAge then duration(entry.ReadAge) else "no refresh"
+		table.insert(
+			lines,
+			`{Sanitize.Truncate(safe.Message, 64)} (bundle {entry.BundleId}): {entry.Status}; {entry.PendingWrites} pending, {entry.RetryingWrites} retrying, {entry.RejectedWrites} rejected; cache {age}`
+		)
+	end
+	if #entries > 5 then
+		table.insert(lines, `+{#entries - 5} more monitored boards`)
+	end
+	if #lines > 0 then
+		table.insert(fields, { Name = "Leaderboard details", Value = table.concat(lines, "\n"), Inline = false })
+	end
+	return fields
+end
+
 -- Collection ---------------------------------------------------------------------
 
 function Handle.onStatus(self: any, new: string, old: string?)
@@ -639,6 +763,7 @@ type SummaryInputs = {
 	Previous: { [string]: any },
 	Percentiles: { [string]: any },
 	Budget: { [string]: any }?,
+	LeaderboardFields: { Format.Field }?,
 }
 
 function Handle.summarise(self: any)
@@ -660,6 +785,7 @@ function Handle.summarise(self: any)
 		Previous = previous.Metrics,
 		Percentiles = self.scribe.GetPercentiles(),
 		Budget = budget,
+		LeaderboardFields = self:leaderboardFields(),
 	})
 end
 
@@ -671,7 +797,7 @@ function Handle.reportSummary(self: any, inputs: SummaryInputs, preview: any?)
 	end
 	local bytes = delta(metrics, inputs.Previous, "BytesOut")
 	local fields: { Format.Field } = {
-		{ Name = "Health", Value = inputs.Status, Inline = true },
+		{ Name = "Profile health", Value = inputs.Status, Inline = true },
 		{ Name = "Sessions", Value = tostring(counter(metrics, "ActiveSessions") or "n/a"), Inline = true },
 		{ Name = "Interval", Value = duration(elapsed), Inline = true },
 		{
@@ -684,11 +810,17 @@ function Handle.reportSummary(self: any, inputs: SummaryInputs, preview: any?)
 		{ Name = "Save duration", Value = percentileText(percentiles.SaveDuration, duration), Inline = false },
 		{ Name = "Profile size", Value = percentileText(percentiles.ProfileSize, bytesText), Inline = false },
 	}
+	for _, field in inputs.LeaderboardFields or {} do
+		table.insert(fields, field)
+	end
+	for _, field in Diagnostics.Fields(metrics, inputs.Previous, percentiles) do
+		table.insert(fields, field)
+	end
 	local snapshot = inputs.Budget
 	if snapshot ~= nil then
 		if snapshot.Available then
 			local parts = {}
-			for _, name in { "UpdateAsync", "GetAsync", "SetIncrementSortedAsync" } do
+			for _, name in { "UpdateAsync", "GetAsync", "GetSortedAsync", "SetIncrementSortedAsync", "OrderedRemove" } do
 				local remaining = snapshot.Budgets[name]
 				if remaining ~= nil then
 					table.insert(parts, `{name} {remaining}`)
@@ -828,6 +960,7 @@ end
 function Handle.tick(self: any)
 	local now = self.deps.Clock.Monotonic()
 	self.router:Tick()
+	self.leaderboards:Tick()
 	if now >= self.performanceDue then
 		self.performanceDue = now + self.config.PerformanceInterval
 		self:evaluatePerformance()
@@ -943,6 +1076,16 @@ function Handle.GetStats(self: any): Stats
 	stats.Groups = if self.router then self.router.count else 0
 	stats.EncodeFailures = self.encodeFailures or 0
 	stats.LastTickError = self.lastTickError
+	local monitor = self.leaderboards
+	stats.Leaderboards = {
+		State = if monitor then monitor.State else self.state,
+		Monitored = if monitor then #monitor.Entries else 0,
+		Omitted = if monitor then monitor.Omitted else 0,
+		SnapshotAge = if monitor and monitor.ObservedAt
+			then math.max(0, self.deps.Clock.Monotonic() - monitor.ObservedAt)
+			else nil,
+		LastError = if monitor then monitor.LastError else nil,
+	}
 	return stats
 end
 
@@ -960,6 +1103,7 @@ function Handle.Stop(self: any)
 	end
 	self.state = "Stopped"
 	self.running = false
+	self.leaderboards:Stop()
 	if self.removeSink then
 		(self.removeSink :: () -> ())()
 		self.removeSink = nil

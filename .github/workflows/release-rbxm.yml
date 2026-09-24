@@ -67,7 +67,9 @@ jobs:
           gh release upload "$TAG_NAME" --clobber \
             Scribe.rbxm \
             "ScribeTelemetry-Addon.rbxm#ScribeTelemetry (Addon).rbxm" \
-            "ScribeUIAdapters-Addon.rbxm#ScribeUIAdapters (Addon).rbxm"
+            "ScribeUIAdapters-Addon.rbxm#ScribeUIAdapters (Addon).rbxm" \
+            "ScribeLeaderstats-Addon.rbxm#ScribeLeaderstats (Addon).rbxm" \
+            Scribe-source-map.json
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.event.release.tag_name }}
@@ -81,3 +83,5 @@ jobs:
             Scribe.rbxm
             ScribeTelemetry-Addon.rbxm
             ScribeUIAdapters-Addon.rbxm
+            ScribeLeaderstats-Addon.rbxm
+            Scribe-source-map.json

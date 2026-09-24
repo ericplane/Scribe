@@ -184,16 +184,15 @@ end
 
 -- Recursively freeze a table (template safety).
 function Util.deepFreeze<T>(value: T): T
-	if type(value) ~= "table" then
-		return value
-	end
-	for _, v in value :: any do
-		if type(v) == "table" and not table.isfrozen(v) then
-			Util.deepFreeze(v)
+	if type(value) == "table" then
+		for _, v in value :: any do
+			if type(v) == "table" and not table.isfrozen(v) then
+				Util.deepFreeze(v)
+			end
 		end
-	end
-	if not table.isfrozen(value :: any) then
-		table.freeze(value :: any)
+		if not table.isfrozen(value :: any) then
+			table.freeze(value :: any)
+		end
 	end
 	return value
 end

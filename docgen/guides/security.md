@@ -100,6 +100,8 @@ The [Commands guide](./commands) has the full dispatch order. The security-relev
 
 Semantic authority stays yours. `Args` proves the payload's shape. Whether *this* player may buy *that* item is your handler's job.
 
+Keep handler work bounded too: reject long client strings before pattern matching or expensive processing. `xpcall` catches errors; it does not impose an execution timeout. `RequestTimeout` only stops the client waiting. Scribe caps Big numeric strings at 256 bytes and telemetry text at 4096 bytes before processing, but those limits do not apply to your own callbacks.
+
 ### Replication
 
 Visibility is a compile-time property of each root, and [`ServerOnly`](./visibility) data never enters a client queue at all.
@@ -118,7 +120,7 @@ Visibility is a compile-time property of each root, and [`ServerOnly`](./visibil
 ### Monetization
 
 - Receipts fail closed. `PurchaseGranted` is returned only after a durable commit. Anything else answers `NotProcessedYet` so Roblox retries, and Robux are never eaten.
-- Idempotency runs off a persisted receipt ring. Entries age out after `PurchaseIdTTL`, seven days, well past any retry window. If a player buys faster than that drains, the count backstop evicts the oldest and logs [`PURCHASE_ID_EVICTED`](./log-codes#monetization), which is the one eviction that could let a retry grant twice.
+- Completed receipt IDs stay in persistent history for 30 days. If a new ID would exceed `MaxReceiptHistoryBytes`, its grant waits and `RECEIPT_HISTORY_FULL` identifies the affected profile; recent IDs are not evicted to make room. After a record expires, an unresolved retry can grant again. Returning `PurchaseGranted` does not prove Roblox recorded the acknowledgement. IDs evicted by an older build cannot be reconstructed automatically.
 - Soft-currency claims are separate, keyed by the `IdempotencyKey` you pass to `Data.Purchase`, capped by `MaxPurchaseClaims` and expiring after `PurchaseClaimTTL`. An eviction there logs `PURCHASE_CLAIM_EVICTED`.
 - Grants are atomic. A `Grant` that throws rolls back completely rather than leaving partial writes that compound on the next retry.
 - Gift intents carry a TTL and are keyed by product, so a second gift cannot overwrite a live intent and misdeliver the first purchase.
@@ -151,8 +153,7 @@ The wipe guard is the same idea at profile scale. Every save is compared against
 | `MaxInboundFrameRate` | `max(60, CommandRateLimit * 4)` | You have measured your busiest legitimate client |
 | `BoundsPolicy` | `"Clamp"` | You would rather a bad write throw than silently clamp |
 | `WipeGuardPolicy` | `"Warn"` | A suspected wipe should not reach the DataStore at all |
-| `PurchaseIdTTL` | 7 days | Never lengthen it past the retry window without raising the cap too |
-| `MaxProcessedPurchaseIds` | 200 | Raise it if you see `PURCHASE_ID_EVICTED` |
+| `MaxReceiptHistoryBytes` | 1 MiB | Set a storage budget for receipt history; increasing it requires room in the profile. Capacity exhaustion defers new grants instead of evicting IDs within the 30-day window. |
 
 Every one of these is set in the [configuration table](./configuration) you pass to `Scribe({ ... })`.
 

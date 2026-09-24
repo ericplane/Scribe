@@ -5,3 +5,5 @@
 # Depth-agnostic on purpose: the format gate is run against LF copies of the tree
 # at a different root, and a root-relative pattern silently stops matching there.
 **/Internal/Store/ProfileStore.luau
+**/roblox-ts/include/**
+**/roblox-ts/out/**

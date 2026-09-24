@@ -90,7 +90,7 @@ return function()
 	it("Block policy clears itself once the data passes the guard again", function()
 		local harness = TestCtx.make({
 			Template = bigTemplate(),
-			Options = { WipeGuardPolicy = "Block" },
+			Options = { WipeGuardPolicy = "Block", LogRingLevel = "Info" },
 		})
 		local player, entry, data = harness.Join()
 		local key = `Default/PLAYER_{entry.UserId}`

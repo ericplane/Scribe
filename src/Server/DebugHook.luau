@@ -541,7 +541,7 @@ function DebugHook.Attach(Data: any, ctx: any): (() -> ())?
 				recordLog(logEntry)
 			end
 		end)
-		table.insert(teardown, Log.AddSink(recordLog))
+		table.insert(teardown, Log.AddSink(recordLog, { Level = "Debug" }))
 
 		local statusConn = Health.OnStatusChanged:Connect(function(newStatus: string, oldStatus: string)
 			local record = { T = os.clock(), WallAt = os.time(), From = oldStatus, To = newStatus }

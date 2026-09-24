@@ -179,9 +179,16 @@ local POOL_FOR_REQUEST_TYPE: { [string]: { string } } = {
 	GetAsync = { "StandardRead" },
 	SetIncrementAsync = { "StandardWrite" },
 	UpdateAsync = { "StandardRead", "StandardWrite" },
-	GetSortedAsync = { "OrderedRead" },
+	GetSortedAsync = { "OrderedList" },
 	SetIncrementSortedAsync = { "OrderedWrite" },
 	OrderedRemove = { "OrderedRemove" },
+	StandardRead = { "StandardRead" },
+	StandardWrite = { "StandardWrite" },
+	StandardList = { "StandardList" },
+	StandardRemove = { "StandardRemove" },
+	OrderedRead = { "OrderedRead" },
+	OrderedWrite = { "OrderedWrite" },
+	OrderedList = { "OrderedList" },
 }
 
 --- The documented budget query.

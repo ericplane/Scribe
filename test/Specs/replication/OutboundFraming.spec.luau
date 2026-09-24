@@ -382,13 +382,8 @@ return function()
 		-- whoever changes the encoder updates configuration.md and Replication.luau
 		-- in the same commit.
 		--
-		-- 29810 until the reserved root gained a ninth child. A static record spends
-		-- `varintLen(declared) + ceil(declared / 8)` on its presence mask
-		-- (Wire.luau:674), so the eight-to-nine crossing widened `_Scribe`'s mask
-		-- from one byte to two. The template changed, not the encoder: the schema
-		-- hash moves with it and a drifted client is already refused by the
-		-- fail-closed SCHEMA_MISMATCH path, so the wire protocol version stands.
-		expect(`init={initBytes}`).to.equal("init=29811")
+		-- The empty session timer map adds two bytes to the previous 29811-byte snapshot.
+		expect(`init={initBytes}`).to.equal("init=29813")
 		harness.Cleanup()
 	end)
 

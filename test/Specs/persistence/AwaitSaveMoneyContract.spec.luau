@@ -254,6 +254,20 @@ return function()
 			return buyer, recipient, entry, slot.GiftId
 		end
 
+		local function failAtRecipientSave(harness, recipientId: number)
+			local awaitSave = harness.Ctx.Persistence.AwaitSave
+			harness.Ctx.Persistence.AwaitSave = function(entry, timeout)
+				if entry.UserId == recipientId then
+					harness.Fake.FailSaves = true
+				end
+				return awaitSave(entry, timeout)
+			end
+			return function()
+				harness.Ctx.Persistence.AwaitSave = awaitSave
+				harness.Fake.FailSaves = false
+			end
+		end
+
 		it("prompts only after the intent is durable, and aims it at the named recipient", function()
 			-- Money moves at the prompt, so the recipient has to be recorded on disk
 			-- BEFORE the prompt fires. Otherwise a crash between the two leaves a
@@ -293,9 +307,9 @@ return function()
 			local harness = makeHarness()
 			local buyer, recipient, entry, giftId = promptedGift(harness, 94014, 94015)
 
-			harness.Fake.FailSaves = true
+			local recover = failAtRecipientSave(harness, 94015)
 			local decision = harness.Data.HandleReceipt(receipt(entry.UserId, GIFT_PRODUCT, "gift-2"))
-			harness.Fake.FailSaves = false
+			recover()
 
 			expect(decision).to.equal(NOT_PROCESSED)
 			expect(Health.GetStatus() ~= "Outage").to.equal(true)
@@ -317,18 +331,16 @@ return function()
 		end)
 
 		it("refuses a retry that arrives while the store is still down, without delivering twice", function()
-			-- Second pass through deliverGiftLocal, this time on the already-processed
-			-- branch: the recipient carries the marker from the first attempt, so the
-			-- answer is purely "is it durable yet". It is not, so nothing is added.
+			-- A retry must not duplicate the recipient's unconfirmed grant.
 			local harness = makeHarness()
 			local buyer, _, entry = promptedGift(harness, 94016, 94017)
 			local recipientEntry = harness.Ctx.Persistence.EntryForUserId(94017)
 
-			harness.Fake.FailSaves = true
+			local recover = failAtRecipientSave(harness, 94017)
 			expect(harness.Data.HandleReceipt(receipt(entry.UserId, GIFT_PRODUCT, "gift-3"))).to.equal(NOT_PROCESSED)
 			expect(liveMarkers(recipientEntry, "gift-3")).to.equal(1)
 			local retry = harness.Data.HandleReceipt(receipt(entry.UserId, GIFT_PRODUCT, "gift-3"))
-			harness.Fake.FailSaves = false
+			recover()
 
 			expect(retry).to.equal(NOT_PROCESSED)
 			expect(Health.GetStatus() ~= "Outage").to.equal(true)
@@ -346,9 +358,10 @@ return function()
 			local harness = makeHarness()
 			local buyer, recipient, entry = promptedGift(harness, 94018, 94019)
 
-			harness.Fake.FailSaves = true
+			local recover = failAtRecipientSave(harness, 94019)
 			expect(harness.Data.HandleReceipt(receipt(entry.UserId, GIFT_PRODUCT, "gift-4"))).to.equal(NOT_PROCESSED)
-			harness.Fake.FailSaves = false
+			expect(harness.Data.Owns(recipient, "VIP")).to.equal(true)
+			recover()
 
 			expect(harness.Data.HandleReceipt(receipt(entry.UserId, GIFT_PRODUCT, "gift-4"))).to.equal(GRANTED)
 			expect(harness.Data.Owns(recipient, "VIP")).to.equal(true)

@@ -71,7 +71,7 @@ return function()
 					table.insert(codes, entry.Context and entry.Context.Field)
 					table.insert(levels, entry.Level)
 				end
-			end)
+			end, { Level = "Error" })
 
 			local harness = TestCtx.make({ Template = template })
 			local player = harness.Join()
@@ -82,6 +82,7 @@ return function()
 			-- leak this sink into the rest of the run. (It used to be unconditionally
 			-- leaked -- Scribe.AddLogSink returned nothing, so the guard this replaces
 			-- was dead code that only looked like a teardown.)
+			task.wait()
 			unsubscribe()
 
 			expect(table.find(codes, "Owns") ~= nil).to.equal(true)
@@ -110,11 +111,12 @@ return function()
 				if entry.Code == "API_NAME_COLLISION" and entry.Context then
 					seen[tostring(entry.Context.Field)] = entry.Level
 				end
-			end)
+			end, { Level = "Error" })
 			local harness = TestCtx.make({ Template = template, Options = options })
 			local player = harness.Join()
 			harness.Transport.LocalPlayer = player
 			Client.new(harness.Options, harness.Compiled)
+			task.wait()
 			unsubscribe()
 			harness.Cleanup()
 			return seen
@@ -149,8 +151,9 @@ return function()
 				if entry.Code == "API_NAME_COLLISION" and entry.Context then
 					seen[tostring(entry.Context.Field)] = entry.Level
 				end
-			end)
+			end, { Level = "Warn" })
 			local harness = TestCtx.make({ Template = template, Options = { DevMode = true } })
+			task.wait()
 			unsubscribe()
 			harness.Cleanup()
 			return seen
@@ -186,9 +189,10 @@ return function()
 				if entry.Code == "API_NAME_COLLISION" and entry.Context then
 					seen[tostring(entry.Context.Field)] = entry.Level
 				end
-			end)
+			end, { Level = "Warn" })
 			-- IsStudio is pinned false in this harness, so DevMode is off by default.
 			local harness = TestCtx.make({ Template = template, Options = { DevMode = false } })
+			task.wait()
 			unsubscribe()
 			harness.Cleanup()
 			expect(`Raw={tostring(seen.Raw)}`).to.equal("Raw=nil")
@@ -237,6 +241,13 @@ return function()
 			return if #out == 0 then "none" else table.concat(out, ",")
 		end
 
+		local function drainCollisions(keys, seen)
+			local deadline = os.clock() + 1
+			repeat
+				task.wait()
+			until missing(keys, seen) == "none" or os.clock() >= deadline
+		end
+
 		it("reports EVERY key of the server Data table", function()
 			local probe = TestCtx.make({})
 			local keys = apiKeysOf(probe.Data)
@@ -247,8 +258,9 @@ return function()
 				if entry.Code == "API_NAME_COLLISION" and entry.Context then
 					seen[tostring(entry.Context.Field)] = true
 				end
-			end)
+			end, { Level = "Warn" })
 			local harness = TestCtx.make({ Template = templateOf(keys), Options = { DevMode = true } })
+			drainCollisions(keys, seen)
 			unsubscribe()
 			harness.Cleanup()
 
@@ -269,11 +281,12 @@ return function()
 				if entry.Code == "API_NAME_COLLISION" and entry.Context then
 					seen[tostring(entry.Context.Field)] = true
 				end
-			end)
+			end, { Level = "Error" })
 			local harness = TestCtx.make({ Template = templateOf(keys) })
 			local player = harness.Join()
 			harness.Transport.LocalPlayer = player
 			Client.new(harness.Options, harness.Compiled)
+			drainCollisions(keys, seen)
 			unsubscribe()
 			harness.Cleanup()
 
@@ -366,16 +379,14 @@ return function()
 			reset()
 			Scribe.Configure({ AutoSaveInterval = 60 })
 			local codes = {}
-			-- Detached below. The sink list is a process singleton and `codes` closes
-			-- over a table this test keeps appending to, so leaving it attached costs
-			-- every later spec a spawn per log entry and grows the table for the rest
-			-- of the run.
+			-- Detach before assertions so a failure cannot leak the sink.
 			local unsubscribe = Scribe.AddLogSink(function(entry)
 				table.insert(codes, entry.Code)
-			end)
+			end, { Level = "Debug" })
 			local harness = TestCtx.make({ Options = { SaveInterval = 90, LogLevel = "Debug" } })
 			-- Detached before the first expect: a failing assertion would otherwise
 			-- skip the removal and leak the sink into every spec that runs after.
+			task.wait()
 			unsubscribe()
 			-- SaveInterval is applied last, so it wins, exactly as before.
 			expect(harness.Fake.Constants.AUTO_SAVE_PERIOD).to.equal(90)
@@ -977,9 +988,18 @@ return function()
 
 			expect(harness.Data.PromptGift(buyer, "GiftVIP", 91002)).to.equal(true)
 
-			-- Deliver succeeds (recipient granted), but the buyer's confirming
-			-- save fails -> NotProcessedYet with the intent still pending.
-			harness.Fake.FailSaves = true
+			-- Let the route and recipient save; fail only the buyer completion.
+			local awaitSave = harness.Ctx.Persistence.AwaitSave
+			harness.Ctx.Persistence.AwaitSave = function(target, timeout)
+				if target == entry then
+					for _, record in entry.LiveData._Scribe.ProcessedPurchaseIds do
+						if record.Id == "gc-1" then
+							harness.Fake.FailSaves = true
+						end
+					end
+				end
+				return awaitSave(target, timeout)
+			end
 			local receipt = {
 				PlayerId = entry.UserId,
 				ProductId = 222,
@@ -988,13 +1008,16 @@ return function()
 				CurrencyType = Enum.CurrencyType.Robux,
 				PlaceIdWherePurchased = 0,
 			}
-			harness.Data.HandleReceipt(receipt)
+			expect(harness.Data.HandleReceipt(receipt)).to.equal(Enum.ProductPurchaseDecision.NotProcessedYet)
 			expect(harness.Data.Owns(recipient, "VIP")).to.equal(true)
+			expect(harness.Fake.Persisted["Default/PLAYER_91002"]._Scribe.Perks.VIP).to.equal(true)
+			expect(#harness.Fake.Persisted["Default/PLAYER_91001"]._Scribe.ProcessedPurchaseIds).to.equal(0)
+			harness.Ctx.Persistence.AwaitSave = awaitSave
 			harness.Fake.FailSaves = false
 
 			-- The retry must settle as a completed delivery, NOT convert to a
 			-- buyer credit on top of the already-delivered gift.
-			harness.Data.HandleReceipt(receipt)
+			expect(harness.Data.HandleReceipt(receipt)).to.equal(Enum.ProductPurchaseDecision.PurchaseGranted)
 			expect(harness.Data.GetGiftCredits(buyer).GiftVIP).to.equal(nil)
 
 			harness.Cleanup()

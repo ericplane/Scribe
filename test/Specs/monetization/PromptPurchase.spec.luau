@@ -14,9 +14,39 @@ return function()
 	local Scribe = require(Root.Scribe) :: any
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
 
-	local function harnessed(fn)
+	local function countedSignal()
+		local listeners = {}
+		local signal = {}
+		function signal:Connect(fn)
+			local connection = { Connected = true }
+			function connection.Disconnect(disconnecting)
+				disconnecting.Connected = false
+				listeners[disconnecting] = nil
+			end
+			listeners[connection] = fn
+			return connection
+		end
+		function signal:Fire(...)
+			for connection, fn in table.clone(listeners) do
+				if connection.Connected then
+					fn(...)
+				end
+			end
+		end
+		function signal.Count()
+			local count = 0
+			for _ in listeners do
+				count += 1
+			end
+			return count
+		end
+		return signal
+	end
+
+	local function harnessed(fn, extra)
 		local prompted = {}
-		local harness = TestCtx.make({
+		local productFinished, passFinished = countedSignal(), countedSignal()
+		local config = {
 			Template = { Coins = Scribe.Int(0, { Min = 0 }) },
 			Options = {
 				Products = {
@@ -26,6 +56,8 @@ return function()
 					CoinBag = { Id = 4243 },
 				},
 				Passes = { VIPPass = { Id = 777 } },
+				PromptProductPurchaseFinished = productFinished,
+				PromptGamePassPurchaseFinished = passFinished,
 				PromptProductPurchase = function(player: Player, productId: number)
 					table.insert(prompted, `product {player.UserId}:{productId}`)
 				end,
@@ -38,8 +70,12 @@ return function()
 					return false
 				end,
 			},
-		})
-		local ok, err = pcall(fn, harness, prompted)
+		}
+		for key, value in extra or {} do
+			config.Options[key] = value
+		end
+		local harness = TestCtx.make(config)
+		local ok, err = pcall(fn, harness, prompted, productFinished, passFinished)
 		harness.Cleanup()
 		if not ok then
 			error(err, 0)
@@ -51,6 +87,199 @@ return function()
 		local ok, why = harness.Data.PromptPurchase(player, name)
 		return `{tostring(ok)} why={tostring(why)}`
 	end
+
+	describe("one active purchase prompt per player", function()
+		it("subscribes only for an active prompt, and a matching cancellation permits another", function()
+			harnessed(function(harness, prompted, productFinished, passFinished)
+				local player = harness.Join(9301)
+				expect(productFinished.Count() + passFinished.Count()).to.equal(0)
+				expect(attempt(harness, player, "CoinBag")).to.equal("true why=nil")
+				expect(productFinished.Count()).to.equal(1)
+				expect(attempt(harness, player, "VIPPass")).to.equal("false why=purchase prompt already open")
+				productFinished:Fire(player.UserId + 1, 4243, false)
+				productFinished:Fire(player.UserId, 4242, false)
+				passFinished:Fire(player, 777, false)
+				expect(attempt(harness, player, "CoinBag")).to.equal("false why=purchase prompt already open")
+				productFinished:Fire(player.UserId, 4243, false)
+				expect(productFinished.Count()).to.equal(0)
+				expect(attempt(harness, player, "VIPPass")).to.equal("true why=nil")
+				expect(#prompted).to.equal(2)
+				expect(passFinished.Count()).to.equal(1)
+				passFinished:Fire(player, 777, true)
+				expect(passFinished.Count()).to.equal(0)
+			end)
+		end)
+
+		it("allows different players to prompt independently and matches the pass Player identity", function()
+			harnessed(function(harness, prompted, _, passFinished)
+				local FakePlayer = require(Root.Test.Helpers.FakePlayer)
+				local first = harness.Join(9302)
+				local second = harness.Join(9303)
+				expect(attempt(harness, first, "VIPPass")).to.equal("true why=nil")
+				expect(attempt(harness, second, "VIPPass")).to.equal("true why=nil")
+				passFinished:Fire(FakePlayer.new(first.UserId), 777, false)
+				passFinished:Fire(first, 778, false)
+				expect(attempt(harness, first, "CoinBag")).to.equal("false why=purchase prompt already open")
+				passFinished:Fire(second, 777, false)
+				expect(attempt(harness, first, "CoinBag")).to.equal("false why=purchase prompt already open")
+				expect(attempt(harness, second, "CoinBag")).to.equal("true why=nil")
+				expect(#prompted).to.equal(3)
+			end)
+		end)
+
+		it("disconnects on session unload while a stale unload cannot clear the live entry", function()
+			harnessed(function(harness, _, productFinished)
+				local player, entry = harness.Join(9304)
+				expect(attempt(harness, player, "CoinBag")).to.equal("true why=nil")
+				harness.Ctx.Monetization.OnUnload(table.clone(entry))
+				expect(productFinished.Count()).to.equal(1)
+				expect(attempt(harness, player, "CoinBag")).to.equal("false why=purchase prompt already open")
+				harness.Leave(player)
+				expect(productFinished.Count()).to.equal(0)
+				local nextPlayer = harness.Join(9304)
+				expect(attempt(harness, nextPlayer, "CoinBag")).to.equal("true why=nil")
+				harness.Ctx.Monetization.OnUnload(entry)
+				expect(attempt(harness, nextPlayer, "CoinBag")).to.equal("false why=purchase prompt already open")
+			end)
+		end)
+
+		it("disconnects all active dialogs on Stop and refuses new prompts", function()
+			harnessed(function(harness, _, productFinished, passFinished)
+				local first = harness.Join(9305)
+				local second = harness.Join(9306)
+				expect(attempt(harness, first, "CoinBag")).to.equal("true why=nil")
+				expect(attempt(harness, second, "VIPPass")).to.equal("true why=nil")
+				harness.Ctx.Monetization.Stop()
+				expect(productFinished.Count() + passFinished.Count()).to.equal(0)
+				expect(attempt(harness, first, "CoinBag")).to.equal("false why=not-loaded")
+			end)
+		end)
+
+		it("connects before a synchronous close and releases the guard even before prompt returns", function()
+			local finish = countedSignal()
+			local calls = 0
+			harnessed(function(harness)
+				local player = harness.Join(9307)
+				expect(attempt(harness, player, "CoinBag")).to.equal("true why=nil")
+				expect(finish.Count()).to.equal(0)
+				expect(attempt(harness, player, "CoinBag")).to.equal("true why=nil")
+				expect(calls).to.equal(2)
+			end, {
+				PromptProductPurchaseFinished = finish,
+				PromptProductPurchase = function(player, id)
+					calls += 1
+					finish:Fire(player.UserId, id, false)
+				end,
+			})
+		end)
+
+		it("releases failed prompts so an engine error never leaves a permanent busy state", function()
+			local calls = 0
+			harnessed(function(harness, _, productFinished)
+				local player = harness.Join(9308)
+				local ok, why = harness.Data.PromptPurchase(player, "CoinBag")
+				expect(ok).to.equal(false)
+				expect(string.find(why, "prompt unavailable", 1, true) ~= nil).to.equal(true)
+				expect(productFinished.Count()).to.equal(0)
+				expect(attempt(harness, player, "CoinBag")).to.equal("true why=nil")
+				expect(calls).to.equal(2)
+			end, {
+				PromptProductPurchase = function()
+					calls += 1
+					if calls == 1 then
+						error("prompt unavailable", 0)
+					end
+				end,
+			})
+		end)
+
+		it("disconnects a late subscription if Stop runs inside Connect and never invokes the prompt", function()
+			local finish = countedSignal()
+			local connect = finish.Connect
+			local stop
+			function finish:Connect(fn)
+				local connection = connect(self, fn)
+				stop()
+				return connection
+			end
+			harnessed(function(harness, prompted)
+				local player = harness.Join(9309)
+				stop = harness.Ctx.Monetization.Stop
+				expect(attempt(harness, player, "CoinBag")).to.equal("false why=not-loaded")
+				expect(finish.Count()).to.equal(0)
+				expect(#prompted).to.equal(0)
+			end, { PromptProductPurchaseFinished = finish })
+		end)
+
+		it("refuses a torn-down entry even before its Ready state has been replaced", function()
+			harnessed(function(harness, prompted, productFinished)
+				local player, entry = harness.Join(9310)
+				entry.TornDown = true
+				local outcome = attempt(harness, player, "CoinBag")
+				entry.TornDown = false
+				expect(outcome).to.equal("false why=not-loaded")
+				expect(productFinished.Count()).to.equal(0)
+				expect(#prompted).to.equal(0)
+			end)
+		end)
+
+		it("rechecks teardown after a reentrant subscription before calling the engine", function()
+			local finish = countedSignal()
+			local connect = finish.Connect
+			local entry
+			function finish:Connect(fn)
+				local connection = connect(self, fn)
+				entry.TornDown = true
+				return connection
+			end
+			harnessed(function(harness, prompted)
+				local player, current = harness.Join(9311)
+				entry = current
+				local outcome = attempt(harness, player, "CoinBag")
+				entry.TornDown = false
+				expect(outcome).to.equal("false why=not-loaded")
+				expect(finish.Count()).to.equal(0)
+				expect(#prompted).to.equal(0)
+			end, { PromptProductPurchaseFinished = finish })
+		end)
+
+		it("reserves the guard before invoking a reentrant engine seam", function()
+			local activeHarness, nested
+			harnessed(function(harness)
+				activeHarness = harness
+				local player = harness.Join(9312)
+				expect(attempt(harness, player, "CoinBag")).to.equal("true why=nil")
+				expect(nested).to.equal("false why=purchase prompt already open")
+			end, {
+				PromptProductPurchase = function(player)
+					nested = attempt(activeHarness, player, "VIPPass")
+				end,
+			})
+		end)
+
+		it("does not reattach a listener after a yielding engine call resumes past Stop", function()
+			local parked
+			harnessed(function(harness, _, productFinished)
+				local player = harness.Join(9313)
+				local outcome
+				task.spawn(function()
+					outcome = attempt(harness, player, "CoinBag")
+				end)
+				expect(parked ~= nil).to.equal(true)
+				expect(productFinished.Count()).to.equal(1)
+				harness.Ctx.Monetization.Stop()
+				expect(productFinished.Count()).to.equal(0)
+				task.spawn(parked)
+				expect(outcome).to.equal("true why=nil")
+				expect(productFinished.Count()).to.equal(0)
+			end, {
+				PromptProductPurchase = function()
+					parked = coroutine.running()
+					coroutine.yield()
+				end,
+			})
+		end)
+	end)
 
 	it("prompts the player for the product's declared Id, by name", function()
 		harnessed(function(harness, prompted)
@@ -245,10 +474,11 @@ return function()
 				if entry.Code == "UNDECLARED_PERK" then
 					seen += 1
 				end
-			end)
+			end, { Level = "Warn" })
 			local ran, err = pcall(function()
 				TestCtx.make({ Template = { Coins = Scribe.Int(0, { Min = 0 }) }, Options = options }).Cleanup()
 			end)
+			task.wait()
 			detach()
 			if not ran then
 				error(err, 0)
@@ -292,7 +522,7 @@ return function()
 				if entry.Code == "UNDECLARED_PERK" then
 					seen += 1
 				end
-			end)
+			end, { Level = "Warn" })
 			local harness = TestCtx.make({
 				Template = { Coins = Scribe.Int(0, { Min = 0 }) },
 				Options = {
@@ -305,6 +535,7 @@ return function()
 			local ran, err = pcall(function()
 				local player = harness.Join(9200)
 				harness.Data.GrantPerk(player, "VIP")
+				task.wait()
 				answer = `warnings={seen} owns={tostring(harness.Data.Owns(player, "VIP"))}`
 			end)
 			harness.Cleanup()

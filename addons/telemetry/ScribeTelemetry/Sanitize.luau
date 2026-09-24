@@ -6,6 +6,8 @@ local Sanitize = {}
 
 local ELLIPSIS = "\u{2026}"
 local ELLIPSIS_BYTES = #ELLIPSIS
+local MAX_INPUT_BYTES = 4096
+local OVERSIZED_TEXT = "[oversized text omitted]"
 
 export type Options = {
 	IncludePlayerIds: boolean?,
@@ -39,6 +41,9 @@ function Sanitize.Truncate(s: string, maxBytes: number): string
 	end
 	if maxBytes <= 0 then
 		return ""
+	end
+	if maxBytes < ELLIPSIS_BYTES then
+		return string.sub("...", 1, maxBytes)
 	end
 	local keep = math.max(0, maxBytes - ELLIPSIS_BYTES)
 	-- Back up off any continuation byte so the cut lands on a character boundary.
@@ -81,13 +86,65 @@ local PLAYER_KEY_PATTERNS =
 local PLAYER_PATTERNS = {
 	{ "([Uu]ser[Ii][Dd]%s*[=:]%s*)%d+", "%1[player]" },
 	{ "([Pp]layer%s*[=:]%s*)%d+", "%1[player]" },
-	{ "(%f[%w][%a][%w%-]*_)%d+", "%1[player]" },
 }
+
+local function isLetter(byte: number): boolean
+	return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+end
+
+local function isDigit(byte: number): boolean
+	return byte >= 48 and byte <= 57
+end
+
+local function isWord(byte: number): boolean
+	return isLetter(byte) or isDigit(byte)
+end
+
+-- Scan each prefix once; hyphens must not restart a failing suffix search.
+local function redactProfileKeys(s: string): string
+	local parts = {}
+	local length = #s
+	local index, copied = 1, 1
+	while index <= length do
+		local byte = string.byte(s, index)
+		if not isWord(byte) and byte ~= 45 then
+			index += 1
+			continue
+		end
+		local eligible = false
+		local previous = if index > 1 then string.byte(s, index - 1) else 0
+		repeat
+			if isLetter(byte) and not isWord(previous) then
+				eligible = true
+			end
+			previous = byte
+			index += 1
+			byte = if index <= length then string.byte(s, index) else 0
+		until not isWord(byte) and byte ~= 45
+		if eligible and byte == 95 and index < length and isDigit(string.byte(s, index + 1)) then
+			table.insert(parts, string.sub(s, copied, index))
+			table.insert(parts, "[player]")
+			index += 2
+			while index <= length and isDigit(string.byte(s, index)) do
+				index += 1
+			end
+			copied = index
+		end
+	end
+	if #parts == 0 then
+		return s
+	end
+	table.insert(parts, string.sub(s, copied))
+	return table.concat(parts)
+end
 
 --- A string the report may carry: control characters dropped, webhook URLs and (unless
 --- allowed) player identifiers redacted, bounded to `maxBytes`.
 function Sanitize.Text(value: any, maxBytes: number, options: Options?): string
 	local s = if type(value) == "string" then value else tostring(value)
+	if #s > MAX_INPUT_BYTES then
+		return Sanitize.Truncate(OVERSIZED_TEXT, maxBytes)
+	end
 	s = string.gsub(s, "[%c]", function(c)
 		return if c == "\n" or c == "\t" then c else ""
 	end)
@@ -99,6 +156,7 @@ function Sanitize.Text(value: any, maxBytes: number, options: Options?): string
 		for _, rule in PLAYER_PATTERNS do
 			s = string.gsub(s, rule[1], rule[2])
 		end
+		s = redactProfileKeys(s)
 		local prefix = if options then options.KeyPrefix else nil
 		if prefix ~= nil and prefix ~= "" and prefix ~= "PLAYER_" then
 			s = string.gsub(s, escapePattern(prefix) .. "%d+", string.gsub(prefix, "%%", "%%%%") .. "[player]")
@@ -133,13 +191,18 @@ local function snapshot(value: any, depth: number, options: Options?): any
 			return "[table]"
 		end
 		local out: { [string]: any } = {}
-		local kept = 0
+		local visited = 0
 		for key, child in value do
-			if kept >= MAX_KEYS then
+			if visited >= MAX_KEYS then
 				out["..."] = "more keys omitted"
 				break
 			end
+			visited += 1
 			local keyText = if type(key) == "string" then key else tostring(key)
+			if #keyText > MAX_INPUT_BYTES then
+				out[OVERSIZED_TEXT] = OVERSIZED_TEXT
+				continue
+			end
 			local snap = snapshot(child, depth + 1, options)
 			if snap ~= nil and not (options and options.IncludePlayerIds) and type(child) ~= "table" then
 				for _, pattern in PLAYER_KEY_PATTERNS do
@@ -154,7 +217,6 @@ local function snapshot(value: any, depth: number, options: Options?): any
 			end
 			if snap ~= nil then
 				out[Sanitize.Text(keyText, 64, options)] = snap
-				kept += 1
 			end
 		end
 		return out
@@ -188,6 +250,9 @@ function Sanitize.Subject(context: any, options: Options?): string?
 				if field == "UserId" then
 					return "[player]"
 				elseif field == "Key" then
+					if type(value) == "string" and #value > MAX_INPUT_BYTES then
+						return `key:{OVERSIZED_TEXT}`
+					end
 					return `key:#{digest(tostring(value))}`
 				end
 			end

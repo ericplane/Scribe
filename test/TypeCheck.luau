@@ -48,7 +48,7 @@ type T = typeof(template)
 -- Annotated strict configs: Stat/Cost.Path check against the template's
 -- numeric leaf-path union, and Grant's `data` is the typed accessor tree.
 local boards: { [string]: Scribe.LeaderboardConfig<T> } = {
-	TopCoins = { Stat = "Coins", Limit = 100, Replicate = true },
+	TopCoins = { Stat = "Coins", Limit = 100, Replicate = true, WriteInterval = 30 },
 	WinsDaily = { Stat = "Coins", Period = "Daily", Mode = "Gain" },
 	HereNow = { Stat = "Coins", Scope = "Server", Period = "Weekly" },
 	TopKills = { Stat = "Stats.Kills" },
@@ -81,6 +81,9 @@ local bundle = Scribe({
 	},
 	Leaderboards = boards,
 	Products = products,
+	RetiredProducts = { OldCoins = { Id = 444, Grant = products.Coins1000.Grant } },
+	MaxReceiptHistoryBytes = 1048576,
+	LogRingLevel = Scribe.LogLevel.Warn,
 	Passes = { VIP = { Id = 333 } },
 	Economy = {
 		Prefix = true,
@@ -626,6 +629,7 @@ local function clientUsage()
 	-- breaks these two lines rather than passing silently.
 	local music: boolean = ClientData.Settings.Music.Get()
 	local inCombat: boolean = ClientData.Runtime.InCombat.Get()
+	local timedActive: boolean, timedRemaining: number? = ClientData.XPBooster.Active()
 	local rank: number? = ClientData.GetMyRank("TopCoins")
 	local owns: boolean = ClientData.Owns("VIP")
 	local ownsAsync: boolean = ClientData.OwnsAsync("VIP")
@@ -640,6 +644,7 @@ local function clientUsage()
 	local stopObserving: () -> () = ClientData.ObserveProductInfo("VIP", function(_info) end)
 	ClientData.PrefetchProductInfo({ "VIP" })
 	local _clientState: string = ClientData.GetProductState("VIP")
+	local _prompted: boolean, _promptReason: string?, _promptFailure: {}? = ClientData.PromptPurchase("VIP")
 	local _stopObservingState: () -> () = ClientData.ObserveProductState("VIP", function(_state) end)
 
 	-- A narrower caller type is accepted at every input position, nested fields included.
@@ -674,7 +679,7 @@ local function clientUsage()
 	end)
 	ClientData.Stop()
 	local _pricing = { price, priceAsync, info, infoAsync, stopObserving }
-	return rank, owns, ownsAsync, requestOk, requestOnceOk, ready, music, inCombat
+	return rank, owns, ownsAsync, requestOk, requestOnceOk, ready, music, inCombat, timedActive, timedRemaining
 end
 
 local function diagnosticsUsage()
@@ -856,6 +861,21 @@ local function signalSurface()
 	Data.OnOwnershipChanged:Connect(function(_player: Player, _key: string, _owned: boolean) end)
 end
 
+local function recoveryDiagnostics(player: Player)
+	local _, phase: Scribe.LoadPhase? = Data.GetState(player)
+	local info: Scribe.LeaderboardStatusInfo? = Data.GetLeaderboardStatus("TopCoins")
+	local snapshot: { Scribe.LeaderboardSnapshotEntry } = Scribe.GetLeaderboardSnapshot()
+	for _, board in snapshot do
+		local _: number = board.BundleId
+		local _: string = board.Name
+		local _: Scribe.LeaderboardStatusInfo = board
+	end
+	local status: Scribe.LeaderboardStatus = if info then info.Status else Scribe.LeaderboardStatus.Starting
+	local detach = Scribe.AddLogSink(function(_entry: Scribe.LogEntry) end, { Level = "Warn", MaxQueued = 64 })
+	detach()
+	return phase, status
+end
+
 local function telemetryUsage()
 	local ScribeTelemetry = require(script.Parent.Parent.Addons.Telemetry.ScribeTelemetry)
 	local telemetry = ScribeTelemetry.Start(Scribe, {
@@ -867,9 +887,10 @@ local function telemetryUsage()
 			Health = { Url = "https://api.example.com/telemetry", Enabled = true },
 		},
 		Default = "Alerts",
-		Routes = { Health = "Health", Summaries = false, Performance = { "Alerts", "Health" } },
+		Routes = { Health = "Health", Leaderboards = "Alerts", Summaries = false, Performance = { "Alerts", "Health" } },
 		Warnings = { Include = { "PROFILE_SIZE" } },
 		Summaries = { Enabled = true, Interval = 600 },
+		Leaderboards = { Enabled = true, Interval = 30, MaxBoards = 64 },
 		Performance = { Rules = { SlowSaves = { Threshold = 2 } } },
 		Limits = { MaxQueued = 100 },
 		Environment = "staging",
@@ -877,15 +898,18 @@ local function telemetryUsage()
 	local ok: boolean, reason: string? = telemetry:Test("Alerts")
 	local previewed: boolean, previewWhy: string? = telemetry:Preview("Alerts", "Outage")
 	local everything: boolean = telemetry:Preview("Alerts")
+	telemetry:Preview("Alerts", "Leaderboards")
+	telemetry:Preview("Alerts", "ReceiptCapacity")
 	local drained: boolean = telemetry:Flush(5)
 	local stats = telemetry:GetStats()
 	local queued: number = stats.Queued
 	local previews: number = stats.Previews
+	local monitored: number = stats.Leaderboards.Monitored
 	local overflow: number = stats.Dropped.Overflow
 	local alerts = stats.Destinations.Alerts
 	local state: string? = if alerts then alerts.State else nil
 	telemetry:Stop()
-	return ok, reason, drained, queued, overflow, state, previewed, previewWhy, everything, previews
+	return ok, reason, drained, queued, overflow, state, previewed, previewWhy, everything, previews, monitored
 end
 
 return {
@@ -901,4 +925,5 @@ return {
 	serverOnlyWrappers = serverOnlyWrappers,
 	bigOperators = bigOperators,
 	signalSurface = signalSurface,
+	recoveryDiagnostics = recoveryDiagnostics,
 }

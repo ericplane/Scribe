@@ -245,6 +245,12 @@ A delivery waits if the inventory is full, its key is occupied, or a stack would
 
 Most interruptions need no manual action: Scribe retries resolution on profile load and on periodic sweeps. Persistent storage failures, conflicting records, or blocked deliveries may need an operator to investigate.
 
+### Recovering trades affected by the v2.4.0 key-length bug
+
+Older builds combined both user IDs and a GUID into a verdict key. For larger user IDs, this exceeded Roblox's 50-character limit and left items held in escrow.
+
+The fixed build uses a GUID for new exchanges and a compatible shorter storage key for affected historical IDs. Existing escrow IDs and valid verdict keys stay intact. Deploy the update across all servers; intact affected records can then resolve through the normal load/sweep recovery. Do not delete escrow records or manually replace the held items, because later recovery could deliver them again. Conflicting or damaged records still require investigation.
+
 These server-side recovery tools consult the stored verdict before changing anything. They return `boolean, string?`; check both the success flag and refusal reason.
 
 | Tool | Use it for | Important limit |

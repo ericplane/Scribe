@@ -19,6 +19,21 @@ end
 
 Ben receives the product's effects exactly as if he had bought it himself. `GemPack100` has a `Grant`, so his `Gems` go up by 100 the moment delivery lands, wherever he is.
 
+### One unresolved gift per product
+
+Until a paid gift settles or its current prompt is confirmed cancelled, Scribe refuses another paid gift of the same product. `PromptPurchase` also refuses that product while its gift is unresolved. A later recipient cannot replace the first one just because time passed or the buyer rejoined.
+
+Purchase and gift prompts share one open-dialog guard per buyer. A matching cancellation clears only that prompt's gift record, provided no receipt has already claimed it. Scribe saves that removal before releasing the guard. Failed prompts and attempts aborted before opening use the same cleanup.
+
+If saving the removal fails, new Scribe prompts stay blocked. The next `PromptGift` or `PromptPurchase` attempt retries the save automatically. A purchase-completed prompt event only closes the dialog; `ProcessReceipt` handles all paid delivery.
+
+If the buyer leaves before cancellation is recorded, or the server crashes before saving it, the saved gift may remain blocked. Waiting longer does not prove that no money moved. Check the gift and receipt records before an operator repairs it; Scribe does not discard unresolved destinations on a timer. Spending an existing gift credit does not create another paid receipt.
+
+Older profiles can contain conflicting pending and archived gifts for one product. Scribe holds an unbound receipt in that case for repair; an exact destination already saved for its purchase ID still takes precedence.
+
+!!! warning "An earlier ordinary purchase can still arrive late"
+    Roblox's receipt identifies the buyer and product, but not the gift prompt. Do not start a gift while an earlier ordinary purchase of the same product is still awaiting its receipt. Use separate developer-product IDs for normal purchases and gifts if your flow needs to overlap them. Prompts opened directly through `MarketplaceService` also bypass Scribe's guards.
+
 ??? note "What `true` does not tell you"
     A `true` return means one of two things: a Robux prompt was shown and nothing has been delivered yet, or a held gift credit was consumed and the gift went out immediately at no charge.
 
@@ -36,7 +51,7 @@ Data.OnGiftReceived:Connect(function(player, info)
 end)
 ```
 
-`OnGiftReceived` is the only place the sender and the gift id are available, so use it for the "Ben, Ava sent you this" moment. For a plainer question like "does Ben own VIP now", use [`OnOwnershipChanged` or `ObserveOwned`](./monetization#reacting-to-a-purchase) instead. Those already cover gift deliveries alongside ordinary purchases, whatever route the value took.
+`OnGiftReceived` includes the sender and gift ID, so use it for the "Ben, Ava sent you this" moment. For a plainer question like "does Ben own VIP now", use [`OnOwnershipChanged` or `ObserveOwned`](./monetization#reacting-to-a-purchase) instead. Those already cover gift deliveries alongside ordinary purchases, whatever route the value took.
 
 ## Gift credits
 
@@ -63,11 +78,11 @@ end
 
     Two situations produce one. The recipient acquired the perk between the prompt and the receipt, so delivering it would be a no-op: Scribe writes a credit and logs `GIFT_RECIPIENT_ALREADY_OWNS`. Or a perk product was bought with no gift intent at all by a buyer who already owns it, which is `GIFT_CREDIT_ISSUED`.
 
-    The second case is governed by `NoGiftIntentPolicy`. The default, `"GrantOrCredit"`, writes the credit. `"Hold"` declines the receipt instead, so Roblox eventually refunds and no credit is minted. If the buyer already holds an unused credit for that product, the purchase is declined outright rather than stacking a second one.
+    The second case is governed by `NoGiftIntentPolicy`. The default, `"GrantOrCredit"`, writes the credit. `"Hold"` keeps the receipt pending for retry or manual resolution; it does not issue a refund. If the buyer already holds an unused credit for that product, the receipt stays pending rather than stacking a second one.
 
 ## Reading the refusal
 
-Ownership is checked twice, at prompt time and again at receipt time, so a race between two gifters cannot double-deliver. That is one of fourteen fixed refusals, exported as a frozen table. All but one are text the buyer can be shown; `InvalidRecipient` means the call was handed a user id that is not one, which is the developer's to fix:
+Ownership is checked twice, at prompt time and again at receipt time, so a race between two gifters cannot double-deliver. Refusals are exported as a frozen table. All but one are text the buyer can be shown; `InvalidRecipient` means the call was handed an invalid user ID, which is the developer's to fix:
 
 | `Scribe.GiftReason` member | The string | For |
 | --- | --- | --- |
@@ -75,13 +90,14 @@ Ownership is checked twice, at prompt time and again at receipt time, so a race 
 | `InvalidRecipient` | `"invalid recipient"` | the developer |
 | `CannotGiftYourself` | `"cannot gift yourself"` | the player |
 | `GiftCooldown` | `"gift cooldown"` | the player |
+| `ProductRetired` | `"product retired"` | the player; existing paid credits remain redeemable |
 | `TooManyPending` | `"too many pending gifts"` | the player |
 | `DataServicesDown` | `"data services are experiencing issues; try again later"` | the player |
 | `RecipientAlreadyOwns` | `"recipient already owns this"` | the player |
 | `CreditReserveFailed` | `"could not reserve gift credit; try again later"` | the player |
 | `DeliveryFailed` | `"could not deliver gift; try again later"` | the player |
 | `DeliveryUnconfirmed` | `"gift delivery could not be confirmed; do not send it again"` | the player |
-| `AlreadyPending` | `"a gift of this item is already pending; try again shortly"` | the player |
+| `AlreadyPending` | `"a gift of this item is already pending; try again shortly"` | the player; an unresolved gift or another open purchase dialog blocks this prompt |
 | `IntentRecordFailed` | `"could not record gift intent; try again later"` | the player |
 | `PaidRandomRestricted` | `"paid random items are not available for this account"` | the player |
 | `PolicyPending` | `"cannot check account settings right now; try again in a moment"` | the player |
@@ -106,7 +122,7 @@ end
 
     A gift to someone offline or on another server is delivered by committing a message to their profile key. That write can **commit and then lose its answer** -- a timeout on the way back, or the retry loop ending at shutdown -- and Scribe cannot tell that apart from a write that never happened. So it splits the two outcomes. When the delivery provably did not go out you get `DeliveryFailed`, the spent gift credit is handed straight back, and retrying is exactly right.
 
-    **A full inbox is not by itself proof.** The store retries internally, so a refusal can be reported for a message an earlier attempt of the same call already queued. Scribe asks the store whether *any* attempt could have written rather than assuming the refusal speaks for the call, and only the answer `no` earns a refund. Two things reach `DeliveryFailed`: a same-server `Grant` that threw and was rolled back, and an inbox refusal behind which nothing reached storage -- which includes one preceded by throttled requests, because a throttled request is dropped at the queue and never dispatched.
+    **A full inbox is not by itself proof.** The store retries internally, so a refusal can be reported for a message an earlier attempt of the same call already queued. Scribe asks the store whether *any* attempt could have written rather than assuming the refusal speaks for the call. Confirmed failures include a same-server grant rolled back after an error, a recipient whose receipt history cannot admit the gift, and an inbox refusal where no attempt reached storage. Only a confirmed failure restores the spent credit.
 
     When it is unconfirmed you get `DeliveryUnconfirmed`, and the credit **stays spent**. That is deliberate. A gift credit carries no id a retry could reuse -- each spend mints a fresh one -- so handing the credit back for a gift that was in fact queued lets the same payment deliver a second time, which the recipient's duplicate check cannot catch. Scribe would rather cost one credit than grant twice. It logs `GIFT_CREDIT_UNCONFIRMED` with the buyer, the product and the recipient so you can reconcile the rare case by hand, and counts `GiftCreditsUnconfirmed`.
 
@@ -117,9 +133,17 @@ Three more refusals exist that cannot be members of the table. Two carry an inte
 ??? note "Why so many of them are about writing something down"
     Four refusals (`DataServicesDown`, `IntentRecordFailed`, `CreditReserveFailed`, and the full aim store) all say the same thing in different words: Scribe could not durably record where this gift was going, so it refused to let money move.
 
-    That ordering is the whole design. The intent is saved **before** the purchase prompt appears, because a receipt from Roblox carries the product id and nothing else. If the record of Ben is lost, the receipt has no recipient and settles to Ava as an ordinary purchase. Refusing a prompt that has not been paid for is far cheaper than compensating a paid gift that went nowhere.
+    The intent is saved **before** the purchase prompt appears, because Roblox's receipt does not name the gift recipient. When the paid receipt arrives, Scribe saves its exact recipient under that receipt's ID before delivery. This binding survives expired intents, later gifts of the same product, and a crash between recipient delivery and buyer acknowledgement.
 
-    The one thing Scribe cannot refuse is a receipt that arrives after its intent has aged out. It falls back to a durable **gift aim**, and if even that has expired you get `GIFT_AIM_EXPIRED`, which names the recipient and the product so you can compensate by hand.
+    A receipt Scribe has never handled still relies on its intent or an archived **gift aim**. Unresolved aims do not expire. Their store is bounded to 64 slots per buyer, including reserved space for pending intents; a full store refuses new paid gifts. If an older profile has no room to archive an intent, Scribe keeps the intent instead of losing its destination.
+
+## External purchases and pending gifts
+
+A purchase outside the experience must not take the recipient from a different gift. For example, if Ava has a pending gem-pack gift for Ben and buys another pack from the game's Roblox page, that external purchase follows the normal buyer purchase path. Ben's pending gift stays intact.
+
+Scribe uses the receipt's `ProductPurchaseChannel`: only `InExperience` receipts can claim a pending gift intent or archived aim by product. Receipts without a channel keep the previous behavior for compatibility. A destination already saved for the exact `PurchaseId` takes precedence regardless of channel, so a retry still settles its original gift.
+
+Keep products that require a gift-recipient selection off external listings. See [external purchases](./monetization#external-purchases) for setup and restrictions.
 
 ## Throttles worth knowing
 
@@ -129,11 +153,11 @@ Gifting is a spam and abuse surface, so it ships throttled. All of these live un
 | --- | --- | --- |
 | `GiftCooldown` | 5 seconds | Minimum gap between one sender's prompts. |
 | `GiftMaxPending` | 20 | Unresolved intents one sender may hold at once. |
-| `GiftIntentTTL` | 3600 seconds | How long an intent stays valid before the receipt falls through to `NoGiftIntentPolicy`. |
+| `GiftIntentTTL` | 3600 seconds | Age after which loading a profile moves an intent into the aim store. It does not cancel the gift or release its product slot. |
 | `AllowDuplicateGifts` | `false` | Whether a perk the recipient already owns may be gifted anyway. |
 | `NoGiftIntentPolicy` | `"GrantOrCredit"` | What an intentless perk purchase becomes. |
 
-A second gift of the **same** product by the same sender is refused with `AlreadyPending` while a purchase could still be in flight, which is up to two minutes. Intents are keyed by product id, because that is all a receipt carries, so overwriting a live one would deliver Ava's first purchase to her second recipient.
+A second paid gift of the **same** product by the same sender is refused with `AlreadyPending` while either its intent or archived aim remains unresolved. Neither the old two-minute prompt window nor the intent's age permits replacement. Once a paid receipt is bound to a recipient, retries keep that exact destination.
 
 ??? note "Why gifting grants a perk rather than a pass"
     There is no API to transfer a game pass, so a "gift VIP" product is a developer product whose `Grants` names a perk. Scribe treats perks and passes as one ownership namespace, so `Owns(ben, "VIP")` is true either way and the rest of your game needs no special case. See [Checking what a player owns](./monetization#checking-what-a-player-owns).

@@ -1,53 +1,7 @@
 --!nonstrict
--- D1's NET: PromptGift's TWO ROLLBACK PATHS AND THE SLOT THEY MAY NOT TOUCH.
---
--- THE SHAPE OF THE DEFECT. PromptGift writes the durable intent, then YIELDS:
---
---     local intentAccessor = reservedAcc(entry).PendingGifts[tostring(product.Id)]
---     intentAccessor.Set({ RecipientId = ..., GiftId = giftId, ... })
---     if not ctx.Persistence.AwaitSave(entry, 10) then   -- <<< THE YIELD
---         intentAccessor.Set(nil)                        -- rollback path 1
---         ...
---     end
---     local ok, err = pcall(function() promptProductPurchase(buyer, product.Id) end)
---     if not ok then
---         intentAccessor.Set(nil)                        -- rollback path 2
---     end
---
--- `intentAccessor` is a PATH accessor captured BEFORE the yield. `Set(nil)` deletes
--- whatever occupies `PendingGifts[<productId>]` at the moment it runs -- not the
--- record this call wrote. Intents are one slot per product Id, and a second
--- PromptGift for the same product is legal (and silently overwrites) once the slot
--- is older than giftPromptWindow (120s). Inside a 10-second AwaitSave that is an
--- ordinary interleave, not a contrivance.
---
--- WHAT IT COSTS. The rollback deletes the SECOND gift's intent. That gift has been
--- prompted; if the buyer pays, its receipt lands with no intent and no archived aim,
--- falls through to the no-intent policy, and grants the perk to the BUYER. The
--- recipient gets nothing. No log names the deletion, no metric counts it, and the
--- call that caused it returns `false` as though it had cleaned up after itself.
---
--- THE GUARD THAT IS ALREADY IN THIS FILE, FIVE TIMES OVER. `clearGiftRecord`,
--- `clearGiftRecordRaw` and `refreshGiftRecordTs` all re-read the slot and compare
--- the stored GiftId before touching it -- "the stable identity of an intent is its
--- GiftId, never the slot". Existence is not the test: the slot IS occupied in the
--- hazard, just by someone else. These two rollbacks are the last two writes on the
--- twelve-write PendingGifts census that do not make that comparison.
---
--- WHAT EACH BLOCK BELOW IS.
---   * two characterisations of the guard, one per rollback path. Both were written
---     as DEFECT/MUST FLIP blocks against the unguarded tree and BOTH HAVE FLIPPED;
---     they now pin the guarded outcome, and each records the pin it carried before
---     the fix, so reverting the guard is what fails them.
---   * a third, on the same interleave, pinning that the guard is a GiftId
---     comparison and not a log line: nothing is deleted, so nothing is named.
---   * the controls the guard must not break: an UNCONTESTED rollback still clears
---     its own intent (both paths), still returns the same refusal, and the happy
---     path still leaves exactly one intent behind.
---
--- The recipients here are deliberately OFFLINE. A Ready recipient on this server is
--- delivered through deliverGiftLocal, which never reaches the cross-server send; the
--- hazard is about the buyer's own slot, so the recipient's realm is held constant.
+-- Prompt failures clear only their own intent.
+-- Legacy writers may replace the slot while a save or marketplace call yields.
+-- These fixtures preserve the GiftId guard independently of prompt serialization.
 
 return function()
 	local Root = script.Parent.Parent.Parent.Parent
@@ -62,17 +16,20 @@ return function()
 	local SECOND = 90303 -- the recipient of the gift that takes the slot over
 	local T0 = 1700000000
 	local PRODUCT_ID = 222
-	-- giftPromptWindow = min(120, giftIntentTTL). Spelled out so a silent change to
-	-- either constant fails here rather than quietly making the takeover impossible.
+	-- Advance beyond the former prompt window in legacy-interleave fixtures.
 	local PROMPT_WINDOW = 120
 
 	local function makeHarness(extraOptions)
+		local finished = require(Root.Scribe.Internal.Signal).new()
 		local options = {
 			Products = {
 				GiftVIP = { Id = PRODUCT_ID, Category = "Gamepass", Grants = "VIP" },
 			},
 			GiftCooldown = 0,
-			PromptProductPurchase = function() end,
+			PromptProductPurchaseFinished = finished,
+			PromptProductPurchase = function(player, productId)
+				finished:Fire(player.UserId, productId, true)
+			end,
 		}
 		for key, value in extraOptions or {} do
 			options[key] = value
@@ -144,8 +101,7 @@ return function()
 	--- time, so wrapping the field puts a spec exactly where the coroutine yield is:
 	--- after the intent has been written, before the rollback can run.
 	---
-	--- One-shot on purpose. The hook itself drives a NESTED PromptGift, which saves
-	--- through the same field; re-entering would be a fixture, not an interleave.
+	--- One-shot so the replacement writer cannot recursively re-enter the seam.
 	local function onceInsideTheSaveYield(harness, hook: (real: () -> boolean) -> boolean)
 		local persistence = harness.Ctx.Persistence
 		local real = persistence.AwaitSave
@@ -172,36 +128,24 @@ return function()
 	it(
 		"GUARD (was a DEFECT; flipped when D1's GiftId guard landed): a failed intent save leaves the NEXT gift's intent alone",
 		function()
-			-- TIMELINE, all of it reachable with default options.
-			--   T0      gift A is prompted and settles nothing; it just occupies the slot.
-			--   T0+200  past giftPromptWindow, so a second prompt of the same product may
-			--           legally take the slot. Gift B is prompted; it writes its intent
-			--           and yields in AwaitSave.
-			--   inside  the buyer prompts gift C. Another 200s has passed, so C legally
-			--           overwrites B's record with its own. C's OWN save confirms, so C is
-			--           a fully armed, durable, paid-for-able gift.
-			--   return  B's save comes back FALSE. B rolls back with the accessor it
-			--           captured before the yield, and deletes C.
-			--
-			-- BEFORE THE GUARD this pinned "slot=empty ... buyerVIP=true rcpQueued=0": C's
-			-- receipt granted VIP to the BUYER and C's recipient was sent nothing.
-			--
-			-- PINNED NOW: the rollback re-reads the slot, sees a GiftId that is not B's,
-			-- and leaves it alone. C survives, C's receipt routes to C's recipient, and B
-			-- still refuses with its own unchanged reason. Reverting either rollback in
-			-- PromptGift to a bare `intentAccessor.Set(nil)` fails this block.
+			-- A legacy writer replaces the slot while the intent save is unconfirmed.
+			-- Rollback must preserve that replacement's identity and delivery.
 			withClock(T0, function(advance)
 				local harness = makeHarness()
 				local buyer, entry = harness.Join(BUYER)
 
-				expect(harness.Data.PromptGift(buyer, "GiftVIP", FIRST)).to.equal(true)
-				advance(PROMPT_WINDOW + 80)
+				-- A legacy writer will replace this prompt's intent during its save.
 
 				local giftC
 				local restore = onceInsideTheSaveYield(harness, function(real)
-					-- The interleave: a second prompt lands while B's save is in flight.
+					-- Replace the slot during the first prompt's save.
 					advance(PROMPT_WINDOW + 80)
-					expect(harness.Data.PromptGift(buyer, "GiftVIP", SECOND)).to.equal(true)
+					entry.Tree.Reserved.PendingGifts[tostring(PRODUCT_ID)].Set({
+						RecipientId = SECOND,
+						GiftId = "legacy-replacement",
+						Ts = Clock.Now(),
+						Product = "GiftVIP",
+					})
 					giftC = tostring(slot(entry).GiftId)
 					-- ...and only now does B's save come back, unconfirmed. Driven through
 					-- the real save path so the `false` is the production one.
@@ -213,7 +157,7 @@ return function()
 				local promptB, reasonB = harness.Data.PromptGift(buyer, "GiftVIP", SECOND + 1)
 				restore()
 
-				-- C is gone, so C's receipt has nothing to route with.
+				-- The replacement survives and remains deliverable.
 				local afterRollback = slotState(entry, giftC)
 				local decision = harness.Data.HandleReceipt(receipt("D1-path1"))
 				harness.Data.Flush(buyer)
@@ -263,8 +207,7 @@ return function()
 				local harness = makeHarness()
 				local buyer, entry = harness.Join(BUYER)
 
-				expect(harness.Data.PromptGift(buyer, "GiftVIP", FIRST)).to.equal(true)
-				advance(PROMPT_WINDOW + 80)
+				-- A legacy writer will replace this prompt's intent during its save.
 
 				local seen = {}
 				for _, line in Scribe.GetRecentLogs({ Limit = 200 }) do
@@ -274,7 +217,12 @@ return function()
 				local giftC
 				local restore = onceInsideTheSaveYield(harness, function(real)
 					advance(PROMPT_WINDOW + 80)
-					expect(harness.Data.PromptGift(buyer, "GiftVIP", SECOND)).to.equal(true)
+					entry.Tree.Reserved.PendingGifts[tostring(PRODUCT_ID)].Set({
+						RecipientId = SECOND,
+						GiftId = "legacy-replacement",
+						Ts = Clock.Now(),
+						Product = "GiftVIP",
+					})
 					giftC = tostring(slot(entry).GiftId)
 					harness.Fake.FailSaves = true
 					local answer = real()
@@ -312,44 +260,25 @@ return function()
 	it(
 		"GUARD (was a DEFECT; flipped when D1's GiftId guard landed): a throwing purchase prompt leaves the NEXT gift's intent alone",
 		function()
-			-- The second path, and the reason both need the guard rather than one. Here
-			-- the SAVE succeeds; the yield is the same AwaitSave, and the failure arrives
-			-- afterwards from `promptProductPurchase`. The rollback uses the same
-			-- pre-yield accessor, so it deletes the same innocent record.
-			--
-			-- BEFORE THE GUARD this pinned "slot=empty ... buyerVIP=true rcpQueued=0": the
-			-- taking-over gift's receipt reached the buyer.
-			--
-			-- PINNED NOW: C survives this rollback too, and its receipt reaches its own
-			-- recipient. Two rollbacks, two guards -- guarding one would leave the other
-			-- still deleting.
-			withClock(T0, function(advance)
-				local throwNext = false
+			-- The marketplace call replaces the slot before raising.
+			-- Prompt-failure cleanup must preserve the replacement too.
+			withClock(T0, function()
+				local entry, giftC
 				local harness = makeHarness({
 					PromptProductPurchase = function()
-						if throwNext then
-							throwNext = false
-							error("MarketplaceService is down", 0)
-						end
+						entry.Tree.Reserved.PendingGifts[tostring(PRODUCT_ID)].Set({
+							RecipientId = SECOND,
+							GiftId = "legacy-replacement",
+							Ts = Clock.Now(),
+							Product = "GiftVIP",
+						})
+						giftC = tostring(slot(entry).GiftId)
+						error("MarketplaceService is down", 0)
 					end,
 				})
-				local buyer, entry = harness.Join(BUYER)
-
-				expect(harness.Data.PromptGift(buyer, "GiftVIP", FIRST)).to.equal(true)
-				advance(PROMPT_WINDOW + 80)
-
-				local giftC
-				local restore = onceInsideTheSaveYield(harness, function(real)
-					advance(PROMPT_WINDOW + 80)
-					expect(harness.Data.PromptGift(buyer, "GiftVIP", SECOND)).to.equal(true)
-					giftC = tostring(slot(entry).GiftId)
-					local answer = real() -- this save CONFIRMS; the prompt is what fails
-					throwNext = true
-					return answer
-				end)
+				local buyer
+				buyer, entry = harness.Join(BUYER)
 				local promptB, reasonB = harness.Data.PromptGift(buyer, "GiftVIP", SECOND + 1)
-				restore()
-				throwNext = false
 
 				local afterRollback = slotState(entry, giftC)
 				local decision = harness.Data.HandleReceipt(receipt("D1-path2"))
@@ -442,24 +371,22 @@ return function()
 		end)
 	end)
 
-	it("CONTROL: a takeover the rollback leaves alone still settles to ITS OWN recipient", function()
-		-- The destination state of both defect blocks, proven reachable on the
-		-- unmodified tree so the fix is measured against a real target rather than a
-		-- guess. Same interleave, no failure: gift B's PromptGift SUCCEEDS, gift C
-		-- takes the slot over inside its save yield, nothing rolls back, and C's
-		-- receipt reaches C's recipient. That is exactly the outcome the guarded
-		-- rollbacks must produce.
+	it("refuses a replaced intent before opening a dialog and preserves its new owner", function()
 		withClock(T0, function(advance)
 			local harness = makeHarness()
 			local buyer, entry = harness.Join(BUYER)
 
-			expect(harness.Data.PromptGift(buyer, "GiftVIP", FIRST)).to.equal(true)
-			advance(PROMPT_WINDOW + 80)
+			-- A legacy writer replaces the slot while the first intent save yields.
 
 			local giftC
 			local restore = onceInsideTheSaveYield(harness, function(real)
 				advance(PROMPT_WINDOW + 80)
-				expect(harness.Data.PromptGift(buyer, "GiftVIP", SECOND)).to.equal(true)
+				entry.Tree.Reserved.PendingGifts[tostring(PRODUCT_ID)].Set({
+					RecipientId = SECOND,
+					GiftId = "legacy-replacement",
+					Ts = Clock.Now(),
+					Product = "GiftVIP",
+				})
 				giftC = tostring(slot(entry).GiftId)
 				return real()
 			end)
@@ -483,7 +410,7 @@ return function()
 					tostring(owns(harness, BUYER, "VIP")),
 					mailbox(harness, SECOND)
 				)
-			).to.equal("promptB=true slotIsC=to=90303 isExpected=true d=GRANTED buyerVIP=false queued=1")
+			).to.equal("promptB=false slotIsC=to=90303 isExpected=true d=GRANTED buyerVIP=false queued=1")
 
 			harness.Cleanup()
 		end)

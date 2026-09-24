@@ -1,0 +1,18 @@
+---
+import EditLink from 'virtual:starlight/components/EditLink';
+import LastUpdated from 'virtual:starlight/components/LastUpdated';
+import Pagination from 'virtual:starlight/components/Pagination';
+import SiteCredit from './SiteCredit.astro';
+---
+<footer class="scribe-docs-footer">
+    <div class="meta"><EditLink /><LastUpdated /></div>
+    <Pagination />
+    <SiteCredit />
+</footer>
+
+<style>
+    footer { display: flex; flex-direction: column; gap: 1.5rem; }
+    .meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .75rem 3rem; margin-top: 3rem; font-size: var(--sl-text-sm); color: var(--sl-color-gray-3); }
+    .meta > :global(p:only-child) { margin-inline-start: auto; }
+    footer > :global(.scribe-site-credit) { align-self: center; margin-block: 1.5rem; }
+</style>

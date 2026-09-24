@@ -1,21 +1,5 @@
 --!nonstrict
--- The leaderboard write pacer under a backlog.
---
--- The pacer drains one queued score per tick at a flat 1.5s, i.e. 40/min, whatever
--- the server is actually allowed. That is fine until more than 40 distinct
--- (board, user) pairs change in a minute; past that the queue grows, and at
--- QUEUE_CAP the overflow path evicts the OLDEST -- so the scores that have waited
--- longest are the ones thrown away.
---
--- The fix reacts to BACKLOG, not to the allowance on its own. This matters, and it
--- is why the item is not the "derive the interval from the budget" it started as:
--- the modelled ordered-write allowance is 30/min on an empty server (BELOW the
--- flat 40/min, so small servers would have got slower) and about 280/min at 50
--- players (which would have shattered the dedup window that collapses a burst of
--- score changes into a single write). Neither is an improvement. A deep queue is.
---
--- So: with no backlog, or with no budget opinion, the pacer behaves exactly as it
--- always has. Those inertness specs are the important half of this file.
+-- Live writes share budget pacing; Defer drains up to eight per tick.
 
 return function()
 	local Root = script.Parent.Parent.Parent.Parent
@@ -143,28 +127,33 @@ return function()
 			expect(`ceiling={wrote <= 20} drained={wrote > 0}`).to.equal("ceiling=true drained=true")
 		end)
 
-		it("drains only what the allowance actually leaves spare", function()
-			-- Reserve is 1, so an allowance of 4 leaves 3 to spend.
+		it("rechecks remaining allowance after each write and preserves headroom", function()
 			local uni = build({ Options = withBoard({ BudgetPolicy = "Defer" }) })
+			local remaining = 0
 			stubBudget(uni.Disk, function(name)
-				return if name == "SetIncrementSortedAsync" then 4 else 1000
+				return if name == "SetIncrementSortedAsync" then remaining else 1000
 			end)
 			local server = uni:Server(1)
 			backlog(uni, server, 40)
-
+			local name = server.Bundle.Ctx.Leaderboards.BoardStoreName("Coins")
+			local store = uni.Disk:GetOrderedDataStore(name)
+			local setAsync = store.SetAsync
+			store.SetAsync = function(view, ...)
+				remaining -= 1
+				return setAsync(view, ...)
+			end
+			-- Reserve 46 of the 230 writes/minute allowed for 40 players.
+			remaining = 49
 			local before = server.Bundle.Scribe.GetMetrics().LbWrites or 0
-			uni:Run(3) -- about two ticks, so at most six writes
-			local wrote = (server.Bundle.Scribe.GetMetrics().LbWrites or 0) - before
-			-- Three per tick, not the eight the ceiling alone would allow.
-			expect(`spare={wrote <= 6} drained={wrote > 0}`).to.equal("spare=true drained=true")
+			uni:Run(3)
+			expect((server.Bundle.Scribe.GetMetrics().LbWrites or 0) - before).to.equal(3)
+			expect(remaining).to.equal(46)
+			expect(depth(server) > 0).to.equal(true)
 		end)
 
-		it("still asks the engine only once per tick", function()
-			-- Sizing the drain must reuse the gate's reading. Two queries per tick
-			-- can disagree -- the gate saying proceed while the sizing backs off --
-			-- and they double a number three other specs pin at exactly zero.
+		it("does not query repeatedly within one tick when headroom is exhausted", function()
 			local uni = build({ Options = withBoard({ BudgetPolicy = "Defer" }) })
-			-- Two writes a tick keeps the backlog for the whole window; the pacer parks on an empty one.
+			-- An exhausted reserve keeps the backlog for the whole window.
 			local queries = stubBudget(uni.Disk, function(name)
 				return if name == "SetIncrementSortedAsync" then 3 else 1000
 			end)
@@ -180,7 +169,7 @@ return function()
 		end)
 	end)
 
-	describe("inertness", function()
+	describe("coalescing and unknown budget", function()
 		it("drains one per tick when the queue is not backed up", function()
 			-- The dedup window depends on this. A single queued score must still
 			-- wait its tick, or a burst of changes stops collapsing into one write.
@@ -204,17 +193,16 @@ return function()
 			expect(`writes={wrote}`).to.equal("writes=1")
 		end)
 
-		it("stays at one per tick when budgets are switched off entirely", function()
-			-- NoBudget makes the modelled disk answer infinity. Treating that as
-			-- headroom would empty the queue in one tick across most of the suite,
-			-- and a formula dividing by it would produce a zero-second interval --
-			-- which is a scheduler spin, not a fast pacer.
+		it("retains bounded pacing when the model answers an infinite budget", function()
+			-- Unlimited backend budget must still respect the rate and burst caps.
 			local uni = build({ Options = withBoard({ BudgetPolicy = "Defer" }), NoBudget = true })
 			local server = uni:Server(1)
-			backlog(uni, server, 20)
-			uni:Run(10)
-
-			expect((server.Bundle.Scribe.GetMetrics().LbWrites or 0) < 15).to.equal(true)
+			backlog(uni, server, 60)
+			local before = server.Bundle.Scribe.GetMetrics().LbWrites or 0
+			uni:Run(3)
+			local wrote = (server.Bundle.Scribe.GetMetrics().LbWrites or 0) - before
+			expect(wrote > 0 and wrote <= 20).to.equal(true)
+			expect(depth(server) > 0).to.equal(true)
 			expect(uni.Sched.Stalled).to.equal(false)
 		end)
 	end)

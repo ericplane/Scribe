@@ -1,27 +1,6 @@
 --!nonstrict
--- F2's CONSEQUENCE SPEC: the online success arm clears only ITS OWN intent.
---
--- handleGiftReceipt's success arm runs AFTER deliverGift, which yields on a
--- cross-server MessageAsync round trip. Intents are one slot per product Id, so a
--- second PromptGift landing inside that yield -- legal once the slot is older than
--- giftPromptWindow (120s) and younger than giftIntentTTL (3600s) -- replaces the
--- slot with a different gift. Clearing it blind deletes a gift the receipt does not
--- own: that second gift's receipt then finds no intent, falls to the no-intent
--- policy, and grants the perk to the BUYER while its recipient gets nothing. No
--- log, no metric, no failed save.
---
--- The identity of an intent is its GiftId, never the slot. The guard added here is
--- the same one the failure arm eight lines above already carries.
---
--- SCOPE: this fix stops the DELETION only. PromptGift's silent same-product
--- overwrite (gift A's receipt delivering to gift B's recipient) is untouched, and
--- is still pinned unchanged by GiftIntentNet.spec's overwrite block.
---
--- Recipients are deliberately OFFLINE wherever the spec has to act mid-delivery:
--- deliverGift short-circuits to deliverGiftLocal for a Ready recipient on this
--- server and never reaches MessageAsync, which is the only seam that reaches into
--- the yield. Online delivery is covered by the ordinary-success block, which needs
--- no seam.
+-- A completed gift must not clear a different intent left by a legacy writer.
+-- Offline recipients expose the MessageAsync yield used by these race fixtures.
 
 return function()
 	local Root = script.Parent.Parent.Parent.Parent
@@ -33,12 +12,16 @@ return function()
 	local NOT_PROCESSED = Enum.ProductPurchaseDecision.NotProcessedYet
 
 	local function makeHarness(extraOptions)
+		local finished = require(Root.Scribe.Internal.Signal).new()
 		local options = {
 			Products = {
 				GiftVIP = { Id = 222, Category = "Gamepass", Grants = "VIP" },
 			},
 			GiftCooldown = 0,
-			PromptProductPurchase = function() end,
+			PromptProductPurchaseFinished = finished,
+			PromptProductPurchase = function(player, productId)
+				finished:Fire(player.UserId, productId, true)
+			end,
 		}
 		for key, value in extraOptions or {} do
 			options[key] = value
@@ -112,17 +95,18 @@ return function()
 			expect(harness.Data.PromptGift(buyer, "GiftVIP", 82002)).to.equal(true)
 			local giftA = slot(entry, 222).GiftId
 
-			-- Roblox delivers the receipt well after the prompt, which is normal: the
-			-- slot is now older than giftPromptWindow, so a second prompt may take it.
+			-- Simulate a legacy writer replacing the slot during receipt delivery.
 			advance(200)
 
 			local giftB
 			local restore = interceptDelivery(harness, function()
 				if giftB == nil then
-					-- The buyer prompts a second gift of the same product WHILE A's
-					-- delivery is in flight. A real PromptGift, not a planted record:
-					-- it is the only writer allowed to create a slot.
-					expect(harness.Data.PromptGift(buyer, "GiftVIP", 82003)).to.equal(true)
+					entry.Tree.Reserved.PendingGifts["222"].Set({
+						RecipientId = 82003,
+						GiftId = "legacy-replacement",
+						Ts = Clock.Now(),
+						Product = "GiftVIP",
+					})
 					giftB = slot(entry, 222).GiftId
 					expect(giftB ~= giftA).to.equal(true)
 				end
@@ -228,7 +212,7 @@ return function()
 		local seen = {}
 		local unsubscribe = Scribe.AddLogSink(function(logEntry)
 			seen[logEntry.Code] = (seen[logEntry.Code] or 0) + 1
-		end)
+		end, { Level = "Info" })
 		withClock(1700000000, function(advance)
 			local harness = makeHarness()
 			local buyer, entry = harness.Join(82031)
@@ -239,7 +223,12 @@ return function()
 			local restore = interceptDelivery(harness, function()
 				if not done then
 					done = true
-					expect(harness.Data.PromptGift(buyer, "GiftVIP", 82033)).to.equal(true)
+					entry.Tree.Reserved.PendingGifts["222"].Set({
+						RecipientId = 82033,
+						GiftId = "legacy-replacement",
+						Ts = Clock.Now(),
+						Product = "GiftVIP",
+					})
 				end
 				return true
 			end)

@@ -250,9 +250,7 @@ return function()
 		it("closes it AT DEPTH: a nested record inside the copy is not the stored one", function()
 			-- A SHALLOW copy would pass the case above and fail this one: fresh outer
 			-- tables holding the same inner records, so the hole moves down one level
-			-- instead of closing. The ledger nests -- PurchaseLogs.Robux is a ring of
-			-- receipt records and ProcessedPurchaseIds a ring of { Id, At } -- so depth
-			-- is where it actually lives.
+			-- instead of closing. PurchaseLogs.Robux contains nested receipt records.
 			local harness = makeHarness()
 			local _player, entry, data = harness.Join(81011)
 			expect(harness.Data.HandleReceipt(receipt(entry.UserId, 111, "deep-1"))).to.equal(GRANTED)
@@ -287,12 +285,13 @@ return function()
 			expect(storedLog[1].PurchaseId).to.equal(storedId)
 			expect(entry.LiveData[RESERVED].Perks.Cheat).to.equal(nil)
 
-			-- And the dedupe record itself, which is the { Id, At } pair a retry is
-			-- matched against: blanking it in the copy must not un-dedupe the purchase.
+			-- Mutating a copied receipt must not erase duplicate protection.
 			local processed = data[RESERVED].ProcessedPurchaseIds.Get()
 			expect(type(processed[1])).to.equal("table")
 			processed[1].Id = "forged"
+			processed[1].At = 1
 			expect(entry.LiveData[RESERVED].ProcessedPurchaseIds[1].Id).to.equal("deep-1")
+			expect(entry.LiveData[RESERVED].ProcessedPurchaseIds[1].At > 1).to.equal(true)
 
 			-- The consequence, after all four attempts.
 			expect(harness.Data.HandleReceipt(receipt(entry.UserId, 111, "deep-1"))).to.equal(GRANTED)

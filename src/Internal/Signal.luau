@@ -70,6 +70,7 @@ Connection.__index = Connection
 	another connection of the same signal: a connection detached mid-fire does not
 	run for that fire if its turn has not come yet.
 ]=]
+-- Detaches this handler; repeated calls do nothing.
 function Connection.Disconnect(self: any)
 	if not self.Connected then
 		return
@@ -138,6 +139,7 @@ end
 	the next one. There is no duplicate check, so connecting the same function twice
 	runs it twice.
 ]=]
+-- Registers a handler and returns its disconnectable connection.
 function Signal.Connect(self: any, fn: (...any) -> ()): any
 	local connection = setmetatable({
 		Connected = true,
@@ -182,6 +184,7 @@ end
 	The detach happens before `handler` runs, so a handler that raises, or that
 	somehow causes the signal to fire again, still cannot run a second time.
 ]=]
+-- Disconnects before the handler's first call.
 function Signal.Once(self: any, fn: (...any) -> ()): any
 	local connection
 	connection = Signal.Connect(self, function(...)
@@ -271,6 +274,7 @@ end
 	[DisconnectAll](#disconnectall) while you wait, the thread stays parked for good.
 	Prefer [Once](#once) whenever you have somewhere else to be.
 ]=]
+-- Yields until the next fire and returns its arguments.
 function Signal.Wait(self: any): ...any
 	local waiting = coroutine.running()
 	local connection
@@ -295,6 +299,7 @@ end
 
 	The signal stays usable. Connect to it again and it fires again.
 ]=]
+-- Detaches every handler and marks its connection disconnected.
 function Signal.DisconnectAll(self: any)
 	local item = self._head
 	while item do
@@ -316,6 +321,7 @@ end
 	You will rarely need it. The signals Scribe hands you live as long as the server
 	or the client session does, so this is for a signal you made yourself.
 ]=]
+-- Disconnects handlers; the signal can still be reused.
 Signal.Destroy = Signal.DisconnectAll
 
 --------------------------------------------------------------------------------

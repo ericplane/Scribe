@@ -60,7 +60,7 @@ return function()
 			if logEntry.Code == "MESSAGE_HANDLER_STALLED" then
 				seen._outstanding = tonumber(logEntry.Context and logEntry.Context.Outstanding) or -1
 			end
-		end)
+		end, { Level = "Warn" })
 		return seen, unsubscribe
 	end
 

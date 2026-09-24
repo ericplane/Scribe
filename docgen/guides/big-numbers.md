@@ -29,6 +29,8 @@ print(data.Essence.Get():Short())    --> "9.775e99"
 
 `Set`, `Increment`, `Decrement`, `Multiply` and `Divide` all accept a plain number, a numeric string like `"1.5e100"`, or another big value. That is one operand rule for the whole surface, so you never have to remember which call takes which.
 
+Numeric strings are limited to **256 bytes, including whitespace**. Longer strings are rejected before parsing, never truncated. This also applies to defaults, bounds, and arithmetic or comparison operands. Plain numbers and stored big values are unaffected; use scientific notation for large magnitudes.
+
 !!! warning "This trades precision for range on purpose"
     A big carries about 15 significant digits at any magnitude, so `1e20 + 1 == 1e20`. That is the right trade for a currency whose magnitude is the point, and the wrong one for anything audited. Emberfall's `Gems` stay a `Scribe.Int` for exactly that reason: they are bought with Robux, and a lost unit is a support ticket.
 

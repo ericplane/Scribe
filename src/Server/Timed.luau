@@ -61,6 +61,12 @@ end
 function Timed.new(ctx: any)
 	local self = {} :: any
 	local compiled: Template.Compiled = ctx.Compiled
+	local visibleFields: { [string]: string } = {}
+	for id, node in compiled.ById do
+		if node.Timed and node.Visibility ~= "ServerOnly" then
+			visibleFields[Util.pathKey(node.Path)] = tostring(id)
+		end
+	end
 
 	local stopped = false
 	local sweepThread: thread? = nil
@@ -97,7 +103,7 @@ function Timed.new(ctx: any)
 	-- field's pathKey embeds the \31 separator, which Node's dictionary-key guard rejects.
 	-- The store lives in profile.Data, so a raw write persists on the next save; Dirty only
 	-- makes that save prompt rather than the next autosave tick.
-	local function setTimed(entry: any, pathKey: string, value: number?)
+	local function setTimed(entry: any, pathKey: string, value: number?, replicate: boolean?)
 		local store = timedStore(entry)
 		if not store then
 			return
@@ -122,13 +128,18 @@ function Timed.new(ctx: any)
 		if value ~= nil then
 			watch(entry)
 		end
+		local fieldId = visibleFields[pathKey]
+		if fieldId and tree then
+			-- Session metadata shares normal replication and transaction rollback.
+			tree.Accessor.Child(Template.SESSION_ROOT).Child("Timed").Child(fieldId).Set(value, replicate)
+		end
 	end
 
 	local function fieldAccessorFromKey(entry: any, pathKey: string): (any, Template.SchemaNode?)
 		local segments = string.split(pathKey, "\31")
 		local accessor = entry.Tree.Accessor
 		for _, segment in segments do
-			accessor = accessor[segment]
+			accessor = accessor.Child(segment)
 		end
 		-- node.Default is only the field's default when Resolve fully consumed the path.
 		-- For a field a newer template removed, Resolve stops at a surviving ancestor whose
@@ -144,15 +155,15 @@ function Timed.new(ctx: any)
 	function self.HooksFor(entry: any)
 		return {
 			SetTimed = function(accessor: any, value: any, seconds: number, replicate: boolean?)
-				if type(seconds) ~= "number" or seconds <= 0 then
+				if type(seconds) ~= "number" or seconds ~= seconds or seconds <= 0 then
 					error("Scribe: SetTimed seconds must be a positive number", 3)
 				end
 				accessor.Set(value, replicate)
 				local pathKey = Node.PathKeyOf(accessor)
-				setTimed(entry, pathKey, Clock.Now() + clampSeconds(seconds))
+				setTimed(entry, pathKey, Clock.Now() + clampSeconds(seconds), replicate)
 			end,
 			ExtendTimed = function(accessor: any, seconds: number, replicate: boolean?)
-				if type(seconds) ~= "number" or seconds <= 0 then
+				if type(seconds) ~= "number" or seconds ~= seconds or seconds <= 0 then
 					error("Scribe: ExtendTimed seconds must be a positive number", 3)
 				end
 				local pathKey = Node.PathKeyOf(accessor)
@@ -162,8 +173,7 @@ function Timed.new(ctx: any)
 				-- Stack onto a running timer; if expired, behave like SetTimed from
 				-- now, leaving the value itself untouched.
 				local base = if current and current > now then current else now
-				setTimed(entry, pathKey, base + clampSeconds(seconds))
-				local _ = replicate
+				setTimed(entry, pathKey, base + clampSeconds(seconds), replicate)
 			end,
 			Active = function(accessor: any): (boolean, number?)
 				local pathKey = Node.PathKeyOf(accessor)
@@ -466,6 +476,16 @@ function Timed.new(ctx: any)
 		restoreDeadlines(entry)
 		sweepEntry(entry)
 		local store = timedStore(entry)
+		if next(visibleFields) ~= nil then
+			local visible: { [string]: number } = {}
+			for pathKey, expiry in store or {} do
+				local fieldId = visibleFields[pathKey]
+				if fieldId and type(expiry) == "number" and expiry > -math.huge and expiry < math.huge then
+					visible[fieldId] = expiry
+				end
+			end
+			entry.Tree.Accessor.Child(Template.SESSION_ROOT).Child("Timed").Set(visible)
+		end
 		if store ~= nil and next(store) ~= nil then
 			watch(entry)
 		end

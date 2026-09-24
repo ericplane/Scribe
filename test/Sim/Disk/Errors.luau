@@ -68,6 +68,12 @@ Errors.Catalog = {
 		"Transient",
 		true
 	),
+	GetSortedQueueFull = describe(
+		305,
+		"305: GetSortedAsync request dropped. Request queue was full.",
+		"Transient",
+		true
+	),
 	RemoveQueueFull = describe(
 		306,
 		"306: RemoveAsync request dropped. Request was throttled, but throttled request queue was full.",

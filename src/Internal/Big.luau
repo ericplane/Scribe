@@ -18,6 +18,7 @@ local PRECISION_GAP = 18
 -- varint, which doubles it, and the varint writer stops at 2^53. Saturating here
 -- beats storing an infinity that fails the whole profile save.
 local MAX_EXPONENT = 2 ^ 52
+local MAX_INPUT_BYTES = 256
 
 local SUFFIXES = {
 	"",
@@ -107,6 +108,24 @@ end
 
 Big.normalize = normalize
 
+-- Distinguish literal zero from tonumber underflow in one pass.
+local function isPlainZero(text: string): boolean
+	local first = string.byte(text, 1)
+	local start = if first == 43 or first == 45 then 2 else 1
+	local dot, digit = false, false
+	for i = start, #text do
+		local byte = string.byte(text, i)
+		if byte == 48 then
+			digit = true
+		elseif byte == 46 and not dot then
+			dot = true
+		else
+			return false
+		end
+	end
+	return digit
+end
+
 -- Accepts a Big, the stored { m, e } array, a plain number, or a string like
 -- "1.5e100" or "1500". Returns nil for anything else, so callers can produce their
 -- own error with the path in it.
@@ -133,7 +152,7 @@ function Big.from(value: any): Big?
 		end
 		return nil
 	end
-	if t ~= "string" then
+	if t ~= "string" or #(value :: string) > MAX_INPUT_BYTES then
 		return nil
 	end
 	local text = (value :: string):gsub("%s", "")
@@ -146,7 +165,7 @@ function Big.from(value: any): Big?
 		and plain == plain
 		and plain ~= math.huge
 		and plain ~= -math.huge
-		and (plain ~= 0 or string.match(text, "^[%+%-]?0*%.?0*$") ~= nil)
+		and (plain ~= 0 or isPlainZero(text))
 	then
 		return normalize(plain, 0)
 	end
@@ -409,6 +428,107 @@ BIG_MT.__tostring = function(a)
 	return Big.toString(a)
 end
 
+-- Named equivalents of the operators for explicit arithmetic and method chaining.
+-- These return values; they never write a Scribe field. Reuse the operator bodies
+-- so coercion and division errors agree.
+--[=[
+	@method Add
+	@within BigValue
+	@tag Methods
+	@param other number | string | BigValue
+	@return BigValue
+	Returns the sum, like `self + other`. Does not change the stored field: save
+	the returned value with `Set`, or use the field's `Increment` to write directly.
+]=]
+-- Returns a new sum without changing the stored field.
+function BIG_MT.Add(self: Big, other: Big | number | string): Big
+	return BIG_MT.__add(self, other)
+end
+
+--[=[
+	@method Subtract
+	@within BigValue
+	@tag Methods
+	@param other number | string | BigValue
+	@return BigValue
+	Returns the difference, like `self - other`, without writing the stored field.
+]=]
+-- Returns a new difference without changing the stored field.
+function BIG_MT.Subtract(self: Big, other: Big | number | string): Big
+	return BIG_MT.__sub(self, other)
+end
+
+--[=[
+	@method Multiply
+	@within BigValue
+	@tag Methods
+	@param other number | string | BigValue
+	@return BigValue
+	Returns the product, like `self * other`, without writing the stored field.
+	The accessor's `Multiply` method writes; this value method only calculates.
+]=]
+-- Returns a new product without changing the stored field.
+function BIG_MT.Multiply(self: Big, other: Big | number | string): Big
+	return BIG_MT.__mul(self, other)
+end
+
+--[=[
+	@method Divide
+	@within BigValue
+	@tag Methods
+	@param other number | string | BigValue
+	@return BigValue
+	Returns the quotient, like `self / other`, without writing the stored field.
+	Division by zero errors, matching the operator and the accessor's `Divide`.
+]=]
+-- Returns a new quotient; division by zero errors.
+function BIG_MT.Divide(self: Big, other: Big | number | string): Big
+	return BIG_MT.__div(self, other)
+end
+
+--[=[
+	@method Negate
+	@within BigValue
+	@tag Methods
+	@return BigValue
+	Returns the opposite value, like `-self`, without writing the stored field.
+]=]
+-- Returns the opposite value without changing the stored field.
+function BIG_MT.Negate(self: Big): Big
+	return BIG_MT.__unm(self)
+end
+
+-- Unlike Luau's comparison operators, named comparison can accept a number or
+-- numeric string without requiring both operands to carry the Big metatable.
+--[=[
+	@method Compare
+	@within BigValue
+	@tag Methods
+	@param other number | string | BigValue
+	@return number
+	Returns `-1`, `0` or `1` when this value is smaller, equal or larger than `other`.
+	Accepts a number or numeric string even beyond the double range. Invalid operands
+	error; neither operand is changed.
+]=]
+-- Returns -1, 0, or 1 after validating the other operand.
+function BIG_MT.Compare(self: Big, other: Big | number | string): number
+	return Big.compare(self, operand(other, "compare"))
+end
+
+--[=[
+	@method Equals
+	@within BigValue
+	@tag Methods
+	@param other number | string | BigValue
+	@return boolean
+	Whether `Compare(other)` is zero. Accepts numeric strings and numbers as well
+	as other big values, and errors on an invalid operand.
+]=]
+-- Compares numeric value, accepting numbers and numeric strings.
+function BIG_MT.Equals(self: Big, other: Big | number | string): boolean
+	return BIG_MT.Compare(self, other) == 0
+end
+
 -- Integer exponentiation carries the mantissa in two doubles (Dekker) so the 15-digit snap
 -- runs once, at the end. Squaring over Big.mul instead compounds one rounding per pass and
 -- produces wrong leaderboard ranking keys well before n = 1000.
@@ -509,6 +629,7 @@ end
 	either side, so `essence + 5` and `5 + essence` both work. Any other operand
 	errors naming its type, and dividing by zero errors rather than handing back an
 	infinity that no save would survive.
+	Numeric strings are limited to 256 bytes, including whitespace, and are never truncated.
 
 	!!! warning "Comparisons need a big on both sides"
 	    Luau picks `<` and `<=` by metatable identity, so `Get() < 2000` throws. `==` is
@@ -542,6 +663,7 @@ end
 	rounds once at the end where a chain rounds at every step; the measured
 	difference is in the [Big Numbers](../big-numbers.md) guide.
 ]=]
+-- Returns a new power; the exponent must be a non-negative integer.
 function BIG_MT.Pow(self: Big, n: number): Big
 	local result = Big.pow(self, n)
 	if result == nil then
@@ -569,6 +691,7 @@ end
 	17 significant digits at `1e0` to 10 at `1e1000000` and none near the exponent
 	ceiling, so read [`E`](#e) when you need the integer part exactly.
 ]=]
+-- Returns the base-10 logarithm as a plain number.
 function BIG_MT.Log10(self: Big): number
 	return Big.log10(self)
 end
@@ -593,6 +716,7 @@ end
 	`1500` gives `"2K"`. The full suffix table is in the
 	[Big Numbers](../big-numbers.md#showing-it-to-a-player) guide.
 ]=]
+-- Formats a compact suffix or scientific-notation label.
 function BIG_MT.Short(self: Big, decimals: number?): string
 	return Big.toShort(self, decimals)
 end
@@ -618,6 +742,7 @@ end
 	balance to what a double can hold, which is the ceiling the field exists to
 	escape.
 ]=]
+-- Converts to a plain number, losing precision or overflowing when necessary.
 function BIG_MT.ToNumber(self: Big): number
 	return Big.toNumber(self)
 end

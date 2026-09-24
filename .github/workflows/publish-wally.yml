@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Only verify the version match; do not publish"
+        description: "Build and verify the package without publishing"
         type: boolean
         default: true
 
@@ -64,10 +64,13 @@ jobs:
           fi
           echo "Version $WALLY_VER verified."
 
+      - name: Assemble and verify Wally package
+        uses: ./.github/actions/assemble-wally
+
       - name: Publish to Wally
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
         env:
           WALLY_AUTH_TOKEN: ${{ secrets.WALLY_AUTH_TOKEN }}
         run: |
           wally login --token "$WALLY_AUTH_TOKEN"
-          wally publish
+          wally publish --project-path dist/wally

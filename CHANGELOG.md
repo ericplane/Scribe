@@ -1,5 +1,152 @@
 # Changelog
 
+## 2.5.0
+
+Unreleased.
+
+Safer purchase and gift recovery, fewer leaderboard requests, client purchase prompts and
+countdowns, roblox-ts support, and an optional leaderstats add-on.
+
+### Behaviour changes
+
+- Unresolved gifts now block another paid gift or ordinary purchase prompt for the same
+  product, including after a rejoin or the old two-minute window. Gift and purchase dialogs
+  share a guard; cancellation saves the removal of its unbound gift record before releasing
+  the guard. Failed saves block new prompts and are retried by the next prompt attempt. Unresolved
+  gift aims no longer expire, and full aim storage refuses new gifts while preserving
+  pending destinations. `GiftIntentTTL` still controls archival, not cancellation. An earlier
+  ordinary purchase awaiting its receipt remains a documented correlation limitation.
+
+- Completed receipt and gift IDs are retained for 30 days as timestamped records. Expired
+  records are removed during profile loads and receipt operations, without a background sweep.
+  New grants defer with `RECEIPT_HISTORY_FULL` before completion history exceeds
+  `MaxReceiptHistoryBytes` (default 1 MiB); recent IDs are not evicted to make room.
+  An unresolved receipt retried after its record expires can grant again. `PurchaseIdTTL`
+  and `MaxProcessedPurchaseIds` do not control this fixed window. Legacy timestamped records
+  keep their age; compact string IDs start their window when safely migrated on a load/write.
+  If timestamp metadata would exceed the profile-size guard, unknown-age IDs stay protected.
+  No automatic archive is added, and previously evicted IDs cannot be reconstructed. Paid gift receipts
+  save their exact recipient and reserve sender history capacity before delivery, so a late
+  retry cannot lose its destination when an intent expires or a later gift replaces it.
+  Pending receipt bindings do not expire with completed history.
+  The first online delivery adds a buyer save; ordinary self-purchases are unchanged.
+  The new reserved `ReceiptReservations` field changes the schema hash: deploy server and
+  client together, and upgrade every server handling the same profiles.
+
+- Big numeric strings now reject inputs over 256 bytes, including whitespace, before
+  parsing. Zero detection and telemetry profile-key redaction use bounded scans.
+  Telemetry omits strings over 4096 bytes before redaction instead of processing or
+  partially exposing oversized text. Number inputs and stored Big values are unchanged.
+
+### Added
+
+- Added roblox-ts declarations and npm packaging for the shared Luau runtime, with
+  schema inference, server/client APIs, diagnostics, and separate optional React,
+  Vide, Fusion, telemetry, and leaderstats packages. CI checks declarations and runs
+  compiled TypeScript consumers against the Luau implementation. npm publication
+  remains gated on the initial registry and trusted-publisher setup.
+
+- Added client `Data.PromptPurchase(name)` for declared products and passes. The server checks
+  eligibility and opens the local player's prompt through its existing purchase API. Duplicate
+  pending requests and open prompts are refused. Request failures carry `Scribe.RequestFailed`;
+  a timeout may occur after the prompt opens, and Scribe does not retry automatically. Receipts,
+  grants, and prompt metrics remain server-side. Includes Luau types.
+
+- Client timed-field `Active()` now reports the actual timer and remaining seconds from the
+  replicated deadline. `ExtendTimed` replicates deadline changes by default; `false` suppresses
+  that update. Value observers do not tick with the clock. Server-only timers, cooldowns,
+  and internal claims remain private. The new unsaved `_ScribeSession.Timed` field changes
+  the schema hash: deploy server and client together.
+
+- Added `RetiredProducts` to preserve historical receipt/gift handlers without offering new
+  sales. Existing paid gift credits remain redeemable; new gifts without a credit refuse
+  with `Scribe.GiftReason.ProductRetired`.
+
+- Added the optional `ScribeLeaderstats` addon. Map display
+  names to data paths to keep Roblox's player list updated, with cleanup on leave or stop.
+
+- Added `node.Child(key)` for exact child access, including keys that collide with method names,
+  and named arithmetic/comparison methods on Big values as Luau conveniences.
+
+- Added `Scribe.GetLeaderboardSnapshot()` for cached status across active bundles, identified
+  by bundle ID and board name, without DataStore reads. `ScribeTelemetry` monitors it by default
+  every 30 seconds and sends board degradation/recovery reports through the new `Leaderboards`
+  route. Monitoring is bounded and configurable; disappearing boards do not imply recovery.
+  Summaries distinguish profile health from board health and add leaderboard activity, per-board
+  backlogs, receipt-history refusals, log-sink failures and join/leave timing percentiles.
+  Default warnings now include leaderboard failures/budget pressure, slow leaving callbacks
+  and receipt retries. Added leaderboard and diagnostic warning previews. Older Scribe versions
+  without the snapshot API remain supported, with board information marked unavailable.
+
+### Fixed
+
+- Fixed the public constructor ignoring `ServerStore` and reporting it as an unknown option.
+  Store templates now infer field and accessor types on server and client, including typed
+  template modules; client types hide `ServerOnly` fields. Store roots named `Get`, `Changed`,
+  or another accessor method are now reachable. The exported API types accept an optional second
+  store-template type. If you already declare a store, deploy server and client
+  together: the previously ignored fields now form part of the compiled schema.
+
+- Receipts for buyers joining or loading on this server now wait for Ready before granting,
+  bounded by `LoadTimeout` (default 120 seconds, minimum 60). Departure, failed loads, stop,
+  and timeout leave the receipt pending; the receipt timeout does not cancel profile loading.
+  External purchase channels cannot consume unrelated product-keyed gift intents or aims.
+  Saved destinations for an exact purchase ID still settle, and receipts without a channel
+  retain their previous routing behavior. External-sales setup and restrictions are documented.
+
+- Fixed exchange verdict IDs exceeding Roblox's 50-character key limit. New exchanges use
+  bounded GUIDs; intact legacy overlong escrows recover through compatible verdict keys.
+  Existing valid keys and escrow IDs stay unchanged. Operator settlement verifies the pair
+  and basket before applying a verdict. Deploy across all servers and preserve stuck escrow.
+
+- Leaderboards retain transiently failed scores with capped backoff rather than abandoning
+  them after three failures. Added server `GetLeaderboardStatus(name)` for independent board
+  health, cached-result age and pending/rejected writes. Generated store names are validated.
+
+- Added `LbWritesSkipped` diagnostics and corrected the capacity simulation's ordered-read
+  budget queries and separate standard/ordered experience allowances, with sustained traffic
+  regressions for small servers.
+
+### Changed
+
+- Global leaderboards now keep the latest pending score and skip encoded scores that match the
+  last successful write, including unchanged peak scores, rounded scores, and departure writes.
+  Added per-board `WriteInterval` (default 30 seconds, minimum 1) to limit changed-score writes
+  per player/store during play. Departures bypass this interval for pending changed scores.
+  Includes Luau declarations.
+
+- Global leaderboard background reads and writes automatically share budget pacing across
+  bundles on the same server, leaving headroom instead of relying on `BudgetPolicy = "Defer"`.
+  Previous-period reads are checked individually, and a deferred refresh remains due. `Defer`
+  retains faster draining of eligible backlogs when allowance permits. Shutdown drains and
+  explicit debug refreshes still attempt their work immediately.
+
+- Log sinks filter before dispatch and use one worker with a bounded queue per registration.
+  `AddLogSink(fn, { Level, MaxQueued })` selects severity and capacity; default severity follows
+  `LogLevel`. Added `LogRingLevel`, defaulting to Warn in production and Debug in Studio.
+  Queue overflow preserves higher-severity entries where possible and counts `LogSinkDropped`.
+
+- Slow joins and leaving callbacks now report while still waiting, with per-player loading
+  phases and duration measurements. Session-lock timing and final-save ordering are unchanged.
+
+- RBXM, Wally, and npm releases omit long API documentation blocks and retain concise
+  source comments, types, and directives. Repository sources keep the full documentation.
+  Source-line maps accompany the models and packages for debugging.
+
+- Updated Luau LSP to 1.70.0 with matching Roblox type definitions in CI. Type helpers
+  now satisfy the newer checker without weakening the public API's type checks.
+
+### Documentation
+
+- Added roblox-ts and leaderstats guides covering installation, typed templates, and addon
+  setup. npm publishing requirements are recorded in CONTRIBUTING.md.
+
+- Updated the gifting and monetization guides with receipt retention, retired products,
+  external sales, unresolved gift handling, and the remaining purchase-correlation limitation.
+
+- Documented release staging and source-line maps, including how packaged error lines map
+  back to the original source. The API documentation stays in the repository and on the site.
+
 ## 2.4.0
 
 Released 2026-09-17.

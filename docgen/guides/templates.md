@@ -206,6 +206,8 @@ end
 
 Use `Scribe.ServerData<T>` and `Scribe.ClientData<T>` when you need to name the whole `Data` object rather than one player's tree.
 
+If you use `ServerStore`, add its template as the second type parameter to keep its autocomplete: `Scribe.ServerData<T, S>` or `Scribe.ClientData<T, S>`. See [Types and autocomplete](./server-store#types-and-autocomplete) for an example.
+
 ### If Luau says the code is too complex
 
 On a large template the `Scribe({ ... })` call can report "Code is too complex to typecheck", and Luau then silently stops checking the whole file. The accessor trees are not the cost. What the solver cannot afford is instantiating both halves of the bundle inside one call, so name the options, cast the call, and annotate the half you use:

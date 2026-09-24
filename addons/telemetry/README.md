@@ -1,12 +1,19 @@
 # ScribeTelemetry
 
-Scribe's health, failures, selected warnings, performance rules and periodic summaries, posted
-to Discord webhooks from the server. Optional, server-only, and built on Scribe's public
-diagnostics API alone: one log sink, one status connection and the metric readers. It never
-writes a DataStore and never touches a player.
+Scribe's profile and leaderboard health, failures, selected warnings, performance rules and
+periodic summaries, posted to Discord webhooks from the server. Optional and server-only,
+using public diagnostics: one log sink, one status connection, metric readers and cached
+leaderboard snapshots. It makes no DataStore requests and never changes player data.
 
-**Not part of the Scribe package.** Copy the `ScribeTelemetry` folder into `ServerStorage` (or
-anywhere only the server can require) and start it from a server script.
+**Wally users:** copy the `ScribeTelemetry` folder into `ServerStorage` (or anywhere only the
+server can require) and start it from a server script.
+Keep webhook configuration in a server script even when the package itself is replicated.
+
+**roblox-ts users:** the separate optional `@rbxts/scribe-telemetry` package includes
+the same implementation with typed configuration, destination names, preview kinds,
+and statistics, including the leaderboard monitor. See [roblox-ts](../../docgen/guides/roblox-ts.md)
+for publication status and [the telemetry guide](../../docgen/guides/telemetry.md#roblox-ts)
+for a TypeScript example. Import it from a server script and keep endpoint URLs there.
 
 ## Install
 
@@ -84,11 +91,13 @@ ScribeTelemetry.Start(Scribe, {
             Mention = { RoleId = "123456789012345678" }, -- on Fatal and Outage, once per 5 minutes
         },
         Health = { Url = "https://discord.com/api/webhooks/<id>/<token>" },
+        Boards = { Url = "https://discord.com/api/webhooks/<id>/<token>" },
         Summaries = { Url = "https://discord.com/api/webhooks/<id>/<token>" },
     },
     Default = "Alerts",
     Routes = {
         Health = "Health",
+        Leaderboards = "Boards",
         Summaries = "Summaries",
         Performance = { "Alerts", "Health" },
         Warnings = false,
@@ -103,20 +112,55 @@ ScribeTelemetry.Start(Scribe, {
 })
 ```
 
-The five categories are `Health`, `Issues`, `Warnings`, `Performance` and `Summaries`. Two
-names on the same URL deliver a report once.
+The categories are `Health`, `Leaderboards`, `Issues`, `Warnings`, `Performance` and
+`Summaries`. Two names on the same URL deliver a report once.
 
 ## What is sent
 
 Every message is an embed. Its footer names the report id (the server's first eight characters and a counter), the place version, the environment and the time in UTC; Discord shows the same time in your zone beside it. A message from a live server, one with a place id and a `JobId`, carries a `Server` field whose link launches the game into that server; Studio has no live server JobId, so its messages omit the join link. Health reports and summaries also carry the place id and the Scribe version.
 
-| Category    | When                                                                                                                                                                                                                                                                                                                  | Default                          |
-| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
-| Health      | `Scribe.OnStatusChanged` moves: degraded, outage, partial recovery, full recovery, with how long the previous state was observed. An incident already underway when telemetry starts is reported as such, without claiming a start time.                                                                              | On                               |
-| Issues      | Every `Error` and `Fatal` log entry, minus `Issues.ExcludeCodes` and `Issues.ExcludeCategories`.                                                                                                                                                                                                                      | On                               |
-| Warnings    | `Warn` entries whose code is in `Warnings.Include` or whose category is in `Warnings.Categories`. The default list is `ScribeTelemetry.DefaultWarningCodes`.                                                                                                                                                          | On, allowlisted                  |
-| Performance | A rule holding for `Performance.Checks` consecutive checks (`Performance.Interval` seconds apart), and its clear. Rules: `SlowSaves` (p99 save duration in seconds, needs `MinSamples` fresh samples), `SaveFailures` (per minute), `Traffic` (`BytesOut` per second). Each needs a `Threshold`; there is no default. | Off until a rule has a threshold |
-| Summaries   | Every `Summaries.Interval` seconds: health, sessions, loads and saves in the interval, bytes out per second, save duration and profile size percentiles with their own windows, and the DataStore budget when it is readable.                                                                                         | Off                              |
+| Category | When | Default |
+| --- | --- | --- |
+| `Health` | Profile-service degradation, outage and recovery, with the observed duration. | On |
+| `Leaderboards` | A board is first observed degraded, becomes degraded or recovers. | On |
+| `Issues` | Errors and fatal errors, minus `Issues.ExcludeCodes` and `Issues.ExcludeCategories`. | On |
+| `Warnings` | Codes in `Warnings.Include` or categories in `Warnings.Categories`. | Selected codes |
+| `Performance` | A configured rule holds for `Performance.Checks` checks, then when it clears. | Off until configured |
+| `Summaries` | Health, activity and performance every `Summaries.Interval` seconds. | Off |
+
+Performance rules are `SlowSaves` (p99 save duration, with `MinSamples` fresh samples),
+`SaveFailures` (per minute) and `Traffic` (bytes out per second). Each needs a `Threshold`;
+checks run every `Performance.Interval` seconds.
+
+`ScribeTelemetry.DefaultWarningCodes` includes leaderboard read/write failures, overflow and
+budget deferrals, slow leaving callbacks and receipt retries. Receipt-history capacity errors
+already use `Issues`.
+
+### Leaderboard monitoring and summaries
+
+`Leaderboards = { Enabled = true, Interval = 30, MaxBoards = 64 }` is the default. The interval
+has a 5-second minimum. Monitoring runs in the existing telemetry tick and reads
+`Scribe.GetLeaderboardSnapshot()` from memory across all active bundles using that module.
+It adds no DataStore reads. Reports identify boards by numeric `BundleId` and name.
+
+An initially degraded board sends an alert; later degraded/recovered transitions send another.
+`Starting` is quiet, and a disappearing board is removed without a recovery claim.
+`Routes.Leaderboards` can target its own channel, use `Default`, or be `false` to suppress alerts.
+That route switch leaves monitoring and summaries active; `Leaderboards.Enabled = false`
+stops polling. Above `MaxBoards`, the first boards by bundle ID and name are tracked and
+summaries report monitored/omitted counts. Omitted boards are not monitored.
+Profile health stays separate: a healthy profile service does not promise healthy boards.
+
+Summaries label the shared status **Profile health** and include bounded board details with
+backlog and cache age. They identify disabled/unavailable monitoring and omitted boards.
+Leaderboard counter deltas, receipt-history refusals, and log-sink drops/errors appear beside
+the existing load/save and traffic totals. The last reported queue gauge belongs to the last
+reporting bundle, not all bundles combined; per-board pending counts describe each backlog.
+Profile-load, total join and leaving-hook duration percentiles join save duration and profile
+size, with sample windows shown. Measurements absent from older Scribe versions are omitted.
+
+An older Scribe without the snapshot API still works: it produces no board health reports,
+and summaries mark that information unavailable.
 
 Every report describes **this server**. There is no cross-server aggregation and no global
 verdict: an outage reported here is the condition this server observed.
@@ -135,6 +179,8 @@ profile keys with the player prefix and `Player` instances in a log context all 
 `[player]`. Webhook URLs are always redacted. Context tables are trimmed to twelve keys and two
 levels, functions, threads and other Roblox objects are dropped, and every text is cut on a
 UTF-8 boundary inside Discord's limits.
+Strings over 4096 bytes become `[oversized text omitted]` before redaction, keeping
+processing bounded without exposing a partial secret.
 
 ## Delivery
 
@@ -169,7 +215,7 @@ telemetry:Test("Alerts")   -- one test message to a named destination: (ok, reas
 telemetry:Preview("Alerts", "All")  -- every report design, synthetic, to one destination: (ok, reason)
 telemetry:Flush(5)         -- wait up to 5 s for the queues to drain: drained?
 telemetry:GetStats()       -- queue, delivery and per-destination state, no URLs
-telemetry:Stop()           -- remove the sink and the status connection; idempotent
+telemetry:Stop()           -- stop monitoring and remove listeners; idempotent
 ```
 
 `Start` errors, before anything listens, on a URL that is not http or https, a route to
@@ -195,8 +241,9 @@ The examples come from the same builders, formatting and delivery queue as real 
 | Kind | Scenarios |
 | --- | --- |
 | `Health` | `HealthyStartup`, `Degraded`, `Outage`, `PartialRecovery`, `Recovery`, `IncidentUnderway` |
-| `Issues` | `Error`, `Fatal` |
-| `Warnings` | `Warning` |
+| `Leaderboards` | `LeaderboardDegraded`, `LeaderboardRecovery` |
+| `Issues` | `Error`, `Fatal`, `ReceiptCapacity` |
+| `Warnings` | `Warning`, `SlowLoad`, `SlowLeavingHook`, `ReceiptRoutingRetry` |
 | `Grouping` | `Repeat`, `UpstreamSuppressed` |
 | `Performance` | `SlowSaves`, `SaveFailures`, `Traffic`, each with a `Cleared` counterpart |
 | `Summaries` | `Summary`, `SummaryNoSamples`, `SummaryNoBudget` |

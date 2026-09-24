@@ -12,6 +12,7 @@ export type Kind =
 	| "Warnings"
 	| "Grouping"
 	| "Performance"
+	| "Leaderboards"
 	| "Summaries"
 	| "Formatting"
 	| "HealthyStartup"
@@ -25,6 +26,12 @@ export type Kind =
 	| "Fatal"
 	| "Repeat"
 	| "UpstreamSuppressed"
+	| "SlowLoad"
+	| "SlowLeavingHook"
+	| "ReceiptCapacity"
+	| "ReceiptRoutingRetry"
+	| "LeaderboardDegraded"
+	| "LeaderboardRecovery"
 	| "SlowSaves"
 	| "SlowSavesCleared"
 	| "SaveFailures"
@@ -77,10 +84,23 @@ local function summary(shape: string)
 			SavesOk = 620,
 			SavesFailed = 2,
 			BytesOut = 52428800,
+			ReceiptHistoryRefusals = 1,
+			LogSinkDropped = 12,
+			LogSinkErrors = 2,
+			LbWrites = 1240,
+			LbWritesSkipped = 810,
+			LbReadFailures = 2,
+			LbWriteFailures = 3,
+			LbQueueDepth = 4,
+			LbBudgetDeferred = 18,
+			LbQueueOverflow = 0,
 		}
 		local percentiles: { [string]: any } = {
 			SaveDuration = { P50 = 0.42, P90 = 0.9, P99 = 1.6, Samples = 620, Window = 600, Age = 3 },
 			ProfileSize = { P50 = 24000, P90 = 61000, P99 = 118000, Samples = 180, Window = 600, Age = 12 },
+			ProfileLoadDuration = { P50 = 0.6, P90 = 1.8, P99 = 5.2, Samples = 180, Window = 600, Age = 12 },
+			LoadDuration = { P50 = 0.9, P90 = 2.4, P99 = 8.5, Samples = 180, Window = 600, Age = 12 },
+			PlayerLeavingHookDuration = { P50 = 0.01, P90 = 0.2, P99 = 1.1, Samples = 150, Window = 600, Age = 18 },
 		}
 		local budget: { [string]: any }? = {
 			Available = true,
@@ -96,9 +116,19 @@ local function summary(shape: string)
 			Status = "Healthy",
 			Elapsed = handle.config.SummaryInterval,
 			Metrics = metrics,
-			Previous = {},
+			Previous = { LbWrites = 1000, LbWritesSkipped = 500, LbBudgetDeferred = 10 },
 			Percentiles = percentiles,
 			Budget = budget,
+			LeaderboardFields = {
+				{
+					Name = "Leaderboard health",
+					Value = "1 healthy · 0 degraded · 0 starting\n4 pending · 0 retrying · 0 rejected writes",
+				},
+				{
+					Name = "Leaderboard details",
+					Value = "TopCoins (bundle 1): Healthy; 4 pending, 0 retrying, 0 rejected; cache 2.00s",
+				},
+			},
 		}, preview)
 	end
 end
@@ -150,6 +180,38 @@ Preview.SCENARIOS = table.freeze({
 	{ Name = "Recovery", Group = "Health", Run = health("Degraded", "Healthy", 1500) },
 	{ Name = "IncidentUnderway", Group = "Health", Run = health(nil, "Outage", nil) },
 	{
+		Name = "LeaderboardDegraded",
+		Group = "Leaderboards",
+		Run = function(handle: any, preview: any)
+			handle:reportLeaderboard({
+				BundleId = 1,
+				Name = "TopCoins",
+				Status = "Degraded",
+				PendingWrites = 8,
+				RetryingWrites = 3,
+				RejectedWrites = 0,
+				ReadAge = 180,
+				LastReadError = "HTTP 503 (Service Unavailable)",
+				LastWriteError = "OrderedDataStore write throttled",
+			}, "Healthy", 120, preview)
+		end,
+	},
+	{
+		Name = "LeaderboardRecovery",
+		Group = "Leaderboards",
+		Run = function(handle: any, preview: any)
+			handle:reportLeaderboard({
+				BundleId = 1,
+				Name = "TopCoins",
+				Status = "Healthy",
+				PendingWrites = 0,
+				RetryingWrites = 0,
+				RejectedWrites = 0,
+				ReadAge = 2,
+			}, "Degraded", 300, preview)
+		end,
+	},
+	{
 		Name = "Warning",
 		Group = "Warnings",
 		Run = warning(
@@ -183,12 +245,60 @@ Preview.SCENARIOS = table.freeze({
 	},
 	{ Name = "Repeat", Group = "Grouping", Run = repeatGroup },
 	{
+		Name = "SlowLoad",
+		Group = "Warnings",
+		Run = warning("SLOW_LOAD", "Persistence", "profile load exceeded 10s; inspect its phase and store errors", {
+			UserId = USER,
+			Phase = "ProfileAcquisition",
+			Duration = 12.4,
+		}),
+	},
+	{
+		Name = "SlowLeavingHook",
+		Group = "Warnings",
+		Run = warning("PLAYER_LEAVING_HOOK_SLOW", "Lifecycle", "OnPlayerLeaving exceeded 10s before the final save", {
+			UserId = USER,
+			Reason = "Left",
+			Duration = 11.2,
+		}),
+	},
+	{
+		Name = "ReceiptCapacity",
+		Group = "Issues",
+		Run = issue(
+			"Error",
+			"RECEIPT_HISTORY_FULL",
+			"Monetization",
+			"receipt history is full; grant deferred without dropping recent completed IDs",
+			{
+				UserId = USER,
+				Bytes = 1048590,
+				Limit = 1048576,
+				ProfileBytes = 1700000,
+			}
+		),
+	},
+	{
+		Name = "ReceiptRoutingRetry",
+		Group = "Warnings",
+		Run = warning(
+			"RECEIPT_RETRY",
+			"Monetization",
+			"gift route or recipient proof unavailable; letting Roblox retry",
+			{
+				UserId = USER,
+				Product = "GiftVIP",
+				PurchaseId = "preview-receipt",
+			}
+		),
+	},
+	{
 		Name = "UpstreamSuppressed",
 		Group = "Grouping",
 		Run = warning(
-			"LB_WRITE_DROPPED",
+			"LB_WRITE_FAIL",
 			"Leaderboards",
-			"leaderboard write abandoned after retries",
+			"leaderboard write is still pending after repeated failures; retrying with backoff",
 			{ Board = "TopCoins", UserId = USER },
 			12
 		),

@@ -19,6 +19,10 @@ Wire.PROTOCOL_VERSION = 6
 -- server's decode guard cannot drift.
 Wire.MAX_COMMAND_ARGS = 16
 
+-- Built-in purchase prompt request; it uses the existing Command/CommandReply layout.
+-- A game cannot register over it and replace the server's purchase checks.
+Wire.PURCHASE_PROMPT_COMMAND = "__scribe_prompt_purchase"
+
 -- Max bytes in an idempotency key, enforced on both sides. It governs a Command
 -- frame's key and the persisted Data.Purchase key, so raising it raises what a
 -- profile can carry. The number is repeated in prose nothing binds to this line:

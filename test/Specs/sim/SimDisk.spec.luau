@@ -461,7 +461,8 @@ return function()
 			-- mutation: an inequality between two chosen points still held with the
 			-- experience multiplier doubled to match the per-server one, so the very
 			-- property the spec is named for went untested.
-			local experienceSlope = Budget.EXPERIENCE_LIMITS.Write(2000) - Budget.EXPERIENCE_LIMITS.Write(1000)
+			local experienceSlope = Budget.EXPERIENCE_LIMITS.StandardWrite(2000)
+				- Budget.EXPERIENCE_LIMITS.StandardWrite(1000)
 			local serverSlope = Budget.SERVER_LIMITS.StandardWrite(2000) - Budget.SERVER_LIMITS.StandardWrite(1000)
 			expect(experienceSlope * 2).to.equal(serverSlope)
 		end)

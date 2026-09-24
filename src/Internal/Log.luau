@@ -11,6 +11,7 @@ local Signal = require(script.Parent.Signal)
 local Types = require(script.Parent.Parent.Types)
 local Clock = require(script.Parent.Clock)
 local Sched = require(script.Parent.Sched)
+local Metrics = require(script.Parent.Metrics)
 
 type LogEntry = Types.LogEntry
 
@@ -18,6 +19,7 @@ type LogEntry = Types.LogEntry
 -- runs long enough that 512 truncates the interesting part.
 local DEFAULT_RING_SIZE = 512
 local ringSize = DEFAULT_RING_SIZE
+local MAX_MESSAGE_LEN = 400
 local MAX_STRUCTURED_CONTEXT_BYTES = 1000 -- keep structured-log context under ~1 KiB
 
 local LEVEL_ORDER: { [string]: number } = {
@@ -33,10 +35,84 @@ local Log = {}
 Log.OnIssue = Signal.new() :: Signal.Signal<Types.LogEntry> -- fires (entry) for every Error/Fatal entry
 
 local minLevel = if RunService:IsStudio() then LEVEL_ORDER.Debug else LEVEL_ORDER.Warn
+local ringLevel = minLevel
 local ring: { LogEntry } = table.create(ringSize) :: any
 local ringNext = 1
 local ringCount = 0
-local sinks: { (entry: LogEntry) -> () } = {}
+type Sink = {
+	Fn: (entry: LogEntry) -> (),
+	Level: number?,
+	MaxQueued: number,
+	Queue: { { Entry: LogEntry, Severity: number } },
+	Running: boolean,
+	Attached: boolean,
+}
+local sinks: { Sink } = {}
+
+local function sinkErrorText(err: any): string
+	local ok, message = pcall(tostring, err)
+	if not ok then
+		return "[unprintable error]"
+	end
+	if #message > MAX_MESSAGE_LEN then
+		message = string.sub(message, 1, MAX_MESSAGE_LEN)
+		for _ = 1, 3 do
+			if utf8.len(message) ~= nil then
+				break
+			end
+			message = string.sub(message, 1, -2)
+		end
+		message ..= "…"
+	end
+	return message
+end
+
+local function enqueue(sink: Sink, entry: LogEntry, severity: number)
+	local queue = sink.Queue
+	if #queue >= sink.MaxQueued then
+		local victim: number? = nil
+		local lowest = severity
+		for i, pending in queue do
+			if pending.Severity < lowest then
+				victim, lowest = i, pending.Severity
+			end
+		end
+		Metrics.Add("LogSinkDropped")
+		if victim == nil then
+			return
+		end
+		table.remove(queue, victim)
+	end
+	table.insert(queue, { Entry = entry, Severity = severity })
+	if sink.Running then
+		return
+	end
+	sink.Running = true
+	Sched.Defer(function()
+		local batch = 0
+		local warned = false
+		while sink.Attached and #queue > 0 do
+			local nextEntry = table.remove(queue, 1)
+			if nextEntry == nil then
+				break
+			end
+			local ok, err = pcall(sink.Fn, nextEntry.Entry)
+			if not ok then
+				Metrics.Add("LogSinkErrors")
+				if not warned then
+					warn(`[Scribe] log sink error: {sinkErrorText(err)}`)
+					warned = true
+				end
+			end
+			batch += 1
+			if batch >= 32 and #queue > 0 then
+				batch = 0
+				Clock.Wait()
+			end
+		end
+		sink.Running = false
+	end)
+end
 
 -- LogService structured logging, feature-detected with a print/warn fallback.
 local structuredAvailable = pcall(function()
@@ -105,8 +181,6 @@ local function defaultSink(entry: LogEntry)
 	end
 end
 
-local MAX_MESSAGE_LEN = 400
-
 local function emit(
 	level: Types.LogLevel,
 	category: Types.LogCategory,
@@ -114,6 +188,21 @@ local function emit(
 	message: string,
 	context: { [string]: any }?
 )
+	local severity = LEVEL_ORDER[level]
+	local capture = severity >= ringLevel
+	local output = severity >= minLevel
+	local wanted = capture or output or severity >= LEVEL_ORDER.Error
+	if not wanted then
+		for _, sink in sinks do
+			if severity >= (sink.Level or minLevel) then
+				wanted = true
+				break
+			end
+		end
+	end
+	if not wanted then
+		return
+	end
 	-- Capped so a client-supplied string or a long traceback cannot bloat the ring
 	-- buffer, the console fallback, or the structured context.
 	if #message > MAX_MESSAGE_LEN then
@@ -136,22 +225,20 @@ local function emit(
 		Context = context,
 	}
 
-	-- Ring buffer always records the full, untrimmed entry.
-	ring[ringNext] = entry
-	ringNext = (ringNext % ringSize) + 1
-	ringCount = math.min(ringCount + 1, ringSize)
+	if capture then
+		ring[ringNext] = entry
+		ringNext = (ringNext % ringSize) + 1
+		ringCount = math.min(ringCount + 1, ringSize)
+	end
 
-	if LEVEL_ORDER[level] >= minLevel then
+	if output then
 		defaultSink(entry)
 	end
 
 	for _, sink in sinks do
-		Sched.Spawn(function()
-			local ok, err = pcall(sink :: any, entry)
-			if not ok then
-				warn(`[Scribe] log sink error: {err}`)
-			end
-		end)
+		if severity >= (sink.Level or minLevel) then
+			enqueue(sink, entry, severity)
+		end
 	end
 
 	if LEVEL_ORDER[level] >= LEVEL_ORDER.Error then
@@ -161,6 +248,11 @@ end
 
 function Log.SetLevel(level: string)
 	minLevel = LEVEL_ORDER[level] or minLevel
+end
+
+function Log.SetRingLevel(level: string?)
+	ringLevel = (if level then LEVEL_ORDER[level] else nil)
+		or (if RunService:IsStudio() then LEVEL_ORDER.Debug else LEVEL_ORDER.Warn)
 end
 
 function Log.Debug(category: Types.LogCategory, code: Types.LogCode, message: string, context: { [string]: any }?)
@@ -183,14 +275,29 @@ function Log.Fatal(category: Types.LogCategory, code: Types.LogCode, message: st
 	emit("Fatal", category, code, message, context)
 end
 
---- Register a sink, and hand back a function that removes it. Every entry spawns one
---- thread per sink, so a sink nobody detaches keeps costing on the hottest failure
---- path. The remover is idempotent: calling it twice is a no-op rather than removing
---- whatever has since taken that index.
-function Log.AddSink(fn: (entry: LogEntry) -> ()): () -> ()
-	table.insert(sinks, fn)
+-- One worker per sink, with a bounded queue and filtering before dispatch.
+function Log.AddSink(fn: (entry: LogEntry) -> (), options: Types.LogSinkOptions?): () -> ()
+	assert(type(fn) == "function", "Scribe: log sink must be a function")
+	local level = if options then options.Level else nil
+	assert(level == nil or LEVEL_ORDER[level] ~= nil, "Scribe: invalid log sink Level")
+	local maxQueued = if options and options.MaxQueued ~= nil then options.MaxQueued else 128
+	assert(
+		type(maxQueued) == "number" and maxQueued >= 1 and maxQueued <= 4096 and maxQueued % 1 == 0,
+		"Scribe: log sink MaxQueued must be an integer from 1 to 4096"
+	)
+	local sink: Sink = {
+		Fn = fn,
+		Level = if level then LEVEL_ORDER[level] else nil,
+		MaxQueued = maxQueued,
+		Queue = {},
+		Running = false,
+		Attached = true,
+	}
+	table.insert(sinks, sink)
 	return function()
-		local index = table.find(sinks, fn)
+		sink.Attached = false
+		table.clear(sink.Queue)
+		local index = table.find(sinks, sink)
 		if index ~= nil then
 			table.remove(sinks, index)
 		end

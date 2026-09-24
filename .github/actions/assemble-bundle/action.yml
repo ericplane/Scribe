@@ -1,9 +1,8 @@
 name: Assemble Scribe bundle
 description: >
-  Stamp the version into the bundle and build Scribe.rbxm, plus the two add-on
-  models, at the repo root. Shared by the release workflow (which publishes the
-  result) and the PR smoke test (which discards it). Assumes rojo is already on
-  PATH (setup-rokit).
+  Stage sources, remove API doc blocks, and build the core and optional models.
+  Shared by release and smoke-test workflows. Requires Python 3.10+ and the
+  Rokit toolchain on PATH.
 inputs:
   version:
     description: Version string stamped into the bundle (README + root folder name).
@@ -11,36 +10,36 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Test documentation stripping
+      shell: bash
+      run: python3 -m unittest discover -s bundle -p test_stage.py
+
     - name: Assemble the bundle
       shell: bash
       env:
         VER: ${{ inputs.version }}
       run: |
-        # Scribe vendors its store at src/Internal/Store, so the bundle is just src
-        # plus a README: no `wally install`, no dependency copy, no ServerPackages
-        # folder. A game that wants ProfileStore for its own purposes brings its own.
-        #
-        # The backstop below is why that is safe: it fails the build if any
-        # non-roblox.com URL is present in what gets packed, so an edit that
-        # reintroduces one is caught here rather than shipping inside the model.
-        # The licence texts live outside src/ precisely so they do not trip it, and
-        # are shipped with the source package instead.
+        # Check originals too, so stripping cannot hide a forbidden URL.
         if grep -rnoE 'https?://[^ "*]+' src bundle/README.luau | grep -viE 'roblox\.com'; then
           echo "::error::off-platform URL in bundle inputs; remove it at the source in src/"
           exit 1
         fi
 
-        # Name the root folder after the release and stamp the version into the README.
-        sed -i "s|\"name\": \"Scribe\"|\"name\": \"Scribe v${VER}\"|" bundle/rbxm.project.json
-        sed -i "s|__VERSION__|${VER}|g" bundle/README.luau
+        python3 bundle/stage.py --version "$VER"
+        cp dist/rbxm/Scribe-source-map.json Scribe-source-map.json
 
     - name: Build Scribe.rbxm
       shell: bash
-      run: rojo build bundle/rbxm.project.json -o Scribe.rbxm
+      run: rojo build dist/rbxm/bundle/rbxm.project.json -o Scribe.rbxm
 
     # Outside the package and outside the URL backstop: telemetry names Discord by design.
     - name: Build the add-on models
       shell: bash
       run: |
-        rojo build bundle/telemetry.project.json -o ScribeTelemetry-Addon.rbxm
-        rojo build bundle/ui-adapters.project.json -o ScribeUIAdapters-Addon.rbxm
+        rojo build dist/rbxm/bundle/telemetry.project.json -o ScribeTelemetry-Addon.rbxm
+        rojo build dist/rbxm/bundle/ui-adapters.project.json -o ScribeUIAdapters-Addon.rbxm
+        rojo build dist/rbxm/bundle/leaderstats.project.json -o ScribeLeaderstats-Addon.rbxm
+
+    - name: Verify packaged source and executable bytecode
+      shell: bash
+      run: lune run bundle/verify

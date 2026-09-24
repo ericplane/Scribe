@@ -1,14 +1,6 @@
 name: Bundle smoke test
 
-# Dry-runs the exact rbxm assembly that release-rbxm.yml performs (wally install
-# -> copy & sanitize ProfileStore -> off-platform URL backstop -> rojo build)
-# WITHOUT publishing. The ProfileStore _Index glob and the URL backstop are
-# fragile to a ProfileStore bump; this catches breakage before a release rather
-# than during one.
-#
-# Runs on push to main as well as on PRs: work lands on main directly here, so a
-# PR-only trigger meant this never actually fired and the assembly went unchecked
-# until release time, which is exactly what it exists to prevent.
+# Exercise the release staging, URL check, model builds, and bytecode comparison.
 
 on:
   pull_request:
@@ -68,3 +60,5 @@ jobs:
             Scribe.rbxm
             ScribeTelemetry-Addon.rbxm
             ScribeUIAdapters-Addon.rbxm
+            ScribeLeaderstats-Addon.rbxm
+            Scribe-source-map.json

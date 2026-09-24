@@ -129,18 +129,17 @@ end
 -- here as "declared but never emitted", so the gate goes red and names it instead
 -- of silently shrinking its own coverage. Loud is the correct failure.
 --
--- No allowlist. Every code in the union is emitted today; if one ever genuinely
--- needs to be declared ahead of its use, add it here with a comment saying why,
--- never a pattern that happens to skip it.
+-- Keep published historical codes typeable after their behavior is removed.
+local historical = { PURCHASE_ID_EVICTED = true, GIFT_AIM_EXPIRED = true }
 local deadUnion: { string } = {}
 local deadDocs: { string } = {}
 for code in declared do
-	if not emitted[code] then
+	if not emitted[code] and not historical[code] then
 		table.insert(deadUnion, code)
 	end
 end
 for code in documented do
-	if not emitted[code] then
+	if not emitted[code] and not historical[code] then
 		table.insert(deadDocs, code)
 	end
 end

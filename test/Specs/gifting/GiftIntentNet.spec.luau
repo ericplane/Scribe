@@ -21,6 +21,7 @@ return function()
 	local Scribe = require(Root.Scribe)
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
 	local Clock = require(Root.Scribe.Internal.Clock)
+	local Signal = require(Root.Scribe.Internal.Signal)
 
 	local GRANTED = Enum.ProductPurchaseDecision.PurchaseGranted
 	local NOT_PROCESSED = Enum.ProductPurchaseDecision.NotProcessedYet
@@ -29,6 +30,7 @@ return function()
 
 	local function makeHarness(extraOptions)
 		promptLog = {}
+		local finished = Signal.new()
 		local options = {
 			Products = {
 				Coins1000 = {
@@ -41,8 +43,10 @@ return function()
 				GiftVIP = { Id = 222, Category = "Gamepass", Grants = "VIP" },
 			},
 			GiftCooldown = 0,
+			PromptProductPurchaseFinished = finished,
 			PromptProductPurchase = function(player, productId)
 				table.insert(promptLog, { Player = player, ProductId = productId })
+				finished:Fire(player.UserId, productId, true)
 			end,
 		}
 		for key, value in extraOptions or {} do
@@ -145,7 +149,7 @@ return function()
 			if entry.Code == wanted then
 				n += 1
 			end
-		end)
+		end, { Level = "Warn" })
 		return function(): number
 			return n
 		end, unsubscribe
@@ -157,11 +161,7 @@ return function()
 
 	describe("the failure arm's guarded Ts refresh", function()
 		it("refreshes the intent when the slot is still the SAME gift", function()
-			-- The refresh is what keeps PromptGift's short overwrite window refusing a
-			-- second same-product gift while THIS paid purchase is still retrying.
-			-- Without it a long retry drifts past giftPromptWindow, a second prompt
-			-- overwrites the slot, and the first purchase's value is routed to the
-			-- second recipient.
+			-- Failed delivery refreshes the original record without replacing its identity.
 			withClock(1700000000, function(advance)
 				local harness = makeHarness()
 				local buyer, entry = harness.Join(80101)
@@ -294,13 +294,8 @@ return function()
 				Product = "GiftVIP",
 			})
 			advance(301)
-			-- NotProcessedYet here is correct and deliberate, not a failure of this
-			-- arm: intentFor expires the intent and the receipt falls to the no-intent
-			-- policy, where the buyer now owns the perk AND holds the unused credit
-			-- arm 3 minted -- so the purchase could only stack a second credit and is
-			-- declined (RECEIPT_DECLINED_PENDING_CREDIT). What this arm pins is the
-			-- census: the expiry cleared the slot and left nothing half-built.
-			expect(harness.Data.HandleReceipt(receipt(80201, 222, "arm-stale"))).to.equal(NOT_PROCESSED)
+			-- An old unresolved intent still routes to its original recipient.
+			expect(harness.Data.HandleReceipt(receipt(80201, 222, "arm-stale"))).to.equal(GRANTED)
 			expect(describePending(entry)).to.equal("")
 
 			harness.Cleanup()
@@ -346,7 +341,7 @@ return function()
 			end)
 		end)
 
-		it("expires an intent older than GiftIntentTTL", function()
+		it("keeps an unresolved recipient older than GiftIntentTTL", function()
 			withClock(1700000000, function(advance)
 				local expired, unsubscribe = codeCounter("GIFT_INTENT_EXPIRED")
 				local harness = makeHarness({ GiftIntentTTL = 300 })
@@ -368,7 +363,7 @@ return function()
 						describePending(entry),
 						expired()
 					)
-				).to.equal("d=true recipient=false buyer=true pending=[] logs=1")
+				).to.equal("d=true recipient=true buyer=false pending=[] logs=0")
 
 				harness.Cleanup()
 			end)
@@ -379,11 +374,7 @@ return function()
 	-- INVARIANT 5: an uncleared slot costs the buyer permanent gift capacity
 	--------------------------------------------------------------------------------
 
-	it("reclaims a stranded intent on the next load, so capacity is never lost for good", function()
-		-- PromptGift refuses at GiftMaxPending. The only reclaim paths are intentFor's
-		-- TTL branch, the OnLoad sweep, and the explicit clears. A fix that leaves an
-		-- intent no path can clear converts a transient failure into a permanent
-		-- capacity loss with no diagnostic at all.
+	it("archives a stranded intent while preserving its recipient lock", function()
 		withClock(1700000000, function(advance)
 			local harness = makeHarness({ GiftMaxPending = 1, GiftIntentTTL = 300 })
 			local buyer, entry = harness.Join(80401)
@@ -404,7 +395,7 @@ return function()
 			harness.Fake.FailMessages = false
 			expect(describePending(entry)).to.equal("222")
 
-			-- Roblox gives up. The intent is now stranded -- and the next load sweeps it.
+			-- The next load moves the unresolved intent into its archived slot.
 			harness.Data.Flush(buyer)
 			harness.Leave(buyer)
 			advance(301)
@@ -412,10 +403,11 @@ return function()
 
 			local ok2 = harness.Data.PromptGift(buyer2, "GiftVIP", 80404)
 			expect(("pending=[%s] regift=%s"):format(describePending(entry2), tostring(ok2))).to.equal(
-				"pending=[222] regift=true"
+				"pending=[] regift=false"
 			)
-			-- ...and the slot it now holds is the NEW gift, not the swept one.
-			expect(slot(entry2, 222).RecipientId).to.equal(80404)
+			expect(entry2.LiveData._Scribe.GiftAims["222"].RecipientId).to.equal(80402)
+			expect(harness.Data.HandleReceipt(receipt(80401, 222, "stranded-1"))).to.equal(GRANTED)
+			expect(harness.Data.PromptGift(buyer2, "GiftVIP", 80404)).to.equal(true)
 
 			harness.Cleanup()
 		end)
@@ -505,7 +497,9 @@ return function()
 			)
 
 			local ok, reason = harness.Data.PromptGift(buyer, "GiftVIP", 80603)
-			expect(("%s/%s"):format(tostring(ok), tostring(reason))).to.equal("false/gift cooldown")
+			expect(("%s/%s"):format(tostring(ok), tostring(reason))).to.equal(
+				"false/a gift of this item is already pending; try again shortly"
+			)
 
 			for _ = 1, 20 do
 				if first ~= nil then
@@ -624,21 +618,11 @@ return function()
 	end)
 
 	--------------------------------------------------------------------------------
-	-- DEFECT CHARACTERISATION -- these blocks record behaviour that is WRONG.
+	-- Same-product routing and malformed legacy records.
 	--------------------------------------------------------------------------------
 
-	describe("DEFECT CHARACTERISATION: the same-product overwrite", function()
-		it("routes the FIRST purchase to the SECOND recipient once the prompt window lapses", function()
-			-- PromptGift silently overwrites a live intent as soon as it is older than
-			-- giftPromptWindow (120s), with no read-back and no log. Gift A's receipt --
-			-- still legitimately retrying, or simply slow -- then reads B's RecipientId
-			-- and delivers A's paid product to B's recipient.
-			--
-			-- THIS IS NOT WHAT THE F2 FIX ADDRESSES. F2 stops A's SUCCESS arm from
-			-- DELETING B's intent; the misrouting below is untouched by it. This spec
-			-- must therefore pass IDENTICALLY before and after F2. If it starts failing,
-			-- the fix did more than it was scoped to and that is the finding, not a
-			-- reason to edit this block.
+	describe("same-product intent isolation", function()
+		it("refuses a second recipient after 120 seconds until the first gift settles", function()
 			withClock(1700000000, function(advance)
 				local harness = makeHarness()
 				local buyer, entry = harness.Join(80901)
@@ -648,11 +632,10 @@ return function()
 				expect(harness.Data.PromptGift(buyer, "GiftVIP", 80902)).to.equal(true)
 				local giftA = slot(entry, 222).GiftId
 
-				-- Past giftPromptWindow (120s), under GiftIntentTTL (3600s).
+				-- Beyond the former 120-second overwrite window.
 				advance(121)
-				expect(harness.Data.PromptGift(buyer, "GiftVIP", 80903)).to.equal(true)
-				local giftB = slot(entry, 222).GiftId
-				expect(giftA ~= giftB).to.equal(true)
+				expect(harness.Data.PromptGift(buyer, "GiftVIP", 80903)).to.equal(false)
+				expect(slot(entry, 222).GiftId).to.equal(giftA)
 
 				-- A's receipt finally arrives.
 				expect(harness.Data.HandleReceipt(receipt(80901, 222, "overwrite-A"))).to.equal(GRANTED)
@@ -664,9 +647,9 @@ return function()
 						tostring(harness.Data.Owns(r1, "VIP")),
 						tostring(harness.Data.Owns(r2, "VIP")),
 						tostring(line.From.ToUserId),
-						tostring(line.From.GiftId == giftB)
+						tostring(line.From.GiftId == giftA)
 					)
-				).to.equal("r1=false r2=true to=80903 gift=true")
+				).to.equal("r1=true r2=false to=80902 gift=true")
 
 				harness.Cleanup()
 			end)
@@ -721,19 +704,8 @@ return function()
 		end)
 	end)
 
-	describe("DEFECT CHARACTERISATION: the blind clear on the success arm (F2)", function()
-		it("deletes a SECOND gift's live intent when the first gift's receipt settles", function()
-			-- THE F2 DEFECT, measured. Two prompts of the same product to two different
-			-- recipients, separated by more than giftPromptWindow. Gift A's receipt
-			-- settles and the success arm clears PendingGifts[productId] BLIND -- so it
-			-- deletes gift B's intent, which it does not own.
-			--
-			-- No log, no metric, no error, no failed save. B's own receipt then finds no
-			-- intent and falls into the no-intent policy, granting the perk to the BUYER.
-			--
-			-- THIS BLOCK MUST FLIP WHEN F2 LANDS. When it does, replace the expectation
-			-- with the fixed one (B's intent survives, B's receipt reaches B's recipient)
-			-- rather than deleting the block.
+	describe("sequential gifts", function()
+		it("delivers both purchases to their intended recipients", function()
 			withClock(1700000000, function(advance)
 				local harness = makeHarness()
 				local buyer, entry = harness.Join(81001)
@@ -742,15 +714,12 @@ return function()
 
 				expect(harness.Data.PromptGift(buyer, "GiftVIP", 81002)).to.equal(true)
 				advance(121)
+				expect(harness.Data.PromptGift(buyer, "GiftVIP", 81003)).to.equal(false)
+				expect(harness.Data.HandleReceipt(receipt(81001, 222, "blind-A"))).to.equal(GRANTED)
 				expect(harness.Data.PromptGift(buyer, "GiftVIP", 81003)).to.equal(true)
 				local giftB = slot(entry, 222).GiftId
-
-				-- A's receipt settles. It delivers to whoever holds the slot (see the
-				-- overwrite block above) and then clears the slot outright.
 				expect(harness.Data.HandleReceipt(receipt(81001, 222, "blind-A"))).to.equal(GRANTED)
-				local survived = slot(entry, 222) ~= nil
-
-				-- B's receipt arrives to find nothing.
+				local survived = slot(entry, 222).GiftId == giftB
 				expect(harness.Data.HandleReceipt(receipt(81001, 222, "blind-B"))).to.equal(GRANTED)
 
 				expect(
@@ -761,7 +730,7 @@ return function()
 						tostring(harness.Data.Owns(r2, "VIP")),
 						tostring(harness.Data.Owns(buyer, "VIP"))
 					)
-				).to.equal("survived=false giftB=true r1=false r2=true buyer=true")
+				).to.equal("survived=true giftB=true r1=true r2=true buyer=false")
 
 				harness.Cleanup()
 			end)

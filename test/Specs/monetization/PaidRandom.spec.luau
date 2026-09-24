@@ -8,6 +8,7 @@ return function()
 	local Clock = require(Root.Scribe.Internal.Clock)
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
 	local FakePlayer = require(Root.Test.Helpers.FakePlayer)
+	local Signal = require(Root.Scribe.Internal.Signal)
 
 	local LOOT_ID, PET_ID, BAG_ID, VIP_ID = 5001, 5002, 5003, 777
 	-- Purchase and PromptGift refuse in sentences; PromptPurchase in ProductState.
@@ -53,6 +54,7 @@ return function()
 	local function harnessed(modes, fn, extra)
 		local fake, calls, release = fakePolicy(modes)
 		local prompted = {}
+		local productFinished = Signal.new()
 		local options = {
 			Products = {
 				LootBox = {
@@ -72,6 +74,7 @@ return function()
 			},
 			Passes = { VIPPass = { Id = VIP_ID } },
 			GetPolicyInfoAsync = fake,
+			PromptProductPurchaseFinished = productFinished,
 			PromptProductPurchase = function(player, id)
 				table.insert(prompted, `product {player.UserId}:{id}`)
 			end,
@@ -89,8 +92,15 @@ return function()
 			Template = { Coins = Scribe.Int(10, { Min = 0 }), Boxes = Scribe.Int(0, { Min = 0 }) },
 			Options = options,
 		})
-		local ok, err = pcall(fn, harness, { Prompted = prompted, Calls = calls, Release = release, Modes = modes })
+		local ok, err = pcall(fn, harness, {
+			Prompted = prompted,
+			ProductFinished = productFinished,
+			Calls = calls,
+			Release = release,
+			Modes = modes,
+		})
 		harness.Cleanup()
+		productFinished:Destroy()
 		if not ok then
 			error(err, 0)
 		end
@@ -157,6 +167,8 @@ return function()
 				local hanging = harness.Join(6)
 				settle()
 				local bag = attempt(harness, hanging, "CoinBag")
+				t.ProductFinished:Fire(hanging.UserId, BAG_ID, false)
+				settle()
 				local vip = attempt(harness, hanging, "VIPPass")
 				expect(`{loot} | {bag} | {vip} | prompts={table.concat(t.Prompted, ",")}`).to.equal(
 					"true why=nil | true why=nil | true why=nil | prompts=product 4:5001,product 6:5003,pass 6:777"

@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noLib": true,
+    "target": "ESNext",
+    "module": "commonjs",
+    "moduleDetection": "force",
+    "moduleResolution": "node",
+    "allowSyntheticDefaultImports": true,
+    "typeRoots": ["node_modules/@rbxts"],
+    "types": ["compiler-types", "types"],
+    "baseUrl": ".",
+    "paths": {
+      "@rbxts/scribe": ["types/index.d.ts"],
+      "@rbxts/scribe-*": ["types/addons/*"]
+    },
+    "noEmit": true,
+    "skipLibCheck": false
+  },
+  "include": ["types/**/*.d.ts", "test/roblox-ts/src/**/*.ts"]
+}

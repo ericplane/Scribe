@@ -30,7 +30,7 @@ end)
 
 Every entry is a plain table: `{ At, Level, Category, Code, Message, Context }`. `Level` is one of `Debug`, `Info`, `Warn`, `Error` or `Fatal`. `Code` is a stable string such as `PROFILE_LOAD_FAIL` or `WIPE_GUARD_TRIPPED` that never changes between versions, so it is safe to match on.
 
-Entries land in a ring buffer holding 512 of them, and in any sinks you add.
+The ring keeps up to 512 entries. In production, the console, ring and default sinks start at `Warn`; Studio starts at `Debug`. Use `LogRingLevel` to change retained history independently of the console's `LogLevel`.
 
 ```lua
 -- Pull recent entries on demand. Oldest first, so the newest is the LAST element.
@@ -38,24 +38,26 @@ local recent = Scribe.GetRecentLogs({ Code = "PROFILE_LOAD_FAIL", Limit = 20 })
 
 -- Or forward them somewhere as they happen.
 local detach = Scribe.AddLogSink(function(entry)
-    if entry.Level == "Error" or entry.Level == "Fatal" then
-        MyBackend:Report(entry)
-    end
-end)
+    MyBackend:Report(entry)
+end, { Level = "Error", MaxQueued = 128 })
 ```
 
 `Code`, `Level` and `Category` are typed string unions, so your editor autocompletes them both in a filter and on `entry` inside a sink. Raise the ring size with the `LogRingSize` option when 512 entries is not enough history. Scribe itself has no webhooks; the optional [ScribeTelemetry](./telemetry) add-on posts these entries to Discord, and the credentials stay in your own game code either way.
 
 Every code Scribe can emit, with its severity and its meaning, is in the [Log Code Reference](./log-codes). Skim that page once when you decide which codes to route to your own backend.
 
+Filtering happens before a callback is queued. Each sink has one worker and at most `MaxQueued` waiting entries (default 128, maximum 4096). A slow sink cannot create an unlimited number of tasks. On overflow, an incoming entry replaces an older lower-severity entry if possible; otherwise the incoming entry is dropped. Watch `LogSinkDropped` and `LogSinkErrors`. Logs are diagnostics, not a durable transaction ledger.
+
 ??? note "When to keep the detach function"
     [`AddLogSink`](/api/Scribe#AddLogSink) returns a function that removes the sink again. Calling it twice is a no-op rather than removing whoever took that slot since.
 
-    Ignore the return value for a sink you register once at startup and keep forever, which is the normal case. Keep it when the sink has a lifetime: a hot-reloaded module, a bundle you `Stop()`, a test. The sink list is a module singleton that nothing else clears, and every log entry spawns one thread per registered sink, on the busiest failure path there is. A sink re-registered on every reload multiplies that cost with no other way to undo it.
+    Keep it for a hot-reloaded module, a bundle you stop, or a test. Detaching clears queued entries; a callback already running may finish. Registering the same function twice creates two independent sinks.
 
 ## Service health
 
 [`Scribe.GetStatus()`](/api/Scribe#GetStatus) reports `"Healthy"`, `"Degraded"` or `"Outage"`. The verdict is broadcast to clients too, so you can put a notice in the Emberfall UI when saves are struggling.
+
+This status describes profile persistence. For rankings, read `Data.GetLeaderboardStatus(name)` on the server. It reports `Starting`, `Healthy` or `Degraded`, pending/retrying/rejected writes, the latest errors and `ReadAge` in seconds. It reads cached diagnostics and makes no DataStore request. A broken leaderboard does not stop otherwise healthy purchases.
 
 ```lua
 -- StarterPlayerScripts/EmberfallUi.client.luau
@@ -91,6 +93,10 @@ These are the ones worth putting on a panel first.
 | --- | --- | --- |
 | `ActiveSessions` | gauge | Emberfall profiles held on this server right now |
 | `ProfilesLoaded`, `ProfileLoadFailures` | counter | Loads that succeeded, and loads that did not |
+| `ProfileLoadDuration` | distribution | Seconds per profile-store acquisition/read attempt, including failures |
+| `PlayerLeavingHookDuration` | distribution | Seconds spent in completed `OnPlayerLeaving` callbacks |
+| `LogSinkDropped`, `LogSinkErrors` | counter | Entries lost to full sink queues, and callbacks that failed |
+| `ReceiptHistoryRefusals` | counter | New receipt/gift grants deferred because completion history cannot fit |
 | `SavesOk`, `SavesFailed` | counter | Save outcomes, counted once per save |
 | `SaveDuration` | distribution | Seconds per save |
 | `ProfileSize` | distribution | Estimated bytes of the last saved data payload, excluding the record around it |
@@ -104,6 +110,8 @@ These are the ones worth putting on a panel first.
 | `InitApplyDuration`, `DiffApplyDuration`, `SharedApplyDuration` | distribution | Client only: elapsed seconds to apply one frame; inline listeners in full, an `OnSharedChanged` handler to its first yield |
 
 Per-player save state is separate. [`Data.GetSaveInfo(player)`](/api/Server#GetSaveInfo) returns `{ LastSaveAt, LastResult, Dirty, Size }` and is mirrored to that player, so a "Saved" or "Unsaved changes" indicator in the Emberfall UI reads [the client copy](/api/Client#GetSaveInfo) with no round trip.
+
+For a slow join, read the second return from `Data.GetState(player)`. It identifies phases such as `AcquiringSession`, `Importing` and `Initializing`. `SLOW_LOAD` reports a join still waiting after ten seconds. `PLAYER_LEAVING_HOOK_SLOW` identifies a game callback delaying that player's final save and session release. These warnings do not change session locks or cancel callbacks.
 
 ### Percentiles, not averages
 
@@ -139,7 +147,7 @@ The window is why `Count` in `GetMetrics` and the percentiles disagree. `Count` 
     Note also that `DataStoreErrors_Throttled` is not a general throttling signal. Ordinary budget exhaustion makes a request **wait** rather than fail, so a heavily throttled server can show zero here. Use [`Scribe.GetBudgetSnapshot()`](/api/Scribe#GetBudgetSnapshot) for that.
 
 ??? note "Why HealthFailures climbs while the status holds steady"
-    `HealthFailures` counts every error, retries included, plus one `HealthFailures_<Subsystem>` counter per subsystem such as `ProfileStore`, `ProfileLoad` or `Leaderboards`.
+    `HealthFailures` counts errors reported to persistence health, retries included, plus one `HealthFailures_<Subsystem>` counter such as `ProfileStore` or `ProfileLoad`. Leaderboard errors use `LbReadFailures` and `LbWriteFailures` instead.
 
     The health state machine counts distinct **problems** instead. One stuck profile retried hard is one problem however many errors it produces, and a throttle is one problem no matter how many keys it hits. Being throttled is the DataStore asking to be asked less often, which is what a crowd of players joining at once produces, not a store that cannot write. Sustained throttling still reaches `Degraded` on its own. Reaching `Outage` takes writes that genuinely failed.
 
@@ -209,7 +217,8 @@ These describe what Scribe is putting on the wire. Reach for them when the Ember
     | `MessageQueueFullAmbiguous` | The subset of those refusals where an earlier attempt inside the same call may already have queued the message. Non-zero means a refused send can still arrive, so a duplicate delivery is reconcilable rather than mysterious. Pair it with `Context.ProvablyClean` on the `MESSAGE_QUEUE_FULL` lines |
     | `GiftCreditsUnconfirmed` | Gift credits kept spent because the delivery write may have committed with its answer lost. Refunding one would let a single payment grant twice, so the credit is held and `GIFT_CREDIT_UNCONFIRMED` names it for manual reconciliation |
     | `LbWrites`, `LbWriteFailures`, `LbReadFailures`, `LbQueueOverflow`, `LbScoreOutOfRange`, `LbQueueDepth` | `TopLevel` board traffic |
-    | `LbBudgetDeferred` | Board requests postponed because the DataStore budget was low. Only ever non-zero with `BudgetPolicy = "Defer"`, and nothing is dropped |
+    | `LbWritesSkipped` | Scores skipped because their encoded value matches the last successful write. Includes unchanged departure scores; replacing a still-pending score does not count |
+    | `LbBudgetDeferred` | Board requests postponed by automatic shared pacing or low DataStore allowance. The write remains queued or the refresh remains due; this can increase without `BudgetPolicy = "Defer"` |
     | `EconomyEvents`, `EconomyEventFailures` | Analytics events emitted, and analytics events dropped |
     | `LegacyImports`, `LegacyImportFailures` | `ImportLegacyData` outcomes |
     | `MigrationsFailed` | Migration steps that threw or produced unpersistable data |

@@ -10,8 +10,9 @@ on:
 permissions:
   contents: read
 
-# One in-flight run per ref; newer pushes cancel older ones. Release runs use a
-# distinct ref (a tag), so this never cancels a release's verify job.
+# One in-flight run per caller and ref. Each release channel calls this workflow;
+# including the caller keeps npm, Wally and model verification from cancelling
+# each other when they build the same tag.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -60,7 +61,7 @@ jobs:
       # std on first run. If a runner ever flakes on that fetch, add a
       # `selene generate-roblox-std` step before this one.
       - name: Lint
-        run: selene src test lune addons
+        run: selene src test lune addons bundle/verify.luau
 
   format:
     runs-on: ubuntu-latest
@@ -73,7 +74,31 @@ jobs:
           path: ~/.rokit
           key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
       - name: Check formatting
-        run: stylua --check src test lune addons
+        run: stylua --check src test lune addons bundle/verify.luau
+
+  roblox-ts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
+      - name: Install roblox-ts dependencies
+        run: npm ci
+      - name: Verify declarations, six packages, and compiled runtime integration
+        run: npm test
+
+  wally-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
+      - uses: ./.github/actions/assemble-wally
 
   analyze:
     runs-on: ubuntu-latest
@@ -97,12 +122,10 @@ jobs:
         run: rojo sourcemap test.project.json -o sourcemap.json
       - name: Fetch Roblox global type defs
         run: |
+          LUAU_LSP_VER="$(python3 -c 'import tomllib; print(tomllib.load(open("rokit.toml", "rb"))["tools"]["luau-lsp"].rsplit("@", 1)[1])')"
           curl -fsSL \
             "https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/${LUAU_LSP_VER}/scripts/globalTypes.d.luau" \
             -o globalTypes.d.luau
-        env:
-          # Keep in sync with rokit.toml's luau-lsp pin.
-          LUAU_LSP_VER: "1.69.0"
       # Positive gate: the typed accessor API and the Scribe() entry point must
       # type-check clean under the NEW solver (--settings mirrors the editor's
       # enableNewSolver). `src` itself is intentionally NOT gated here: the new
@@ -119,42 +142,38 @@ jobs:
             --ignore="**/ServerPackages/**" \
             test/TypeCheck.luau \
             test/TypeCheckSignatureA.luau \
-            test/TypeCheckSignatureB.luau
-      # Negative gate: TypeCheckErrors.luau is a fixture of deliberate type
-      # errors. It must report EXACTLY the number of diagnostics declared in its
-      # own `EXPECTED_ERRORS:` header. If a change silently loosens the
+            test/TypeCheckSignatureB.luau \
+            test/TypeCheckInterop.luau \
+            test/TypeCheckServerStore.luau
+      # Negative gate: each fixture of deliberate type errors must report EXACTLY
+      # the number of diagnostics in its EXPECTED_ERRORS header. If a change loosens the
       # template-aware config types, the count drops and this fails, catching a
       # regression the positive fixture cannot.
       - name: Type-check (negative fixture must report the expected count)
         run: |
-          # `|| true`: grep exits 1 on no match, which under `set -eo pipefail`
-          # would abort the step before the guard below can print its message.
-          expected="$(grep -oE 'EXPECTED_ERRORS: [0-9]+' test/TypeCheckErrors.luau | grep -oE '[0-9]+' || true)"
-          if [ -z "$expected" ]; then
-            echo "::error::could not read EXPECTED_ERRORS from test/TypeCheckErrors.luau"
-            exit 1
-          fi
-          # analyze exits nonzero because the fixture has errors by design, so we
-          # capture output rather than trust the exit code, then count diagnostics
-          # (each is anchored by a `(line,col): TypeError:` location prefix).
-          set +e
-          out="$(luau-lsp analyze \
-            --sourcemap=sourcemap.json \
-            --defs=globalTypes.d.luau \
-            --settings=.vscode/settings.json \
-            --ignore="**/DevPackages/**" \
-            --ignore="**/ServerPackages/**" \
-            test/TypeCheckErrors.luau 2>&1)"
-          set -e
-          # `|| true`: grep -c exits 1 when the count is 0 (the exact regression
-          # this gate catches); without it the step would die before reporting.
-          actual="$(printf '%s\n' "$out" | grep -cE '\([0-9]+,[0-9]+\): (TypeError|SyntaxError):' || true)"
-          echo "TypeCheckErrors.luau: expected ${expected} diagnostics, got ${actual}"
-          if [ "$actual" != "$expected" ]; then
-            echo "::error::negative fixture drift: expected ${expected} type errors, got ${actual}. If this change is intentional, update the EXPECTED_ERRORS header in test/TypeCheckErrors.luau."
-            printf '%s\n' "$out"
-            exit 1
-          fi
+          for fixture in test/TypeCheckErrors.luau test/TypeCheckInteropErrors.luau test/TypeCheckServerStoreErrors.luau; do
+            # grep exits 1 on no match; keep the diagnostic useful under pipefail.
+            expected="$(grep -oE 'EXPECTED_ERRORS: [0-9]+' "$fixture" | grep -oE '[0-9]+' || true)"
+            if [ -z "$expected" ]; then
+              echo "::error::could not read EXPECTED_ERRORS from $fixture"
+              exit 1
+            fi
+            # analyze exits nonzero by design, so count located diagnostics.
+            out="$(luau-lsp analyze \
+              --sourcemap=sourcemap.json \
+              --defs=globalTypes.d.luau \
+              --settings=.vscode/settings.json \
+              --ignore="**/DevPackages/**" \
+              --ignore="**/ServerPackages/**" \
+              "$fixture" 2>&1 || true)"
+            actual="$(printf '%s\n' "$out" | grep -cE '\([0-9]+,[0-9]+\): (TypeError|SyntaxError):' || true)"
+            echo "$fixture: expected ${expected} diagnostics, got ${actual}"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::negative fixture drift in $fixture: expected $expected errors, got $actual."
+              printf '%s\n' "$out"
+              exit 1
+            fi
+          done
 
   clock-seam:
     runs-on: ubuntu-latest
@@ -191,7 +210,7 @@ jobs:
       - name: Time and waits must route through Internal/Clock
         run: |
           HITS=$(grep -rnF --include='*.luau' \
-            -e 'os.time()' -e 'os.clock()' -e 'task.wait(' -e 'task.delay(' \
+            -e 'os.time()' -e 'os.clock()' -e 'task.wait(' -e 'task.delay(' -e ':GetServerTimeNow(' \
             src \
             | grep -v 'src/Internal/Store/' \
             | grep -v 'src/Internal/Clock.luau' \
@@ -201,7 +220,7 @@ jobs:
           if [ -n "$HITS" ]; then
             echo "::error::raw time/wait calls outside Internal/Clock:"
             echo "$HITS"
-            echo 'Use Clock.Now() / Clock.Monotonic() / Clock.Wait() / Clock.Delay().'
+            echo 'Use Clock.Now() / Clock.ServerNow() / Clock.Monotonic() / Clock.Wait() / Clock.Delay().'
             exit 1
           fi
           echo 'All time and wait calls route through Internal/Clock.'

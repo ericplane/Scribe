@@ -16,6 +16,7 @@ local Health = require(script.Internal.Health)
 local Addons = require(script.Internal.Addons)
 local Config = require(script.Internal.Config)
 local Budget = require(script.Internal.Budget)
+local LeaderboardDiagnostics = require(script.Internal.LeaderboardDiagnostics)
 -- Named BigMath because `Scribe.Big` is the declarator; this is the arithmetic.
 local BigMath = require(script.Internal.Big)
 -- Types only. Both are leaf modules with no services, so this is safe on the client.
@@ -27,8 +28,10 @@ export type Op = Types.Op
 export type LogEntry = Types.LogEntry
 export type LogCode = Types.LogCode
 export type LogLevel = Types.LogLevel
+export type LogSinkOptions = Types.LogSinkOptions
 export type LogCategory = Types.LogCategory
 export type Status = Types.Status
+export type LoadPhase = Types.LoadPhase
 export type SaveInfo = Types.SaveInfo
 export type BudgetSnapshot = Budget.Snapshot
 export type ExchangeLeg = ExchangeLegType.Leg
@@ -48,6 +51,9 @@ export type PurchaseReason = Types.PurchaseReason
 export type GiftReason = Types.GiftReason
 export type ProductState = Types.ProductState
 export type LeaderboardEntry = Types.LeaderboardEntry
+export type LeaderboardStatus = Types.LeaderboardStatus
+export type LeaderboardStatusInfo = Types.LeaderboardStatusInfo
+export type LeaderboardSnapshotEntry = Types.LeaderboardSnapshotEntry
 export type PassConfig = Types.PassConfig
 export type PurchaseFilter = Types.PurchaseFilter
 export type EconomyMeta = Types.EconomyMeta
@@ -131,6 +137,13 @@ export type function ValueType(T)
 		-- snapshots that table. setproperty on the live type object instead.
 		big:setproperty(ts.singleton("Pow"), ts.newfunction({ head = { big, ts.number } }, { head = { big } }))
 		local operand = ts.unionof(big, ts.number, ts.string)
+		local binaryMethod = ts.newfunction({ head = { big, operand } }, { head = { big } })
+		for _, name in { "Add", "Subtract", "Multiply", "Divide" } do
+			big:setproperty(ts.singleton(name), binaryMethod)
+		end
+		big:setproperty(ts.singleton("Negate"), ts.newfunction({ head = { big } }, { head = { big } }))
+		big:setproperty(ts.singleton("Compare"), ts.newfunction({ head = { big, operand } }, { head = { ts.number } }))
+		big:setproperty(ts.singleton("Equals"), ts.newfunction({ head = { big, operand } }, { head = { ts.boolean } }))
 		local arith = ts.newfunction({ head = { operand, operand } }, { head = { big } })
 		local cmp = ts.newfunction({ head = { operand, operand } }, { head = { ts.boolean } })
 		local mtProps: { [type]: type } = {}
@@ -436,6 +449,7 @@ export type function ValueType(T)
 		-- cannot do that: two ts.singleton("Remove") calls are distinct objects.
 		local props: { { key: type, ty: type } } = {}
 		local indexerSpec: { index: type, readresult: type, writeresult: type }? = nil
+		local childLookups: { type } = {}
 
 		-- Strips a nested Timed / ServerOnly label, the one thing a read should not show.
 		local valueType = unwrapWrappers(t, depth)
@@ -451,7 +465,9 @@ export type function ValueType(T)
 			for key, prop in t:properties() do
 				local childType = prop.read or prop.write
 				if childType ~= nil then
-					table.insert(props, { key = key, ty = build(childType, false, depth + 1) })
+					local childNode = build(childType, false, depth + 1)
+					table.insert(props, { key = key, ty = childNode })
+					table.insert(childLookups, fn({ key }, { childNode }))
 				end
 			end
 
@@ -475,6 +491,7 @@ export type function ValueType(T)
 					-- Array node: the indexer makes `arr[i]` an accessor node, which is
 					-- the only way to reach a Scribe.ArrayOf element field.
 					local elemNode = build(indexer.readresult, false, depth + 1)
+					table.insert(childLookups, fn({ indexer.index }, { elemNode }))
 					indexerSpec = {
 						index = indexer.index,
 						readresult = elemNode,
@@ -491,6 +508,7 @@ export type function ValueType(T)
 				else
 					-- Dictionary node: children are accessor nodes.
 					local childNode = build(indexer.readresult, false, depth + 1)
+					table.insert(childLookups, fn({ indexer.index }, { childNode }))
 					indexerSpec = {
 						index = indexer.index,
 						readresult = childNode,
@@ -527,6 +545,7 @@ export type function ValueType(T)
 			-- events and Remove carry the element rather than the whole map.
 			local element = mapElement :: type
 			local childNode = build(mapValue :: type, false, depth + 1)
+			table.insert(childLookups, fn({ mapKey }, { childNode }))
 			indexerSpec = { index = mapKey, readresult = childNode, writeresult = childNode }
 			add("Remove", fn({ mapKey, optBool }, { optional(element) }))
 			add("OnKeyAdded", fn({ fn({ mapKey, element }, {}) }, { disconnectType }))
@@ -534,6 +553,16 @@ export type function ValueType(T)
 			add("OnChildChanged", fn({ fn({ mapKey, optional(element), optional(element) }, {}) }, { disconnectType }))
 			add("Clear", fn({ optBool }, {}))
 			add("Count", fn({}, { ts.number }))
+		end
+
+		-- A homogeneous container keeps the exact child type. Static records use
+		-- an untyped lookup: overloads duplicate every recursive child node in the
+		-- callable surface and push ordinary templates past the Luau solver budget.
+		-- Direct property access remains exact; TypeScript can type this lookup too.
+		if #childLookups == 1 then
+			add("Child", childLookups[1])
+		elseif #childLookups > 1 then
+			add("Child", fn({ ts.unionof(ts.string, ts.number) }, { anyType }))
 		end
 
 		-- Common node methods.
@@ -635,7 +664,7 @@ end
 -- `string` when the template has no such leaf. `IncludeBig` is true for leaderboards and
 -- false for cost paths, which must be plain numbers.
 -- selene: allow(undefined_variable)
-export type function StatPathsType(T, IncludeBig)
+export type function StatPathsType(T: type, IncludeBig: type?): type
 	local ts = types
 	local MAX_STAT_PATHS = 32
 	local includeBig = IncludeBig ~= nil and IncludeBig:is("singleton") and IncludeBig:value() == true
@@ -796,11 +825,40 @@ export type function GrantDataType(T)
 	return ValueType(T)
 end
 
+-- Store proxies expose declared roots, without the root accessor's methods.
+-- selene: allow(undefined_variable)
+type function StoreDataType(S: type): type
+	local ts = types
+	if not S:is("table") then
+		return ts.any
+	end
+
+	local fields = ts.newtable(nil, S:indexer(), nil)
+	local names: { [type]: type } = {}
+	local index = 0
+	for key, prop in S:properties() do
+		local fieldType = prop.read or prop.write
+		if fieldType ~= nil then
+			index += 1
+			-- Avoid accessor names such as Get while building each field's type.
+			local alias = ts.singleton(`_storeField{index}`)
+			fields:setproperty(alias, fieldType)
+			names[key] = alias
+		end
+	end
+	local nodes = ValueType(fields)
+	local roots = ts.newtable(nil, nodes:indexer(), nil)
+	for key, alias in names do
+		roots:setproperty(key, nodes:readproperty(alias))
+	end
+	return roots
+end
+
 -- The client `Data` is the accessor tree root plus the client API. A type function
 -- rather than `ValueType<T> & { ... }`, because normalizing an intersection over a
 -- large accessor tree exceeds the solver's budget at the Scribe() call site.
 -- selene: allow(undefined_variable)
-export type function ClientDataType(T)
+type function BuildClientDataType(T, S)
 	local ts = types
 
 	local function optional(t: type): type
@@ -885,6 +943,7 @@ export type function ClientDataType(T)
 	add("GetProductInfoAsync", fn({ ts.string, optional(ts.number) }, { optional(anyTable) }))
 	add("GetPriceAsync", fn({ ts.string, optional(ts.number) }, { optional(ts.number) }))
 	add("ObserveProductInfo", fn({ ts.string, fn({ optional(anyTable) }, {}) }, { fn({}, {}) }))
+	add("PromptPurchase", fn({ ts.string }, { ts.boolean, optional(ts.string), optional(ts.newtable(nil, nil, nil)) }))
 	add("GetProductState", fn({ ts.string }, { ts.string }))
 	add("ObserveProductState", fn({ ts.string, fn({ ts.string }, {}) }, { fn({}, {}) }))
 	add("PrefetchProductInfo", fn({ optional(stringArray) }, {}))
@@ -895,16 +954,21 @@ export type function ClientDataType(T)
 		ts.newfunction({ head = { ts.string, ts.newfunction({ tail = ts.any }, { tail = ts.any }) } }, { head = {} })
 	)
 	add("Raw", ts.any)
-	add("ServerStore", ts.any)
+	add("ServerStore", StoreDataType(StripServerOnly(S)))
 
 	return out
+end
+
+-- selene: allow(undefined_variable)
+export type function ClientDataType(T)
+	return BuildClientDataType(T, types.any)
 end
 
 -- The server `Data` API. P is the Player class type, passed in as a type argument
 -- because class types are not constructible inside a type function. A type function
 -- for the same complexity-budget reason as ClientDataType.
 -- selene: allow(undefined_variable)
-export type function ServerDataType(T, P)
+type function BuildServerDataType(T, P, S)
 	local ts = types
 
 	local node = ValueType(T)
@@ -989,7 +1053,20 @@ export type function ServerDataType(T, P)
 	add("WaitForData", fn({ P, optional(ts.number) }, { optional(node), optional(reasonUnion) }))
 	add(
 		"GetState",
-		fn({ P }, { ts.unionof(ts.singleton("Loading"), ts.singleton("Ready"), ts.singleton("SessionEnded")) })
+		fn({ P }, {
+			ts.unionof(ts.singleton("Loading"), ts.singleton("Ready"), ts.singleton("SessionEnded")),
+			optional(
+				ts.unionof(
+					ts.singleton("WaitingForErase"),
+					ts.singleton("AcquiringSession"),
+					ts.singleton("ReadingProfile"),
+					ts.singleton("Retrying"),
+					ts.singleton("Initializing"),
+					ts.singleton("Importing"),
+					ts.singleton("ImportThrottled")
+				)
+			),
+		})
 	)
 
 	add("Batch", fn({ P, fn({}, {}) }, {}))
@@ -1027,6 +1104,19 @@ export type function ServerDataType(T, P)
 	add("GetLeaderboard", fn({ ts.string, optional(ts.number), optional(ts.number) }, { entryArray }))
 	add("GetMyRank", fn({ P, ts.string }, { optional(ts.number) }))
 	add("GetLeaderboardRefreshIn", fn({ ts.string }, { optional(ts.number) }))
+	local boardStatusProps: { [type]: type } = {}
+	boardStatusProps[ts.singleton("Status")] =
+		ts.unionof(ts.singleton("Starting"), ts.singleton("Healthy"), ts.singleton("Degraded"))
+	for _, key in { "PendingWrites", "RetryingWrites", "RejectedWrites" } do
+		boardStatusProps[ts.singleton(key)] = ts.number
+	end
+	for _, key in { "LastReadAt", "ReadAge", "LastWriteAt" } do
+		boardStatusProps[ts.singleton(key)] = optional(ts.number)
+	end
+	for _, key in { "LastReadError", "LastWriteError" } do
+		boardStatusProps[ts.singleton(key)] = optional(ts.string)
+	end
+	add("GetLeaderboardStatus", fn({ ts.string }, { optional(ts.newtable(boardStatusProps, nil, nil)) }))
 	add("GetLeaderboardResetIn", fn({ ts.string }, { optional(ts.number) }))
 
 	add("PromptGift", fn({ P, ts.string, ts.number }, boolAndReason))
@@ -1121,12 +1211,14 @@ export type function ServerDataType(T, P)
 	add("SendMessage", fn({ ts.number, ts.any }, { ts.boolean }))
 	add("ProfileStore", ts.any)
 	add("Raw", ts.any)
-	-- Typed `any` for now, like Raw: the store template is not a parameter of this type
-	-- function, so its accessors cannot be spelled here. Declared so a strict script can
-	-- reach it at all.
-	add("ServerStore", ts.any)
+	add("ServerStore", StoreDataType(S))
 
 	return ts.newtable(props, { index = P, readresult = node, writeresult = node }, nil)
+end
+
+-- selene: allow(undefined_variable)
+export type function ServerDataType(T, P)
+	return BuildServerDataType(T, P, types.any)
 end
 
 --------------------------------------------------------------------------------
@@ -1177,6 +1269,15 @@ type BigFields = {
 	-- accessor tree gets the real self-referential type from ValueType above.
 	Pow: (self: any, n: number) -> any,
 	Log10: (self: any) -> number,
+	-- The marker stays shallow, like Pow; accessor reads gain exact recursive
+	-- result types from bigValueType above. BigMath.Big is only the M/E shape.
+	Add: (self: any, other: BigMath.Big | number | string) -> any,
+	Subtract: (self: any, other: BigMath.Big | number | string) -> any,
+	Multiply: (self: any, other: BigMath.Big | number | string) -> any,
+	Divide: (self: any, other: BigMath.Big | number | string) -> any,
+	Negate: (self: any) -> any,
+	Compare: (self: any, other: BigMath.Big | number | string) -> number,
+	Equals: (self: any, other: BigMath.Big | number | string) -> boolean,
 }
 type BigMt = { __scribeBig: true }
 export type BigValue = typeof(setmetatable({} :: BigFields, {} :: BigMt))
@@ -1210,6 +1311,7 @@ export type LeaderboardConfig<T = any> = {
 	SigFigs: number?,
 	Replicate: boolean?, -- default false: server-only (Data.GetLeaderboard on the server); true streams the board to clients
 	RefreshInterval: number?, -- approximate seconds between reads of this board (default 60, floor 60, jittered)
+	WriteInterval: number?, -- minimum seconds between changed-score writes per player/store (default 30, minimum 1); ignored for Server scope
 	StoreName: string?, -- override the OrderedDataStore name (default "LB_<board>"); a periodic board appends the period
 	Period: ("Daily" | "Weekly")?, -- a board that resets; nil is lifetime
 	Mode: ("Gain" | "Peak")?, -- with Period: the gain since it began (default) or the peak seen in it
@@ -1242,6 +1344,7 @@ type LeaderboardConfigLoose = {
 	read SigFigs: number?,
 	read Replicate: boolean?,
 	read RefreshInterval: number?,
+	read WriteInterval: number?,
 	read StoreName: string?,
 	read Period: string?,
 	read Mode: string?,
@@ -1278,11 +1381,10 @@ export type MigrationContext = {
 	AwaitBudget: (requestType: string, count: number?, timeout: number?) -> (boolean, () -> ()),
 }
 
-export type ScribeOptions<T> = {
+export type ScribeOptions<T, S = any> = {
 	Template: T,
-	-- Roots owned by the server rather than a player: match state, wave number, boss
-	-- health. Never persisted, replicated to everyone, one per server.
-	ServerStore: { [string]: any }?,
+	-- One unsaved tree per server, replicated to everyone.
+	ServerStore: S?,
 	Transport: (Types.ScribeTransport | "Default")?,
 
 	Migrations: { [number]: (data: { [string]: any }) -> () }?,
@@ -1343,6 +1445,7 @@ export type ScribeOptions<T> = {
 	Leaderboards: { read [string]: LeaderboardConfigLoose }?,
 	PeriodReset: { read UtcOffset: number?, read WeekStart: string? }?, -- the clock periodic boards reset on: hours from UTC (-12 to 14, default 0) and the day a week starts (default Monday)
 	Products: { read [string]: ProductConfigLoose }?,
+	RetiredProducts: { read [string]: ProductConfigLoose }?,
 	Passes: { [string]: PassConfig }?,
 	Perks: { string }?,
 	OwnReceipts: boolean?,
@@ -1363,6 +1466,7 @@ export type ScribeOptions<T> = {
 	GiftIntentTTL: number?,
 	PurchaseIdTTL: number?,
 	MaxProcessedPurchaseIds: number?,
+	MaxReceiptHistoryBytes: number?,
 	PurchaseClaimTTL: number?,
 	MaxPurchaseClaims: number?,
 	AllowDuplicateGifts: boolean?,
@@ -1384,20 +1488,21 @@ export type ScribeOptions<T> = {
 	BoundsPolicy: ("Clamp" | "Reject")?,
 	WipeGuardPolicy: ("Warn" | "Block")?,
 	SchemaPolicy: ("Warn" | "Reject")?, -- check stored data against the template at load; off when absent
-	BudgetPolicy: "Defer"?, -- pace the leaderboard background loops on the DataStore request budget; off when absent
+	BudgetPolicy: "Defer"?, -- burst-drain eligible leaderboard writes and budget-pace erasure; background request pacing is always on
 	WipeGuardShrinkRatio: number?,
 
 	-- diagnostics
 	LogLevel: ("Debug" | "Info" | "Warn" | "Error" | "Fatal")?,
+	LogRingLevel: Types.LogLevel?,
 	LogRingSize: number?, -- entries Log.GetRecent retains (default 512)
 	StatusThresholds: { FailWindow: number?, FailCount: number?, RecoverStreak: number? }?,
 	Banner: boolean?, -- default true: print one "Scribe vX.Y.Z ... ready" line on load
 	StudioHook: boolean?, -- default false: the Studio debug hooks the Scribe Studio plugin reads
 }
 
-export type ServerData<T> = ServerDataType<T, Player>
+export type ServerData<T, S = any> = BuildServerDataType<T, Player, S>
 
-export type ClientData<T> = ClientDataType<T>
+export type ClientData<T, S = any> = BuildClientDataType<T, S>
 
 -- One player's typed accessor tree: the type of `Data[player]`, `Data.Get(player)` and
 -- the client's `Data.Get()`. A plain alias because a type function cannot be invoked
@@ -1405,9 +1510,9 @@ export type ClientData<T> = ClientDataType<T>
 -- erroring, so this is the only way a consumer can name the type.
 export type PlayerData<T> = ValueType<T>
 
-export type Bundle<T> = {
-	Server: ServerData<T>,
-	Client: ClientData<T>,
+export type Bundle<T, S = any> = {
+	Server: ServerData<T, S>,
+	Client: ClientData<T, S>,
 }
 
 --[=[
@@ -1734,10 +1839,60 @@ export type Bundle<T> = {
 --[=[
 	@type LogLevel "Debug" | "Info" | "Warn" | "Error" | "Fatal"
 	@tag Diagnostics
-	How severe a [LogEntry] is. The `LogLevel` option sets the floor, and
-	anything below it is never recorded at all, so raising it is the cheapest way
-	to quieten a noisy production log. See
-	[Configuration](../configuration.md#diagnostics).
+	How severe a [LogEntry] is. `LogLevel` filters the console and default sinks;
+	`LogRingLevel` controls retained history. A sink can set its own `Level`.
+]=]
+
+--[=[
+	@interface LogSinkOptions
+	.Level LogLevel? -- minimum severity; defaults to the configured LogLevel
+	.MaxQueued number? -- waiting entries per sink, 1 to 4096; default 128
+	@tag Diagnostics
+	Options for [Scribe.AddLogSink]. One callback runs at a time per sink.
+]=]
+
+--[=[
+	@type LeaderboardStatus "Starting" | "Healthy" | "Degraded"
+	@tag Leaderboards
+	Health of one board, independent of profile persistence health.
+]=]
+
+--[=[
+	@type LoadPhase "WaitingForErase" | "AcquiringSession" | "ReadingProfile" | "Retrying" | "Initializing" | "Importing" | "ImportThrottled"
+	@tag Lifecycle
+	The stage of a pending load, returned by [Server.GetState].
+]=]
+
+--[=[
+	@interface LeaderboardStatusInfo
+	.Status LeaderboardStatus -- Starting before a refresh succeeds or a failure is reported
+	.PendingWrites number -- latest scores waiting to be written, including rejected scores
+	.RetryingWrites number -- pending scores whose last write failed
+	.RejectedWrites number -- permanently rejected scores waiting for a new value
+	.LastReadAt number? -- Unix timestamp of the last successful refresh
+	.ReadAge number? -- seconds since the last successful refresh
+	.LastWriteAt number? -- Unix timestamp of the last successful write
+	.LastReadError string? -- current refresh failure
+	.LastWriteError string? -- latest write failure
+	@tag Leaderboards
+	Returned by [Server.GetLeaderboardStatus]. Reading it makes no requests.
+]=]
+
+--[=[
+	@interface LeaderboardSnapshotEntry
+	.BundleId number -- stable within this process; distinguishes bundles
+	.Name string -- configured board name
+	.Status LeaderboardStatus -- current board health
+	.PendingWrites number -- queued, in-flight and rejected scores
+	.RetryingWrites number -- pending scores whose last write failed
+	.RejectedWrites number -- rejected scores waiting for a changed value
+	.LastReadAt number? -- Unix timestamp of the last successful refresh
+	.ReadAge number? -- seconds since that refresh
+	.LastWriteAt number? -- Unix timestamp of the last successful write
+	.LastReadError string? -- current refresh failure
+	.LastWriteError string? -- latest write failure
+	@tag Diagnostics
+	One record from [Scribe.GetLeaderboardSnapshot].
 ]=]
 
 --[=[
@@ -1794,6 +1949,7 @@ export type Bundle<T> = {
 	The fixed refusals of [Server.PromptGift]. Each one is a finished sentence you
 	can show a player unaltered: `"buyer data not loaded"`,
 	`"invalid recipient"`, `"cannot gift yourself"`, `"gift cooldown"`,
+	`"product retired"`,
 	`"too many pending gifts"`, `"recipient already owns this"`,
 	`"data services are experiencing issues; try again later"`,
 	`"could not reserve gift credit; try again later"`,
@@ -1860,6 +2016,7 @@ export type Bundle<T> = {
 	.SigFigs number? -- Scribe.Big stats only: ranking-key significant figures, 1 to 15 (default 12)
 	.Replicate boolean? -- default false (server-only); true streams the board to clients
 	.RefreshInterval number? -- approximate seconds between reads (default 60, floor 60, jittered)
+	.WriteInterval number? -- minimum seconds between changed-score writes per player/store (default 30, minimum 1); ignored for Server scope
 	.StoreName string? -- override the OrderedDataStore name (default "LB_<board>"); a periodic board appends the period
 	.Period ("Daily" | "Weekly")? -- a board that resets on the bundle's `PeriodReset` clock; nil is lifetime
 	.Mode ("Gain" | "Peak")? -- with Period: rank the gain since it began (default) or the peak seen in it
@@ -1965,17 +2122,17 @@ export type Bundle<T> = {
 ]=]
 
 --[=[
-	@type ServerData<T> ServerDataType<T, Player>
+	@type ServerData<T, S = any> BuildServerDataType<T, Player, S>
 	@tag Setup
 	The type of the `.Server` half of [Bundle], for annotating a variable that holds
-	it.
+	it. Pass the server-store template as `S` to type its accessors too.
 ]=]
 
 --[=[
-	@type ClientData<T> ClientDataType<T>
+	@type ClientData<T, S = any> BuildClientDataType<T, S>
 	@tag Setup
 	The type of the `.Client` half of [Bundle]. `Scribe.ServerOnly` roots are absent
-	from it, so reading one on the client is a type error rather than a nil.
+	from it. Pass the server-store template as `S` to type its visible accessors too.
 ]=]
 
 --[=[
@@ -1990,7 +2147,7 @@ export type Bundle<T> = {
 ]=]
 
 --[=[
-	@type ScribeModule typeof(Scribe) & <T>(options: ScribeOptions<T>) -> Bundle<T>
+	@type ScribeModule typeof(Scribe) & <T, S>(options: ScribeOptions<T, S>) -> Bundle<T, S>
 	@tag Setup
 	The module itself: every `Scribe.*` declarator and helper, plus the call
 	signature that builds a [Bundle]. Name it when you pass the module around.
@@ -2002,6 +2159,7 @@ export type Bundle<T> = {
 
 local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	Template = true,
+	ServerStore = true,
 	Exchangeable = true,
 	Transport = true,
 	TransportChannel = true,
@@ -2045,6 +2203,7 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	Leaderboards = true,
 	PeriodReset = true,
 	Products = true,
+	RetiredProducts = true,
 	Passes = true,
 	Perks = true,
 	OwnReceipts = true,
@@ -2054,6 +2213,7 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	GiftIntentTTL = true,
 	PurchaseIdTTL = true,
 	MaxProcessedPurchaseIds = true,
+	MaxReceiptHistoryBytes = true,
 	PurchaseClaimTTL = true,
 	MaxPurchaseClaims = true,
 	AllowDuplicateGifts = true,
@@ -2071,13 +2231,14 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	BudgetPolicy = true,
 	WipeGuardShrinkRatio = true,
 	LogLevel = true,
+	LogRingLevel = true,
 	LogRingSize = true,
 	StatusThresholds = true,
 	Banner = true,
 	StudioHook = true,
 }
 
-local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
+local function buildBundle<T, S>(options: ScribeOptions<T, S>): Bundle<T, S>
 	if type(options) ~= "table" then
 		error("Scribe: options must be a table", 2)
 	end
@@ -2132,11 +2293,13 @@ local function buildBundle<T>(options: ScribeOptions<T>): Bundle<T>
 	local compiled = Template.Compile(anyOptions.Template, {
 		ReplicateRobuxLog = purchaseLog.ReplicateRobux == true,
 		ReplicateInGameLog = purchaseLog.ReplicateInGame == true,
+		ServerStore = anyOptions.ServerStore,
 	})
 
 	-- Template safety: deep-freeze after compilation; any accidental
 	-- mutation of the shared template throws at the call site.
 	Util.deepFreeze(anyOptions.Template)
+	Util.deepFreeze(anyOptions.ServerStore)
 
 	-- A Sandboxed script cannot fire a non-Sandboxed event, so a Sandboxed Scribe
 	-- silently never sends a replication frame and nothing syncs. Usually caused by
@@ -2221,6 +2384,7 @@ end
 	})
 	```
 ]=]
+-- Shared entry point for bundle creation, declarators, and diagnostics.
 local Scribe = {}
 
 --[=[
@@ -2249,6 +2413,7 @@ Scribe.Version = require(script.Internal.Version)
 	`Scribe.ServerOnly(Scribe.Session(v))`. Combining it with [Scribe.Shared] is
 	a startup error, since a field has one replication target, not two.
 ]=]
+-- Keeps this field and its subtree off the client.
 function Scribe.ServerOnly<T>(value: T): ServerOnly<T>
 	return Marker.make("ServerOnly", value) :: any
 end
@@ -2266,6 +2431,7 @@ end
 	saves: `Scribe.Shared(Scribe.Session(v))`. Combining it with
 	[Scribe.ServerOnly] is a startup error.
 ]=]
+-- Replicates a root field to every client.
 function Scribe.Shared<T>(value: T): T
 	return Marker.make("Shared", value) :: any
 end
@@ -2284,6 +2450,7 @@ end
 	[Scribe.ServerOnly] (nobody sees it) or [Scribe.Shared] (everyone does), in
 	either order. Doubling it up is a startup error.
 ]=]
+-- Keeps a root field unsaved; its visibility wrappers still apply.
 function Scribe.Session<T>(value: T): T
 	return Marker.make("Session", value) :: any
 end
@@ -2299,6 +2466,7 @@ end
 	`BoundsPolicy = "Reject"`); out-of-range writes clamp. Bounded ints also
 	pack to a smaller wire width.
 ]=]
+-- Declares integer data with optional bounds.
 function Scribe.Int(default: number, meta: NumberMeta?): number
 	return Marker.make("Int", default, meta :: any) :: any
 end
@@ -2327,6 +2495,7 @@ end
 
 	See [Narrowing a float](../templates.md#narrowing-a-float) for the byte table.
 ]=]
+-- Declares floating-point data with optional bounds and wire precision.
 function Scribe.Number(default: number, meta: FloatMeta?): number
 	return Marker.make("Number", default, meta :: any) :: any
 end
@@ -2349,6 +2518,8 @@ end
 
 	`Set` and every arithmetic method take a plain number, a numeric string, or
 	another big value, and [Value.Multiply] and [Value.Divide] exist only here.
+	Numeric strings, including defaults and bounds, are limited to 256 bytes before
+	whitespace removal. Longer strings are rejected, never truncated.
 	`Get()` returns a [BigValue](bigvalue.md), not a plain number, and it will not
 	compare against one: `Get() < 2000` throws and `Get() == 5` is silently false.
 
@@ -2356,6 +2527,7 @@ end
 	refuses `Scale`. See [Big Numbers](../big-numbers.md) and
 	[Leaderboards](../leaderboards.md#ranking-a-scribebig).
 ]=]
+-- Declares large-range numbers; numeric strings are limited to 256 bytes.
 function Scribe.Big(default: (number | string)?, meta: BigMeta?): BigValue
 	return Marker.make("Big", if default == nil then 0 else default, meta :: any) :: any
 end
@@ -2375,6 +2547,7 @@ end
 	fail the profile's next save), or refused outright under
 	`BoundsPolicy = "Reject"`.
 ]=]
+-- Declares string data with an optional byte limit.
 function Scribe.String(default: string, meta: StringMeta?): string
 	return Marker.make("String", default, meta :: any) :: any
 end
@@ -2389,6 +2562,7 @@ end
 	Declares a string field restricted to a fixed set of members. Writes
 	outside the set are rejected, and the value packs to a single byte.
 ]=]
+-- Restricts a string field to the declared members.
 function Scribe.Enum(default: string, members: { string }): string
 	return Marker.make("Enum", default, { Members = members }) :: any
 end
@@ -2417,6 +2591,7 @@ end
 	later is safe, and more than 32 is refused when the template compiles. See
 	[Named booleans](../containers.md#named-booleans).
 ]=]
+-- Stores up to 32 named booleans as one field.
 function Scribe.Flags(members: { string }): Flags
 	return Marker.make("Flags", {}, { Members = members }) :: any
 end
@@ -2431,6 +2606,7 @@ end
 	it auto-clears back to `default` when the timer lapses (firing `Changed`).
 	Great for boosters and temporary buffs.
 ]=]
+-- Declares a leaf reset to its default after SetTimed expires.
 function Scribe.Timed<T>(default: T): Timed<T>
 	return Marker.make("Timed", default) :: any
 end
@@ -2459,6 +2635,7 @@ end
 	player-specific defaults belong in `OnPlayerInit`, and `Scribe.Dynamic` inside a
 	[Scribe.Session] root is a startup error.
 ]=]
+-- Seeds missing profile values with a pure factory, also sampled at declaration.
 -- `(...any) -> T` (not `() -> T`) so standard-library functions with optional
 -- params typecheck when passed directly, e.g. `Scribe.Dynamic(os.time)`.
 function Scribe.Dynamic<T>(factory: (...any) -> T): T
@@ -2489,6 +2666,7 @@ end
 	container is refused when the template compiles. See
 	[Derived Fields](../derived.md).
 ]=]
+-- Declares a read-only value computed from named inputs; compute must be pure.
 function Scribe.Derived<T>(output: T, inputs: { string }, compute: (...any) -> T): Derived<T>
 	return Marker.make("Derived", output, { Inputs = inputs, Compute = compute :: any }) :: any
 end
@@ -2518,6 +2696,7 @@ end
 	declarators are all refused inside it, since each of the three exists to supply
 	a value an optional field is defined not to have.
 ]=]
+-- Allows an absent leaf value; the inner default is not seeded.
 function Scribe.Optional<T>(inner: T): T?
 	return Marker.make("Optional", inner) :: any
 end
@@ -2547,6 +2726,7 @@ end
 	Element records are closed at every depth, and [Value.Find], [Value.Has] and
 	[Value.RemoveValue] compare by value. See [Containers](../containers.md#element-rules).
 ]=]
+-- Declares a typed array with optional size and eviction limits.
 function Scribe.ArrayOf<T>(shape: T, opts: ArrayOpts?): { T }
 	if opts ~= nil then
 		for key in opts :: any do
@@ -2589,6 +2769,7 @@ end
 	record shape is refused by the declarator. `MaxItems` caps membership and is the
 	only option. See [Sets of unique values](../containers.md#sets-of-unique-values).
 ]=]
+-- Declares unique scalar members with an optional size limit.
 function Scribe.SetOf<T>(element: T, opts: SetOpts?): SetOf<T>
 	if opts ~= nil then
 		for key in opts :: any do
@@ -2635,6 +2816,7 @@ end
 	with `keyType = "integer"` is an error rather than a cap that could never fire.
 	See [Maps with typed keys](../containers.md#maps-with-typed-keys).
 ]=]
+-- Declares a map with integer or string keys and a value schema.
 function Scribe.MapOf<K, V>(keyType: K & MapKeyType, value: V, opts: DictOpts?): MapOf<K, V>
 	if keyType ~= "integer" and keyType ~= "string" then
 		error(`Scribe.MapOf: keyType must be "integer" or "string", got {tostring(keyType)}`, 2)
@@ -2681,6 +2863,7 @@ end
 	are write errors, and `MaxKeyLength` rejects rather than truncates. The element
 	rules match [Scribe.ArrayOf]; see [Containers](../containers.md#element-rules).
 ]=]
+-- Declares a string-keyed dictionary with a value schema and optional limits.
 function Scribe.DictOf<V>(shape: V, opts: DictOpts?): { [string]: V }
 	if opts ~= nil then
 		for key in opts :: any do
@@ -2718,6 +2901,7 @@ end
 	`BrickColor`, `UDim`, `UDim2`, `Rect`, `NumberRange`, `NumberSequence`,
 	`ColorSequence`, `DateTime`, `EnumItem`, `Font`, `PhysicalProperties`.
 ]=]
+-- Declares Vector3 data, packed for storage and replication.
 function Scribe.Vector3(default: Vector3): Vector3
 	return datatypeMarker("Vector3", default)
 end
@@ -2758,6 +2942,7 @@ end
 	See [Full-precision CFrames](../datatypes.md#full-precision-cframes) for the byte
 	table and for the axis snapping the 13-byte path does.
 ]=]
+-- Declares packed CFrame data; Precision = "exact" preserves its f32 components.
 function Scribe.CFrame(default: CFrame, meta: CFrameMeta?): CFrame
 	if meta ~= nil then
 		for key in meta :: any do
@@ -2840,6 +3025,7 @@ end
 	the ones it does. `Unpack` takes none, because every layout is self-describing
 	from its first byte, which is what lets old data keep decoding.
 ]=]
+-- Codec helpers for packing and unpacking Roblox datatypes.
 Scribe.Datatypes = require(script.Internal.Datatypes)
 
 --[=[
@@ -2883,6 +3069,7 @@ Scribe.Datatypes = require(script.Internal.Datatypes)
 	gives `"2K"`. Anything past the suffix table renders in full rather than losing
 	its magnitude.
 ]=]
+-- Formats a number or Big value with suffixes and rounded decimal places.
 function Scribe.Short(value: (number | BigValue)?, decimals: number?): string
 	if decimals ~= nil and (type(decimals) ~= "number" or decimals < 0 or decimals % 1 ~= 0) then
 		error(`Scribe.Short: decimals must be a non-negative whole number, got {tostring(decimals)}`, 2)
@@ -2908,6 +3095,7 @@ end
 	using this one. Index 1 is the units tier and must be empty, because it is what
 	renders a small number unchanged.
 ]=]
+-- Replaces suffixes used by Short; the first suffix must be empty.
 function Scribe.SetShortSuffixes(suffixes: { string })
 	BigMath.SetSuffixes(suffixes)
 end
@@ -2933,6 +3121,7 @@ end
 	Calling this twice with different values, or after a bundle exists, is an error,
 	because the value may already have been applied.
 ]=]
+-- Sets process-wide options before any bundle is built; conflicting calls error.
 function Scribe.Configure(config: { AutoSaveInterval: number? })
 	if type(config) ~= "table" then
 		error("Scribe.Configure: config must be a table", 2)
@@ -2993,6 +3182,7 @@ Scribe.Reason = table.freeze({
 	deliberately not members, so a reason that is not in this table came from your
 	handler rather than from Scribe.
 ]=]
+-- Named framework refusals for Request; handlers may return their own reasons.
 Scribe.RequestReason = table.freeze({
 	RateLimited = "rate-limited" :: Types.RequestReason,
 	NotReady = "not-ready" :: Types.RequestReason,
@@ -3032,6 +3222,7 @@ Scribe.RequestReason = table.freeze({
 	It is present on every framework refusal, including the four the client raises
 	with no reply frame at all, and absent on success and on handler values.
 ]=]
+-- Identity marker distinguishing framework request failures from handler replies.
 Scribe.RequestFailed = Types.RequestFailed
 
 --[=[
@@ -3046,6 +3237,7 @@ Scribe.RequestFailed = Types.RequestFailed
 	`PaidRandomRestricted` and `PolicyPending`. Each one's
 	string is in the [Monetization](../monetization.md#reading-the-refusal) guide.
 ]=]
+-- Fixed soft-currency purchase refusals; grant errors return their own text.
 Scribe.PurchaseReason = table.freeze({
 	DataNotLoaded = "player data not loaded" :: Types.PurchaseReason,
 	InvalidCostSpec = "invalid Cost spec" :: Types.PurchaseReason,
@@ -3072,7 +3264,9 @@ Scribe.PurchaseReason = table.freeze({
 	`PaidRandomRestricted` and `PolicyPending`. Each one's
 	string is in the [Gifting](../gifting.md#reading-the-refusal) guide.
 ]=]
+-- Fixed gift refusals; other failures may return diagnostic text.
 Scribe.GiftReason = table.freeze({
+	ProductRetired = "product retired" :: Types.GiftReason,
 	BuyerDataNotLoaded = "buyer data not loaded" :: Types.GiftReason,
 	InvalidRecipient = "invalid recipient" :: Types.GiftReason,
 	CannotGiftYourself = "cannot gift yourself" :: Types.GiftReason,
@@ -3106,6 +3300,7 @@ Scribe.GiftReason = table.freeze({
 	and `NotLoaded`. Each one's string is in the
 	[Monetization](../monetization.md#paid-random-items) guide.
 ]=]
+-- Named eligibility states for product queries and purchase prompts.
 Scribe.ProductState = table.freeze({
 	Purchasable = "purchasable" :: Types.ProductState,
 	Owned = "owned" :: Types.ProductState,
@@ -3120,6 +3315,7 @@ Scribe.ProductState = table.freeze({
 	@prop OpKind { [string]: OpKind }
 	The kinds of replication op, as named constants.
 ]=]
+-- Named replication operations for diagnostics.
 Scribe.OpKind = table.freeze({
 	Init = "Init" :: Types.OpKind,
 	Set = "Set" :: Types.OpKind,
@@ -3134,6 +3330,7 @@ Scribe.OpKind = table.freeze({
 	@prop LogLevel { [string]: LogLevel }
 	The log levels, as named constants, for [Scribe.GetRecentLogs] filters.
 ]=]
+-- Named severity levels for logging and log filters.
 Scribe.LogLevel = table.freeze({
 	Debug = "Debug" :: Types.LogLevel,
 	Info = "Info" :: Types.LogLevel,
@@ -3148,6 +3345,7 @@ Scribe.LogLevel = table.freeze({
 	@prop LogCategory { [string]: LogCategory }
 	The log categories, as named constants, for [Scribe.GetRecentLogs] filters.
 ]=]
+-- Named subsystem categories for log filters.
 Scribe.LogCategory = table.freeze({
 	Persistence = "Persistence" :: Types.LogCategory,
 	Replication = "Replication" :: Types.LogCategory,
@@ -3168,6 +3366,7 @@ Scribe.LogCategory = table.freeze({
 	@prop Status { [string]: Status }
 	The DataStore health states, as named constants. See [Scribe.GetStatus] and [Client.GetServiceStatus].
 ]=]
+-- Named DataStore health states.
 Scribe.Status = table.freeze({
 	Healthy = "Healthy" :: Types.Status,
 	Degraded = "Degraded" :: Types.Status,
@@ -3176,10 +3375,24 @@ Scribe.Status = table.freeze({
 
 --[=[
 	@within Scribe
+	@tag Leaderboards
+	@prop LeaderboardStatus { [string]: LeaderboardStatus }
+	The per-board states returned by Server.GetLeaderboardStatus.
+]=]
+-- Named per-board health states, separate from DataStore health.
+Scribe.LeaderboardStatus = table.freeze({
+	Starting = "Starting" :: Types.LeaderboardStatus,
+	Healthy = "Healthy" :: Types.LeaderboardStatus,
+	Degraded = "Degraded" :: Types.LeaderboardStatus,
+})
+
+--[=[
+	@within Scribe
 	@tag Lifecycle
 	@prop SessionState { [string]: SessionState }
 	A profile's session states, as named constants. See [Server.GetState].
 ]=]
+-- Named profile lifecycle states returned by GetState.
 Scribe.SessionState = table.freeze({
 	Loading = "Loading" :: Types.SessionState,
 	Ready = "Ready" :: Types.SessionState,
@@ -3188,10 +3401,28 @@ Scribe.SessionState = table.freeze({
 
 --[=[
 	@within Scribe
+	@tag Lifecycle
+	@prop LoadPhase { [string]: LoadPhase }
+	The loading stages returned as the second value from Server.GetState.
+]=]
+-- Named stages reported while a profile is loading.
+Scribe.LoadPhase = table.freeze({
+	WaitingForErase = "WaitingForErase" :: Types.LoadPhase,
+	AcquiringSession = "AcquiringSession" :: Types.LoadPhase,
+	ReadingProfile = "ReadingProfile" :: Types.LoadPhase,
+	Retrying = "Retrying" :: Types.LoadPhase,
+	Initializing = "Initializing" :: Types.LoadPhase,
+	Importing = "Importing" :: Types.LoadPhase,
+	ImportThrottled = "ImportThrottled" :: Types.LoadPhase,
+})
+
+--[=[
+	@within Scribe
 	@tag Visibility
 	@prop Visibility { [string]: Visibility }
 	The root visibilities, as named constants.
 ]=]
+-- Named replication targets for declared fields.
 Scribe.Visibility = table.freeze({
 	Replicated = "Replicated" :: Types.Visibility,
 	ServerOnly = "ServerOnly" :: Types.Visibility,
@@ -3205,6 +3436,7 @@ Scribe.Visibility = table.freeze({
 	The same table as [Scribe.Reason], under the name of the type it holds.
 	`Scribe.Reason` is the older name and both stay.
 ]=]
+-- Alias of Reason using the matching exported type name.
 Scribe.LifecycleReason = Scribe.Reason
 
 --[=[
@@ -3216,6 +3448,7 @@ Scribe.LifecycleReason = Scribe.Reason
 	any and on the client. Add-ons use it to recognise profile keys in log text, so a custom
 	prefix is redacted as the default one is.
 ]=]
+-- Returns the server bundle prefix, or PLAYER_ before setup and on clients.
 function Scribe.GetProfileKeyPrefix(): string
 	return Addons.ProfileKeyPrefix()
 end
@@ -3228,8 +3461,23 @@ end
 	The current data-service health, derived from ProfileStore's error signals
 	with hysteresis. Also broadcast to clients via `Client:GetServiceStatus`.
 ]=]
+-- Returns current DataStore health.
 function Scribe.GetStatus(): Status
 	return Health.GetStatus()
+end
+
+--[=[
+	@within Scribe
+	@tag Diagnostics
+	@function GetLeaderboardSnapshot
+	@return { LeaderboardSnapshotEntry }
+	Cached health for every board in running server bundles. Makes no DataStore
+	requests. Returns fresh records sorted by process-local `BundleId`, then `Name`.
+	Empty on clients and when no boards are running. Bundle IDs are not persistent.
+]=]
+-- Returns cached board health without DataStore requests; empty on clients.
+function Scribe.GetLeaderboardSnapshot(): { LeaderboardSnapshotEntry }
+	return if RunService:IsServer() then LeaderboardDiagnostics.Snapshot() else {}
 end
 
 --[=[
@@ -3241,6 +3489,7 @@ end
 
 	The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 ]=]
+-- Fires when DataStore health changes.
 Scribe.OnStatusChanged = Health.OnStatusChanged
 
 --[=[
@@ -3252,6 +3501,7 @@ Scribe.OnStatusChanged = Health.OnStatusChanged
 
 	The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 ]=]
+-- Fires for each Error or Fatal log entry.
 Scribe.OnIssue = Log.OnIssue
 
 --[=[
@@ -3259,18 +3509,21 @@ Scribe.OnIssue = Log.OnIssue
 	@tag Diagnostics
 	@function AddLogSink
 	@param fn (entry: LogEntry) -> ()
+	@param options LogSinkOptions?
 	@return () -> ()
 	Registers an extra log sink. Scribe never sends logs anywhere itself. Add a
 	sink to forward them to your own pipeline. Keep secrets in game code.
 
-	Returns a function that removes the sink again. Calling it twice is a no-op
-	rather than removing whoever took that slot since. Keep it if your sink has a
-	lifetime (a hot-reloaded module, a bundle you `Stop()`), because the sink list
-	is a module singleton that nothing else clears, and **every entry spawns a
-	thread per registered sink**, on the busiest failure path there is.
+	Filters at `options.Level` or the configured `LogLevel` before dispatch.
+	Each sink has one worker and a bounded queue (`MaxQueued`, default 128).
+	On overflow, more severe entries replace lower-severity entries; otherwise
+	the incoming entry is dropped. `LogSinkDropped` counts these losses.
+	The returned function detaches the sink and clears queued entries. A callback
+	already running may finish. Detaching twice is safe.
 ]=]
-function Scribe.AddLogSink(fn: (entry: LogEntry) -> ()): () -> ()
-	return Log.AddSink(fn :: any)
+-- Adds a filtered, bounded log sink; returns its disconnect function.
+function Scribe.AddLogSink(fn: (entry: LogEntry) -> (), options: LogSinkOptions?): () -> ()
+	return Log.AddSink(fn :: any, options)
 end
 
 --[=[
@@ -3287,6 +3540,7 @@ end
 	Returns a function that removes this registration and never a later one; keep
 	it for the add-on's Stop.
 ]=]
+-- Registers plugin actions; returned cleanup removes only this registration.
 function Scribe.RegisterAddon(name: string, actions: Addons.Actions): () -> ()
 	return Addons.Register(name, actions)
 end
@@ -3304,6 +3558,7 @@ end
 	string unions, so editors autocomplete valid values (see the Log Code
 	Reference for the full list of codes).
 ]=]
+-- Returns filtered retained logs, oldest first; Limit keeps the newest entries.
 function Scribe.GetRecentLogs(filter: Log.LogFilter?): { LogEntry }
 	return Log.GetRecent(filter)
 end
@@ -3317,6 +3572,7 @@ end
 	depths, …) for admin panels and load tests. Plain counters are numbers;
 	timing and size distributions are `{ Count, Average, Max }` records.
 ]=]
+-- Returns this context's counters and distribution summaries.
 function Scribe.GetMetrics(): { [string]: number | { Count: number, Average: number, Max: number } }
 	return Metrics.Get()
 end
@@ -3347,6 +3603,7 @@ end
 	how many the window holds, `Age` the seconds since the newest, and `Window` the
 	seconds the ring spans, so a caller can tell a burst from an afternoon.
 ]=]
+-- Returns recent distribution percentiles with sample age and window size.
 function Scribe.GetPercentiles(): { [string]: Metrics.Percentiles }
 	return Metrics.GetPercentiles()
 end
@@ -3370,10 +3627,12 @@ end
 	is not the same as an allowance of zero, and code that confuses the two stalls
 	forever in exactly the environments where there is nothing to conserve.
 
-	Purely a read. To have Scribe act on it, set
-	[`BudgetPolicy`](../configuration.md#integrity), which paces the two leaderboard
-	background loops and deliberately touches no save path.
+	Purely a read. Global leaderboard background requests automatically use shared
+	budget pacing. [`BudgetPolicy`](../configuration.md#integrity) additionally enables
+	faster backlog draining when allowance permits and budget waits during leaderboard
+	erasure. These settings do not change profile saves.
 ]=]
+-- Reads current DataStore allowances; Available is false if the query fails.
 function Scribe.GetBudgetSnapshot(): Budget.Snapshot
 	return Budget.Snapshot()
 end
@@ -3394,17 +3653,18 @@ end
 	[The three you must set](../configuration.md#the-three-you-must-set) is where
 	to start on a first bundle.
 ]=]
+-- Builds a Server/Client bundle; calling Scribe(options) uses the same function.
 Scribe.new = buildBundle
 
 -- The metatable is attached through a cast so it stays invisible to the type
 -- system; the callable type is declared explicitly below instead (the new
 -- solver does not yet instantiate generic __call metamethods).
 setmetatable(Scribe :: any, {
-	__call = function<T>(_self: any, options: ScribeOptions<T>): Bundle<T>
+	__call = function<T, S>(_self: any, options: ScribeOptions<T, S>): Bundle<T, S>
 		return buildBundle(options)
 	end,
 })
 
-export type ScribeModule = typeof(Scribe) & <T>(options: ScribeOptions<T>) -> Bundle<T>
+export type ScribeModule = typeof(Scribe) & <T, S>(options: ScribeOptions<T, S>) -> Bundle<T, S>
 
 return (Scribe :: any) :: ScribeModule

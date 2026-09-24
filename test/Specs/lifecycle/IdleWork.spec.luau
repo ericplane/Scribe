@@ -13,10 +13,10 @@ return function()
 	local Profile = require(Root.Scribe.Internal.Profile)
 	local TestCtx = require(Root.Test.Helpers.TestCtx)
 
-	local realNow, realWait = Clock.Now, Clock.Wait
+	local realNow, realWait, realMonotonic = Clock.Now, Clock.Wait, Clock.Monotonic
 	local realSpan = Profile.SyncSpan
 	afterEach(function()
-		Clock.Install({ Now = realNow, Wait = realWait })
+		Clock.Install({ Now = realNow, Wait = realWait, Monotonic = realMonotonic })
 		Sched.Reset()
 		Profile.SyncSpan = realSpan
 	end)
@@ -91,6 +91,12 @@ return function()
 
 		it("parks the write pacer while its queue is empty and wakes it for a score", function()
 			countWaits()
+			local now = realMonotonic()
+			Clock.Install({
+				Monotonic = function()
+					return now
+				end,
+			})
 			local harness = TestCtx.make({
 				Template = { Wins = Scribe.Int(0, { Min = 0 }) },
 				Options = { Leaderboards = { Wins = { Stat = "Wins" } } },
@@ -103,6 +109,8 @@ return function()
 			end)
 			data.Wins.Set(3)
 			local awake = not lb.Workers().PacerParked
+			-- Advance past the write interval.
+			now += 30
 			local parkedAgain = within(200, function()
 				return lb.Workers().PacerParked
 			end)

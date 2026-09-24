@@ -37,6 +37,7 @@ return function()
 	local RECIPIENT_KEY = "Default/PLAYER_91002"
 
 	local function makeHarness(extraOptions)
+		local finished = require(Root.Scribe.Internal.Signal).new()
 		local options = {
 			Products = {
 				Coins1000 = {
@@ -49,7 +50,10 @@ return function()
 				GiftVIP = { Id = 222, Category = "Gamepass", Grants = "VIP" },
 			},
 			GiftCooldown = 0,
-			PromptProductPurchase = function() end,
+			PromptProductPurchaseFinished = finished,
+			PromptProductPurchase = function(player, productId)
+				finished:Fire(player.UserId, productId, true)
+			end,
 		}
 		for key, value in extraOptions or {} do
 			options[key] = value
@@ -201,13 +205,14 @@ return function()
 			end, "row1")).to.equal("d=GRANTED buyerVIP=true credits=0 queued=0 pendingOn=[] pendingOff=[222]")
 		end)
 
-		it("row 2: an intent older than GiftIntentTTL is not honoured", function()
+		it("row 2: an unresolved intent keeps its recipient beyond GiftIntentTTL", function()
 			-- The comparison is on Clock.Now (WALL time) on both arms, and has to be:
 			-- the stamp is persisted and read back in a later session, where a
 			-- monotonic value would be meaningless.
-			expect(bothArms({ GiftIntentTTL = 300 }, function(_harness, _buyer, entry)
+			expect(bothArms({ GiftIntentTTL = 300 }, function(harness, _buyer, entry)
+				harness.Leave(harness.Join(RECIPIENT))
 				plantIntent(entry, { GiftId = "stale", Ts = Clock.Now() - 400 })
-			end, "row2")).to.equal("d=GRANTED buyerVIP=true credits=0 queued=0 pendingOn=[] pendingOff=[222]")
+			end, "row2")).to.equal("d=GRANTED buyerVIP=false credits=0 queued=1 pendingOn=[] pendingOff=[]")
 		end)
 
 		it("row 3: a recipient who already owns the perk converts the purchase to a credit", function()
@@ -299,7 +304,7 @@ return function()
 						local context = entry.Context or {}
 						table.insert(seen, if context.Player ~= nil then "Player" else "UserId")
 					end
-				end)
+				end, { Level = "Warn" })
 
 				local harness = makeHarness()
 				local buyer, entry = harness.Join(BUYER)
@@ -330,15 +335,10 @@ return function()
 			end)
 		end)
 
-		it("only the ONLINE arm clears a TTL-expired slot; offline ignores it in place", function()
-			-- Offline skips the clear on purpose: it sits on a read-only path, and
-			-- clearing would cost an extra DataStore round trip to remove a record the
-			-- OnLoad sweep will collect for free on the buyer's next session. Rows 1
-			-- and 2 above already show the DECISION is the same either way; this pins
-			-- that the storage difference is intended, so a parity fix that "tidies"
-			-- it has to say so.
+		it("both arms clear an old intent only after its gift settles", function()
 			withClock(1700000000, function()
 				local harness = makeHarness({ GiftIntentTTL = 300 })
+				harness.Leave(harness.Join(RECIPIENT))
 				local buyer, entry = harness.Join(BUYER)
 				entry.Tree.Reserved.PendingGifts["222"].Set({
 					RecipientId = RECIPIENT,
@@ -361,17 +361,12 @@ return function()
 					Product = "GiftVIP",
 				})
 				harness.Data.Flush(buyer2)
-				-- GRANTED, and for a reason worth naming: the offline receipt above
-				-- already granted the buyer the perk, so this one falls into the
-				-- no-intent policy with the perk owned and no credit banked, and
-				-- GrantOrCredit mints one. The slot census is what this test is about.
+				-- The second gift is queued for the same intended recipient.
 				expect(harness.Data.HandleReceipt(receipt(BUYER, 222, "ttl-online"))).to.equal(GRANTED)
 				harness.Data.Flush(buyer2)
 				local afterOnline = pendingKeys(harness.Fake.Persisted[BUYER_KEY]._Scribe)
 
-				expect(("offline=[%s] online=[%s]"):format(afterOffline, afterOnline)).to.equal(
-					"offline=[222] online=[]"
-				)
+				expect(("offline=[%s] online=[%s]"):format(afterOffline, afterOnline)).to.equal("offline=[] online=[]")
 				harness.Cleanup()
 			end)
 		end)

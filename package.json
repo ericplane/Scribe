@@ -1,0 +1,44 @@
+{
+  "name": "@rbxts/scribe",
+  "version": "2.5.0",
+  "description": "Persistent, schema-typed, automatically replicated Roblox data.",
+  "main": "dist/npm/src/init.luau",
+  "types": "types/index.d.ts",
+  "files": [
+    "dist/npm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ericplane/Scribe.git"
+  },
+  "homepage": "https://scribe.ericplane.dev/",
+  "license": "MIT",
+  "author": "ericplane",
+  "scripts": {
+    "build": "node scripts/build-npm.mjs",
+    "test:types": "node scripts/check-types.mjs",
+    "test:roblox-ts": "node scripts/check-roblox-ts.mjs",
+    "test": "node scripts/test-all.mjs"
+  },
+  "devDependencies": {
+    "@rbxts/compiler-types": "3.0.0-types.0",
+    "@rbxts/fusion": "0.2.0",
+    "@rbxts/react": "17.3.7-ts.2",
+    "@rbxts/types": "1.0.953",
+    "@rbxts/vide": "0.6.1",
+    "roblox-ts": "3.0.0",
+    "typescript": "5.5.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "private": true,
+  "keywords": [
+    "roblox",
+    "roblox-ts",
+    "rbxts",
+    "scribe",
+    "luau",
+    "datastore"
+  ]
+}

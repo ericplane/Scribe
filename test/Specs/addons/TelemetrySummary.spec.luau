@@ -78,6 +78,33 @@ return function()
 		expect(`before={beforeAnySave} {titles}`).to.equal("before=0 Performance: SlowSaves")
 	end)
 
+	it("includes fresh runtime diagnostics with independent rolling load timings", function()
+		local h = H.start({ Summaries = { Enabled = true, Interval = 60 } }, function(scribe)
+			scribe.Metrics = { ReceiptHistoryRefusals = 7, LogSinkDropped = 30, LbWrites = 200, LbQueueDepth = 12 }
+		end)
+		h.Scribe.Metrics = { ReceiptHistoryRefusals = 9, LogSinkDropped = 34, LbWrites = 220, LbQueueDepth = 2 }
+		h.Scribe.Percentiles = {
+			ProfileLoadDuration = { P50 = 0.3, P90 = 0.8, P99 = 2, Samples = 10, Window = 300, Age = 5 },
+			LoadDuration = { P50 = 0.5, P90 = 1.2, P99 = 3, Samples = 10, Window = 300, Age = 5 },
+			PlayerLeavingHookDuration = { P50 = 0.01, P90 = 0.1, P99 = 0.2, Samples = 8, Window = 240, Age = 7 },
+		}
+		h.Advance(60)
+		local payload = h.Http.Requests[1].Payload
+		h.Telemetry:Stop()
+		expect(field(payload, "Profile health")).to.equal("Healthy")
+		expect(field(payload, "Receipts")).to.equal("2 history-capacity refusals")
+		expect(field(payload, "Log delivery")).to.equal("4 dropped · n/a sink errors")
+		expect(field(payload, "Leaderboard requests")).to.equal(
+			"20 writes · n/a skipped\nn/a read failures · n/a write failures\n2 last reported queue · n/a budget deferrals · n/a queue drops"
+		)
+		expect(field(payload, "Profile acquisition (rolling)")).to.equal(
+			"p50 0.30s · p90 0.80s · p99 2.00s (10 samples over 5m 0s, newest 5.00s ago)"
+		)
+		expect(field(payload, "Player load (rolling)") ~= nil).to.equal(true)
+		expect(field(payload, "Player leaving hook (rolling)") ~= nil).to.equal(true)
+		expect(#payload.embeds[1].fields <= 25).to.equal(true)
+	end)
+
 	it("needs MinSamples fresh saves at every check, not one fresh save on top of old ones", function()
 		local h = H.start({
 			Performance = { Interval = 60, Checks = 3, Rules = { SlowSaves = { Threshold = 2, MinSamples = 10 } } },

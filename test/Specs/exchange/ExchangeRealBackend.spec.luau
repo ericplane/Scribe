@@ -53,7 +53,7 @@ return function()
 	local nextId = 0
 	local function freshUserId(): number
 		nextId += 1
-		return 940000 + nextId
+		return 9400000000 + nextId
 	end
 	local nextExchange = 0
 	local function freshExchangeId(): string

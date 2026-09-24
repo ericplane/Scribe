@@ -26,6 +26,7 @@
 -- and that is the one direction this simulation must never err in.
 
 local Loader = require(script.Parent.Loader)
+local Guard = require(script.Parent.Guard)
 
 local SimHost = __SimHost
 
@@ -103,25 +104,27 @@ local function newFrameSignal()
 	return signal, errors
 end
 
---- A `game` for one bundle: the harness's, with a PRIVATE RunService.
----
---- Only RunService is replaced, and only its frame signals. Everything else
---- forwards, which matters more than it looks: test/Sim/Guard installs the
---- simulation's disk into the SHARED harness DataStoreService, and
---- src/Internal/Budget.luau:53 re-resolves that service on every call. A proxy
---- that rebuilt the service table instead of forwarding to it would hand Scribe a
---- DataStoreService with no disk behind it, and that surfaces as budget snapshots
---- quietly reporting "unavailable" rather than as an error.
----
---- Why a private signal at all: Scribe's replication flush loop is
---- `RunService.PostSimulation:Connect` (src/Server/Replication.luau:319). With the
---- harness's shared signal every simulated server in every universe hangs off ONE
---- object, so firing it would flush unrelated servers -- and nothing in the
---- simulation fires it, which is half of why replication has never run here.
-local function bundleGame(jobId: string?)
+--- Isolate frame signals, players and DataStore budgets per simulated server.
+--- Resolve the disk on each call to follow Guard installs and resets.
+local function bundleGame(jobId: string?, getPlayers: (() -> { any })?)
 	local baseGame = SimHost.BaseGlobals.game
 	local baseRun = baseGame:GetService("RunService")
 	local frame, errors = newFrameSignal()
+	local dataStoreService = Guard.ServiceFor(jobId or baseGame.JobId)
+	local basePlayers = baseGame:GetService("Players")
+	local players = setmetatable({
+		GetPlayers = function()
+			return if getPlayers then getPlayers() else {}
+		end,
+		GetPlayerByUserId = function(_self, userId)
+			for _, player in if getPlayers then getPlayers() else {} do
+				if player.UserId == userId then
+					return player
+				end
+			end
+			return nil
+		end,
+	}, { __index = basePlayers })
 
 	-- __index rather than a copy: IsStudio/IsServer/IsRunning must keep answering
 	-- exactly what the harness answers.
@@ -144,12 +147,16 @@ local function bundleGame(jobId: string?)
 		GetService = function(_self: any, name: string)
 			if name == "RunService" then
 				return runService
+			elseif name == "DataStoreService" then
+				return dataStoreService
+			elseif name == "Players" then
+				return players
 			end
 			return baseGame:GetService(name)
 		end,
 	}, { __index = baseGame })
 
-	return proxy, frame, errors
+	return proxy, frame, errors, players
 end
 
 export type Config = {
@@ -160,6 +167,7 @@ export type Config = {
 	ProfileStore: any, -- that server's ProfileStore module instance
 	Transport: any,
 	JobId: string?,
+	GetPlayers: (() -> { any })?,
 }
 
 --- Build one server's Scribe.
@@ -176,7 +184,7 @@ function Bundle.new(config: Config)
 	local root = SimHost.Root
 	local cache = Loader.NewCache()
 	local overrides = scribeGlobals()
-	local gameProxy, frameSignal, frameErrors = bundleGame(config.JobId)
+	local gameProxy, frameSignal, frameErrors, players = bundleGame(config.JobId, config.GetPlayers)
 	overrides.game = gameProxy
 
 	local Scribe = Loader.RequireFresh(root.Scribe, cache, overrides)
@@ -249,6 +257,7 @@ function Bundle.new(config: Config)
 		Health = Health,
 		Failure = Failure,
 		FrameSignal = frameSignal,
+		Players = players,
 		-- Anything the flush loop threw this run. Empty is the invariant; Guard
 		-- asserts it so no spec has to remember to.
 		FrameErrors = frameErrors,

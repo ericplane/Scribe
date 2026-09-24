@@ -56,6 +56,28 @@ function Guard.Install(universe)
 	installed = universe
 end
 
+--- Bind requests to this server; resolve the disk after each Install or Reset.
+function Guard.ServiceFor(jobId: string)
+	local fallback = game:GetService("DataStoreService")
+	local function current()
+		return if installed then installed.Disk:ServiceFor(jobId) else fallback
+	end
+	return {
+		GetDataStore = function(_self, ...)
+			local service = current()
+			return service:GetDataStore(...)
+		end,
+		GetOrderedDataStore = function(_self, ...)
+			local service = current()
+			return service:GetOrderedDataStore(...)
+		end,
+		GetRequestBudgetForRequestType = function(_self, ...)
+			local service = current()
+			return service:GetRequestBudgetForRequestType(...)
+		end,
+	}
+end
+
 --- Put everything back. Safe to call when nothing was installed.
 function Guard.Reset()
 	local DataStoreService = game:GetService("DataStoreService")

@@ -73,7 +73,7 @@ return function()
 			if logEntry.Code == "MESSAGE_HANDLER_ERROR" then
 				seen._error = tostring(logEntry.Message)
 			end
-		end)
+		end, { Level = "Warn" })
 		return seen, unsubscribe
 	end
 

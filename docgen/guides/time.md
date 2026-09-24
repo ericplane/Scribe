@@ -33,7 +33,7 @@ local function claimDaily(player: Player): boolean
 end
 ```
 
-`SetTimed(value, seconds)` sets the value and arms the timer. When the timer lapses Scribe writes the declared default back and fires `Changed`, so a client `Observe` is all the UI needs:
+`SetTimed(value, seconds)` sets the value and arms the timer. When the timer lapses Scribe writes the declared default back. A client `Observe` follows that value, which is enough to show or hide the claim button:
 
 ```lua
 Data.LastDaily.Observe(function(spent)
@@ -41,11 +41,51 @@ Data.LastDaily.Observe(function(spent)
 end)
 ```
 
-`Active()` returns two things, so the countdown comes for free:
+`Active()` returns whether the timer is running and its remaining seconds. If it is inactive, it returns `false, nil`:
 
 ```lua
 local spent, remaining = data.LastDaily.Active()
 ```
+
+## Showing a client countdown
+
+The client can read the same timer with `Data.LastDaily.Active()`. It uses the replicated expiry, so a timed `false` or `0` can still be active. Only the server can call `SetTimed` and `ExtendTimed`.
+
+Read `Active()` again when you want to refresh the display. `Observe` and `Changed` track the **value**, not elapsed time; extending a timer without changing its value does not call them.
+
+This LocalScript assumes `countdownLabel` is your `TextLabel` and `EmberfallData` declares `LastDaily`:
+
+```lua
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Data = require(ReplicatedStorage.Shared.EmberfallData).Client
+
+local ticker = task.spawn(function()
+    while true do
+        if Data.IsReady() then
+            local active, remaining = Data.LastDaily.Active()
+            countdownLabel.Text = if active and remaining
+                then `Ready in {math.ceil(remaining)}s`
+                else "Ready"
+        else
+            countdownLabel.Text = "Loading..."
+        end
+        task.wait(0.25)
+    end
+end)
+
+countdownLabel.Destroying:Once(function()
+    task.cancel(ticker)
+end)
+```
+
+The refresh interval is your UI's choice. These reads are local and send no requests to the server. Stop the task when unmounting the UI too, if you remove it without destroying the label.
+
+Scribe uses [`Workspace:GetServerTimeNow()`](https://create.roblox.com/docs/reference/engine/classes/Workspace#GetServerTimeNow) for the client's estimate of server time. The display can reach zero before the server's next expiry sweep resets the value. Always check eligibility again on the server before granting a reward or applying an effect.
+
+Only the local player's visible timed fields expose deadlines. `ServerOnly` timers, cooldown keys, and internal claim records stay private. `GetShared` still returns other players' shared values, without timer accessors or deadlines.
+
+!!! important "Deploy both sides together"
+    Client deadlines use a new unsaved `_ScribeSession.Timed` field, which changes the schema hash in 2.5.0. Deploy the server and client together.
 
 ## What a timed field can hold
 
@@ -65,7 +105,7 @@ Two more behaviours to know:
 - **Durations cap at a finite value of roughly 126 years**, so `SetTimed(value, math.huge)` means "effectively permanent".
 
 !!! warning "A plain `Set` does not cancel a running timer"
-    If you `Set` a permanent value while an earlier `SetTimed` is still armed, the old timer still lapses and resets the field to its template default, throwing your value away. To convert a timed value into a permanent one, re-issue `SetTimed(value, math.huge)`, or wait until `Active()` reports false before the plain `Set`.
+    If you `Set` a permanent value while an earlier `SetTimed` is still armed, the old timer still lapses and resets the field to its template default, throwing your value away. To make a timed value effectively permanent, re-issue `SetTimed(value, math.huge)`. An inactive `Active()` result alone does not mean the server's expiry sweep has cleared the old timer yet.
 
 ## Extending a running timer
 
@@ -83,7 +123,9 @@ else
 end
 ```
 
-The `Active()` check matters. `ExtendTimed` with no timer running **arms a fresh one** from now, so a field that was never `SetTimed` starts counting down and reverts to its declared default. `ExtendTimed` never writes the value itself, so unlike `SetTimed` it has nothing to replicate.
+The `Active()` check matters. `ExtendTimed` with no timer running **arms a fresh one** from now, so a field that was never `SetTimed` starts counting down and reverts to its declared default. It leaves the value unchanged and replicates the updated deadline by default.
+
+`SetTimed(value, seconds, false)` suppresses that write's value and deadline updates. `ExtendTimed(seconds, false)` suppresses its deadline update. As with ordinary values, a later full snapshot still includes the current state; `false` is not a privacy setting.
 
 ## Cooldowns
 
@@ -121,9 +163,9 @@ One signal covers every cooldown, because keys are arbitrary strings rather than
 | --- | --- | --- |
 | Holds a value | yes | no |
 | Declared in the template | yes | no, keyed by a string |
-| Replicates to the owner | yes, like any field | never |
+| Replicates to the owner | visible value and deadline | never |
 | Expiry notification | `Changed` fires with the default | `OnCooldownEnded` |
-| Read without side effects | `Get()`, `Active()` | `PeekCooldown` |
+| Read without side effects | `Get()`, `Active()` on server and client | `PeekCooldown` on server |
 | Good for | boosters, buffs, a claimed flag | ability recharges, rate limits |
 
 Emberfall's daily reward is a timed field because the UI shows a claimed state and a countdown. Emberfall's dash is a cooldown because nothing ever needs to read it.

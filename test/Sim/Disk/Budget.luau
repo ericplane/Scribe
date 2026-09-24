@@ -64,33 +64,33 @@ local SERVER_LIMITS = {
 	end,
 }
 
--- Per-experience, summed over every live server. `Write` at CCU*20 against the
--- per-server CCU*40 is the asymmetry described above.
+-- Standard and ordered stores have separate experience budgets.
+-- https://create.roblox.com/docs/cloud-services/data-stores/error-codes-and-limits
 local EXPERIENCE_LIMITS = {
-	Read = function(ccu)
+	StandardRead = function(ccu)
 		return 300 + ccu * 40
 	end,
-	Write = function(ccu)
+	StandardWrite = function(ccu)
 		return 300 + ccu * 20
 	end,
-	List = function(ccu)
+	StandardList = function(ccu)
 		return 300 + ccu * 2
 	end,
-	Remove = function(ccu)
+	StandardRemove = function(ccu)
 		return 300 + ccu * 40
 	end,
-}
-
--- Which experience pool a per-server kind draws from.
-local EXPERIENCE_TIER = {
-	StandardRead = "Read",
-	OrderedRead = "Read",
-	StandardWrite = "Write",
-	OrderedWrite = "Write",
-	StandardRemove = "Remove",
-	OrderedRemove = "Remove",
-	StandardList = "List",
-	OrderedList = "List",
+	OrderedRead = function(ccu)
+		return 300 + ccu * 40
+	end,
+	OrderedWrite = function(ccu)
+		return 300 + ccu * 20
+	end,
+	OrderedList = function(ccu)
+		return 300 + ccu * 2
+	end,
+	OrderedRemove = function(ccu)
+		return 300 + ccu * 40
+	end,
 }
 
 -- Which of the four queues a request waits in, and the error it is dropped with.
@@ -107,6 +107,7 @@ local QUEUE_OF = {
 
 local DROP_ERROR = {
 	GetAsync = "RequestQueueFull",
+	GetSortedAsync = "GetSortedQueueFull",
 	ListVersionsAsync = "RequestQueueFull",
 	SetAsync = "SetQueueFull",
 	UpdateAsync = "UpdateQueueFull",
@@ -199,18 +200,15 @@ function Budget.TryTake(self, jobId: string, kind: string): boolean
 	end
 
 	local pool = poolFor(self, jobId)
-	local serverBefore = pool.Tokens[kind]
 	if not take(self, pool, kind, serverLimit(self._playerCount(jobId)), 1) then
 		self.Stats.RefusedServer += 1
 		return false
 	end
 
-	local tier = EXPERIENCE_TIER[kind]
+	local tier = kind
 	if not take(self, self._experience, tier, EXPERIENCE_LIMITS[tier](self._ccu()), 1) then
-		-- Refund the server tier. Without this the experience ceiling would
-		-- silently drain per-server allowances too, and a queued request would
-		-- pay twice for one eventual admission.
-		pool.Tokens[kind] = if serverBefore ~= nil then serverBefore else pool.Tokens[kind] + 1
+		-- Refund the server token when the experience budget refuses.
+		pool.Tokens[kind] += 1
 		self.Stats.RefusedExperience += 1
 		return false
 	end

@@ -43,8 +43,9 @@ return function()
 			if entry.Code == "DERIVED_MISMATCH" then
 				table.insert(seen, tostring(entry.Message))
 			end
-		end)
+		end, { Level = "Warn" })
 		local ok, err = pcall(body)
+		task.wait()
 		if unsubscribe then
 			unsubscribe()
 		end

@@ -45,9 +45,11 @@ end
 -- Test seam: a spec drives the pump against a budget it controls. nil restores the
 -- engine, and Reset clears it.
 local probe: ((requestType: string) -> number?)? = nil
+local playerCountProbe: (() -> number)? = nil
 
-function Budget.SetProbe(fn: ((requestType: string) -> number?)?)
+function Budget.SetProbe(fn: ((requestType: string) -> number?)?, countPlayers: (() -> number)?)
 	probe = fn
+	playerCountProbe = countPlayers
 end
 
 --- Requests left for one type, or nil when the engine cannot answer. nil and 0 are
@@ -134,11 +136,11 @@ local pumping: { [string]: boolean } = {}
 -- Granted but presumed unspent. Budget.Remaining reads the ENGINE, which has not moved
 -- between a grant and that caller issuing its request, so granting the next one off the
 -- same reading over-grants.
-local outstanding: { [string]: { { Count: number, At: number } } } = {}
+local outstanding: { [string]: { { Count: number, At: number, InFlight: boolean } } } = {}
 -- Held back from pacing callers, sized by the server.
 local reserves: { [string]: number } = {}
 
---- Sum of grants still inside GRANT_TTL, pruning the rest.
+--- Sum of unreleased requests and foreground grants still inside GRANT_TTL.
 local function outstandingFor(requestType: string): number
 	local held = outstanding[requestType]
 	if held == nil then
@@ -148,7 +150,7 @@ local function outstandingFor(requestType: string): number
 	local total, keep = 0, 1
 	for i = 1, #held do
 		local entry = held[i]
-		if now - entry.At < GRANT_TTL then
+		if entry.InFlight or now - entry.At < GRANT_TTL then
 			held[keep] = entry
 			keep += 1
 			total += entry.Count
@@ -162,13 +164,13 @@ end
 
 --- Records a grant and returns its release. By identity: outstandingFor compacts the
 --- list in place, so a position taken now means nothing later.
-local function debit(requestType: string, count: number): () -> ()
+local function debit(requestType: string, count: number, inFlight: boolean?): () -> ()
 	local held = outstanding[requestType]
 	if held == nil then
 		held = {}
 		outstanding[requestType] = held
 	end
-	local entry = { Count = count, At = Clock.Monotonic() }
+	local entry = { Count = count, At = Clock.Monotonic(), InFlight = inFlight == true }
 	table.insert(held, entry)
 	local released = false
 	return function()
@@ -193,6 +195,63 @@ local function spare(requestType: string): number?
 		return nil
 	end
 	return remaining - outstandingFor(requestType) - (reserves[requestType] or 0)
+end
+
+-- Shared per-server limit; other scripts and experience-wide limits are separate.
+-- The token bucket also bounds requests when the engine budget is unavailable.
+local BACKGROUND_FRACTION = 0.8
+type BackgroundRate = { Base: number, PerPlayer: number, Burst: number, MinReserve: number }
+local BACKGROUND_RATES: { [string]: BackgroundRate } = {
+	GetSortedAsync = { Base = 5, PerPlayer = 2, Burst = 2, MinReserve = 2 },
+	SetIncrementSortedAsync = { Base = 30, PerPlayer = 5, Burst = 8, MinReserve = 5 },
+}
+
+type BackgroundBucket = { Tokens: number, At: number, Rate: number }
+local background: { [string]: BackgroundBucket } = {}
+
+local function playerCount(): number
+	if playerCountProbe then
+		return math.max(0, playerCountProbe())
+	end
+	local ok, players = pcall(function()
+		return game:GetService("Players"):GetPlayers()
+	end)
+	return if ok then #players else 0
+end
+
+--- Claims one background request. Always release after the request, including failures.
+--- Release clears the reservation; it does not refund the rate token.
+function Budget.TryBackground(requestType: string): (boolean, () -> ())
+	local config = BACKGROUND_RATES[requestType]
+	assert(config ~= nil, `unsupported background budget {requestType}`)
+	local limit = config.Base + config.PerPlayer * playerCount()
+	local rate = limit * BACKGROUND_FRACTION / 60
+	local now = Clock.Monotonic()
+	local bucket = background[requestType]
+	if bucket == nil then
+		bucket = { Tokens = config.Burst, At = now, Rate = rate }
+		background[requestType] = bucket
+	else
+		-- Refill at the old rate so joins don't add retroactive credit.
+		bucket.Tokens = math.min(config.Burst, bucket.Tokens + math.max(0, now - bucket.At) * bucket.Rate)
+		bucket.At = now
+		bucket.Rate = rate
+	end
+	if bucket.Tokens < 1 then
+		return false, noRelease
+	end
+	-- Let queued foreground requests go first.
+	local queue = queues[requestType]
+	if queue ~= nil and #queue > 0 then
+		return false, noRelease
+	end
+	local remaining = Budget.Remaining(requestType)
+	local reserve = math.max(config.MinReserve, math.ceil(limit / 5), reserves[requestType] or 0)
+	if remaining ~= nil and remaining == remaining and remaining - outstandingFor(requestType) - reserve < 1 then
+		return false, noRelease
+	end
+	bucket.Tokens -= 1
+	return true, debit(requestType, 1, true)
 end
 
 --- Remove the head, record the outcome, then resume it.
@@ -309,6 +368,7 @@ function Budget.Reset()
 	pumping = {}
 	outstanding = {}
 	reserves = {}
+	background = {}
 	Budget.SetProbe(nil)
 end
 

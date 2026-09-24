@@ -1,10 +1,11 @@
 --!strict
 -- The clock seam: every time reading and timed wait goes through here, so a test can
--- replace them and fast-forward. Two clocks, because conflating them is a real bug:
+-- replace them and fast-forward. Keep their purposes separate:
 --   Now()       wall time (os.time). For anything persisted or compared across servers;
 --               it can jump when corrected, so never measure an interval with it.
 --   Monotonic() a steady process timer (os.clock). For intervals in one session; never
 --               persist it.
+--   ServerNow() synchronized server time for client countdown displays.
 -- ProfileStore reaches the clock only through globals, so loading it under a per-server
 -- environment (test/Sim/Env.luau) virtualises it without a fork.
 
@@ -12,6 +13,7 @@ local Clock = {}
 
 export type Impl = {
 	Now: (() -> number)?,
+	ServerNow: (() -> number)?,
 	Monotonic: (() -> number)?,
 	Wait: ((seconds: number?) -> number)?,
 	Delay: ((seconds: number, fn: (...any) -> (), ...any) -> thread)?,
@@ -23,16 +25,20 @@ export type Impl = {
 local DEFAULT_NOW: () -> number = function()
 	return os.time()
 end
+local DEFAULT_SERVER_NOW: () -> number = function()
+	return game:GetService("Workspace"):GetServerTimeNow()
+end
 local DEFAULT_MONOTONIC: () -> number = os.clock
 local DEFAULT_WAIT: (seconds: number?) -> number = task.wait
 local DEFAULT_DELAY: (seconds: number, fn: (...any) -> (), ...any) -> thread = task.delay
 
 Clock.Now = DEFAULT_NOW
+Clock.ServerNow = DEFAULT_SERVER_NOW
 Clock.Monotonic = DEFAULT_MONOTONIC
 Clock.Wait = DEFAULT_WAIT
 Clock.Delay = DEFAULT_DELAY
 
---- Replace one or more of the four. Anything omitted keeps its current value.
+--- Replace clock functions. A virtual Now also supplies ServerNow unless overridden.
 ---
 --- A replacement `Wait` must still yield. Scribe's background loops are shaped
 --- `while ... do Clock.Wait(n) ... end`, so a Wait that returns without yielding
@@ -40,6 +46,10 @@ Clock.Delay = DEFAULT_DELAY
 function Clock.Install(impl: Impl)
 	if impl.Now ~= nil then
 		Clock.Now = impl.Now
+		Clock.ServerNow = impl.Now
+	end
+	if impl.ServerNow ~= nil then
+		Clock.ServerNow = impl.ServerNow
 	end
 	if impl.Monotonic ~= nil then
 		Clock.Monotonic = impl.Monotonic
@@ -52,10 +62,11 @@ function Clock.Install(impl: Impl)
 	end
 end
 
---- Restore all four. A test that installs must reset, or it leaks a virtual clock
+--- Restore defaults. A test that installs must reset, or it leaks a virtual clock
 --- into every spec that runs after it.
 function Clock.Reset()
 	Clock.Now = DEFAULT_NOW
+	Clock.ServerNow = DEFAULT_SERVER_NOW
 	Clock.Monotonic = DEFAULT_MONOTONIC
 	Clock.Wait = DEFAULT_WAIT
 	Clock.Delay = DEFAULT_DELAY

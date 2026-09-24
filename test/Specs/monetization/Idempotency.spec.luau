@@ -6,10 +6,8 @@
 -- for soft-currency purchases, for callers who have a natural key (a shop click id,
 -- a quest reward id) and retry on failure.
 --
--- The claim deliberately does NOT live in _Scribe.ProcessedPurchaseIds. That ring is
--- capped at 200 and its own eviction warning says an evicted un-expired id means a
--- retried receipt could be granted twice -- so pushing ordinary shop traffic through
--- it would flush real receipt ids. Claims get their own namespace in the Timed store.
+-- Claims use a separate Timed namespace so shop traffic does not consume the
+-- receipt history's byte allowance or share its thirty-day retention window.
 
 local TestCtx = require(script.Parent.Parent.Parent.Helpers.TestCtx)
 

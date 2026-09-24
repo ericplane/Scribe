@@ -308,10 +308,7 @@ return function()
 			end
 		end)
 
-		it("is independent of the receipt TTL, which governs real money", function()
-			-- Shortening PurchaseIdTTL to bound claims would also shorten how long a
-			-- Roblox receipt is remembered, and Roblox's retry window is not the
-			-- game's to shorten. The two knobs are separate for exactly that reason.
+		it("lets PurchaseClaimTTL override the legacy PurchaseIdTTL fallback", function()
 			local now = 1700000000
 			Clock.Install({
 				Now = function()
@@ -335,7 +332,7 @@ return function()
 			end
 		end)
 
-		it("defaults to the receipt TTL, so an existing game is unchanged", function()
+		it("defaults to legacy PurchaseIdTTL when PurchaseClaimTTL is absent", function()
 			local now = 1700000000
 			Clock.Install({
 				Now = function()

@@ -168,7 +168,7 @@ return function()
 			for _, ccu in { 100, 500, 1000, 2000, 5000, 10000 } do
 				local servers = math.ceil(ccu / 50)
 				local perServer = Budget.SERVER_LIMITS.StandardWrite(50) * servers
-				local experience = Budget.EXPERIENCE_LIMITS.Write(ccu)
+				local experience = Budget.EXPERIENCE_LIMITS.StandardWrite(ccu)
 				line(
 					"%-8d %-14d %-16d %-12s",
 					ccu,

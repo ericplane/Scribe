@@ -15,6 +15,7 @@ local ExchangeVerdict = {}
 ExchangeVerdict.STORE_NAME = "ClaimExchangeVerdicts"
 
 export type Verdict = {
+	Id: string?, -- original id for a recovered legacy key
 	V: string, -- "Commit" or "Abort"
 	A: number, -- userId of role A
 	B: number, -- userId of role B
@@ -26,6 +27,33 @@ export type Verdict = {
 
 local function fail(message: string): ()
 	error(`ExchangeVerdict: {message}`, 0)
+end
+
+local function storeKey(exchangeId: string): (string?, string?)
+	if utf8.len(exchangeId) == nil then
+		return nil, "exchange id must be valid UTF-8"
+	end
+	if #exchangeId <= 50 then
+		return exchangeId, nil
+	end
+	local guid = string.match(exchangeId, "^%d+%-%d+%-(.+)$")
+	if guid ~= nil and #guid == 36 then
+		local groups = string.split(guid, "-")
+		local sizes = { 8, 4, 4, 4, 12 }
+		local valid = #groups == #sizes
+		for index, size in sizes do
+			local group = groups[index]
+			if group == nil or #group ~= size or string.match(group, "^%x+$") == nil then
+				valid = false
+				break
+			end
+		end
+		if valid then
+			-- Overlong legacy keys never reached Roblox. Preserve their profile records.
+			return `legacy:{guid}`, nil
+		end
+	end
+	return nil, "exchange id exceeds the 50 character limit and is not a recognized legacy id"
 end
 
 --- Is this a verdict record, rather than something else that happens to be stored?
@@ -54,10 +82,14 @@ function ExchangeVerdict.Propose(store: any, exchangeId: string, proposal: any):
 	if not wellFormed(proposal) then
 		fail("Propose needs a well-formed verdict of Commit or Abort")
 	end
+	local key, keyError = storeKey(exchangeId)
+	if key == nil then
+		return nil, false, keyError
+	end
 
 	local decided = false
 	local ok, committed = pcall(function()
-		return store:UpdateAsync(exchangeId, function(old)
+		return store:UpdateAsync(key, function(old)
 			-- NEVER nil. See the header: a nil return aborts the write and the caller
 			-- gets (nil, nil), which is indistinguishable from a failure.
 			if old ~= nil then
@@ -65,6 +97,7 @@ function ExchangeVerdict.Propose(store: any, exchangeId: string, proposal: any):
 			end
 			decided = true
 			return {
+				Id = if key ~= exchangeId then exchangeId else nil,
 				V = proposal.V,
 				A = proposal.A,
 				B = proposal.B,
@@ -88,6 +121,9 @@ function ExchangeVerdict.Propose(store: any, exchangeId: string, proposal: any):
 	if not wellFormed(committed) then
 		return nil, false, "verdict key holds a malformed record"
 	end
+	if key ~= exchangeId and committed.Id ~= exchangeId then
+		return nil, false, "verdict key belongs to another exchange"
+	end
 	-- `decided` is set inside the transform, which can run more than once under
 	-- contention; the return value is the authority on WHAT was decided, and this
 	-- flag only reports whether the last transform pass wrote.
@@ -102,8 +138,12 @@ function ExchangeVerdict.Read(store: any, exchangeId: string): (any, string?)
 	if type(exchangeId) ~= "string" or #exchangeId == 0 then
 		fail("Read needs an exchange id")
 	end
+	local key, keyError = storeKey(exchangeId)
+	if key == nil then
+		return nil, keyError
+	end
 	local ok, value = pcall(function()
-		return store:GetAsync(exchangeId)
+		return store:GetAsync(key)
 	end)
 	if not ok then
 		return nil, tostring(value)
@@ -113,6 +153,9 @@ function ExchangeVerdict.Read(store: any, exchangeId: string): (any, string?)
 	end
 	if not wellFormed(value) then
 		return nil, "verdict key holds a malformed record"
+	end
+	if key ~= exchangeId and value.Id ~= exchangeId then
+		return nil, "verdict key belongs to another exchange"
 	end
 	return value, nil
 end

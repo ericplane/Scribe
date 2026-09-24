@@ -4,7 +4,7 @@
 -- exactly EXPECTED_ERRORS diagnostics: if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
--- EXPECTED_ERRORS: 33
+-- EXPECTED_ERRORS: 38
 
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -12,6 +12,7 @@ local template = {
 	Coins = Scribe.Int(0, { Min = 0 }),
 	Stats = { Kills = 0 },
 	Nick = "",
+	Booster = Scribe.Timed(false),
 	Quests = {} :: { number },
 	Bag = Scribe.ArrayOf(Scribe.Int(0)),
 	Secret = Scribe.ServerOnly({ Flagged = false }),
@@ -47,6 +48,10 @@ local badBoards: { [string]: Scribe.LeaderboardConfig<T> } = {
 -- 2) Nick is a string leaf, not numeric, so not a valid stat.
 local badStat: { [string]: Scribe.LeaderboardConfig<T> } = {
 	Top = { Stat = "Nick" }, -- TypeError: string leaf excluded from the union
+}
+
+local badWriteInterval: { [string]: Scribe.LeaderboardConfig<T> } = {
+	Top = { Stat = "Coins", WriteInterval = "thirty" }, -- TypeError: string vs number?
 }
 
 -- 3) Grant's data is the typed accessor tree.
@@ -104,6 +109,8 @@ local function badTypedApis(player: Player)
 	ScribeTelemetry.Start(Scribe, { Webhooks = {} }):Preview("Alerts", "Sometimes") -- TypeError: not a PreviewKind
 	local _remover: number = Scribe.RegisterAddon("Fixture", {}) -- TypeError: function vs number
 	Data.UpdateOffline(1, function(_raw) end, { Validate = "yes" }) -- TypeError: string vs boolean?
+	bundle.Client.PromptPurchase(123) -- TypeError: a registered name is a string
+	local _prompted: number = bundle.Client.PromptPurchase("VIP") -- TypeError: boolean vs number
 end
 
 local function badLifecycleReason()
@@ -199,10 +206,17 @@ local function badDerived(player: Player)
 	return wrong
 end
 
+local function badClientTimer()
+	local active: number, remaining: string = bundle.Client.Booster.Active()
+	return active, remaining
+end
+
 return {
+	badClientTimer,
 	badDerived,
 	badBoards,
 	badStat,
+	badWriteInterval,
 	badProducts,
 	rootAndRemove,
 	badOption,

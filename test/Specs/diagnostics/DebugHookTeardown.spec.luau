@@ -45,15 +45,17 @@ return function()
 	--- says so, and a queueing one silently reorders everything downstream), so this
 	--- counts and then delegates.
 	local function sinkCount(): number
+		task.wait() -- finish the previous sink batch
 		local spawns = 0
 		Sched.Install({
-			Spawn = function(fn, ...)
+			Defer = function(fn, ...)
 				spawns += 1
-				return task.spawn(fn, ...)
+				return task.defer(fn, ...)
 			end,
 		})
 		Log.Info("Lifecycle", "DEBUG_HOOK_ATTACHED", "sink census", {})
 		Sched.Reset()
+		task.wait()
 		return spawns
 	end
 
