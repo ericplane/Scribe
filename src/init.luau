@@ -3040,7 +3040,6 @@ function Scribe.Axes(default: Axes): Axes
 	return datatypeMarker("Axes", default)
 end
 
-
 --[=[
 	@within Scribe
 	@tag Field Types
