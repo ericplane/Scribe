@@ -3045,7 +3045,7 @@ end
 	@within Scribe
 	@tag Field Types
 	@prop Datatypes table
-	Low-level helpers for the 17 Roblox datatypes, exposed so a migration can convert
+	Low-level helpers for the 23 Roblox datatypes, exposed so a migration can convert
 	a legacy representation into the packed form.
 
 	| Call | Returns |
