@@ -21,6 +21,12 @@ declare namespace Scribe {
         readonly Timed: <T>(this: void, value: T) => Schema.Timed<T>;
         readonly Dynamic: <T>(this: void, factory: (this: void) => T) => T;
         /** Annotate compute arguments: the enclosing template is not in scope here. */
+        readonly Ray: (this: void, value: Ray) => Ray;
+        readonly Region3: (this: void, value: Region3) => Region3;
+        readonly Region3int16: (this: void, value: Region3int16) => Region3int16;
+        readonly Faces: (this: void, value: Faces) => Faces;
+        readonly Axes: (this: void, value: Axes) => Axes;
+        readonly Content: (this: void, value: Content) => Content;
         readonly Derived: <T, A extends unknown[]>(this: void, output: T, inputs: readonly string[], compute: (this: void, ...args: A) => Schema.ValueOf<T>) => Schema.Derived<T>;
         readonly Optional: <T>(this: void, value: T) => Schema.Optional<T>;
         readonly ArrayOf: <T>(this: void, shape: T, options?: ArrayOpts) => Schema.ArrayOf<T>;
@@ -66,7 +72,6 @@ declare namespace Scribe {
             readonly Unpack: <K extends keyof DatatypeValues>(this: void, name: K, bytes: buffer) => DatatypeValues[K];
             readonly NONFINITE: "Scribe:nonfinite:";
         };
-
     }
 
     interface NumberMeta { Min?: number; Max?: number; }
@@ -75,6 +80,7 @@ declare namespace Scribe {
         CFrame: CFrame; Color3: Color3; BrickColor: BrickColor; UDim: UDim; UDim2: UDim2;
         Rect: Rect; NumberRange: NumberRange; NumberSequence: NumberSequence; ColorSequence: ColorSequence;
         DateTime: DateTime; EnumItem: EnumItem; Font: Font; PhysicalProperties: PhysicalProperties;
+        Ray: Ray; Region3: Region3; Region3int16: Region3int16; Faces: Faces; Axes: Axes; Content: Content;
     }
     interface FloatMeta extends NumberMeta { Precision?: number | "f32"; }
     interface BigMeta { Min?: number | string; Max?: number | string; }
