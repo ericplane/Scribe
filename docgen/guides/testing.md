@@ -155,7 +155,7 @@ The [Scribe Studio plugin](./studio-plugin) gives you a live panel for inspectin
 
 ## Headless tests
 
-For most game projects, start with the Studio tests above. An automated harness is useful when you need repeatable tests of your own game logic. Scribe's repository uses TestEZ and [Lune](https://lune-org.github.io/docs) with a fake ProfileStore and transport.
+For most game projects, start with the Studio tests above. An automated harness is useful when you need repeatable tests of your own game logic. Scribe's repository uses [Jest Roblox](https://github.com/Roblox/jest-roblox) and [Lune](https://lune-org.github.io/docs). Its helpers provide isolated stores and transports, and its deterministic multi-server simulation also runs the real ProfileStore source against simulated services.
 
 ??? warning "Advanced: constructing an isolated server with internal APIs"
     `Server.build` and the template compiler are internal and can change between releases. They are not methods on the public bundle. With a Wally installation, the link module also does not expose their children, so this example uses the versioned `_Index` folder.
@@ -204,7 +204,21 @@ For most game projects, start with the Studio tests above. An automated harness 
     - `Template.Compile(options.Template, { ReplicateRobuxLog = true, ReplicateInGameLog = true })` includes purchase logs when your test needs them. Public `Scribe(options)` derives these flags from `PurchaseLog`.
 
 ??? tip "Running Scribe's own suite"
-    In the repository, run `lune run lune/run-tests`. Its deterministic multi-server simulation models latency, request budgets, failures, and contention. Read `test/Sim/SCOPE.md` for what it covers and what still needs a real Roblox test. These simulations do not measure production service performance.
+    In the repository, run `rokit install`, `wally install`, then `lune run lune/run-tests` (or `npm run test:unit`). The official Jest Roblox packages are pinned in the Wally manifest and lockfile. `node scripts/verify-test-runner.mjs` (or `npm run test:runner`) checks the runner's failure handling.
+
+    Use `SCRIBE_SPECS` to select spec files, `SCRIBE_TEST_NAME` for a Jest test-name pattern, and `SCRIBE_TEST_TIMEOUT` to change the per-test timeout in seconds (default 10). `SCRIBE_TEST_VERBOSE=1` prints individual test names. Reports are written to `test-results/results.json` and `test-results/junit.xml`; `SCRIBE_TEST_REPORT_DIR` changes the directory. CI also runs with `SCRIBE_FRAGMENT_ALL=1` to exercise transport fragmentation and saves that run's reports separately.
+
+    A tight loop that never yields can prevent Jest's local timeout from firing; stop that Lune process with Ctrl+C. CI also enforces an external deadline on each run.
+
+    Snapshot comparisons use `__snapshots__/*.spec.snap.lua` files beside the specs, mapped by Rojo as ModuleScripts. Normal runs refuse snapshot writes. Set `SCRIBE_UPDATE_SNAPSHOTS=1` outside CI to create or update snapshots, then review the diff.
+
+    The Studio entry point uses the same Jest configuration. Build `rojo build test.project.json -o ScribeTest.rbxlx`, open the place, and press Run (F8). `ServerScriptService.RunScribeTests` prints a startup banner, the spec count, and the command to start Jest. While Run is active, execute `require(game:GetService("ReplicatedStorage").ScribeDev.Test.RunTests)()` from the **server command bar**. Jest requires that context's script-source permissions; the isolated test place enables `LoadStringEnabled` for its fallback loader. A normal Studio run has been confirmed: 2,813 tests passed, 360 skipped, none failed, and both snapshots passed. Specs that require the Lune simulation host remain headless-only.
+
+    The default suite does not write to cloud DataStores. To opt into real backend checks, use a disposable published test universe with Studio API access enabled. Before Run, edit the source of `test/Helpers/ConformanceStore.luau` to set `ConformanceStore.UseReal = true`, then rebuild or sync. An external `require` and table assignment cannot enable them because Jest isolates module instances. Restore `false` afterward.
+
+    Live tests and setup have a 600-second ceiling for write pacing, session loading, and saves; cleanup has 60 seconds. Ordinary tests keep the 10-second default. The shared exchange round trip runs once, and cleanup hooks release owned harnesses after failures or timeouts. After a failed cloud run, stop Run and start a fresh session before retrying.
+
+    The deterministic multi-server simulation models latency, request budgets, failures, and contention. Read `test/Sim/SCOPE.md` for what it covers and what still needs a real Roblox test. These simulations do not measure production service performance.
 
 ## Where to next
 

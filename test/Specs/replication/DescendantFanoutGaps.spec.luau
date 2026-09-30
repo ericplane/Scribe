@@ -21,93 +21,96 @@
 -- spurious fires per op with 500 bound rows. `fireDescendants` therefore compares by
 -- identity: `table.insert`/`table.remove` shift references, so identity is an exact
 -- signal for "did this row move". Appends now wake nothing they should not.
-return function()
-	local Root = script.Parent.Parent.Parent.Parent
-	local Scribe = require(Root.Scribe)
-	local TestCtx = require(Root.Test.Helpers.TestCtx)
+local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local describe = JestGlobals.describe
+local it = JestGlobals.it
+local expect = JestGlobals.expect
 
-	local function arrayHarness()
-		return TestCtx.make({
-			Template = {
-				Log = Scribe.ArrayOf({ Text = Scribe.String("") }),
-			},
-		})
-	end
+local Root = script.Parent.Parent.Parent.Parent
+local Scribe = require(Root.Scribe)
+local TestCtx = require(Root.Test.Helpers.TestCtx)
 
-	describe("descendant fanout", function()
-		it("fires for a key a parent Set introduces from absent", function()
-			local harness = TestCtx.make()
-			local _p, _e, data = harness.Join()
-
-			local fires = 0
-			data.Inventory.Sword.Dmg.Changed(function()
-				fires += 1
-			end)
-
-			data.Inventory.Set({ Sword = { Dmg = 9 } })
-
-			expect(data.Inventory.Sword.Dmg.Get()).to.equal(9)
-			expect(fires).to.equal(1)
-			harness.Cleanup()
-		end)
-
-		it("fires for an element whose index an Insert shifted", function()
-			local harness = arrayHarness()
-			local _p, _e, data = harness.Join()
-
-			data.Log.Insert({ Text = "one" })
-			local seen = nil
-			data.Log[1].Text.Changed(function(new)
-				seen = new
-			end)
-
-			data.Log.Insert({ Text = "two" }, 1) -- pushes "one" to index 2
-
-			expect(data.Log[1].Text.Get()).to.equal("two")
-			expect(seen).to.equal("two")
-			harness.Cleanup()
-		end)
-
-		it("fires for an element whose index a Remove shifted", function()
-			local harness = arrayHarness()
-			local _p, _e, data = harness.Join()
-
-			data.Log.Insert({ Text = "a" })
-			data.Log.Insert({ Text = "b" })
-			local seen = nil
-			data.Log[1].Text.Changed(function(new)
-				seen = new
-			end)
-
-			data.Log.Remove(1) -- "b" shifts down into index 1
-
-			expect(data.Log[1].Text.Get()).to.equal("b")
-			expect(seen).to.equal("b")
-			harness.Cleanup()
-		end)
-
-		it("does not wake rows an append cannot have moved", function()
-			-- The regression the naive fix introduced. Appending shifts nothing, so a
-			-- listener on an existing row must stay silent. Measured before the
-			-- identity test: 500 bound rows meant 500 spurious fires on every append.
-			local harness = arrayHarness()
-			local _p, _e, data = harness.Join()
-
-			for i = 1, 20 do
-				data.Log.Insert({ Text = `row{i}` })
-			end
-			local woken = 0
-			for i = 1, 20 do
-				data.Log[i].Text.Changed(function()
-					woken += 1
-				end)
-			end
-
-			data.Log.Insert({ Text = "appended" }) -- at the end: nothing shifts
-
-			expect(data.Log[21].Text.Get()).to.equal("appended")
-			expect(woken).to.equal(0)
-			harness.Cleanup()
-		end)
-	end)
+local function arrayHarness()
+	return TestCtx.make({
+		Template = {
+			Log = Scribe.ArrayOf({ Text = Scribe.String("") }),
+		},
+	})
 end
+
+describe("descendant fanout", function()
+	it("fires for a key a parent Set introduces from absent", function()
+		local harness = TestCtx.make()
+		local _p, _e, data = harness.Join()
+
+		local fires = 0
+		data.Inventory.Sword.Dmg.Changed(function()
+			fires += 1
+		end)
+
+		data.Inventory.Set({ Sword = { Dmg = 9 } })
+
+		expect(data.Inventory.Sword.Dmg.Get()).toBe(9)
+		expect(fires).toBe(1)
+		harness.Cleanup()
+	end)
+
+	it("fires for an element whose index an Insert shifted", function()
+		local harness = arrayHarness()
+		local _p, _e, data = harness.Join()
+
+		data.Log.Insert({ Text = "one" })
+		local seen = nil
+		data.Log[1].Text.Changed(function(new)
+			seen = new
+		end)
+
+		data.Log.Insert({ Text = "two" }, 1) -- pushes "one" to index 2
+
+		expect(data.Log[1].Text.Get()).toBe("two")
+		expect(seen).toBe("two")
+		harness.Cleanup()
+	end)
+
+	it("fires for an element whose index a Remove shifted", function()
+		local harness = arrayHarness()
+		local _p, _e, data = harness.Join()
+
+		data.Log.Insert({ Text = "a" })
+		data.Log.Insert({ Text = "b" })
+		local seen = nil
+		data.Log[1].Text.Changed(function(new)
+			seen = new
+		end)
+
+		data.Log.Remove(1) -- "b" shifts down into index 1
+
+		expect(data.Log[1].Text.Get()).toBe("b")
+		expect(seen).toBe("b")
+		harness.Cleanup()
+	end)
+
+	it("does not wake rows an append cannot have moved", function()
+		-- The regression the naive fix introduced. Appending shifts nothing, so a
+		-- listener on an existing row must stay silent. Measured before the
+		-- identity test: 500 bound rows meant 500 spurious fires on every append.
+		local harness = arrayHarness()
+		local _p, _e, data = harness.Join()
+
+		for i = 1, 20 do
+			data.Log.Insert({ Text = `row{i}` })
+		end
+		local woken = 0
+		for i = 1, 20 do
+			data.Log[i].Text.Changed(function()
+				woken += 1
+			end)
+		end
+
+		data.Log.Insert({ Text = "appended" }) -- at the end: nothing shifts
+
+		expect(data.Log[21].Text.Get()).toBe("appended")
+		expect(woken).toBe(0)
+		harness.Cleanup()
+	end)
+end)

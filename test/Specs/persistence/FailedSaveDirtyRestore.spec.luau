@@ -41,150 +41,154 @@
 -- hoping it does). Deleting the restore line still kills all four tests here, so
 -- the two mechanisms are independent and both are load-bearing.
 
-return function()
-	local Root = script.Parent.Parent.Parent.Parent
-	local Scribe = require(Root.Scribe)
-	local TestCtx = require(Root.Test.Helpers.TestCtx)
+local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local describe = JestGlobals.describe
+local it = JestGlobals.it
+local expect = JestGlobals.expect
+local afterEach = JestGlobals.afterEach
 
-	local GRANTED = Enum.ProductPurchaseDecision.PurchaseGranted
-	local NOT_PROCESSED = Enum.ProductPurchaseDecision.NotProcessedYet
+local Root = script.Parent.Parent.Parent.Parent
+local Scribe = require(Root.Scribe)
+local TestCtx = require(Root.Test.Helpers.TestCtx)
 
-	local function template()
-		return {
-			Coins = Scribe.Int(0, { Min = 0 }),
-			Settings = { Music = true },
-		}
+local GRANTED = Enum.ProductPurchaseDecision.PurchaseGranted
+local NOT_PROCESSED = Enum.ProductPurchaseDecision.NotProcessedYet
+
+local function template()
+	return {
+		Coins = Scribe.Int(0, { Min = 0 }),
+		Settings = { Music = true },
+	}
+end
+
+local function saves(harness, entry): number
+	return harness.Fake.SaveCounts[`Default/{entry.Key}`] or 0
+end
+
+-- Cleanup runs from afterEach rather than the end of each `it`. These tests
+-- deliberately drive save failures, which push the SHARED Health singleton away
+-- from Healthy, and TestCtx.Cleanup is what walks it back. A trailing
+-- `harness.Cleanup()` is skipped when an assertion throws -- which is exactly the
+-- case this file is built to produce -- and the poisoned singleton then fails
+-- unrelated specs (measured: deleting the restore line took FailureReport's GDPR
+-- erase and version restore down with it). The failure signal has to stay local
+-- to this file.
+local harness: any = nil
+
+afterEach(function()
+	if harness then
+		harness.Cleanup()
+		harness = nil
 	end
+end)
 
-	local function saves(harness, entry): number
-		return harness.Fake.SaveCounts[`Default/{entry.Key}`] or 0
-	end
+describe("a save that failed leaves the entry dirty", function()
+	it("restores the dirtiness the payload snapshot cleared", function()
+		harness = TestCtx.make({ Template = template() })
+		local player, entry, data = harness.Join(64001)
 
-	-- Cleanup runs from afterEach rather than the end of each `it`. These tests
-	-- deliberately drive save failures, which push the SHARED Health singleton away
-	-- from Healthy, and TestCtx.Cleanup is what walks it back. A trailing
-	-- `harness.Cleanup()` is skipped when an assertion throws -- which is exactly the
-	-- case this file is built to produce -- and the poisoned singleton then fails
-	-- unrelated specs (measured: deleting the restore line took FailureReport's GDPR
-	-- erase and version restore down with it). The failure signal has to stay local
-	-- to this file.
-	local harness: any = nil
+		data.Coins.Set(7)
+		expect(entry.SaveInfo.Dirty).toBe(true)
 
-	afterEach(function()
-		if harness then
-			harness.Cleanup()
-			harness = nil
-		end
+		harness.Fake.FailSaves = true
+		harness.Data.Flush(player)
+		harness.Fake.FailSaves = false
+
+		-- The save was attempted (so the snapshot ran and cleared the flag) and it
+		-- did not land.
+		expect(entry.SaveInfo.LastResult).toBe("Fail")
+		expect(saves(harness, entry)).toBe(0)
+		-- ...so the entry must still read as carrying unstored writes. This is the
+		-- assertion the restore line owns; nothing else in the failure path writes
+		-- Dirty, and the snapshot set it to false on the way in.
+		expect(entry.SaveInfo.Dirty).toBe(true)
 	end)
 
-	describe("a save that failed leaves the entry dirty", function()
-		it("restores the dirtiness the payload snapshot cleared", function()
-			harness = TestCtx.make({ Template = template() })
-			local player, entry, data = harness.Join(64001)
+	it("reports that through the public GetSaveInfo surface", function()
+		harness = TestCtx.make({ Template = template() })
+		local player, entry, data = harness.Join(64002)
 
-			data.Coins.Set(7)
-			expect(entry.SaveInfo.Dirty).to.equal(true)
+		data.Coins.Set(11)
+		harness.Fake.FailSaves = true
+		harness.Data.Flush(player)
+		harness.Fake.FailSaves = false
 
-			harness.Fake.FailSaves = true
-			harness.Data.Flush(player)
-			harness.Fake.FailSaves = false
-
-			-- The save was attempted (so the snapshot ran and cleared the flag) and it
-			-- did not land.
-			expect(entry.SaveInfo.LastResult).to.equal("Fail")
-			expect(saves(harness, entry)).to.equal(0)
-			-- ...so the entry must still read as carrying unstored writes. This is the
-			-- assertion the restore line owns; nothing else in the failure path writes
-			-- Dirty, and the snapshot set it to false on the way in.
-			expect(entry.SaveInfo.Dirty).to.equal(true)
-		end)
-
-		it("reports that through the public GetSaveInfo surface", function()
-			harness = TestCtx.make({ Template = template() })
-			local player, entry, data = harness.Join(64002)
-
-			data.Coins.Set(11)
-			harness.Fake.FailSaves = true
-			harness.Data.Flush(player)
-			harness.Fake.FailSaves = false
-
-			local info = harness.Data.GetSaveInfo(player)
-			expect(info.LastResult).to.equal("Fail")
-			expect(info.Dirty).to.equal(true)
-			expect(saves(harness, entry)).to.equal(0)
-		end)
-
-		it("makes a later CLEAN save the thing that clears it, not the failure", function()
-			-- Guards the assertion above against being satisfied by a Dirty that simply
-			-- never moves: the same flag has to come back down once a save lands.
-			harness = TestCtx.make({ Template = template() })
-			local player, entry, data = harness.Join(64003)
-
-			data.Coins.Set(13)
-			harness.Fake.FailSaves = true
-			harness.Data.Flush(player)
-			harness.Fake.FailSaves = false
-			expect(entry.SaveInfo.Dirty).to.equal(true)
-
-			expect(harness.Data.Flush(player)).to.equal(true)
-			expect(saves(harness, entry)).to.equal(1)
-			expect(entry.SaveInfo.LastResult).to.equal("Ok")
-			expect(entry.SaveInfo.Dirty).to.equal(false)
-			expect(harness.Fake.Persisted[`Default/{entry.Key}`].Coins).to.equal(13)
-		end)
+		local info = harness.Data.GetSaveInfo(player)
+		expect(info.LastResult).toBe("Fail")
+		expect(info.Dirty).toBe(true)
+		expect(saves(harness, entry)).toBe(0)
 	end)
 
-	describe("the consumer with no LastResult clause", function()
-		it("does not acknowledge a duplicate receipt off a save that failed", function()
-			-- Monetization's duplicate branch reads Dirty and SavesInFlight only. Without
-			-- the restore both read "clean" after a failed save, and the retry is answered
-			-- PurchaseGranted with the grant and its dedupe marker still only in memory --
-			-- and Roblox never retries a granted receipt.
-			harness = TestCtx.make({
-				Template = template(),
-				Options = {
-					Products = {
-						Coins1000 = {
-							Id = 111,
-							Category = "Currency",
-							Grant = function(data)
-								data.Coins.Increment(1000)
-							end,
-						},
+	it("makes a later CLEAN save the thing that clears it, not the failure", function()
+		-- Guards the assertion above against being satisfied by a Dirty that simply
+		-- never moves: the same flag has to come back down once a save lands.
+		harness = TestCtx.make({ Template = template() })
+		local player, entry, data = harness.Join(64003)
+
+		data.Coins.Set(13)
+		harness.Fake.FailSaves = true
+		harness.Data.Flush(player)
+		harness.Fake.FailSaves = false
+		expect(entry.SaveInfo.Dirty).toBe(true)
+
+		expect(harness.Data.Flush(player)).toBe(true)
+		expect(saves(harness, entry)).toBe(1)
+		expect(entry.SaveInfo.LastResult).toBe("Ok")
+		expect(entry.SaveInfo.Dirty).toBe(false)
+		expect(harness.Fake.Persisted[`Default/{entry.Key}`].Coins).toBe(13)
+	end)
+end)
+
+describe("the consumer with no LastResult clause", function()
+	it("does not acknowledge a duplicate receipt off a save that failed", function()
+		-- Monetization's duplicate branch reads Dirty and SavesInFlight only. Without
+		-- the restore both read "clean" after a failed save, and the retry is answered
+		-- PurchaseGranted with the grant and its dedupe marker still only in memory --
+		-- and Roblox never retries a granted receipt.
+		harness = TestCtx.make({
+			Template = template(),
+			Options = {
+				Products = {
+					Coins1000 = {
+						Id = 111,
+						Category = "Currency",
+						Grant = function(data)
+							data.Coins.Increment(1000)
+						end,
 					},
 				},
-			})
-			local _player, entry, data = harness.Join(64004)
+			},
+		})
+		local _player, entry, data = harness.Join(64004)
 
-			local function receipt(purchaseId: string)
-				return {
-					PlayerId = entry.UserId,
-					ProductId = 111,
-					PurchaseId = purchaseId,
-					CurrencySpent = 99,
-					CurrencyType = Enum.CurrencyType.Robux,
-				}
-			end
+		local function receipt(purchaseId: string)
+			return {
+				PlayerId = entry.UserId,
+				ProductId = 111,
+				PurchaseId = purchaseId,
+				CurrencySpent = 99,
+				CurrencyType = Enum.CurrencyType.Robux,
+			}
+		end
 
-			-- First delivery: the grant applies, the save fails, Roblox is told to retry.
-			harness.Fake.FailSaves = true
-			expect(harness.Data.HandleReceipt(receipt("p-dirty-1"))).to.equal(NOT_PROCESSED)
-			harness.Fake.FailSaves = false
+		-- First delivery: the grant applies, the save fails, Roblox is told to retry.
+		harness.Fake.FailSaves = true
+		expect(harness.Data.HandleReceipt(receipt("p-dirty-1"))).toBe(NOT_PROCESSED)
+		harness.Fake.FailSaves = false
 
-			expect(data.Coins.Get()).to.equal(1000)
-			expect(entry.SaveInfo.LastResult).to.equal("Fail")
-			-- Nothing reached the store, so the marker exists only in the live tree.
-			expect(saves(harness, entry)).to.equal(0)
-			expect(harness.Fake.Persisted[`Default/{entry.Key}`]).to.equal(nil)
+		expect(data.Coins.Get()).toBe(1000)
+		expect(entry.SaveInfo.LastResult).toBe("Fail")
+		-- Nothing reached the store, so the marker exists only in the live tree.
+		expect(saves(harness, entry)).toBe(0)
+		expect(harness.Fake.Persisted[`Default/{entry.Key}`]).toBe(nil)
 
-			-- The retry takes the duplicate branch. It may only answer GRANTED by way of
-			-- a confirmed save, which requires Dirty to still be true.
-			local before = saves(harness, entry)
-			expect(harness.Data.HandleReceipt(receipt("p-dirty-1"))).to.equal(GRANTED)
-			expect(saves(harness, entry)).to.equal(before + 1)
-			expect(harness.Fake.Persisted[`Default/{entry.Key}`].Coins).to.equal(1000)
-			-- ...and still exactly once.
-			expect(data.Coins.Get()).to.equal(1000)
-		end)
+		-- The retry takes the duplicate branch. It may only answer GRANTED by way of
+		-- a confirmed save, which requires Dirty to still be true.
+		local before = saves(harness, entry)
+		expect(harness.Data.HandleReceipt(receipt("p-dirty-1"))).toBe(GRANTED)
+		expect(saves(harness, entry)).toBe(before + 1)
+		expect(harness.Fake.Persisted[`Default/{entry.Key}`].Coins).toBe(1000)
+		-- ...and still exactly once.
+		expect(data.Coins.Get()).toBe(1000)
 	end)
-end
+end)

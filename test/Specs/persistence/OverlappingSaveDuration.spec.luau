@@ -24,156 +24,159 @@
 -- The interleaving is driven signal by signal, for the reason
 -- OverlappingSaveFailure.spec gives: the fake persists synchronously, so overlap
 -- has to be constructed rather than hoped for.
-return function()
-	local Root = script.Parent.Parent.Parent.Parent
-	local Clock = require(Root.Scribe.Internal.Clock)
-	local TestCtx = require(Root.Test.Helpers.TestCtx)
+local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local describe = JestGlobals.describe
+local it = JestGlobals.it
+local expect = JestGlobals.expect
 
-	--- Same shape as ClockSeam.spec's, restated because this spec needs to move
-	--- Monotonic and Now independently of any harness stepping.
-	local function virtualClock(startAt: number?)
-		local now = startAt or 1700000000
-		Clock.Install({
-			Now = function()
-				return now
-			end,
-			Monotonic = function()
-				return now
-			end,
-			Wait = function()
-				return task.wait()
-			end,
-			Delay = function(_seconds, fn, ...)
-				return task.spawn(fn, ...)
-			end,
-		})
-		return function(seconds: number)
-			now += seconds
-		end
+local Root = script.Parent.Parent.Parent.Parent
+local Clock = require(Root.Scribe.Internal.Clock)
+local TestCtx = require(Root.Test.Helpers.TestCtx)
+
+--- Same shape as ClockSeam.spec's, restated because this spec needs to move
+--- Monotonic and Now independently of any harness stepping.
+local function virtualClock(startAt: number?)
+	local now = startAt or 1700000000
+	Clock.Install({
+		Now = function()
+			return now
+		end,
+		Monotonic = function()
+			return now
+		end,
+		Wait = function()
+			return task.wait()
+		end,
+		Delay = function(_seconds, fn, ...)
+			return task.spawn(fn, ...)
+		end,
+	})
+	return function(seconds: number)
+		now += seconds
 	end
-
-	--- Collect every Duration the public Data.OnSave publishes, in order.
-	local function durationsOf(harness)
-		local seen = {}
-		harness.Data.OnSave:Connect(function(info)
-			table.insert(seen, info.Duration)
-		end)
-		return seen
-	end
-
-	describe("SaveDuration under overlapping saves", function()
-		it("reports a lone save's own elapsed time", function()
-			-- THE CONTROL, and it must stay exact. Everything below is about not
-			-- disturbing this number.
-			local harness = TestCtx.make()
-			local advance = virtualClock()
-			local player, entry = harness.Join()
-			local durations = durationsOf(harness)
-
-			harness.Data.Get(player).Coins.Set(1)
-			entry.Profile.OnSave:Fire({})
-			advance(0.5)
-			entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
-			entry.Profile.OnSettled:Fire({}, "Saved")
-
-			expect(#durations).to.equal(1)
-			expect(durations[1]).to.equal(0.5)
-			expect(entry.SavesInFlight).to.equal(0)
-
-			Clock.Reset()
-			harness.Cleanup()
-		end)
-
-		it("clears the start slot once every save has drained, so the next save is fresh", function()
-			-- The other half of the accumulate, and the reason it is safe: holding the
-			-- earliest start must not outlive the in-flight window, or every later save
-			-- in the session would be measured from the first one and grow without
-			-- bound.
-			local harness = TestCtx.make()
-			local advance = virtualClock()
-			local player, entry = harness.Join()
-			local durations = durationsOf(harness)
-
-			harness.Data.Get(player).Coins.Set(1)
-			entry.Profile.OnSave:Fire({})
-			advance(0.5)
-			entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
-			entry.Profile.OnSettled:Fire({}, "Saved")
-			expect(entry.SaveT0).to.equal(nil)
-
-			advance(90)
-			entry.Profile.OnSave:Fire({})
-			advance(0.25)
-			entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
-			entry.Profile.OnSettled:Fire({}, "Saved")
-
-			expect(#durations).to.equal(2)
-			expect(durations[2]).to.equal(0.25)
-
-			Clock.Reset()
-			harness.Cleanup()
-		end)
-
-		it("measures the FIRST save from its own start, not from the overlapping one's", function()
-			-- The defect. Save A runs 0.5s; save B starts 0.2s in. A must report 0.5,
-			-- not 0.3.
-			local harness = TestCtx.make()
-			local advance = virtualClock()
-			local player, entry = harness.Join()
-			local durations = durationsOf(harness)
-
-			harness.Data.Get(player).Coins.Set(4242)
-
-			entry.Profile.OnSave:Fire({}) -- save A starts
-			advance(0.2)
-			entry.Profile.OnSave:Fire({}) -- save B starts, A still on the wire
-			expect(entry.SavesInFlight).to.equal(2)
-
-			advance(0.3) -- A has now been out for 0.5s
-			entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
-			entry.Profile.OnSettled:Fire({}, "Saved")
-
-			expect(#durations).to.equal(1)
-			expect(durations[1]).to.equal(0.5)
-
-			Clock.Reset()
-			harness.Cleanup()
-		end)
-
-		it("never reports a duration SHORTER than the save actually took", function()
-			-- Stated as the invariant rather than as two numbers, and swept across the
-			-- orderings, so a fix that merely moved the error around cannot pass. The
-			-- second save is allowed to read pessimistically -- it shares one slot with
-			-- the first by construction -- but neither may read low.
-			for _, gap in { 0, 0.05, 0.2, 1.5 } do
-				local harness = TestCtx.make()
-				local advance = virtualClock()
-				local player, entry = harness.Join()
-				local durations = durationsOf(harness)
-
-				harness.Data.Get(player).Coins.Set(7)
-				local startA = Clock.Monotonic()
-				entry.Profile.OnSave:Fire({})
-				advance(gap)
-				entry.Profile.OnSave:Fire({})
-				advance(0.4)
-
-				local trueA = Clock.Monotonic() - startA
-				entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
-				entry.Profile.OnSettled:Fire({}, "Saved")
-				if durations[1] < trueA - 1e-9 then
-					error(`gap {gap}: save A took {trueA} but reported {durations[1]}`)
-				end
-
-				advance(0.6)
-				entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
-				entry.Profile.OnSettled:Fire({}, "Saved")
-				expect(entry.SavesInFlight).to.equal(0)
-				expect(entry.SaveT0).to.equal(nil)
-
-				Clock.Reset()
-				harness.Cleanup()
-			end
-		end)
-	end)
 end
+
+--- Collect every Duration the public Data.OnSave publishes, in order.
+local function durationsOf(harness)
+	local seen = {}
+	harness.Data.OnSave:Connect(function(info)
+		table.insert(seen, info.Duration)
+	end)
+	return seen
+end
+
+describe("SaveDuration under overlapping saves", function()
+	it("reports a lone save's own elapsed time", function()
+		-- THE CONTROL, and it must stay exact. Everything below is about not
+		-- disturbing this number.
+		local harness = TestCtx.make()
+		local advance = virtualClock()
+		local player, entry = harness.Join()
+		local durations = durationsOf(harness)
+
+		harness.Data.Get(player).Coins.Set(1)
+		entry.Profile.OnSave:Fire({})
+		advance(0.5)
+		entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
+		entry.Profile.OnSettled:Fire({}, "Saved")
+
+		expect(#durations).toBe(1)
+		expect(durations[1]).toBe(0.5)
+		expect(entry.SavesInFlight).toBe(0)
+
+		Clock.Reset()
+		harness.Cleanup()
+	end)
+
+	it("clears the start slot once every save has drained, so the next save is fresh", function()
+		-- The other half of the accumulate, and the reason it is safe: holding the
+		-- earliest start must not outlive the in-flight window, or every later save
+		-- in the session would be measured from the first one and grow without
+		-- bound.
+		local harness = TestCtx.make()
+		local advance = virtualClock()
+		local player, entry = harness.Join()
+		local durations = durationsOf(harness)
+
+		harness.Data.Get(player).Coins.Set(1)
+		entry.Profile.OnSave:Fire({})
+		advance(0.5)
+		entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
+		entry.Profile.OnSettled:Fire({}, "Saved")
+		expect(entry.SaveT0).toBe(nil)
+
+		advance(90)
+		entry.Profile.OnSave:Fire({})
+		advance(0.25)
+		entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
+		entry.Profile.OnSettled:Fire({}, "Saved")
+
+		expect(#durations).toBe(2)
+		expect(durations[2]).toBe(0.25)
+
+		Clock.Reset()
+		harness.Cleanup()
+	end)
+
+	it("measures the FIRST save from its own start, not from the overlapping one's", function()
+		-- The defect. Save A runs 0.5s; save B starts 0.2s in. A must report 0.5,
+		-- not 0.3.
+		local harness = TestCtx.make()
+		local advance = virtualClock()
+		local player, entry = harness.Join()
+		local durations = durationsOf(harness)
+
+		harness.Data.Get(player).Coins.Set(4242)
+
+		entry.Profile.OnSave:Fire({}) -- save A starts
+		advance(0.2)
+		entry.Profile.OnSave:Fire({}) -- save B starts, A still on the wire
+		expect(entry.SavesInFlight).toBe(2)
+
+		advance(0.3) -- A has now been out for 0.5s
+		entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
+		entry.Profile.OnSettled:Fire({}, "Saved")
+
+		expect(#durations).toBe(1)
+		expect(durations[1]).toBe(0.5)
+
+		Clock.Reset()
+		harness.Cleanup()
+	end)
+
+	it("never reports a duration SHORTER than the save actually took", function()
+		-- Stated as the invariant rather than as two numbers, and swept across the
+		-- orderings, so a fix that merely moved the error around cannot pass. The
+		-- second save is allowed to read pessimistically -- it shares one slot with
+		-- the first by construction -- but neither may read low.
+		for _, gap in { 0, 0.05, 0.2, 1.5 } do
+			local harness = TestCtx.make()
+			local advance = virtualClock()
+			local player, entry = harness.Join()
+			local durations = durationsOf(harness)
+
+			harness.Data.Get(player).Coins.Set(7)
+			local startA = Clock.Monotonic()
+			entry.Profile.OnSave:Fire({})
+			advance(gap)
+			entry.Profile.OnSave:Fire({})
+			advance(0.4)
+
+			local trueA = Clock.Monotonic() - startA
+			entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
+			entry.Profile.OnSettled:Fire({}, "Saved")
+			if durations[1] < trueA - 1e-9 then
+				error(`gap {gap}: save A took {trueA} but reported {durations[1]}`)
+			end
+
+			advance(0.6)
+			entry.Profile.OnAfterSave:Fire(entry.Profile.LastSavedData)
+			entry.Profile.OnSettled:Fire({}, "Saved")
+			expect(entry.SavesInFlight).toBe(0)
+			expect(entry.SaveT0).toBe(nil)
+
+			Clock.Reset()
+			harness.Cleanup()
+		end
+	end)
+end)

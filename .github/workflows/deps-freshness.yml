@@ -1,7 +1,7 @@
 name: Dependency freshness
 
-# Dependabot understands neither wally.toml nor rokit.toml, and wally.lock is
-# gitignored, so the Wally deps (ProfileStore/TestEZ) and the rokit toolchain
+# Dependabot understands neither wally.toml nor rokit.toml, so the pinned
+# Wally development dependencies and the rokit toolchain
 # can silently fall behind with nothing signalling it. This weekly job compares
 # the pinned versions against the latest published ones and opens (or refreshes)
 # a single tracking issue when anything is behind. Best-effort: a lookup that
@@ -43,10 +43,11 @@ jobs:
           }
 
           # ---- Wally dependencies (via the Wally registry API) ----
-          # Parse `Name = "scope/pkg@version"` lines out of wally.toml.
+          # Accept Wally's exact `@=version` pins as well as plain `@version`.
           while IFS= read -r spec; do
             path="${spec%@*}"       # scope/pkg
             pinned="${spec##*@}"    # version
+            pinned="${pinned#=}"     # strip the exact-constraint operator
             latest="$(curl -fsS "https://api.wally.run/v1/package-metadata/${path}" 2>/dev/null \
               | python3 -c 'import sys,json; d=json.load(sys.stdin); vs=[v["package"]["version"] for v in d.get("versions",[])]; print(vs[0] if vs else "")' 2>/dev/null || true)"
             if [ -z "$latest" ]; then
@@ -54,7 +55,7 @@ jobs:
             elif [ "$(is_behind "$pinned" "$latest")" = "yes" ]; then
               report="${report}- ⬆️ \`${path}\` (Wally): pinned \`${pinned}\` → latest \`${latest}\`\n"
             fi
-          done < <(grep -oE '"[^"]+/[^"@]+@[0-9][^"]*"' wally.toml | tr -d '"')
+          done < <(grep -oE '"[^"]+/[^"@]+@=?[0-9][^"]*"' wally.toml | tr -d '"')
 
           # ---- Rokit toolchain (via GitHub releases) ----
           while IFS= read -r spec; do
@@ -75,7 +76,7 @@ jobs:
             echo "has_updates=true" >> "$GITHUB_OUTPUT"
             {
               echo "The following pinned dependencies are behind their latest published version."
-              echo "Bump them in \`wally.toml\` / \`rokit.toml\` (and keep \`bundle/deps\` in mind for ProfileStore, which ships inside Scribe.rbxm)."
+              echo "Bump them in \`wally.toml\` / \`rokit.toml\`, run \`wally install\`, and commit the updated \`wally.lock\` with the manifest."
               echo
               printf '%b' "$report"
               echo

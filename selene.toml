@@ -1,4 +1,4 @@
-std = "roblox+testez"
+std = "roblox+scribe-test"
 
 # The Lune runner uses Lune globals/requires, not Roblox's.
 # `src/Internal/Store/ProfileStore.luau` is a vendored fork kept line-identical

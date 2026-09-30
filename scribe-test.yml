@@ -1,0 +1,10 @@
+---
+# The headless host gives test/Sim access to uncached source for each server.
+# Jest APIs are imported explicitly from JestGlobals by every spec.
+globals:
+  __SimHost:
+    property: read-only
+  __SimHost.*:
+    property: read-only
+  __SimHost.Env.*:
+    property: read-only

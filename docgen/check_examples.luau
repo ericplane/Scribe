@@ -10,28 +10,12 @@ local fs = require("@lune/fs")
 local luau = require("@lune/luau")
 local process = require("@lune/process")
 local task = require("@lune/task")
+local makeHost = require("../lune/test-host")
 
-local runner = fs.readFile("lune/run-tests.luau")
-local boundary = "local specsFolder = root._children.Test._children.Specs"
-local start = string.find(runner, boundary, 1, true)
-assert(start, "The headless runner bootstrap changed; update docgen/check_examples.luau")
-assert(not string.find(runner, boundary, start + 1, true), "Ambiguous headless bootstrap boundary")
-local bootstrap = string.sub(runner, 1, start - 1)
-	.. [[
-return {
-    Require = shimRequire,
-    Root = root,
-    Globals = baseGlobals,
-    -- TestCtx's FakePlayer is deliberately a plain table. The docs use the
-    -- public Data[player] shorthand, so classify these as shim Instances while
-    -- preserving the fake player's existing lifecycle methods and identity.
-    MarkPlayer = function(player) player[INSTANCE_MARKER] = true end,
-}
-]]
-local host = luau.load(bootstrap, { debugName = "docs-example-bootstrap", injectGlobals = true })()
-local Scribe = host.Require(host.Root.Scribe)
-local TestCtx = host.Require(host.Root.Test.Helpers.TestCtx)
-local Client = host.Require(host.Root.Scribe.Client)
+local host = makeHost()
+local Scribe = host.globals.require(host.root.Scribe)
+local TestCtx = host.globals.require(host.root.Test.Helpers.TestCtx)
+local Client = host.globals.require(host.root.Scribe.Client)
 local harnesses = {}
 local passed = 0
 
@@ -50,7 +34,7 @@ local function execute(code, env, label)
 end
 
 local function setup(moduleCode, label)
-	local env = table.clone(host.Globals)
+	local env = table.clone(host.globals)
 	local output = {}
 	env.print = function(...)
 		table.insert(output, { ... })
@@ -111,7 +95,7 @@ local function setup(moduleCode, label)
 	storage.Shared.GameData = bundle
 	storage.Shared.EmberfallData = bundle
 	local player, entry, data = harness.Join(773001)
-	host.MarkPlayer(player)
+	host.markPlayer(player)
 	table.insert(joined, player)
 	harness.Transport.LocalPlayer = player
 	bundle.Client = Client.new(harness.Options, harness.Compiled)
@@ -126,7 +110,7 @@ local function setup(moduleCode, label)
 		JoinLater = function()
 			assert(onPlayerAdded, "Server example did not connect PlayerAdded")
 			local latePlayer, _, lateData = harness.Join(773002)
-			host.MarkPlayer(latePlayer)
+			host.markPlayer(latePlayer)
 			onPlayerAdded(latePlayer)
 			return lateData
 		end,

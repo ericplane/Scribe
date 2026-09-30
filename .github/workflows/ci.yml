@@ -20,32 +20,52 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
       - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
       - name: Cache rokit tool store
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.rokit
           key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
-      # The headless runner ships its own mini-TestEZ, so no `wally install` here.
+      - name: Install Jest dependencies
+        run: wally install
+      - name: Build Studio test place
+        run: |
+          mkdir -p test-results
+          rojo build test.project.json -o test-results/ScribeTest.rbxlx
+      - name: Verify test runner failure handling
+        timeout-minutes: 5
+        run: node scripts/verify-test-runner.mjs
       - name: Run test suite
+        timeout-minutes: 5
         run: lune run lune/run-tests
       # The same tests as the step above, with every outbound frame forced through
       # Wire.Fragment and reassembled by the real client (TestCtx drops
-      # MaxOutboundBytes to 256 when this is set). It is not a duplicate run: the
-      # plain suite above splits 27 frames across the whole run -- 18 Diff, 9 Init
-      # -- and this one splits 51, the extra 16 being SharedInit and SharedDiff
-      # broadcasts that the plain invocation fragments ZERO times. Costs ~28s.
+      # MaxOutboundBytes to 256 when this is set). This exercises shared
+      # broadcasts that can fit in a single frame in the normal run.
       #
       # If this ever goes red while the step above is green, that is a real
       # finding about the fragment path and not a flake -- the run is
       # deterministic (test/Sim seeds its own Rng; there is no wall clock in the
       # seams). Do not paper over it by dropping this step.
       - name: Run test suite (every frame through the fragment path)
+        timeout-minutes: 5
         run: lune run lune/run-tests
         env:
           SCRIBE_FRAGMENT_ALL: "1"
+          SCRIBE_TEST_REPORT_DIR: test-results/fragment
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unit-test-results
+          path: test-results/
+          if-no-files-found: warn
 
   lint:
     runs-on: ubuntu-latest
@@ -57,11 +77,11 @@ jobs:
         with:
           path: ~/.rokit
           key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
-      # selene.toml uses std = "roblox+testez"; selene fetches/caches the roblox
+      # selene.toml uses std = "roblox+scribe-test"; selene fetches/caches the roblox
       # std on first run. If a runner ever flakes on that fetch, add a
       # `selene generate-roblox-std` step before this one.
       - name: Lint
-        run: selene src test lune addons bundle/verify.luau
+        run: selene src test lune addons bundle/verify.luau scripts/RunTests.server.luau
 
   format:
     runs-on: ubuntu-latest
@@ -74,10 +94,11 @@ jobs:
           path: ~/.rokit
           key: rokit-${{ runner.os }}-${{ hashFiles('rokit.toml') }}
       - name: Check formatting
-        run: stylua --check src test lune addons bundle/verify.luau
+        run: stylua --check src test lune addons bundle/verify.luau scripts/RunTests.server.luau
 
   roblox-ts:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -88,10 +109,19 @@ jobs:
           node-version: "24"
           cache: npm
       - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
+      - name: Install Jest dependencies
+        run: wally install
       - name: Install roblox-ts dependencies
         run: npm ci
       - name: Verify declarations, six packages, and compiled runtime integration
         run: npm test
+      - name: Upload compiled integration test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: roblox-ts-test-results
+          path: test-results/
+          if-no-files-found: warn
 
   wally-package:
     runs-on: ubuntu-latest
@@ -114,8 +144,8 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/wally
-          key: wally-${{ runner.os }}-${{ hashFiles('wally.toml') }}
-      # Populates DevPackages (TestEZ) so the test.project.json sourcemap resolves.
+          key: wally-${{ runner.os }}-${{ hashFiles('wally.toml', 'wally.lock') }}
+      # Populates DevPackages so the test.project.json sourcemap resolves.
       - name: Install Wally dependencies
         run: wally install
       - name: Generate sourcemap

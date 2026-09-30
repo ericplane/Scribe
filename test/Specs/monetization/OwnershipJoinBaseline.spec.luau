@@ -18,141 +18,141 @@
 --
 -- The seam is the point: the CONTROL and the TEST differ only in whether the
 -- ownership check yields. Everything else is identical.
-return function()
-	local Root = script.Parent.Parent.Parent.Parent
-	local TestCtx = require(Root.Test.Helpers.TestCtx)
+local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local describe = JestGlobals.describe
+local it = JestGlobals.it
+local expect = JestGlobals.expect
 
-	--- `yields` decides whether the pass check takes a scheduler turn, which is the
-	--- only difference between the two arms.
-	local function makeHarness(owned: boolean, yields: boolean)
-		local events = {}
-		local harness = TestCtx.make({
-			Options = {
-				Passes = { VIPPass = { Id = 777001 } },
-				UserOwnsGamePassAsync = function()
-					if yields then
-						task.wait()
-					end
-					return owned
-				end,
-			},
-		})
-		harness.Data.OnOwnershipChanged:Connect(function(_player, key, isOwned)
-			table.insert(events, `{key}={tostring(isOwned)}`)
-		end)
-		return harness, events
-	end
+local Root = script.Parent.Parent.Parent.Parent
+local TestCtx = require(Root.Test.Helpers.TestCtx)
 
-	local function settle()
-		for _ = 1, 10 do
-			task.wait()
-		end
-	end
-
-	describe("OnOwnershipChanged at join", function()
-		it("says nothing for a pass the player already owned, when the check is instant", function()
-			-- THE CONTROL. This arm already worked: with no yield the cache write lands
-			-- before the baseline is taken, so the baseline absorbs it.
-			local harness, events = makeHarness(true, false)
-			local player = harness.Join(88201)
-			settle()
-
-			expect(#events).to.equal(0)
-			expect(harness.Data.Owns(player, "VIPPass")).to.equal(true)
-
-			harness.Cleanup()
-		end)
-
-		it("says nothing for a pass the player already owned, when the check YIELDS", function()
-			-- The defect, and the only arm that differs from the control above.
-			local harness, events = makeHarness(true, true)
-			local player = harness.Join(88202)
-			settle()
-
-			if #events > 0 then
-				error(`expected no ownership events at join, got: {table.concat(events, ",")}`)
-			end
-			expect(harness.Data.Owns(player, "VIPPass")).to.equal(true)
-
-			harness.Cleanup()
-		end)
-
-		it("says nothing for a pass the player does NOT own, either way", function()
-			-- The other half of "nothing at join", and it guards against a fix that
-			-- seeded the baseline to true unconditionally.
-			for _, yields in { false, true } do
-				local harness, events = makeHarness(false, yields)
-				local player = harness.Join(if yields then 88203 else 88204)
-				settle()
-
-				expect(#events).to.equal(0)
-				expect(harness.Data.Owns(player, "VIPPass")).to.equal(false)
-
-				harness.Cleanup()
-			end
-		end)
-
-		it("STILL fires for a genuine transition after join", function()
-			-- THE CONTROL THAT MATTERS MOST. Suppressing the join report is only
-			-- correct if the signal still works afterwards -- a fix that seeded the
-			-- baseline too aggressively would silence the whole feature and pass every
-			-- test above.
-			local harness, events = makeHarness(false, true)
-			local player = harness.Join(88205)
-			settle()
-			expect(#events).to.equal(0)
-
-			harness.Data.GrantPerk(player, "VIPPass")
-			settle()
-
-			expect(#events).to.equal(1)
-			expect(events[1]).to.equal("VIPPass=true")
-			expect(harness.Data.Owns(player, "VIPPass")).to.equal(true)
-
-			harness.Data.RevokePerk(player, "VIPPass")
-			settle()
-
-			expect(#events).to.equal(2)
-			expect(events[2]).to.equal("VIPPass=false")
-
-			harness.Cleanup()
-		end)
-
-		it(
-			"does not report a change for a PERK the player joined holding, while the pass check is still out",
-			function()
-				-- THE UNION CASE, and the one a naive seed gets wrong. Ownership is
-				-- Perks OR OwnsCache OR RobloxPlus. A player whose STORED profile already
-				-- carries the perk is owned from the instant the baseline is taken, and the
-				-- pass check -- still in flight, and about to come back not-owned -- knows
-				-- nothing about that. Assigning the pass result into the baseline records
-				-- FALSE under a player who is owned, and the very next scan then reports a
-				-- change to true that never happened.
-				--
-				-- The perk has to be on the KEY, not granted afterwards: granting it later
-				-- happens once the resolution has already landed, which is a different and
-				-- much easier ordering.
-				local harness, events = makeHarness(false, true)
-				harness.Fake.Persisted["Default/PLAYER_88206"] = {
-					Coins = 5,
-					_Scribe = { Perks = { VIPPass = true } },
-				}
-				local player = harness.Join(88206)
-				settle()
-
-				expect(harness.Data.Owns(player, "VIPPass")).to.equal(true)
-				if #events > 0 then
-					error(`expected no ownership events for a perk held at join, got: {table.concat(events, ",")}`)
+--- `yields` decides whether the pass check takes a scheduler turn, which is the
+--- only difference between the two arms.
+local function makeHarness(owned: boolean, yields: boolean)
+	local events = {}
+	local harness = TestCtx.make({
+		Options = {
+			Passes = { VIPPass = { Id = 777001 } },
+			UserOwnsGamePassAsync = function()
+				if yields then
+					task.wait()
 				end
-
-				-- ...and the signal is not dead: revoking it still reports.
-				harness.Data.RevokePerk(player, "VIPPass")
-				settle()
-				expect(#events).to.equal(1)
-				expect(events[1]).to.equal("VIPPass=false")
-
-				harness.Cleanup()
-			end
-		)
+				return owned
+			end,
+		},
+	})
+	harness.Data.OnOwnershipChanged:Connect(function(_player, key, isOwned)
+		table.insert(events, `{key}={tostring(isOwned)}`)
 	end)
+	return harness, events
 end
+
+local function settle()
+	for _ = 1, 10 do
+		task.wait()
+	end
+end
+
+describe("OnOwnershipChanged at join", function()
+	it("says nothing for a pass the player already owned, when the check is instant", function()
+		-- THE CONTROL. This arm already worked: with no yield the cache write lands
+		-- before the baseline is taken, so the baseline absorbs it.
+		local harness, events = makeHarness(true, false)
+		local player = harness.Join(88201)
+		settle()
+
+		expect(#events).toBe(0)
+		expect(harness.Data.Owns(player, "VIPPass")).toBe(true)
+
+		harness.Cleanup()
+	end)
+
+	it("says nothing for a pass the player already owned, when the check YIELDS", function()
+		-- The defect, and the only arm that differs from the control above.
+		local harness, events = makeHarness(true, true)
+		local player = harness.Join(88202)
+		settle()
+
+		if #events > 0 then
+			error(`expected no ownership events at join, got: {table.concat(events, ",")}`)
+		end
+		expect(harness.Data.Owns(player, "VIPPass")).toBe(true)
+
+		harness.Cleanup()
+	end)
+
+	it("says nothing for a pass the player does NOT own, either way", function()
+		-- The other half of "nothing at join", and it guards against a fix that
+		-- seeded the baseline to true unconditionally.
+		for _, yields in { false, true } do
+			local harness, events = makeHarness(false, yields)
+			local player = harness.Join(if yields then 88203 else 88204)
+			settle()
+
+			expect(#events).toBe(0)
+			expect(harness.Data.Owns(player, "VIPPass")).toBe(false)
+
+			harness.Cleanup()
+		end
+	end)
+
+	it("STILL fires for a genuine transition after join", function()
+		-- THE CONTROL THAT MATTERS MOST. Suppressing the join report is only
+		-- correct if the signal still works afterwards -- a fix that seeded the
+		-- baseline too aggressively would silence the whole feature and pass every
+		-- test above.
+		local harness, events = makeHarness(false, true)
+		local player = harness.Join(88205)
+		settle()
+		expect(#events).toBe(0)
+
+		harness.Data.GrantPerk(player, "VIPPass")
+		settle()
+
+		expect(#events).toBe(1)
+		expect(events[1]).toBe("VIPPass=true")
+		expect(harness.Data.Owns(player, "VIPPass")).toBe(true)
+
+		harness.Data.RevokePerk(player, "VIPPass")
+		settle()
+
+		expect(#events).toBe(2)
+		expect(events[2]).toBe("VIPPass=false")
+
+		harness.Cleanup()
+	end)
+
+	it("does not report a change for a PERK the player joined holding, while the pass check is still out", function()
+		-- THE UNION CASE, and the one a naive seed gets wrong. Ownership is
+		-- Perks OR OwnsCache OR RobloxPlus. A player whose STORED profile already
+		-- carries the perk is owned from the instant the baseline is taken, and the
+		-- pass check -- still in flight, and about to come back not-owned -- knows
+		-- nothing about that. Assigning the pass result into the baseline records
+		-- FALSE under a player who is owned, and the very next scan then reports a
+		-- change to true that never happened.
+		--
+		-- The perk has to be on the KEY, not granted afterwards: granting it later
+		-- happens once the resolution has already landed, which is a different and
+		-- much easier ordering.
+		local harness, events = makeHarness(false, true)
+		harness.Fake.Persisted["Default/PLAYER_88206"] = {
+			Coins = 5,
+			_Scribe = { Perks = { VIPPass = true } },
+		}
+		local player = harness.Join(88206)
+		settle()
+
+		expect(harness.Data.Owns(player, "VIPPass")).toBe(true)
+		if #events > 0 then
+			error(`expected no ownership events for a perk held at join, got: {table.concat(events, ",")}`)
+		end
+
+		-- ...and the signal is not dead: revoking it still reports.
+		harness.Data.RevokePerk(player, "VIPPass")
+		settle()
+		expect(#events).toBe(1)
+		expect(events[1]).toBe("VIPPass=false")
+
+		harness.Cleanup()
+	end)
+end)

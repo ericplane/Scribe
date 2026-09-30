@@ -83,19 +83,21 @@ assert([helper, leaderstatsHelper, spec].every(file => !fs.existsSync(file)), "R
 try {
     fs.writeFileSync(helper, emitted);
     fs.writeFileSync(leaderstatsHelper, leaderstatsRuntime);
-    fs.writeFileSync(spec, `return function()
- local root = script.Parent.Parent.Parent.Parent
- local run = require(root.Test.Helpers.RobloxTsCompiled)
- local runLeaderstats = require(root.Test.Helpers.RobloxTsLeaderstats)
- local makeDependencies = require(root.Test.Helpers.RobloxTsLeaderstatsDependencies)
- local make = require(root.Test.Helpers.TestCtx).make
- local Scribe = require(root.Scribe)
- local Leaderstats = require(root.Addons.Leaderstats.ScribeLeaderstats)
- describe("roblox-ts compiled consumer", function()
-  it("preserves the public runtime contracts", function() run(Scribe, make) end)
-  it("supports leaderstats updates and cleanup", function() runLeaderstats(Scribe, Leaderstats, make, makeDependencies) end)
- end)
-end
+    fs.writeFileSync(spec, `local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local describe = JestGlobals.describe
+local it = JestGlobals.it
+
+local root = script.Parent.Parent.Parent.Parent
+local run = require(root.Test.Helpers.RobloxTsCompiled)
+local runLeaderstats = require(root.Test.Helpers.RobloxTsLeaderstats)
+local makeDependencies = require(root.Test.Helpers.RobloxTsLeaderstatsDependencies)
+local make = require(root.Test.Helpers.TestCtx).make
+local Scribe = require(root.Scribe)
+local Leaderstats = require(root.Addons.Leaderstats.ScribeLeaderstats)
+describe("roblox-ts compiled consumer", function()
+ it("preserves the public runtime contracts", function() run(Scribe, make) end)
+ it("supports leaderstats updates and cleanup", function() runLeaderstats(Scribe, Leaderstats, make, makeDependencies) end)
+end)
 `);
     execFileSync(process.env.SCRIBE_LUNE || "lune", ["run", "lune/run-tests"], { cwd: root, stdio: "inherit", env: { ...process.env, SCRIBE_SPECS: "api/RobloxTsCompiled" } });
 } finally {

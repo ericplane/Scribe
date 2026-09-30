@@ -17,16 +17,23 @@
 -- the fake against a build nobody ships. The fork is the real implementation, and
 -- checking it against real DataStores is the thing this arm is for.
 --
--- To run against the real library in Studio, build test.project.json, then set
---     require(<this module>).UseReal = true
--- before the test runner starts (top of test/RunTests.server.luau).
+-- To opt into cloud writes in a dedicated test universe, set UseReal below to
+-- true in this module's SOURCE before starting the Studio test run. Jest loads
+-- its own isolated module instances, so changing an externally required table
+-- does not configure the instances the specs use. See CONTRIBUTING.md.
 local Root = script.Parent.Parent.Parent
 
 local ConformanceStore = {}
 
--- Flipped by the Studio runner. A plain module field rather than a global, so it
--- works identically under Lune and in Roblox with no environment assumptions.
+-- Deliberately opt-in. Never enable real DataStores for an ordinary CI run.
 ConformanceStore.UseReal = false
+
+-- Only the opted-in cloud suites use this ceiling. Migration alone can spend
+-- 3 * 90s waiting for budget, 3 * 60s joining, 2 * 30s flushing, and 2 * 7s
+-- pacing writes. Ordinary tests keep Jest's 10s default. This is a failure
+-- deadline, not an expected duration or a delay added to successful tests.
+ConformanceStore.LIVE_TIMEOUT_MS = 600000
+ConformanceStore.CLEANUP_TIMEOUT_MS = 60000
 
 function ConformanceStore.IsReal(): boolean
 	return ConformanceStore.UseReal == true
@@ -226,9 +233,8 @@ end
 
 --- Wait until the engine has room for roughly `needed` more UpdateAsync requests.
 ---
---- The client-side allowance only, and the lesser limit here. It refills at about
---- (60 + 10 * players) per minute for the whole server rather than per DataStore, so a
---- Studio plugin polling its own store competes for it.
+--- The server's current allowance only; Studio and live servers can have different
+--- limits. Other consumers in the same server compete for that allowance.
 ---
 --- Returns the budget last seen, or -1 when the engine cannot be asked, which is every
 --- headless run. Never blocks then: treating "cannot ask" as "none left" would hang CI.

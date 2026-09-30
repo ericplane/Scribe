@@ -2,283 +2,287 @@
 -- Profile lifecycle: load → mutate → flush → unload, with leak assertions
 -- that internal maps end up empty.
 
-return function()
-	local Root = script.Parent.Parent.Parent.Parent
-	local TestCtx = require(Root.Test.Helpers.TestCtx)
+local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local it = JestGlobals.it
+local expect = JestGlobals.expect
+local beforeEach = JestGlobals.beforeEach
+local afterEach = JestGlobals.afterEach
 
-	local harness
+local Root = script.Parent.Parent.Parent.Parent
+local TestCtx = require(Root.Test.Helpers.TestCtx)
 
-	beforeEach(function()
-		harness = TestCtx.make()
+local harness
+
+beforeEach(function()
+	harness = TestCtx.make()
+end)
+
+afterEach(function()
+	harness.Cleanup()
+end)
+
+it("loads a profile to Ready with reconciled template defaults", function()
+	local player, entry, data = harness.Join()
+	expect((harness.Ctx.Persistence.GetState(player))).toBe("Ready")
+	expect(data.Coins.Get()).toBe(0)
+	expect(data.Settings.Music.Get()).toBe(true)
+	expect(data.Secret.Flagged.Get()).toBe(false)
+	-- Reserved root reconciled.
+	expect(entry.LiveData._Scribe).never.toBeNil()
+	expect(entry.LiveData._Scribe.Version).toBe(1)
+	-- Session store built separately, never inside profile data.
+	expect(data.Runtime.InCombat.Get()).toBe(false)
+	expect(entry.LiveData.Runtime).toBe(nil)
+end)
+
+it("persists mutations on flush", function()
+	local player, entry, data = harness.Join()
+	data.Coins.Set(50)
+	data.Inventory.Sword.Set({ Dmg = 5 })
+	expect(harness.Data.Flush(player)).toBe(true)
+
+	local persisted = harness.Fake.Persisted[`Default/PLAYER_{entry.UserId}`]
+	expect(persisted).never.toBeNil()
+	expect(persisted.Coins).toBe(50)
+	expect(persisted.Inventory.Sword.Dmg).toBe(5)
+
+	local info = harness.Data.GetSaveInfo(player)
+	expect(info.LastResult).toBe("Ok")
+	expect(info.Dirty).toBe(false)
+end)
+
+it("never persists Session roots", function()
+	local player, entry, data = harness.Join()
+	data.Runtime.InCombat.Set(true)
+	harness.Data.Flush(player)
+	local persisted = harness.Fake.Persisted[`Default/PLAYER_{entry.UserId}`]
+	expect(persisted.Runtime).toBe(nil)
+end)
+
+it("reloads persisted data on a later session", function()
+	local player, _entry, data = harness.Join(4242)
+	data.Coins.Set(777)
+	harness.Data.Flush(player)
+	harness.Leave(player)
+
+	local _, _, data2 = harness.Join(4242)
+	expect(data2.Coins.Get()).toBe(777)
+end)
+
+it("tears down fully on leave: dead tree, no listeners, empty maps", function()
+	local player, entry, data = harness.Join()
+	local fired = 0
+	data.Coins.Observe(function()
+		fired += 1
 	end)
+	expect(fired).toBe(1)
 
-	afterEach(function()
-		harness.Cleanup()
+	local tree = entry.Tree
+	harness.Leave(player)
+
+	-- Dead-tree writes throw with the documented message.
+	expect(tree.Dead).toBe(true)
+	local ok, err = pcall(function()
+		data.Coins.Set(1)
 	end)
+	expect(ok).toBe(false)
+	expect(string.find(tostring(err), "unloaded") ~= nil).toBe(true)
 
-	it("loads a profile to Ready with reconciled template defaults", function()
-		local player, entry, data = harness.Join()
-		expect(harness.Ctx.Persistence.GetState(player)).to.equal("Ready")
-		expect(data.Coins.Get()).to.equal(0)
-		expect(data.Settings.Music.Get()).to.equal(true)
-		expect(data.Secret.Flagged.Get()).to.equal(false)
-		-- Reserved root reconciled.
-		expect(entry.LiveData._Scribe).to.be.ok()
-		expect(entry.LiveData._Scribe.Version).to.equal(1)
-		-- Session store built separately, never inside profile data.
-		expect(data.Runtime.InCombat.Get()).to.equal(false)
-		expect(entry.LiveData.Runtime).to.equal(nil)
-	end)
+	-- Listener maps cleared. _paths is asserted alongside _listeners because the
+	-- two are populated together, one entry per listened path; this replaces an
+	-- assertion on a _accessors field that was never written to and so could not
+	-- fail. The accessor cache itself is the weak-valued per-parent _children.
+	expect((next(tree._listeners))).toBe(nil)
+	expect((next(tree._paths))).toBe(nil)
+end)
 
-	it("persists mutations on flush", function()
-		local player, entry, data = harness.Join()
-		data.Coins.Set(50)
-		data.Inventory.Sword.Set({ Dmg = 5 })
-		expect(harness.Data.Flush(player)).to.equal(true)
-
-		local persisted = harness.Fake.Persisted[`Default/PLAYER_{entry.UserId}`]
-		expect(persisted).to.be.ok()
-		expect(persisted.Coins).to.equal(50)
-		expect(persisted.Inventory.Sword.Dmg).to.equal(5)
-
-		local info = harness.Data.GetSaveInfo(player)
-		expect(info.LastResult).to.equal("Ok")
-		expect(info.Dirty).to.equal(false)
-	end)
-
-	it("never persists Session roots", function()
-		local player, entry, data = harness.Join()
-		data.Runtime.InCombat.Set(true)
-		harness.Data.Flush(player)
-		local persisted = harness.Fake.Persisted[`Default/PLAYER_{entry.UserId}`]
-		expect(persisted.Runtime).to.equal(nil)
-	end)
-
-	it("reloads persisted data on a later session", function()
-		local player, _entry, data = harness.Join(4242)
-		data.Coins.Set(777)
-		harness.Data.Flush(player)
+it("leaks nothing across many load/unload cycles", function()
+	for _ = 1, 5 do
+		local player = harness.Join()
+		local data = harness.Data.Get(player)
+		data.Coins.Increment(10)
 		harness.Leave(player)
+	end
+	expect((next(harness.Ctx.Persistence.Entries))).toBe(nil)
+	expect((next(harness.Fake.ActiveProfiles))).toBe(nil)
+end)
 
-		local _, _, data2 = harness.Join(4242)
-		expect(data2.Coins.Get()).to.equal(777)
-	end)
-
-	it("tears down fully on leave: dead tree, no listeners, empty maps", function()
-		local player, entry, data = harness.Join()
-		local fired = 0
-		data.Coins.Observe(function()
-			fired += 1
-		end)
-		expect(fired).to.equal(1)
-
-		local tree = entry.Tree
-		harness.Leave(player)
-
-		-- Dead-tree writes throw with the documented message.
-		expect(tree.Dead).to.equal(true)
-		local ok, err = pcall(function()
-			data.Coins.Set(1)
-		end)
-		expect(ok).to.equal(false)
-		expect(string.find(tostring(err), "unloaded") ~= nil).to.equal(true)
-
-		-- Listener maps cleared. _paths is asserted alongside _listeners because the
-		-- two are populated together, one entry per listened path; this replaces an
-		-- assertion on a _accessors field that was never written to and so could not
-		-- fail. The accessor cache itself is the weak-valued per-parent _children.
-		expect(next(tree._listeners)).to.equal(nil)
-		expect(next(tree._paths)).to.equal(nil)
-	end)
-
-	it("leaks nothing across many load/unload cycles", function()
-		for _ = 1, 5 do
-			local player = harness.Join()
-			local data = harness.Data.Get(player)
-			data.Coins.Increment(10)
-			harness.Leave(player)
+it("fires SessionEnded before teardown completes, with the reason", function()
+	local player = harness.Join()
+	local seenReason = nil
+	harness.Ctx.Signals.SessionEnded:Connect(function(endedPlayer, reason)
+		if endedPlayer == player then
+			seenReason = reason
 		end
-		expect(next(harness.Ctx.Persistence.Entries)).to.equal(nil)
-		expect(next(harness.Fake.ActiveProfiles)).to.equal(nil)
 	end)
+	harness.Leave(player)
+	task.wait() -- signal handlers run on their own threads
+	expect(seenReason).toBe("player-left")
+	expect((harness.Ctx.Persistence.GetState(player))).toBe("SessionEnded")
+end)
 
-	it("fires SessionEnded before teardown completes, with the reason", function()
-		local player = harness.Join()
-		local seenReason = nil
-		harness.Ctx.Signals.SessionEnded:Connect(function(endedPlayer, reason)
-			if endedPlayer == player then
-				seenReason = reason
-			end
-		end)
-		harness.Leave(player)
-		task.wait() -- signal handlers run on their own threads
-		expect(seenReason).to.equal("player-left")
-		expect(harness.Ctx.Persistence.GetState(player)).to.equal("SessionEnded")
+it("fails closed when the profile cannot load (Kick policy)", function()
+	harness.Fake.FailNextLoad = true
+	local FakePlayer = require(Root.Test.Helpers.FakePlayer)
+	local player = FakePlayer.new()
+	harness.Ctx.Persistence.OnPlayerAdded(player)
+	local data, reason = harness.Ctx.Persistence.WaitForData(player)
+	expect(data).toBe(nil)
+	expect(reason).toBe("load-failed")
+	expect(player.Kicked).never.toBeNil()
+end)
+
+it("Data.WaitForData returns the accessor once Ready", function()
+	local player = harness.Join()
+	local data, reason = harness.Data.WaitForData(player)
+	expect(data).never.toBeNil()
+	expect(reason).toBe(nil)
+	expect(data.Coins.Get()).toBe(0)
+end)
+
+it("Data.WaitForData with a timeout still returns immediately when Ready", function()
+	local player = harness.Join()
+	local data, reason = harness.Data.WaitForData(player, 0.05)
+	expect(data).never.toBeNil()
+	expect(reason).toBe(nil)
+end)
+
+it("WaitForData reports timeout for a player Scribe has no session for", function()
+	local FakePlayer = require(Root.Test.Helpers.FakePlayer)
+	local player = FakePlayer.new() -- never passed to OnPlayerAdded: no entry
+	local startedAt = os.clock()
+	local data, reason = harness.Ctx.Persistence.WaitForData(player, 0.25)
+	expect(data).toBe(nil)
+	expect(reason).toBe("timeout")
+	expect(os.clock() - startedAt < 5).toBe(true)
+end)
+
+it("WaitForData reports still-loading while an entry is stuck Loading (Wait policy)", function()
+	local waitHarness = TestCtx.make({ Options = { LoadFailurePolicy = "Wait" } })
+	waitHarness.Fake.FailNextLoad = true
+	local FakePlayer = require(Root.Test.Helpers.FakePlayer)
+	local player = FakePlayer.new()
+	waitHarness.Ctx.Persistence.OnPlayerAdded(player)
+	-- The failed first attempt parks the loader in a retry backoff: the entry
+	-- sits in Loading with no state transition to wake a waiter, so only the
+	-- timeout can end the wait.
+	expect((waitHarness.Ctx.Persistence.GetState(player))).toBe("Loading")
+	local startedAt = os.clock()
+	local data, reason = waitHarness.Ctx.Persistence.WaitForData(player, 0.25)
+	expect(data).toBe(nil)
+	-- Not "timeout": the load is still in flight and will very likely succeed.
+	-- The wait is still bounded -- that is the point of the assertion below.
+	expect(reason).toBe("still-loading")
+	expect(os.clock() - startedAt < 5).toBe(true)
+	FakePlayer.leave(player) -- the retry tears the entry down when it wakes
+	-- Its own harness, out of afterEach's reach; the retry wakes inside the next spec otherwise.
+	waitHarness.Cleanup()
+end)
+
+it("Flush honors a custom Timeout when the save never confirms", function()
+	local player, entry = harness.Join()
+	-- A save that neither confirms nor errors: AwaitSave can only time out.
+	-- SaveAwait, not Save -- AwaitSave asks the store for this call's outcome now
+	-- rather than watching OnAfterSave, so stubbing Save would leave the real
+	-- SaveAwait running and the wait would be answered normally.
+	entry.Profile.SaveAwait = function()
+		coroutine.yield() -- never returns, never errors
+		return "Saved", {}
+	end
+	local startedAt = os.clock()
+	expect(harness.Data.Flush(player, { Timeout = 0.2 })).toBe(false)
+	expect(os.clock() - startedAt < 5).toBe(true)
+end)
+
+it("rejects non-persistable value types at the write site", function()
+	local _, _, data = harness.Join()
+	expect(function()
+		data.Inventory.Fn.Set(function() end)
+	end).toThrow()
+	expect(data.Inventory.Count()).toBe(0)
+	expect(function()
+		TestCtx.make({ Template = { Fn = function() end } })
+	end).toThrow()
+end)
+
+it("stores, copies, and persists buffer fields", function()
+	local template = TestCtx.defaultTemplate()
+	template.Packed = buffer.fromstring("\0\1\2")
+	local bufferHarness = TestCtx.make({ Template = template })
+
+	local player, entry, data = bufferHarness.Join(4300)
+	expect(data.Packed.Get()).toEqualBuffer(buffer.fromstring("\0\1\2"))
+
+	-- Writes snapshot the buffer: mutating the caller's copy afterwards
+	-- must not leak into stored data.
+	local written = buffer.fromstring("ABCD")
+	data.Packed.Set(written)
+	buffer.writeu8(written, 0, 88)
+	expect(data.Packed.Get()).toEqualBuffer(buffer.fromstring("ABCD"))
+
+	-- Re-Setting a mutated buffer counts as a change (buffers never
+	-- compare equal by content).
+	local changes = 0
+	data.Packed.Changed(function()
+		changes += 1
 	end)
+	local live = data.Packed.Clone()
+	buffer.writeu8(live, 0, 69) -- "E"
+	data.Packed.Set(live)
+	expect(changes).toBe(1)
 
-	it("fails closed when the profile cannot load (Kick policy)", function()
-		harness.Fake.FailNextLoad = true
-		local FakePlayer = require(Root.Test.Helpers.FakePlayer)
-		local player = FakePlayer.new()
-		harness.Ctx.Persistence.OnPlayerAdded(player)
-		local data, reason = harness.Ctx.Persistence.WaitForData(player)
-		expect(data).to.equal(nil)
-		expect(reason).to.equal("load-failed")
-		expect(player.Kicked).to.be.ok()
-	end)
+	-- Dynamic dictionary paths accept buffers too.
+	data.Inventory.Chunk.Set(buffer.fromstring("chunk"))
 
-	it("Data.WaitForData returns the accessor once Ready", function()
-		local player = harness.Join()
-		local data, reason = harness.Data.WaitForData(player)
-		expect(data).to.be.ok()
-		expect(reason).to.equal(nil)
-		expect(data.Coins.Get()).to.equal(0)
-	end)
+	-- Persistence round-trips content without aliasing live data.
+	expect(bufferHarness.Data.Flush(player)).toBe(true)
+	local persisted = bufferHarness.Fake.Persisted[`Default/PLAYER_4300`]
+	expect(persisted.Packed).toEqualBuffer(buffer.fromstring("EBCD"))
+	expect(persisted.Packed == entry.LiveData.Packed).toBe(false)
+	expect(persisted.Inventory.Chunk).toEqualBuffer(buffer.fromstring("chunk"))
 
-	it("Data.WaitForData with a timeout still returns immediately when Ready", function()
-		local player = harness.Join()
-		local data, reason = harness.Data.WaitForData(player, 0.05)
-		expect(data).to.be.ok()
-		expect(reason).to.equal(nil)
-	end)
+	-- A later session reloads the same bytes.
+	bufferHarness.Leave(player)
+	local player2, _, data2 = bufferHarness.Join(4300)
+	expect(data2.Packed.Get()).toEqualBuffer(buffer.fromstring("EBCD"))
 
-	it("WaitForData reports timeout for a player Scribe has no session for", function()
-		local FakePlayer = require(Root.Test.Helpers.FakePlayer)
-		local player = FakePlayer.new() -- never passed to OnPlayerAdded: no entry
-		local startedAt = os.clock()
-		local data, reason = harness.Ctx.Persistence.WaitForData(player, 0.25)
-		expect(data).to.equal(nil)
-		expect(reason).to.equal("timeout")
-		expect(os.clock() - startedAt < 5).to.equal(true)
-	end)
+	-- GDPR export base64-encodes buffer fields into valid JSON.
+	local exported = bufferHarness.Data.Export(4300)
+	expect(type(exported)).toBe("string")
+	expect(string.find(exported, "base64:", 1, true) ~= nil).toBe(true)
+	local _ = player2
 
-	it("WaitForData reports still-loading while an entry is stuck Loading (Wait policy)", function()
-		local waitHarness = TestCtx.make({ Options = { LoadFailurePolicy = "Wait" } })
-		waitHarness.Fake.FailNextLoad = true
-		local FakePlayer = require(Root.Test.Helpers.FakePlayer)
-		local player = FakePlayer.new()
-		waitHarness.Ctx.Persistence.OnPlayerAdded(player)
-		-- The failed first attempt parks the loader in a retry backoff: the entry
-		-- sits in Loading with no state transition to wake a waiter, so only the
-		-- timeout can end the wait.
-		expect(waitHarness.Ctx.Persistence.GetState(player)).to.equal("Loading")
-		local startedAt = os.clock()
-		local data, reason = waitHarness.Ctx.Persistence.WaitForData(player, 0.25)
-		expect(data).to.equal(nil)
-		-- Not "timeout": the load is still in flight and will very likely succeed.
-		-- The wait is still bounded -- that is the point of the assertion below.
-		expect(reason).to.equal("still-loading")
-		expect(os.clock() - startedAt < 5).to.equal(true)
-		FakePlayer.leave(player) -- the retry tears the entry down when it wakes
-		-- Its own harness, out of afterEach's reach; the retry wakes inside the next spec otherwise.
-		waitHarness.Cleanup()
-	end)
+	bufferHarness.Cleanup()
+end)
 
-	it("Flush honors a custom Timeout when the save never confirms", function()
-		local player, entry = harness.Join()
-		-- A save that neither confirms nor errors: AwaitSave can only time out.
-		-- SaveAwait, not Save -- AwaitSave asks the store for this call's outcome now
-		-- rather than watching OnAfterSave, so stubbing Save would leave the real
-		-- SaveAwait running and the wait would be answered normally.
-		entry.Profile.SaveAwait = function()
-			coroutine.yield() -- never returns, never errors
-			return "Saved", {}
-		end
-		local startedAt = os.clock()
-		expect(harness.Data.Flush(player, { Timeout = 0.2 })).to.equal(false)
-		expect(os.clock() - startedAt < 5).to.equal(true)
-	end)
+it("supports Batch and Transaction semantics", function()
+	local player, _, data = harness.Join()
 
-	it("rejects non-persistable value types at the write site", function()
-		local _, _, data = harness.Join()
-		expect(function()
-			data.Inventory.Fn.Set(function() end)
-		end).to.throw()
-		expect(data.Inventory.Count()).to.equal(0)
-		expect(function()
-			TestCtx.make({ Template = { Fn = function() end } })
-		end).to.throw()
-	end)
-
-	it("stores, copies, and persists buffer fields", function()
-		local template = TestCtx.defaultTemplate()
-		template.Packed = buffer.fromstring("\0\1\2")
-		local bufferHarness = TestCtx.make({ Template = template })
-
-		local player, entry, data = bufferHarness.Join(4300)
-		expect(buffer.tostring(data.Packed.Get())).to.equal("\0\1\2")
-
-		-- Writes snapshot the buffer: mutating the caller's copy afterwards
-		-- must not leak into stored data.
-		local written = buffer.fromstring("ABCD")
-		data.Packed.Set(written)
-		buffer.writeu8(written, 0, 88)
-		expect(buffer.tostring(data.Packed.Get())).to.equal("ABCD")
-
-		-- Re-Setting a mutated buffer counts as a change (buffers never
-		-- compare equal by content).
-		local changes = 0
-		data.Packed.Changed(function()
-			changes += 1
-		end)
-		local live = data.Packed.Clone()
-		buffer.writeu8(live, 0, 69) -- "E"
-		data.Packed.Set(live)
-		expect(changes).to.equal(1)
-
-		-- Dynamic dictionary paths accept buffers too.
-		data.Inventory.Chunk.Set(buffer.fromstring("chunk"))
-
-		-- Persistence round-trips content without aliasing live data.
-		expect(bufferHarness.Data.Flush(player)).to.equal(true)
-		local persisted = bufferHarness.Fake.Persisted[`Default/PLAYER_4300`]
-		expect(buffer.tostring(persisted.Packed)).to.equal("EBCD")
-		expect(persisted.Packed == entry.LiveData.Packed).to.equal(false)
-		expect(buffer.tostring(persisted.Inventory.Chunk)).to.equal("chunk")
-
-		-- A later session reloads the same bytes.
-		bufferHarness.Leave(player)
-		local player2, _, data2 = bufferHarness.Join(4300)
-		expect(buffer.tostring(data2.Packed.Get())).to.equal("EBCD")
-
-		-- GDPR export base64-encodes buffer fields into valid JSON.
-		local exported = bufferHarness.Data.Export(4300)
-		expect(type(exported)).to.equal("string")
-		expect(string.find(exported, "base64:", 1, true) ~= nil).to.equal(true)
-		local _ = player2
-
-		bufferHarness.Cleanup()
-	end)
-
-	it("supports Batch and Transaction semantics", function()
-		local player, _, data = harness.Join()
-
+	harness.Data.Batch(player, function()
+		data.Coins.Set(1)
 		harness.Data.Batch(player, function()
-			data.Coins.Set(1)
-			harness.Data.Batch(player, function()
-				data.Gems.Set(2) -- nested batch coalesces to the outermost
-			end)
-			data.Coins.Set(3)
+			data.Gems.Set(2) -- nested batch coalesces to the outermost
 		end)
-		expect(data.Coins.Get()).to.equal(3)
-		expect(data.Gems.Get()).to.equal(2)
-
-		local ok, err = harness.Data.Transaction(player, function()
-			data.Coins.Set(100)
-			data.Quests.Insert("q1")
-			error("boom")
-		end)
-		expect(ok).to.equal(false)
-		expect(string.find(tostring(err), "boom") ~= nil).to.equal(true)
-		-- Full rollback of every touched field.
-		expect(data.Coins.Get()).to.equal(3)
-		expect(data.Quests.Count()).to.equal(0)
-
-		-- Transactions do not nest.
-		harness.Data.Transaction(player, function()
-			expect(function()
-				harness.Data.Transaction(player, function() end)
-			end).to.throw()
-		end)
+		data.Coins.Set(3)
 	end)
-end
+	expect(data.Coins.Get()).toBe(3)
+	expect(data.Gems.Get()).toBe(2)
+
+	local ok, err = harness.Data.Transaction(player, function()
+		data.Coins.Set(100)
+		data.Quests.Insert("q1")
+		error("boom")
+	end)
+	expect(ok).toBe(false)
+	expect(string.find(tostring(err), "boom") ~= nil).toBe(true)
+	-- Full rollback of every touched field.
+	expect(data.Coins.Get()).toBe(3)
+	expect(data.Quests.Count()).toBe(0)
+
+	-- Transactions do not nest.
+	harness.Data.Transaction(player, function()
+		expect(function()
+			harness.Data.Transaction(player, function() end)
+		end).toThrow()
+	end)
+end)

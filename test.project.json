@@ -38,8 +38,11 @@
     },
     "ServerScriptService": {
       "$className": "ServerScriptService",
+      "$properties": {
+        "LoadStringEnabled": true
+      },
       "RunScribeTests": {
-        "$path": "test/RunTests.server.luau"
+        "$path": "scripts/RunTests.server.luau"
       }
     }
   }

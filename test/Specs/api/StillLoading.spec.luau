@@ -19,148 +19,151 @@
 -- spec here is the one that earns the distinction: it shows the very load that
 -- reported "still-loading" going on to succeed with real data.
 
-return function()
-	local Root = script.Parent.Parent.Parent.Parent
-	local Scribe = require(Root.Scribe)
-	local Universe = require(Root.Test.Sim.Universe)
-	local Guard = require(Root.Test.Sim.Guard)
-	-- Sim-backed: every node below needs a simulated universe, which only the headless
-	-- runner can build. Under Studio they report SKIP instead of each failing with the
-	-- same missing capability -- see test/Sim/Available for why it cannot be provided.
-	local it = if require(Root.Test.Sim.Available).Ready then it else itSKIP
-	local StubTransport = require(Root.Test.Helpers.StubTransport)
-	local FakePlayer = require(Root.Test.Helpers.FakePlayer)
+local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local it = JestGlobals.it
+local expect = JestGlobals.expect
+local afterEach = JestGlobals.afterEach
 
-	local universe
+local Root = script.Parent.Parent.Parent.Parent
+local Scribe = require(Root.Scribe)
+local Universe = require(Root.Test.Sim.Universe)
+local Guard = require(Root.Test.Sim.Guard)
+-- Sim-backed: every node below needs a simulated universe, which only the headless
+-- runner can build. Under Studio they report SKIP instead of each failing with the
+-- same missing capability -- see test/Sim/Available for why it cannot be provided.
+local runIt = if require(Root.Test.Sim.Available).Ready then it else it.skip
+local StubTransport = require(Root.Test.Helpers.StubTransport)
+local FakePlayer = require(Root.Test.Helpers.FakePlayer)
 
-	local function build()
-		universe = Universe.new({
-			Seed = 60120,
-			Servers = 1,
-			Constants = { AUTO_SAVE_PERIOD = 300, SESSION_STEAL = 40, FIRST_LOAD_REPEAT = 5, ASSUME_DEAD = 630 },
-			Transport = StubTransport.new({ AutoPump = false }),
-			LatencyProfile = "Instant",
-			NoBudget = true,
-			StatusThresholds = { FailWindow = 60, FailCount = 3, RecoverStreak = 5 },
-			Template = { Coins = Scribe.Int(0, { Min = 0 }) },
-			-- The shipped defaults, spelled out: this whole band exists because the
-			-- wait (60) is shorter than the load deadline (120).
-			Options = {},
-		})
-		Guard.Install(universe)
-		return universe, universe:Server(1)
-	end
+local universe
 
-	afterEach(function()
-		Guard.Reset()
-		universe = nil
-	end)
-
-	--- Start a WaitForData on its own scheduler thread and hand back a table that
-	--- fills in when it returns. Yielding inside the spec body would block the
-	--- virtual clock the wait is measured against.
-	local function waitInBackground(uni, Persistence, player, timeout: number?)
-		local result = {}
-		uni.Sched:Spawn(function()
-			local accessor, reason = Persistence.WaitForData(player, timeout)
-			result.Done = true
-			result.At = uni.Sched.Now
-			result.Accessor = accessor
-			result.Reason = reason
-		end)
-		return result
-	end
-
-	it("answers still-loading, not timeout, while the load is genuinely in flight", function()
-		local uni, server = build()
-		local Persistence = server.Bundle.Ctx.Persistence
-		-- The load fails and retries: the entry sits in Loading with no state
-		-- transition to wake a waiter, so only the deadline can end the wait.
-		uni.Disk:Arm({ Kind = "ServiceError", Key = "PLAYER_66001", Count = 1000000 })
-
-		local player = FakePlayer.new(66001)
-		server:Join(66001, player)
-		local waited = waitInBackground(uni, Persistence, player)
-
-		uni:Run(75) -- past WaitForData's 60s default, inside the 120s load deadline
-
-		expect(waited.Done).to.equal(true)
-		expect(waited.Accessor).to.equal(nil)
-		expect(waited.Reason).to.equal("still-loading")
-		-- And the caller could always have found this out; it just was not in the
-		-- reason. Both halves are asserted so the reason cannot drift from the state.
-		expect(Persistence.GetState(player)).to.equal("Loading")
-	end)
-
-	it("was telling the truth: the same load then succeeds with real data", function()
-		-- The half that makes the distinction worth having. If the load never
-		-- recovered, "still-loading" would be no more accurate than "timeout".
-		local uni, server = build()
-		local Persistence = server.Bundle.Ctx.Persistence
-		uni.Disk:Arm({ Kind = "ServiceError", Key = "PLAYER_66002", Count = 1000000 })
-
-		local player = FakePlayer.new(66002)
-		server:Join(66002, player)
-		local waited = waitInBackground(uni, Persistence, player)
-		uni:Run(75)
-		expect(waited.Reason).to.equal("still-loading")
-
-		uni.Disk:Heal()
-		uni:Run(120)
-
-		expect(Persistence.GetState(player)).to.equal("Ready")
-		local data = server.Bundle.Data.Get(player)
-		expect(data).to.be.ok()
-		data.Coins.Set(7)
-		expect(data.Coins.Get()).to.equal(7)
-	end)
-
-	it("still answers timeout when Scribe has no session for the player at all", function()
-		-- The value has to stay reachable, and this is what it now means: not "your
-		-- load is slow" but "nothing here is loading you" -- in practice, the bundle
-		-- was constructed after this player joined, so OnPlayerAdded never ran.
-		local uni, server = build()
-		local Persistence = server.Bundle.Ctx.Persistence
-
-		local player = FakePlayer.new(66003) -- deliberately never joined
-		-- Present in this server, but never passed to Scribe's OnPlayerAdded.
-		player.Parent = server.Bundle.Players
-		local waited = waitInBackground(uni, Persistence, player, 5)
-		uni:Run(10)
-
-		expect(waited.Done).to.equal(true)
-		expect(waited.Accessor).to.equal(nil)
-		expect(waited.Reason).to.equal("timeout")
-		expect(Persistence.EntryFor(player)).to.equal(nil)
-	end)
-
-	it("keeps the wait bounded, so this is a better answer and not a longer one", function()
-		-- The rejected alternative was raising WaitForData's default to match the
-		-- load deadline. A caller's own timeout must still be honoured to the
-		-- second, or "still-loading" would just be "we hung".
-		local uni, server = build()
-		local Persistence = server.Bundle.Ctx.Persistence
-		uni.Disk:Arm({ Kind = "ServiceError", Key = "PLAYER_66004", Count = 1000000 })
-
-		local player = FakePlayer.new(66004)
-		server:Join(66004, player)
-		local startedAt = uni.Sched.Now
-		local waited = waitInBackground(uni, Persistence, player, 12)
-		uni:Run(40)
-
-		expect(waited.Reason).to.equal("still-loading")
-		-- Returned on the CALLER'S deadline, not on the load's: 12 seconds, not 60
-		-- and not 120. Asserted as a window rather than an equality because the
-		-- resume is deferred by one scheduler turn on purpose (see
-		-- waitStateChangedUntil), so the exact instant is the scheduler's business.
-		local elapsed = waited.At - startedAt
-		expect(`elapsed={elapsed >= 12 and elapsed < 20}`).to.equal("elapsed=true")
-		expect(Persistence.GetState(player)).to.equal("Loading")
-	end)
-
-	it("exports the reason as a constant alongside the rest", function()
-		expect(Scribe.Reason.StillLoading).to.equal("still-loading")
-		-- The set is frozen and shared by every bundle in the process.
-		expect(table.isfrozen(Scribe.Reason)).to.equal(true)
-	end)
+local function build()
+	universe = Universe.new({
+		Seed = 60120,
+		Servers = 1,
+		Constants = { AUTO_SAVE_PERIOD = 300, SESSION_STEAL = 40, FIRST_LOAD_REPEAT = 5, ASSUME_DEAD = 630 },
+		Transport = StubTransport.new({ AutoPump = false }),
+		LatencyProfile = "Instant",
+		NoBudget = true,
+		StatusThresholds = { FailWindow = 60, FailCount = 3, RecoverStreak = 5 },
+		Template = { Coins = Scribe.Int(0, { Min = 0 }) },
+		-- The shipped defaults, spelled out: this whole band exists because the
+		-- wait (60) is shorter than the load deadline (120).
+		Options = {},
+	})
+	Guard.Install(universe)
+	return universe, universe:Server(1)
 end
+
+afterEach(function()
+	Guard.Reset()
+	universe = nil
+end)
+
+--- Start a WaitForData on its own scheduler thread and hand back a table that
+--- fills in when it returns. Yielding inside the spec body would block the
+--- virtual clock the wait is measured against.
+local function waitInBackground(uni, Persistence, player, timeout: number?)
+	local result = {}
+	uni.Sched:Spawn(function()
+		local accessor, reason = Persistence.WaitForData(player, timeout)
+		result.Done = true
+		result.At = uni.Sched.Now
+		result.Accessor = accessor
+		result.Reason = reason
+	end)
+	return result
+end
+
+runIt("answers still-loading, not timeout, while the load is genuinely in flight", function()
+	local uni, server = build()
+	local Persistence = server.Bundle.Ctx.Persistence
+	-- The load fails and retries: the entry sits in Loading with no state
+	-- transition to wake a waiter, so only the deadline can end the wait.
+	uni.Disk:Arm({ Kind = "ServiceError", Key = "PLAYER_66001", Count = 1000000 })
+
+	local player = FakePlayer.new(66001)
+	server:Join(66001, player)
+	local waited = waitInBackground(uni, Persistence, player)
+
+	uni:Run(75) -- past WaitForData's 60s default, inside the 120s load deadline
+
+	expect(waited.Done).toBe(true)
+	expect(waited.Accessor).toBe(nil)
+	expect(waited.Reason).toBe("still-loading")
+	-- And the caller could always have found this out; it just was not in the
+	-- reason. Both halves are asserted so the reason cannot drift from the state.
+	expect((Persistence.GetState(player))).toBe("Loading")
+end)
+
+runIt("was telling the truth: the same load then succeeds with real data", function()
+	-- The half that makes the distinction worth having. If the load never
+	-- recovered, "still-loading" would be no more accurate than "timeout".
+	local uni, server = build()
+	local Persistence = server.Bundle.Ctx.Persistence
+	uni.Disk:Arm({ Kind = "ServiceError", Key = "PLAYER_66002", Count = 1000000 })
+
+	local player = FakePlayer.new(66002)
+	server:Join(66002, player)
+	local waited = waitInBackground(uni, Persistence, player)
+	uni:Run(75)
+	expect(waited.Reason).toBe("still-loading")
+
+	uni.Disk:Heal()
+	uni:Run(120)
+
+	expect((Persistence.GetState(player))).toBe("Ready")
+	local data = server.Bundle.Data.Get(player)
+	expect(data).never.toBeNil()
+	data.Coins.Set(7)
+	expect(data.Coins.Get()).toBe(7)
+end)
+
+runIt("still answers timeout when Scribe has no session for the player at all", function()
+	-- The value has to stay reachable, and this is what it now means: not "your
+	-- load is slow" but "nothing here is loading you" -- in practice, the bundle
+	-- was constructed after this player joined, so OnPlayerAdded never ran.
+	local uni, server = build()
+	local Persistence = server.Bundle.Ctx.Persistence
+
+	local player = FakePlayer.new(66003) -- deliberately never joined
+	-- Present in this server, but never passed to Scribe's OnPlayerAdded.
+	player.Parent = server.Bundle.Players
+	local waited = waitInBackground(uni, Persistence, player, 5)
+	uni:Run(10)
+
+	expect(waited.Done).toBe(true)
+	expect(waited.Accessor).toBe(nil)
+	expect(waited.Reason).toBe("timeout")
+	expect(Persistence.EntryFor(player)).toBe(nil)
+end)
+
+runIt("keeps the wait bounded, so this is a better answer and not a longer one", function()
+	-- The rejected alternative was raising WaitForData's default to match the
+	-- load deadline. A caller's own timeout must still be honoured to the
+	-- second, or "still-loading" would just be "we hung".
+	local uni, server = build()
+	local Persistence = server.Bundle.Ctx.Persistence
+	uni.Disk:Arm({ Kind = "ServiceError", Key = "PLAYER_66004", Count = 1000000 })
+
+	local player = FakePlayer.new(66004)
+	server:Join(66004, player)
+	local startedAt = uni.Sched.Now
+	local waited = waitInBackground(uni, Persistence, player, 12)
+	uni:Run(40)
+
+	expect(waited.Reason).toBe("still-loading")
+	-- Returned on the CALLER'S deadline, not on the load's: 12 seconds, not 60
+	-- and not 120. Asserted as a window rather than an equality because the
+	-- resume is deferred by one scheduler turn on purpose (see
+	-- waitStateChangedUntil), so the exact instant is the scheduler's business.
+	local elapsed = waited.At - startedAt
+	expect(`elapsed={elapsed >= 12 and elapsed < 20}`).toBe("elapsed=true")
+	expect((Persistence.GetState(player))).toBe("Loading")
+end)
+
+runIt("exports the reason as a constant alongside the rest", function()
+	expect(Scribe.Reason.StillLoading).toBe("still-loading")
+	-- The set is frozen and shared by every bundle in the process.
+	expect(table.isfrozen(Scribe.Reason)).toBe(true)
+end)

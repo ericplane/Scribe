@@ -35,245 +35,247 @@
 -- states a FACT ("not acknowledged at session end; it will be redelivered") rather
 -- than an accusation, and repetition across sessions is what distinguishes the two.
 
-return function()
-	local Root = script.Parent.Parent.Parent.Parent
-	local Scribe = require(Root.Scribe)
-	local TestCtx = require(Root.Test.Helpers.TestCtx)
+local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local it = JestGlobals.it
+local expect = JestGlobals.expect
 
-	local RECIPIENT = 94002
+local Root = script.Parent.Parent.Parent.Parent
+local Scribe = require(Root.Scribe)
+local TestCtx = require(Root.Test.Helpers.TestCtx)
 
-	local function makeHarness()
-		return TestCtx.make({
-			Template = { Coins = Scribe.Int(0, { Min = 0, Max = 1000000 }) },
-		})
-	end
+local RECIPIENT = 94002
 
-	local function mailboxLen(harness, userId: number): number
-		local mailbox = harness.Fake.Mailboxes["Default/" .. harness.Ctx.Persistence.KeyFor(userId)]
-		return if mailbox then #mailbox else 0
-	end
+local function makeHarness()
+	return TestCtx.make({
+		Template = { Coins = Scribe.Int(0, { Min = 0, Max = 1000000 }) },
+	})
+end
 
-	local function codeCounter()
-		local seen = { _outstanding = -1 }
-		local unsubscribe = Scribe.AddLogSink(function(logEntry)
-			seen[logEntry.Code] = (seen[logEntry.Code] or 0) + 1
-			if logEntry.Code == "MESSAGE_HANDLER_STALLED" then
-				seen._outstanding = tonumber(logEntry.Context and logEntry.Context.Outstanding) or -1
-			end
-		end, { Level = "Warn" })
-		return seen, unsubscribe
-	end
+local function mailboxLen(harness, userId: number): number
+	local mailbox = harness.Fake.Mailboxes["Default/" .. harness.Ctx.Persistence.KeyFor(userId)]
+	return if mailbox then #mailbox else 0
+end
 
-	--- A listener that parks at its first call and never returns, exactly like a
-	--- handler awaiting something that never arrives.
-	local function parkForever(harness)
-		local parked = false
-		local connection = harness.Data.OnMessage:Connect(function()
-			parked = true
-			coroutine.yield()
-		end)
-		return function(): boolean
-			return parked
-		end, function()
-			connection:Disconnect()
+local function codeCounter()
+	local seen = { _outstanding = -1 }
+	local unsubscribe = Scribe.AddLogSink(function(logEntry)
+		seen[logEntry.Code] = (seen[logEntry.Code] or 0) + 1
+		if logEntry.Code == "MESSAGE_HANDLER_STALLED" then
+			seen._outstanding = tonumber(logEntry.Context and logEntry.Context.Outstanding) or -1
 		end
+	end, { Level = "Warn" })
+	return seen, unsubscribe
+end
+
+--- A listener that parks at its first call and never returns, exactly like a
+--- handler awaiting something that never arrives.
+local function parkForever(harness)
+	local parked = false
+	local connection = harness.Data.OnMessage:Connect(function()
+		parked = true
+		coroutine.yield()
+	end)
+	return function(): boolean
+		return parked
+	end, function()
+		connection:Disconnect()
 	end
+end
 
-	it("stays quiet while the session runs, then reports the stall when it ends", function()
-		-- THE CONSEQUENCE. Nothing is said DURING the session -- the handler may still
-		-- return, and a diagnostic then would be a guess. At session end it is a fact.
-		local seen, unsubscribe = codeCounter()
-		local harness = makeHarness()
-		local recipient, _entry, data = harness.Join(RECIPIENT)
+it("stays quiet while the session runs, then reports the stall when it ends", function()
+	-- THE CONSEQUENCE. Nothing is said DURING the session -- the handler may still
+	-- return, and a diagnostic then would be a guess. At session end it is a fact.
+	local seen, unsubscribe = codeCounter()
+	local harness = makeHarness()
+	local recipient, _entry, data = harness.Join(RECIPIENT)
 
-		local good = 0
-		local didPark = parkForever(harness)
-		harness.Data.OnMessage:Connect(function()
-			good += 1
-		end)
+	local good = 0
+	local didPark = parkForever(harness)
+	harness.Data.OnMessage:Connect(function()
+		good += 1
+	end)
 
-		expect(harness.Data.SendMessage(RECIPIENT, { Amount = 50 })).to.equal(true)
-		harness.Data.Flush(recipient)
-		task.wait()
+	expect(harness.Data.SendMessage(RECIPIENT, { Amount = 50 })).toBe(true)
+	harness.Data.Flush(recipient)
+	task.wait()
 
-		local during = ("good=%d parked=%s queued=%d coins=%d stalled=%d"):format(
+	local during = ("good=%d parked=%s queued=%d coins=%d stalled=%d"):format(
+		good,
+		tostring(didPark()),
+		mailboxLen(harness, RECIPIENT),
+		data.Coins.Get(),
+		seen.MESSAGE_HANDLER_STALLED or 0
+	)
+
+	harness.Leave(recipient)
+	task.wait()
+	unsubscribe()
+
+	-- One line, once, naming how many deliveries were still open at the moment the
+	-- session ended. `good` is read again afterwards to anchor that number: the
+	-- final save re-offers the still-unacknowledged message (good goes to 2), but
+	-- that offer lands AFTER teardown has already reported, so it is not counted
+	-- twice -- it is the same message, and it has already been named.
+	expect(
+		("%s || good=%d logs=%d outstanding=%d queued=%d"):format(
+			during,
 			good,
-			tostring(didPark()),
+			seen.MESSAGE_HANDLER_STALLED or 0,
+			seen._outstanding,
+			mailboxLen(harness, RECIPIENT)
+		)
+	).toBe("good=1 parked=true queued=1 coins=0 stalled=0 || good=2 logs=1 outstanding=1 queued=1")
+
+	harness.Cleanup()
+end)
+
+it("does not acknowledge the message anyway -- the diagnostic is the whole change", function()
+	-- THE GUARD AGAINST REOPENING F5. Reporting the stall must not become an
+	-- excuse to retire the message: it is still on the recipient's key afterwards,
+	-- and a session that CAN handle it still gets it and still applies it.
+	local harness = makeHarness()
+	local recipient = harness.Join(RECIPIENT)
+	local _didPark, unpark = parkForever(harness)
+
+	expect(harness.Data.SendMessage(RECIPIENT, { Amount = 50 })).toBe(true)
+	harness.Data.Flush(recipient)
+	task.wait()
+	harness.Leave(recipient)
+	task.wait()
+
+	local survived = mailboxLen(harness, RECIPIENT)
+
+	-- A fresh session with a working handler drains it, proving the message really
+	-- was still there rather than merely counted. The stuck listener is a
+	-- server-lifetime connection, so it is removed first -- otherwise it would
+	-- park on the redelivery too and hold the new session's ack open as well,
+	-- which is correct behaviour but proves nothing about the message surviving.
+	unpark()
+	local second, _entry, data = harness.Join(RECIPIENT)
+	harness.Data.OnMessage:Connect(function(_player, message)
+		data.Coins.Increment(message.Amount)
+	end)
+	harness.Data.Flush(second, { Force = true })
+	task.wait()
+
+	expect(("survived=%d queued=%d coins=%d"):format(survived, mailboxLen(harness, RECIPIENT), data.Coins.Get())).toBe(
+		"survived=1 queued=0 coins=50"
+	)
+
+	harness.Cleanup()
+end)
+
+it("says nothing when every handler returned, however slowly", function()
+	-- THE CONTROL, and the one that keeps this from becoming noise on every leave.
+	-- A handler that yields and then FINISHES has settled: the ack was spent, so
+	-- there is nothing outstanding at session end.
+	local seen, unsubscribe = codeCounter()
+	local harness = makeHarness()
+	local recipient, _entry, data = harness.Join(RECIPIENT)
+
+	local parked = nil
+	harness.Data.OnMessage:Connect(function(_player, message)
+		if parked == nil then
+			parked = coroutine.running()
+			coroutine.yield()
+		end
+		data.Coins.Increment(message.Amount)
+	end)
+
+	expect(harness.Data.SendMessage(RECIPIENT, { Amount = 50 })).toBe(true)
+	harness.Data.Flush(recipient)
+	task.wait()
+	local beforeResume = ("queued=%d coins=%d"):format(mailboxLen(harness, RECIPIENT), data.Coins.Get())
+
+	task.spawn(parked) -- the handler finishes, late but genuinely
+	task.wait()
+	local afterResume = ("queued=%d coins=%d"):format(mailboxLen(harness, RECIPIENT), data.Coins.Get())
+
+	harness.Leave(recipient)
+	task.wait()
+	unsubscribe()
+
+	expect(
+		("%s || %s || queued=%d stalled=%d"):format(
+			beforeResume,
+			afterResume,
 			mailboxLen(harness, RECIPIENT),
-			data.Coins.Get(),
 			seen.MESSAGE_HANDLER_STALLED or 0
 		)
+		-- The trailing queued=1 is the fake's one-save lag, not a withheld ack: the
+		-- ack was spent the moment the handler returned (MessageAckDurability.spec
+		-- owns that ordering). What matters here is stalled=0 -- nothing outstanding.
+	).toBe("queued=1 coins=0 || queued=1 coins=50 || queued=1 stalled=0")
 
-		harness.Leave(recipient)
-		task.wait()
-		unsubscribe()
+	harness.Cleanup()
+end)
 
-		-- One line, once, naming how many deliveries were still open at the moment the
-		-- session ended. `good` is read again afterwards to anchor that number: the
-		-- final save re-offers the still-unacknowledged message (good goes to 2), but
-		-- that offer lands AFTER teardown has already reported, so it is not counted
-		-- twice -- it is the same message, and it has already been named.
-		expect(
-			("%s || good=%d logs=%d outstanding=%d queued=%d"):format(
-				during,
-				good,
-				seen.MESSAGE_HANDLER_STALLED or 0,
-				seen._outstanding,
-				mailboxLen(harness, RECIPIENT)
-			)
-		).to.equal("good=1 parked=true queued=1 coins=0 stalled=0 || good=2 logs=1 outstanding=1 queued=1")
+it("says nothing for a handler that RAISED -- that outcome already has a code", function()
+	-- A raise settles the fire, so nothing is outstanding. Two diagnostics for one
+	-- message would double-count every broken handler in the logs. errors=2 because
+	-- the final save re-offers the still-unacknowledged message and the handler
+	-- raises on that offer too -- the same re-offer the stall count sees.
+	local seen, unsubscribe = codeCounter()
+	local harness = makeHarness()
+	local recipient = harness.Join(RECIPIENT)
 
-		harness.Cleanup()
+	harness.Data.OnMessage:Connect(function()
+		error("handler blew up")
 	end)
 
-	it("does not acknowledge the message anyway -- the diagnostic is the whole change", function()
-		-- THE GUARD AGAINST REOPENING F5. Reporting the stall must not become an
-		-- excuse to retire the message: it is still on the recipient's key afterwards,
-		-- and a session that CAN handle it still gets it and still applies it.
-		local harness = makeHarness()
-		local recipient = harness.Join(RECIPIENT)
-		local _didPark, unpark = parkForever(harness)
+	expect(harness.Data.SendMessage(RECIPIENT, { Amount = 50 })).toBe(true)
+	harness.Data.Flush(recipient)
+	task.wait()
+	harness.Leave(recipient)
+	task.wait()
+	unsubscribe()
 
-		expect(harness.Data.SendMessage(RECIPIENT, { Amount = 50 })).to.equal(true)
-		harness.Data.Flush(recipient)
-		task.wait()
-		harness.Leave(recipient)
-		task.wait()
-
-		local survived = mailboxLen(harness, RECIPIENT)
-
-		-- A fresh session with a working handler drains it, proving the message really
-		-- was still there rather than merely counted. The stuck listener is a
-		-- server-lifetime connection, so it is removed first -- otherwise it would
-		-- park on the redelivery too and hold the new session's ack open as well,
-		-- which is correct behaviour but proves nothing about the message surviving.
-		unpark()
-		local second, _entry, data = harness.Join(RECIPIENT)
-		harness.Data.OnMessage:Connect(function(_player, message)
-			data.Coins.Increment(message.Amount)
-		end)
-		harness.Data.Flush(second, { Force = true })
-		task.wait()
-
-		expect(("survived=%d queued=%d coins=%d"):format(survived, mailboxLen(harness, RECIPIENT), data.Coins.Get())).to.equal(
-			"survived=1 queued=0 coins=50"
+	expect(
+		("errors=%d stalled=%d queued=%d"):format(
+			seen.MESSAGE_HANDLER_ERROR or 0,
+			seen.MESSAGE_HANDLER_STALLED or 0,
+			mailboxLen(harness, RECIPIENT)
 		)
+	).toBe("errors=2 stalled=0 queued=1")
 
-		harness.Cleanup()
-	end)
+	harness.Cleanup()
+end)
 
-	it("says nothing when every handler returned, however slowly", function()
-		-- THE CONTROL, and the one that keeps this from becoming noise on every leave.
-		-- A handler that yields and then FINISHES has settled: the ack was spent, so
-		-- there is nothing outstanding at session end.
-		local seen, unsubscribe = codeCounter()
-		local harness = makeHarness()
-		local recipient, _entry, data = harness.Join(RECIPIENT)
+it("says nothing when NOTHING was connected -- that outcome already has a code too", function()
+	local seen, unsubscribe = codeCounter()
+	local harness = makeHarness()
+	local recipient = harness.Join(RECIPIENT)
 
-		local parked = nil
-		harness.Data.OnMessage:Connect(function(_player, message)
-			if parked == nil then
-				parked = coroutine.running()
-				coroutine.yield()
-			end
-			data.Coins.Increment(message.Amount)
-		end)
+	expect(harness.Data.SendMessage(RECIPIENT, { Amount = 50 })).toBe(true)
+	harness.Data.Flush(recipient)
+	task.wait()
+	harness.Leave(recipient)
+	task.wait()
+	unsubscribe()
 
-		expect(harness.Data.SendMessage(RECIPIENT, { Amount = 50 })).to.equal(true)
-		harness.Data.Flush(recipient)
-		task.wait()
-		local beforeResume = ("queued=%d coins=%d"):format(mailboxLen(harness, RECIPIENT), data.Coins.Get())
+	expect(
+		("noListener=%d stalled=%d queued=%d"):format(
+			seen.MESSAGE_NO_LISTENER or 0,
+			seen.MESSAGE_HANDLER_STALLED or 0,
+			mailboxLen(harness, RECIPIENT)
+		)
+	).toBe("noListener=2 stalled=0 queued=1")
 
-		task.spawn(parked) -- the handler finishes, late but genuinely
-		task.wait()
-		local afterResume = ("queued=%d coins=%d"):format(mailboxLen(harness, RECIPIENT), data.Coins.Get())
+	harness.Cleanup()
+end)
 
-		harness.Leave(recipient)
-		task.wait()
-		unsubscribe()
+it("says nothing on an ordinary session with no cross-server message at all", function()
+	-- The cheapest regression this could cause is a warning on every single leave.
+	local seen, unsubscribe = codeCounter()
+	local harness = makeHarness()
+	local player, _entry, data = harness.Join(RECIPIENT)
+	data.Coins.Increment(7)
+	harness.Data.Flush(player)
+	task.wait()
+	harness.Leave(player)
+	task.wait()
+	unsubscribe()
 
-		expect(
-			("%s || %s || queued=%d stalled=%d"):format(
-				beforeResume,
-				afterResume,
-				mailboxLen(harness, RECIPIENT),
-				seen.MESSAGE_HANDLER_STALLED or 0
-			)
-			-- The trailing queued=1 is the fake's one-save lag, not a withheld ack: the
-			-- ack was spent the moment the handler returned (MessageAckDurability.spec
-			-- owns that ordering). What matters here is stalled=0 -- nothing outstanding.
-		).to.equal("queued=1 coins=0 || queued=1 coins=50 || queued=1 stalled=0")
-
-		harness.Cleanup()
-	end)
-
-	it("says nothing for a handler that RAISED -- that outcome already has a code", function()
-		-- A raise settles the fire, so nothing is outstanding. Two diagnostics for one
-		-- message would double-count every broken handler in the logs. errors=2 because
-		-- the final save re-offers the still-unacknowledged message and the handler
-		-- raises on that offer too -- the same re-offer the stall count sees.
-		local seen, unsubscribe = codeCounter()
-		local harness = makeHarness()
-		local recipient = harness.Join(RECIPIENT)
-
-		harness.Data.OnMessage:Connect(function()
-			error("handler blew up")
-		end)
-
-		expect(harness.Data.SendMessage(RECIPIENT, { Amount = 50 })).to.equal(true)
-		harness.Data.Flush(recipient)
-		task.wait()
-		harness.Leave(recipient)
-		task.wait()
-		unsubscribe()
-
-		expect(
-			("errors=%d stalled=%d queued=%d"):format(
-				seen.MESSAGE_HANDLER_ERROR or 0,
-				seen.MESSAGE_HANDLER_STALLED or 0,
-				mailboxLen(harness, RECIPIENT)
-			)
-		).to.equal("errors=2 stalled=0 queued=1")
-
-		harness.Cleanup()
-	end)
-
-	it("says nothing when NOTHING was connected -- that outcome already has a code too", function()
-		local seen, unsubscribe = codeCounter()
-		local harness = makeHarness()
-		local recipient = harness.Join(RECIPIENT)
-
-		expect(harness.Data.SendMessage(RECIPIENT, { Amount = 50 })).to.equal(true)
-		harness.Data.Flush(recipient)
-		task.wait()
-		harness.Leave(recipient)
-		task.wait()
-		unsubscribe()
-
-		expect(
-			("noListener=%d stalled=%d queued=%d"):format(
-				seen.MESSAGE_NO_LISTENER or 0,
-				seen.MESSAGE_HANDLER_STALLED or 0,
-				mailboxLen(harness, RECIPIENT)
-			)
-		).to.equal("noListener=2 stalled=0 queued=1")
-
-		harness.Cleanup()
-	end)
-
-	it("says nothing on an ordinary session with no cross-server message at all", function()
-		-- The cheapest regression this could cause is a warning on every single leave.
-		local seen, unsubscribe = codeCounter()
-		local harness = makeHarness()
-		local player, _entry, data = harness.Join(RECIPIENT)
-		data.Coins.Increment(7)
-		harness.Data.Flush(player)
-		task.wait()
-		harness.Leave(player)
-		task.wait()
-		unsubscribe()
-
-		expect(("stalled=%d"):format(seen.MESSAGE_HANDLER_STALLED or 0)).to.equal("stalled=0")
-		harness.Cleanup()
-	end)
-end
+	expect(("stalled=%d"):format(seen.MESSAGE_HANDLER_STALLED or 0)).toBe("stalled=0")
+	harness.Cleanup()
+end)

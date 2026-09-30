@@ -50,7 +50,11 @@ Package builds and `npm test` need Python 3.10+ alongside the Rokit and Node.js 
 The npm scripts use `python`; set `SCRIBE_PYTHON` if yours has a different path.
 
 ```bash
+rokit install
+wally install
 lune run lune/run-tests
+SCRIBE_FRAGMENT_ALL=1 SCRIBE_TEST_REPORT_DIR=test-results/fragment lune run lune/run-tests
+node scripts/verify-test-runner.mjs
 stylua --check src test lune addons
 selene src test lune addons
 npm ci
@@ -59,9 +63,102 @@ npm test
 
 Specs live in `test/Specs/<topic>/`, one folder per subsystem (`persistence`, `replication`,
 `monetization`, `addons` and so on). A new spec goes in the folder of the code it covers; the
-runner walks the folders and names the test by the file, so the folder is for the reader. A spec
-starts with `local Root = script.Parent.Parent.Parent.Parent`, which is the test place root from
-one folder down.
+runner discovers `*.spec.luau` modules recursively. The suite uses the official Jest Roblox
+packages pinned by `wally.toml` and `wally.lock`, with the same `test/jest.config.luau` in Lune
+and Studio. Import test APIs from `JestGlobals` explicitly and register tests at module scope:
+
+```lua
+local Root = script.Parent.Parent.Parent.Parent
+local JestGlobals = require(Root.DevPackages.JestGlobals)
+local describe, it, expect = JestGlobals.describe, JestGlobals.it, JestGlobals.expect
+
+describe("example", function()
+    it("adds", function()
+        expect(1 + 1).toBe(2)
+    end)
+end)
+```
+
+`Root` is the test place root for a spec one topic folder below `Specs`. Test callbacks use
+Jest matchers, such as `toBe`, `toEqual`, and `toThrow`. Use `afterEach` for cleanup that must
+run after a failed assertion. Scribe's deterministic simulations retain their own clocks,
+schedulers, and isolated server modules; Jest runs those scenarios without replacing them
+with Jest fake timers.
+
+Specs that call the public server constructor use `test/Helpers/ConstructorScope.luau`:
+install the scope in `beforeEach`, then clean it in `afterEach` and `afterAll`. It drains
+the fixtures' private fake stores, stops their bundles, and releases their shutdown
+registrations before the test finishes. `Data.Stop()` alone deliberately leaves final
+session saving to shutdown, so it is not sufficient cleanup for these fixtures.
+
+For binary payloads, use `expect(actualBuffer).toEqualBuffer(expectedBuffer)`. It checks every
+byte and reports the first difference in hex, so invalid UTF-8 cannot break Jest's error
+formatter. `toBeWithin(expected, tolerance)` checks absolute numerical error, including the
+boundary; its default tolerance is `1e-7`.
+
+The headless runner accepts `SCRIBE_SPECS` as comma-separated spec-path substrings,
+`SCRIBE_TEST_NAME` as a Jest test-name pattern, `SCRIBE_TEST_TIMEOUT` for the per-test timeout
+in seconds (default 10), and `SCRIBE_TEST_REPORT_DIR` for its report directory
+(default `test-results`). It writes `results.json` and `junit.xml`, and exits unsuccessfully
+for failed tests, load errors, timeouts, focused tests, or an empty selection. For example,
+in a POSIX shell:
+
+```bash
+SCRIBE_SPECS=Signal SCRIBE_TEST_TIMEOUT=20 lune run lune/run-tests
+```
+
+In PowerShell, set `$env:SCRIBE_SPECS = "Signal"` before running the command, then remove it
+with `Remove-Item Env:SCRIBE_SPECS`. `npm run test:unit` runs the headless suite;
+`npm run test:runner` verifies that the runner detects intentional failures and emits reports.
+`npm test` continues to check declarations, package builds, and compiled roblox-ts consumers.
+Set `SCRIBE_TEST_VERBOSE=1` to print individual test names.
+Jest's per-test timeout requires the scheduler to run: a tight loop that never yields can
+still block a direct local Lune invocation. Stop that process with Ctrl+C. CI bounds the
+normal and fragment runs with separate process deadlines, and the runner verifier checks
+that an external deadline terminates the intentionally non-yielding fixture.
+
+Snapshots live beside their specs in `__snapshots__/<name>.spec.snap.lua`. Rojo maps these
+files as ModuleScripts for the same comparison in Studio. Normal runs compare snapshots
+without writing. To create or intentionally update one locally, set `SCRIBE_UPDATE_SNAPSHOTS=1`,
+run the relevant specs, and review the snapshot diff. Updates are rejected when `CI` is set.
+For example, in a POSIX shell:
+
+```bash
+SCRIBE_SPECS=wire/WireGolden SCRIBE_UPDATE_SNAPSHOTS=1 lune run lune/run-tests
+```
+
+To run the engine-compatible specs in Studio, install Wally dependencies, build
+`rojo build test.project.json -o ScribeTest.rbxlx`, open the place, and press Run (F8).
+`ServerScriptService.RunScribeTests` prints a startup banner and the number of spec modules.
+Ordinary server Scripts cannot read the source that Jest needs, so Output explains that the
+tests are waiting and prints the next command. While Run is active, execute it in the
+**server command bar**:
+
+```lua
+require(game:GetService("ReplicatedStorage").ScribeDev.Test.RunTests)()
+```
+
+Jest needs the command bar's script-source permissions; an ordinary server Script cannot
+provide them. The isolated test place enables `ServerScriptService.LoadStringEnabled` for
+Jest's fallback loader. `RunTests` checks the running server context and loading permissions,
+reports to Output, and raises on failure or no tests. It accepts Jest CLI options such as
+`{ verbose = true, testNamePattern = "Signal" }`. Simulation specs that need the Lune host
+remain headless-only. A normal Studio run has been confirmed: 2,813 tests passed, 360 skipped,
+none failed, and both snapshots passed.
+
+The default suite does not write to cloud DataStores. To opt into the real backend checks,
+use a disposable published test universe with Studio API access enabled. Before starting Run,
+edit `test/Helpers/ConformanceStore.luau` so its source sets `ConformanceStore.UseReal = true`,
+then rebuild or sync the place. Changing the table returned by an external `require` does not
+enable these checks because Jest loads its own isolated module instances. Restore the source
+to `false` when finished.
+
+Real backend tests and their setup have a 600-second ceiling; cleanup has 60 seconds.
+Ordinary tests retain the 10-second default. Live tests include deliberate write pacing,
+session loading, and save confirmation. The shared exchange round trip runs once, and cleanup
+hooks release owned harnesses after failures or timeouts. After an earlier failed cloud run,
+stop Studio's Run session and start a fresh one before retrying, so leftover sessions and
+subscriptions from that run cannot affect the result.
 
 Specs are expected to survive mutation. A spec that passes when the code it covers is broken is
 not evidence, so when you add one, break the line it guards and confirm the spec fails.
@@ -97,7 +194,8 @@ in the shared runtime.
 All distributions use the same Scribe version. Update `package.json`, `package-lock.json`,
 `wally.toml`, and `src/Internal/Version.luau` together when preparing a release.
 `npm version <version> --no-git-tag-version` updates both npm files. Building and testing
-the npm package does not publish it.
+the npm package does not publish it. Run `wally install` after updating the Wally manifest
+and commit its regenerated `wally.lock` too.
 
 ### npm release setup
 
@@ -126,6 +224,7 @@ does not mean a package has been published to npm.
 
 ```sh
 npm ci
+wally install
 npm test
 npm run build
 npm login
@@ -192,6 +291,7 @@ Variables > New repository variable**. Enter the name `SCRIBE_NPM_PUBLISH`, the 
    `2.6.0` for the next minor release. Run `npm version 2.6.0 --no-git-tag-version` to update
    `package.json` and `package-lock.json`, then set the same version in `wally.toml` and
    `src/Internal/Version.luau`. Update the README's Wally install version and changelog too.
+   Run `wally install` to refresh `wally.lock` for that version.
 2. Run `npm test`, commit and push all release changes, and wait for CI to pass.
 3. On GitHub, open **Releases > Draft a new release**. Create the matching tag (for example,
    `v2.6.0`) at the release commit, add the release notes, and click **Publish release**.

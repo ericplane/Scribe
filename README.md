@@ -80,13 +80,18 @@ for staged sources and the source-line maps included with published packages.
 
 ```bash
 rokit install              # wally + rojo + selene + luau-lsp + lune + stylua toolchain
-wally install              # dependencies
+wally install              # pinned Jest Roblox test dependencies
 selene src test lune addons       # lint
 stylua --check src test lune addons  # formatting (drop --check to apply)
-lune run lune/run-tests    # run the test suite (headless, ~2s)
+lune run lune/run-tests    # run the Jest Roblox suite under Lune
+node scripts/verify-test-runner.mjs  # verify runner failures and cleanup
 npm ci                    # install pinned roblox-ts development tools
 npm test                  # check declarations, packages, and compiled Luau consumers
 ```
+
+The headless runner writes `test-results/results.json` and `test-results/junit.xml`.
+`npm run test:unit` and `npm run test:runner` are aliases for the two test commands
+above. See [contributing](CONTRIBUTING.md) for filtering, timeouts, and Studio tests.
 
 The same lint, format, test, and type-check (luau-lsp) checks run in CI on every
 pull request (`.github/workflows/ci.yml`), and releases are gated on a green run.

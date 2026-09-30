@@ -3740,10 +3740,23 @@ function Persistence.new(ctx: any)
 		})
 	end
 
-	function self.BindShutdown()
-		game:BindToClose(function()
+	-- The owner may release this registration after explicitly draining its store.
+	-- Stop alone must not release it: stopped bundles can still own sessions or
+	-- final saves. Roblox retains the bound callback, so clear its only reference
+	-- to the bundle as well as making subsequent invocations inert.
+	function self.BindShutdown(): () -> ()
+		local shutdown: (() -> ())? = function()
 			self.Shutdown(25)
+		end
+		game:BindToClose(function()
+			local run = shutdown
+			if run then
+				run()
+			end
 		end)
+		return function()
+			shutdown = nil
+		end
 	end
 
 	-- Release the process-global signal connections this bundle installed.

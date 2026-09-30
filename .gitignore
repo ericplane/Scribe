@@ -11,7 +11,6 @@ globalTypes.d.luau
 Packages/
 ServerPackages/
 DevPackages/
-wally.lock
 *.rbxlx
 *.rbxl
 *.rbxm
@@ -23,6 +22,7 @@ node_modules/
 *.log
 *.tgz
 /dist/
+/test-results/
 /test/roblox-ts/out/
 /test/roblox-ts/include/
 /test/Helpers/RobloxTsCompiled.luau

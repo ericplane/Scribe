@@ -2,14 +2,13 @@
 -- Install and reset every seam a simulation touches, in one place.
 --
 -- Meant to be used as a beforeEach/afterEach pair so no individual spec can
--- forget, and that matters more than it looks. Scribe's src modules are process
--- singletons under the harness cache, and specs run in alphabetical order -- so a
--- leaked virtual clock does not fail the spec that leaked it, it fails whichever
--- spec happens to sort next. The virtual epoch sits BELOW real os.time(), which
--- inverts every "this deadline is in the future" comparison in the suite: dozens
--- of assertions across many files, none of them near the cause.
+-- forget. Jest isolates module caches between suites, but tests in one suite
+-- still share modules and the Lune host shares service stand-ins across suites.
+-- Leaked clocks or service seams can therefore affect later tests. The virtual
+-- epoch sits below real os.time(), which can invert deadline comparisons and
+-- leave the resulting failure far from its cause.
 --
--- The runner invokes afterEach outside its success guard, so a spec that throws
+-- Jest invokes afterEach even when a test body throws, so a failing test
 -- still resets. That is what makes this safe to rely on.
 
 local Guard = {}
@@ -29,7 +28,7 @@ local installed = nil
 ---
 --- `typeof` is the idiom that works on both: it never touches a member, it answers
 --- "Instance" for anything Roblox created, and the shim's own `typeof`
---- (lune/run-tests.luau) answers "table" for these services because they are tables
+--- (lune/test-host.luau) answers "table" for these services because they are tables
 --- -- only ReplicatedStorage and its siblings are built as fake Instances there. So
 --- the two hosts give opposite answers to the same expression, which is exactly what
 --- a host probe needs to do.

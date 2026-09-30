@@ -24,7 +24,7 @@
 -- loads it into a per-server environment so each simulated server gets its own copy
 -- of every module, its own clock and its own scheduler. Three capabilities make that
 -- possible and all three arrive through the single `__SimHost` table the headless
--- runner injects (lune/run-tests.luau, "The escape hatch a simulation needs"):
+-- host injects (lune/test-host.luau, "The escape hatch a simulation needs"):
 --
 --   * `ReadSource` -- raw file reads, used by Sim/Loader and Sim/Bundle;
 --   * `LoadChunk`  -- compiling a chunk against a supplied environment;
@@ -39,10 +39,10 @@
 -- not fail: the run then says "this needs the headless runner" once per node instead
 -- of burying the next real bug under 260 red ones. Call sites read
 --
---     local it = if require(Root.Test.Sim.Available).Ready then it else itSKIP
+--     local runIt = if require(Root.Test.Sim.Available).Ready then it else it.skip
 --
 -- which leaves the node registered and reported, and costs nothing under Lune --
--- where `Ready` is always true, so `it` stays `it` and every one of those specs runs
+-- where `Ready` is always true, so `runIt` stays `it` and every one of those specs runs
 -- exactly as before. That last point is the whole contract of this module: it must
 -- never be able to silence a spec on the runner that CAN run it.
 --
@@ -118,7 +118,7 @@
 -- would report their own instrument's safety cap as if it were a reading. They SKIP
 -- there. Call sites read
 --
---     local itEngine = if require(Root.Test.Sim.Available).RealEngine then it else itSKIP
+--     local itEngine = if require(Root.Test.Sim.Available).RealEngine then it else it.skip
 --
 -- and, exactly as above, the node stays registered and reported rather than vanishing.
 --
@@ -128,27 +128,26 @@
 -- a capability, so it lives in the spec and not here. This predicate answers only CAN
 -- the host do it, never SHOULD it.
 --
--- WHY NOT `IsRunning()`. Because it is not a realm gate: lune/run-tests.luau:521
+-- WHY NOT `IsRunning()`. Because it is not a realm gate: lune/test-host.luau
 -- shims it to return true, so the `itRunning` idiom discriminates Studio EDIT mode
 -- from everything else, and all 23 specs that use it run headless today. Anyone who
 -- "simplifies" the probe below into `IsRunning()` runs an engine measurement on a
 -- scheduler that has nothing to measure.
 --
 -- WHY `typeof` AND NOT A DUCK-TYPE PROBE. This is the discriminator TestCtx.Step
--- already uses (test/Helpers/TestCtx.luau:179-180), with the reason written there:
+-- already uses (test/Helpers/TestCtx.luau), with the reason written there:
 -- reading an unknown member off a real RBXScriptSignal RAISES ("Fire is not a valid
 -- member of RBXScriptSignal") rather than returning nil, so probing for `.Fire` is
 -- itself what breaks under Studio. `typeof` answers without touching the member.
 -- Neither read can throw on either host: `PostSimulation` is a real member of
--- RunService in Studio and a FakeSignal table under Lune (lune/run-tests.luau:524),
+-- RunService in Studio and a FakeSignal table under Lune (lune/test-host.luau),
 -- and `typeof` is total on tables and on Instances alike.
 --
 -- AND NO `IsRunning()` AS A SECOND CONDITION EITHER, though edit mode is the one host
 -- where `typeof` says yes while a frame loop is arguable. Three reasons, and the
--- first settles it: this suite cannot BE in edit mode. test.project.json mounts
--- test/RunTests.server.luau at ServerScriptService, and a server Script does not
--- execute until the place runs, so `IsRunning()` would be true wherever this line can
--- be read at all. Second, TestCtx.Step already waits on real frames gated on `typeof`
+-- first settles it: test/RunTests.luau rejects calls outside a running server,
+-- so the documented Studio entrypoint cannot start the suite in edit mode.
+-- Second, TestCtx.Step already waits on real frames gated on `typeof`
 -- alone and has never needed a companion. Third, and most important, adding it would
 -- make `RealEngine` answer a host question on top of its capability question -- the
 -- exact error the NOT A HOST CHECK rule above forbids.

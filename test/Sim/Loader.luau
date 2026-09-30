@@ -1,18 +1,17 @@
 --!nonstrict
--- Loading modules OUTSIDE the harness's shared cache, so a simulation can build
+-- Loading modules outside Jest's per-suite cache, so a simulation can build
 -- many independent servers from the same source on disk.
 --
--- The harness caches every module by Instance and hands them all one set of
--- globals, which is right for a test suite: modules are singletons in Roblox too,
--- and a spec wants the same Scribe every other spec has. It is wrong for a
--- simulation. Two simulated servers must disagree about what time it is, which
+-- Jest isolates modules between suites, while tests within one suite share their
+-- cached Scribe modules. A simulation needs finer isolation: two simulated
+-- servers must disagree about what time it is, which
 -- JobId they hold, and what their module-global state contains -- ProfileStore
 -- keeps its session bookkeeping in upvalues, and Scribe keeps Health's failure
 -- counters in module locals. Shared, "two servers" would be one server counted
 -- twice, and every cross-server bug would be invisible by construction.
 --
 -- So this loads chunks fresh, with a caller-supplied environment and a private
--- cache. `__SimHost` (lune/run-tests.luau) is what makes that possible: modules
+-- cache. `__SimHost` (lune/test-host.luau) is what makes that possible: modules
 -- the shim loaded cannot reach @lune/fs or @lune/luau, so the capability is
 -- handed down explicitly rather than smuggled.
 
@@ -28,7 +27,7 @@ export type Cache = { [any]: { Value: any } }
 -- server, re-reading would be the dominant cost of building a universe.
 local sourceCache: { [string]: string } = {}
 
---- Read a file, cached for the process.
+--- Read a file, cached for this loader's suite.
 function Loader.Source(path: string): string
 	local cached = sourceCache[path]
 	if cached == nil then

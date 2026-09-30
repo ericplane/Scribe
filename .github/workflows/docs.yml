@@ -122,6 +122,8 @@ jobs:
           cache: npm
           cache-dependency-path: docs-site/package-lock.json
       - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
+      - name: Install test host dependencies
+        run: wally install
       - name: Install docs dependencies
         run: npm ci --prefix docs-site
       - name: Build site and validate links

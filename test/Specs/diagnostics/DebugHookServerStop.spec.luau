@@ -21,138 +21,161 @@
 -- hook silently vacuous depending on spec order. Substituting `Attach` tests
 -- exactly the thing that was broken, the WIRING, and leaves the behaviour of the
 -- real remover where it is already covered.
-return function()
-	local RunService = game:GetService("RunService")
-	local Root = script.Parent.Parent.Parent.Parent
-	local Scribe = require(Root.Scribe)
-	local Server = require(Root.Scribe.Server) :: any
-	local DebugHook = require(Root.Scribe.Server.DebugHook) :: any
-	local Template = require(Root.Scribe.Internal.Template)
-	local FakeProfileStore = require(Root.Test.Helpers.FakeProfileStore)
-	local StubTransport = require(Root.Test.Helpers.StubTransport)
+local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local describe = JestGlobals.describe
+local it = JestGlobals.it
+local expect = JestGlobals.expect
+local beforeEach = JestGlobals.beforeEach
+local afterEach = JestGlobals.afterEach
+local afterAll = JestGlobals.afterAll
 
-	local compiled = Template.Compile({ Coins = Scribe.Int(0, { Min = 0 }) }, {})
+local RunService = game:GetService("RunService")
+local Root = script.Parent.Parent.Parent.Parent
+local Scribe = require(Root.Scribe)
+local Server = require(Root.Scribe.Server) :: any
+local DebugHook = require(Root.Scribe.Server.DebugHook) :: any
+local Template = require(Root.Scribe.Internal.Template)
+local FakeProfileStore = require(Root.Test.Helpers.FakeProfileStore)
+local StubTransport = require(Root.Test.Helpers.StubTransport)
+local ConstructorScope = require(Root.Test.Helpers.ConstructorScope)
 
-	local function baseOptions()
-		return {
-			Template = { Coins = Scribe.Int(0, { Min = 0 }) },
-			Transport = StubTransport.new(),
-			ProfileStore = FakeProfileStore.new(),
-			ProfileStoreIndex = "Default",
-			ProfileKeyPrefix = "PLAYER_",
-			UseMock = true,
-			OwnReceipts = false,
-			KickOnSessionEnd = false,
-			LogLevel = "Fatal",
-			Banner = false,
-			StudioHook = true,
-		}
+local scope = ConstructorScope.new()
+local savedAttach, savedIsStudio
+beforeEach(function()
+	savedAttach = DebugHook.Attach
+	savedIsStudio = if typeof(RunService) ~= "Instance" then RunService.IsStudio else nil
+	scope.Install()
+end)
+afterEach(function()
+	DebugHook.Attach = savedAttach
+	if savedIsStudio ~= nil then
+		RunService.IsStudio = savedIsStudio
 	end
+end)
+afterEach(scope.Cleanup)
+afterAll(scope.Cleanup)
 
-	--- Run `body` with IsStudio pinned true and DebugHook.Attach replaced by
-	--- `attach`, restoring both whatever happens. Headless pins IsStudio false
-	--- (lune/run-tests.luau), so without the first half the whole branch is dead;
-	--- under real TestEZ in Studio it is already true and left alone.
-	local function withStudioHook(attach, body)
-		local realIsStudio = nil
-		if not RunService:IsStudio() then
-			realIsStudio = RunService.IsStudio
-			RunService.IsStudio = function()
-				return true
+local compiled = Template.Compile({ Coins = Scribe.Int(0, { Min = 0 }) }, {})
+
+local function baseOptions()
+	return {
+		Template = { Coins = Scribe.Int(0, { Min = 0 }) },
+		Transport = StubTransport.new(),
+		ProfileStore = FakeProfileStore.new(),
+		ProfileStoreIndex = "Default",
+		ProfileKeyPrefix = "PLAYER_",
+		UseMock = true,
+		OwnReceipts = false,
+		KickOnSessionEnd = false,
+		LogLevel = "Fatal",
+		Banner = false,
+		StudioHook = true,
+	}
+end
+
+--- Run `body` with IsStudio pinned true and DebugHook.Attach replaced by
+--- `attach`, restoring both whatever happens. Headless pins IsStudio false
+--- (lune/test-host.luau), so without the first half the whole branch is dead;
+--- under Jest in Studio it is already true and left alone.
+local function withStudioHook(attach, body)
+	local realIsStudio = nil
+	if not RunService:IsStudio() then
+		realIsStudio = RunService.IsStudio
+		RunService.IsStudio = function()
+			return true
+		end
+	end
+	local realAttach = DebugHook.Attach
+	DebugHook.Attach = attach
+	local ok, err = pcall(body)
+	DebugHook.Attach = realAttach
+	if realIsStudio ~= nil then
+		RunService.IsStudio = realIsStudio
+	end
+	if not ok then
+		error(err, 0)
+	end
+end
+
+describe("Server.new and the DebugHook remover", function()
+	it("calls the remover Attach handed back, exactly once, on Stop", function()
+		-- The defect. Attach's return value was discarded, so nothing could ever
+		-- call it.
+		local attaches, detaches = 0, 0
+		withStudioHook(function()
+			attaches += 1
+			return function()
+				detaches += 1
 			end
-		end
-		local realAttach = DebugHook.Attach
-		DebugHook.Attach = attach
-		local ok, err = pcall(body)
-		DebugHook.Attach = realAttach
-		if realIsStudio ~= nil then
-			RunService.IsStudio = realIsStudio
-		end
-		if not ok then
-			error(err, 0)
-		end
-	end
+		end, function()
+			local data = Server.new(baseOptions(), compiled)
+			expect(attaches).toBe(1)
+			expect(detaches).toBe(0)
 
-	describe("Server.new and the DebugHook remover", function()
-		it("calls the remover Attach handed back, exactly once, on Stop", function()
-			-- The defect. Attach's return value was discarded, so nothing could ever
-			-- call it.
-			local attaches, detaches = 0, 0
-			withStudioHook(function()
-				attaches += 1
-				return function()
-					detaches += 1
-				end
-			end, function()
-				local data = Server.new(baseOptions(), compiled)
-				expect(attaches).to.equal(1)
-				expect(detaches).to.equal(0)
+			data.Stop()
+			expect(detaches).toBe(1)
 
-				data.Stop()
-				expect(detaches).to.equal(1)
-
-				-- Stop is called more than once in real teardown paths; the remover is
-				-- idempotent, but Server.new must not lean on that.
-				data.Stop()
-				expect(detaches).to.equal(1)
-			end)
-		end)
-
-		it("releases the remover BEFORE the subsystems it was watching", function()
-			-- Ordering, and it is the reason to hold the remover in the Server.new
-			-- scope rather than inside build: the hook watches ctx -- its digest pump
-			-- reads Persistence.Entries once a tick -- so it has to let go before what
-			-- it watches is dismantled underneath it.
-			--
-			-- Asserted from INSIDE the remover, against the ctx the spy was handed,
-			-- because that is the only vantage point that can see the difference.
-			-- Wrapping Data.Stop from outside cannot: both orderings look identical
-			-- from there.
-			local persistenceStoppedAtDetach = nil
-			local detached = false
-			withStudioHook(function(_data, ctx)
-				return function()
-					detached = true
-					persistenceStoppedAtDetach = ctx.Persistence.Stopped
-				end
-			end, function()
-				local data = Server.new(baseOptions(), compiled)
-				data.Stop()
-			end)
-
-			expect(detached).to.equal(true)
-			-- False means the subsystems had not been torn down yet when the hook was
-			-- asked to let go.
-			expect(persistenceStoppedAtDetach).to.equal(false)
-		end)
-
-		it("stops cleanly when the hook itself failed to attach", function()
-			-- Attach is pcalled because a broken hook must never stop a bundle
-			-- booting. The mirror of that has to hold too: a bundle whose hook threw
-			-- must still Stop without raising on a remover that never existed.
-			local stopped = false
-			withStudioHook(function()
-				error("mock debug hook failure")
-			end, function()
-				local data = Server.new(baseOptions(), compiled)
-				data.Stop()
-				stopped = true
-			end)
-			expect(stopped).to.equal(true)
-		end)
-
-		it("stops cleanly when Attach returns nothing at all", function()
-			-- The refusal path of the real hook: a second bundle in one process gets
-			-- DEBUG_HOOK_DUPLICATE and Attach returns nil. Stop must not care.
-			local stopped = false
-			withStudioHook(function()
-				return nil
-			end, function()
-				local data = Server.new(baseOptions(), compiled)
-				data.Stop()
-				stopped = true
-			end)
-			expect(stopped).to.equal(true)
+			-- Stop is called more than once in real teardown paths; the remover is
+			-- idempotent, but Server.new must not lean on that.
+			data.Stop()
+			expect(detaches).toBe(1)
 		end)
 	end)
-end
+
+	it("releases the remover BEFORE the subsystems it was watching", function()
+		-- Ordering, and it is the reason to hold the remover in the Server.new
+		-- scope rather than inside build: the hook watches ctx -- its digest pump
+		-- reads Persistence.Entries once a tick -- so it has to let go before what
+		-- it watches is dismantled underneath it.
+		--
+		-- Asserted from INSIDE the remover, against the ctx the spy was handed,
+		-- because that is the only vantage point that can see the difference.
+		-- Wrapping Data.Stop from outside cannot: both orderings look identical
+		-- from there.
+		local persistenceStoppedAtDetach = nil
+		local detached = false
+		withStudioHook(function(_data, ctx)
+			return function()
+				detached = true
+				persistenceStoppedAtDetach = ctx.Persistence.Stopped
+			end
+		end, function()
+			local data = Server.new(baseOptions(), compiled)
+			data.Stop()
+		end)
+
+		expect(detached).toBe(true)
+		-- False means the subsystems had not been torn down yet when the hook was
+		-- asked to let go.
+		expect(persistenceStoppedAtDetach).toBe(false)
+	end)
+
+	it("stops cleanly when the hook itself failed to attach", function()
+		-- Attach is pcalled because a broken hook must never stop a bundle
+		-- booting. The mirror of that has to hold too: a bundle whose hook threw
+		-- must still Stop without raising on a remover that never existed.
+		local stopped = false
+		withStudioHook(function()
+			error("mock debug hook failure")
+		end, function()
+			local data = Server.new(baseOptions(), compiled)
+			data.Stop()
+			stopped = true
+		end)
+		expect(stopped).toBe(true)
+	end)
+
+	it("stops cleanly when Attach returns nothing at all", function()
+		-- The refusal path of the real hook: a second bundle in one process gets
+		-- DEBUG_HOOK_DUPLICATE and Attach returns nil. Stop must not care.
+		local stopped = false
+		withStudioHook(function()
+			return nil
+		end, function()
+			local data = Server.new(baseOptions(), compiled)
+			data.Stop()
+			stopped = true
+		end)
+		expect(stopped).toBe(true)
+	end)
+end)

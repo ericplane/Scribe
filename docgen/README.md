@@ -58,6 +58,7 @@ Search uses the index created by the production build; use preview to test it.
 Run these from the repository root:
 
 ```sh
+wally install
 npm run build --prefix docs-site
 npm run check --prefix docs-site
 lune run docgen/check_examples

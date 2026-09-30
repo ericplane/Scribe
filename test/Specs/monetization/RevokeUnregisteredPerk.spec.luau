@@ -21,129 +21,132 @@
 -- The registry is optional and ad-hoc names are a documented, working way to use
 -- `GrantPerk`, which is exactly why the two arms below differ only in whether
 -- `Perks` was declared.
-return function()
-	local Root = script.Parent.Parent.Parent.Parent
-	local TestCtx = require(Root.Test.Helpers.TestCtx)
+local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local describe = JestGlobals.describe
+local it = JestGlobals.it
+local expect = JestGlobals.expect
 
-	local function makeHarness(options)
-		local events = {}
-		local harness = TestCtx.make({ Options = options or {} })
-		harness.Data.OnOwnershipChanged:Connect(function(_player, key, owned)
-			table.insert(events, `{key}={tostring(owned)}`)
-		end)
-		return harness, events
-	end
+local Root = script.Parent.Parent.Parent.Parent
+local TestCtx = require(Root.Test.Helpers.TestCtx)
 
-	local function settle()
-		for _ = 1, 6 do
-			task.wait()
-		end
-	end
-
-	describe("RevokePerk and OnOwnershipChanged", function()
-		it("reports both transitions for a REGISTERED perk", function()
-			-- THE CONTROL, and it is what makes the arm below a defect rather than a
-			-- design: the registry keeps the name in the candidate set after the flag
-			-- is cleared, so the false already fires. The two arms differ in one thing.
-			local harness, events = makeHarness({ Perks = { "VIP" } })
-			local player = harness.Join(88101)
-			settle()
-
-			harness.Data.GrantPerk(player, "VIP")
-			settle()
-			harness.Data.RevokePerk(player, "VIP")
-			settle()
-
-			expect(table.concat(events, ",")).to.equal("VIP=true,VIP=false")
-			expect(harness.Data.Owns(player, "VIP")).to.equal(false)
-
-			harness.Cleanup()
-		end)
-
-		it("reports both transitions for a perk outside the registry", function()
-			-- The defect. No Perks registry at all, which is a supported way to use
-			-- GrantPerk -- and the grant is reported while the revoke is not.
-			local harness, events = makeHarness()
-			local player = harness.Join(88102)
-			settle()
-
-			harness.Data.GrantPerk(player, "AdHocVIP")
-			settle()
-			harness.Data.RevokePerk(player, "AdHocVIP")
-			settle()
-
-			expect(table.concat(events, ",")).to.equal("AdHocVIP=true,AdHocVIP=false")
-			-- Owns() was always right; the signal was the thing missing.
-			expect(harness.Data.Owns(player, "AdHocVIP")).to.equal(false)
-
-			harness.Cleanup()
-		end)
-
-		it("reports it exactly once, and does not keep re-reporting on later scans", function()
-			-- The failure mode a candidate-set fix invites: keys retained forever, each
-			-- one re-examined on every scan. A repeat false would be worse than the
-			-- missing one, because listeners are not idempotent by contract.
-			local harness, events = makeHarness()
-			local player = harness.Join(88103)
-			settle()
-
-			harness.Data.GrantPerk(player, "AdHocVIP")
-			harness.Data.RevokePerk(player, "AdHocVIP")
-			settle()
-			local afterRevoke = #events
-
-			-- Several more scans, driven by unrelated ownership writes.
-			harness.Data.GrantPerk(player, "Other")
-			settle()
-			harness.Data.RevokePerk(player, "Other")
-			settle()
-
-			local adHoc = 0
-			for _, event in events do
-				if event == "AdHocVIP=false" then
-					adHoc += 1
-				end
-			end
-			expect(adHoc).to.equal(1)
-			expect(#events > afterRevoke).to.equal(true) -- the other perk did report
-
-			harness.Cleanup()
-		end)
-
-		it("says nothing at all for a name that was never granted", function()
-			-- The other control: retaining previously-seen keys must not turn into
-			-- inventing keys. A name nobody ever held has no transitions.
-			local harness, events = makeHarness()
-			local player = harness.Join(88104)
-			settle()
-
-			harness.Data.RevokePerk(player, "NeverHeld")
-			settle()
-
-			expect(#events).to.equal(0)
-			expect(harness.Data.Owns(player, "NeverHeld")).to.equal(false)
-
-			harness.Cleanup()
-		end)
-
-		it("reports a re-grant after a revoke", function()
-			-- The full cycle. A baseline that retained the key as `false` must still
-			-- allow the next true through.
-			local harness, events = makeHarness()
-			local player = harness.Join(88105)
-			settle()
-
-			harness.Data.GrantPerk(player, "AdHocVIP")
-			settle()
-			harness.Data.RevokePerk(player, "AdHocVIP")
-			settle()
-			harness.Data.GrantPerk(player, "AdHocVIP")
-			settle()
-
-			expect(table.concat(events, ",")).to.equal("AdHocVIP=true,AdHocVIP=false,AdHocVIP=true")
-			expect(harness.Data.Owns(player, "AdHocVIP")).to.equal(true)
-
-			harness.Cleanup()
-		end)
+local function makeHarness(options)
+	local events = {}
+	local harness = TestCtx.make({ Options = options or {} })
+	harness.Data.OnOwnershipChanged:Connect(function(_player, key, owned)
+		table.insert(events, `{key}={tostring(owned)}`)
 	end)
+	return harness, events
 end
+
+local function settle()
+	for _ = 1, 6 do
+		task.wait()
+	end
+end
+
+describe("RevokePerk and OnOwnershipChanged", function()
+	it("reports both transitions for a REGISTERED perk", function()
+		-- THE CONTROL, and it is what makes the arm below a defect rather than a
+		-- design: the registry keeps the name in the candidate set after the flag
+		-- is cleared, so the false already fires. The two arms differ in one thing.
+		local harness, events = makeHarness({ Perks = { "VIP" } })
+		local player = harness.Join(88101)
+		settle()
+
+		harness.Data.GrantPerk(player, "VIP")
+		settle()
+		harness.Data.RevokePerk(player, "VIP")
+		settle()
+
+		expect(table.concat(events, ",")).toBe("VIP=true,VIP=false")
+		expect(harness.Data.Owns(player, "VIP")).toBe(false)
+
+		harness.Cleanup()
+	end)
+
+	it("reports both transitions for a perk outside the registry", function()
+		-- The defect. No Perks registry at all, which is a supported way to use
+		-- GrantPerk -- and the grant is reported while the revoke is not.
+		local harness, events = makeHarness()
+		local player = harness.Join(88102)
+		settle()
+
+		harness.Data.GrantPerk(player, "AdHocVIP")
+		settle()
+		harness.Data.RevokePerk(player, "AdHocVIP")
+		settle()
+
+		expect(table.concat(events, ",")).toBe("AdHocVIP=true,AdHocVIP=false")
+		-- Owns() was always right; the signal was the thing missing.
+		expect(harness.Data.Owns(player, "AdHocVIP")).toBe(false)
+
+		harness.Cleanup()
+	end)
+
+	it("reports it exactly once, and does not keep re-reporting on later scans", function()
+		-- The failure mode a candidate-set fix invites: keys retained forever, each
+		-- one re-examined on every scan. A repeat false would be worse than the
+		-- missing one, because listeners are not idempotent by contract.
+		local harness, events = makeHarness()
+		local player = harness.Join(88103)
+		settle()
+
+		harness.Data.GrantPerk(player, "AdHocVIP")
+		harness.Data.RevokePerk(player, "AdHocVIP")
+		settle()
+		local afterRevoke = #events
+
+		-- Several more scans, driven by unrelated ownership writes.
+		harness.Data.GrantPerk(player, "Other")
+		settle()
+		harness.Data.RevokePerk(player, "Other")
+		settle()
+
+		local adHoc = 0
+		for _, event in events do
+			if event == "AdHocVIP=false" then
+				adHoc += 1
+			end
+		end
+		expect(adHoc).toBe(1)
+		expect(#events > afterRevoke).toBe(true) -- the other perk did report
+
+		harness.Cleanup()
+	end)
+
+	it("says nothing at all for a name that was never granted", function()
+		-- The other control: retaining previously-seen keys must not turn into
+		-- inventing keys. A name nobody ever held has no transitions.
+		local harness, events = makeHarness()
+		local player = harness.Join(88104)
+		settle()
+
+		harness.Data.RevokePerk(player, "NeverHeld")
+		settle()
+
+		expect(#events).toBe(0)
+		expect(harness.Data.Owns(player, "NeverHeld")).toBe(false)
+
+		harness.Cleanup()
+	end)
+
+	it("reports a re-grant after a revoke", function()
+		-- The full cycle. A baseline that retained the key as `false` must still
+		-- allow the next true through.
+		local harness, events = makeHarness()
+		local player = harness.Join(88105)
+		settle()
+
+		harness.Data.GrantPerk(player, "AdHocVIP")
+		settle()
+		harness.Data.RevokePerk(player, "AdHocVIP")
+		settle()
+		harness.Data.GrantPerk(player, "AdHocVIP")
+		settle()
+
+		expect(table.concat(events, ",")).toBe("AdHocVIP=true,AdHocVIP=false,AdHocVIP=true")
+		expect(harness.Data.Owns(player, "AdHocVIP")).toBe(true)
+
+		harness.Cleanup()
+	end)
+end)

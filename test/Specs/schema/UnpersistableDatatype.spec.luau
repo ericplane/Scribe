@@ -9,101 +9,103 @@
 -- Scribe cannot store a DateTime at all when it stores them fine through the
 -- accessor.
 
-return function()
-	local Root = script.Parent.Parent.Parent.Parent
-	local Scribe = require(Root.Scribe)
-	local Util = require(Root.Scribe.Internal.Util)
-	local Log = require(Root.Scribe.Internal.Log)
-	local TestCtx = require(Root.Test.Helpers.TestCtx)
+local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
+local it = JestGlobals.it
+local expect = JestGlobals.expect
 
-	it("names the datatype and the fix", function()
-		local found = Util.findUnpersistable({ Stamp = DateTime.fromUnixTimestampMillis(0) })
-		expect(found).to.be.ok()
-		local detail = tostring(found.Detail)
-		expect(string.find(detail, "DateTime", 1, true) ~= nil).to.equal(true)
-		expect(string.find(detail, "Datatypes.Pack", 1, true) ~= nil).to.equal(true)
-		-- The old wording is what made this confusing.
-		expect(string.find(detail, 'unsupported type "DateTime"', 1, true)).to.equal(nil)
-	end)
+local Root = script.Parent.Parent.Parent.Parent
+local Scribe = require(Root.Scribe)
+local Util = require(Root.Scribe.Internal.Util)
+local Log = require(Root.Scribe.Internal.Log)
+local TestCtx = require(Root.Test.Helpers.TestCtx)
 
-	it("reports the path, not the datatype's internals", function()
-		-- Under the headless shim a datatype is a plain table, so recursing into it
-		-- used to report `Stamp.<key>` with a key-type error rather than the field.
-		local found = Util.findUnpersistable({ Wrap = { Stamp = Scribe.Datatypes and DateTime.now() } })
-		expect(found).to.be.ok()
-		expect(table.concat(found.Path, ".")).to.equal("Wrap.Stamp")
-	end)
+it("names the datatype and the fix", function()
+	local found = Util.findUnpersistable({ Stamp = DateTime.fromUnixTimestampMillis(0) })
+	expect(found).never.toBeNil()
+	local detail = tostring(found.Detail)
+	expect(string.find(detail, "DateTime", 1, true) ~= nil).toBe(true)
+	expect(string.find(detail, "Datatypes.Pack", 1, true) ~= nil).toBe(true)
+	-- The old wording is what made this confusing.
+	expect((string.find(detail, 'unsupported type "DateTime"', 1, true))).toBe(nil)
+end)
 
-	it("covers every packable datatype, not just DateTime", function()
-		for _, case in
-			{
-				{ "Vector3", Vector3.new(1, 2, 3) },
-				{ "CFrame", CFrame.new(1, 2, 3) },
-				{ "Color3", Color3.fromRGB(1, 2, 3) },
-				{ "UDim2", UDim2.new(1, 2, 3, 4) },
-			}
-		do
-			local found = Util.findUnpersistable({ F = case[2] })
-			expect(found).to.be.ok()
-			expect(string.find(tostring(found.Detail), case[1], 1, true) ~= nil).to.equal(true)
-			expect(string.find(tostring(found.Detail), "Datatypes.Pack", 1, true) ~= nil).to.equal(true)
-		end
-	end)
+it("reports the path, not the datatype's internals", function()
+	-- Under the headless shim a datatype is a plain table, so recursing into it
+	-- used to report `Stamp.<key>` with a key-type error rather than the field.
+	local found = Util.findUnpersistable({ Wrap = { Stamp = Scribe.Datatypes and DateTime.now() } })
+	expect(found).never.toBeNil()
+	expect(table.concat(found.Path, ".")).toBe("Wrap.Stamp")
+end)
 
-	it("still reports a genuinely unstorable value plainly", function()
-		local found = Util.findUnpersistable({ F = function() end })
-		expect(found).to.be.ok()
-		expect(string.find(tostring(found.Detail), "unsupported type", 1, true) ~= nil).to.equal(true)
-		expect(string.find(tostring(found.Detail), "Datatypes.Pack", 1, true)).to.equal(nil)
-	end)
+it("covers every packable datatype, not just DateTime", function()
+	for _, case in
+		{
+			{ "Vector3", Vector3.new(1, 2, 3) },
+			{ "CFrame", CFrame.new(1, 2, 3) },
+			{ "Color3", Color3.fromRGB(1, 2, 3) },
+			{ "UDim2", UDim2.new(1, 2, 3, 4) },
+		}
+	do
+		local found = Util.findUnpersistable({ F = case[2] })
+		expect(found).never.toBeNil()
+		expect(string.find(tostring(found.Detail), case[1], 1, true) ~= nil).toBe(true)
+		expect(string.find(tostring(found.Detail), "Datatypes.Pack", 1, true) ~= nil).toBe(true)
+	end
+end)
 
-	it("still passes everything a DataStore can hold, packed buffers included", function()
-		expect(Util.findUnpersistable({
-			N = 1,
-			S = "ok",
-			B = true,
-			Packed = Scribe.Datatypes.Pack("Vector3", Vector3.new(1, 2, 3)),
-			Nested = { Deep = { 1, 2, 3 } },
-		})).to.equal(nil)
-	end)
+it("still reports a genuinely unstorable value plainly", function()
+	local found = Util.findUnpersistable({ F = function() end })
+	expect(found).never.toBeNil()
+	expect(string.find(tostring(found.Detail), "unsupported type", 1, true) ~= nil).toBe(true)
+	expect((string.find(tostring(found.Detail), "Datatypes.Pack", 1, true))).toBe(nil)
+end)
 
-	it("fires PROFILE_UNPERSISTABLE with the new wording from OnPlayerInit", function()
-		local harness = TestCtx.make({
-			Template = { Wrap = { Stamp = Scribe.DateTime(DateTime.fromUnixTimestampMillis(0)) } },
-			Options = {
-				LogLevel = "Error",
-				OnPlayerInit = function(_player, raw)
-					raw.Wrap.Stamp = DateTime.fromUnixTimestampMillis(1700000000000)
-				end,
-			},
-		})
-		harness.Join(98301)
+it("still passes everything a DataStore can hold, packed buffers included", function()
+	expect(Util.findUnpersistable({
+		N = 1,
+		S = "ok",
+		B = true,
+		Packed = Scribe.Datatypes.Pack("Vector3", Vector3.new(1, 2, 3)),
+		Nested = { Deep = { 1, 2, 3 } },
+	})).toBe(nil)
+end)
 
-		local recent = Log.GetRecent({ Code = "PROFILE_UNPERSISTABLE" })
-		local last = recent[#recent]
-		expect(last).to.be.ok()
-		expect(string.find(tostring(last.Message), "Datatypes.Pack", 1, true) ~= nil).to.equal(true)
+it("fires PROFILE_UNPERSISTABLE with the new wording from OnPlayerInit", function()
+	local harness = TestCtx.make({
+		Template = { Wrap = { Stamp = Scribe.DateTime(DateTime.fromUnixTimestampMillis(0)) } },
+		Options = {
+			LogLevel = "Error",
+			OnPlayerInit = function(_player, raw)
+				raw.Wrap.Stamp = DateTime.fromUnixTimestampMillis(1700000000000)
+			end,
+		},
+	})
+	harness.Join(98301)
 
-		harness.Cleanup()
-	end)
+	local recent = Log.GetRecent({ Code = "PROFILE_UNPERSISTABLE" })
+	local last = recent[#recent]
+	expect(last).never.toBeNil()
+	expect(string.find(tostring(last.Message), "Datatypes.Pack", 1, true) ~= nil).toBe(true)
 
-	it("accepts the packed form written the same way", function()
-		local before = #Log.GetRecent({ Code = "PROFILE_UNPERSISTABLE" })
-		local harness = TestCtx.make({
-			Template = { Wrap = { Stamp = Scribe.DateTime(DateTime.fromUnixTimestampMillis(0)) } },
-			Options = {
-				LogLevel = "Error",
-				OnPlayerInit = function(_player, raw)
-					raw.Wrap.Stamp = Scribe.Datatypes.Pack("DateTime", DateTime.fromUnixTimestampMillis(1700000000000))
-				end,
-			},
-		})
-		local _p, _e, data = harness.Join(98302)
+	harness.Cleanup()
+end)
 
-		expect(#Log.GetRecent({ Code = "PROFILE_UNPERSISTABLE" })).to.equal(before)
-		-- And it still reads back as a real datatype through the accessor.
-		expect(typeof(data.Wrap.Stamp.Get())).to.equal("DateTime")
+it("accepts the packed form written the same way", function()
+	local before = #Log.GetRecent({ Code = "PROFILE_UNPERSISTABLE" })
+	local harness = TestCtx.make({
+		Template = { Wrap = { Stamp = Scribe.DateTime(DateTime.fromUnixTimestampMillis(0)) } },
+		Options = {
+			LogLevel = "Error",
+			OnPlayerInit = function(_player, raw)
+				raw.Wrap.Stamp = Scribe.Datatypes.Pack("DateTime", DateTime.fromUnixTimestampMillis(1700000000000))
+			end,
+		},
+	})
+	local _p, _e, data = harness.Join(98302)
 
-		harness.Cleanup()
-	end)
-end
+	expect(#Log.GetRecent({ Code = "PROFILE_UNPERSISTABLE" })).toBe(before)
+	-- And it still reads back as a real datatype through the accessor.
+	expect(typeof(data.Wrap.Stamp.Get())).toBe("DateTime")
+
+	harness.Cleanup()
+end)
