@@ -134,6 +134,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
       - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
       - name: Cache rokit tool store
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -174,7 +177,10 @@ jobs:
             test/TypeCheckSignatureA.luau \
             test/TypeCheckSignatureB.luau \
             test/TypeCheckInterop.luau \
-            test/TypeCheckServerStore.luau
+            test/TypeCheckServerStore.luau \
+            test/TypeCheckNamedParameters.luau
+      - name: Check named Luau signatures and callback completions
+        run: node scripts/check-luau-completions.mjs
       # Negative gate: each fixture of deliberate type errors must report EXACTLY
       # the number of diagnostics in its EXPECTED_ERRORS header. If a change loosens the
       # template-aware config types, the count drops and this fails, catching a

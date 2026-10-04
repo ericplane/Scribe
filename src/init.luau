@@ -69,8 +69,30 @@ export type EconomyLogFn = Types.EconomyLogFn
 -- the recursive typed accessor tree.
 --------------------------------------------------------------------------------
 
+-- Copy these small signatures to retain editor labels without changing node types.
+type NodeFunctionNames = {
+	Listener: (callback: any) -> (),
+	Value: (value: any) -> (),
+	Change: (newValue: any, oldValue: any) -> (),
+	ChildChange: (key: any, newValue: any, oldValue: any) -> (),
+	IndexedValue: (value: any, index: any) -> (),
+	KeyValue: (key: any, value: any) -> (),
+	Set: (value: any, replicate: any) -> (),
+	Update: (callback: any, replicate: any) -> (),
+	Increment: (delta: any, tagsOrReplicate: any) -> (),
+	Insert: (value: any, index: any, replicate: any) -> (),
+	RemoveIndex: (index: any, replicate: any) -> (),
+	RemoveKey: (key: any, replicate: any) -> (),
+	Key: (key: any) -> (),
+	Flag: (name: any) -> (),
+	FlagWrite: (name: any, replicate: any) -> (),
+	Replicate: (replicate: any) -> (),
+	SetTimed: (value: any, seconds: any, replicate: any) -> (),
+	ExtendTimed: (seconds: any, replicate: any) -> (),
+}
+
 -- selene: allow(undefined_variable) -- `types` is the type-function runtime library
-export type function ValueType(T)
+type function BuildValueType(T, Names: type?)
 	local ts = types
 
 	local nilType = ts.singleton(nil)
@@ -83,7 +105,16 @@ export type function ValueType(T)
 	local optBool = optional(ts.boolean)
 	local optNumber = optional(ts.number)
 
-	local function fn(params: { type }, rets: { type }): type
+	local function fn(params: { type }, rets: { type }, name: string?): type
+		if name ~= nil and Names ~= nil then
+			local prototype = Names:readproperty(ts.singleton(name))
+			if prototype ~= nil then
+				local result = ts.copy(prototype)
+				result:setparameters(params)
+				result:setreturns(rets)
+				return result
+			end
+		end
 		return ts.newfunction({ head = params }, { head = rets })
 	end
 
@@ -467,7 +498,7 @@ export type function ValueType(T)
 				if childType ~= nil then
 					local childNode = build(childType, false, depth + 1)
 					table.insert(props, { key = key, ty = childNode })
-					table.insert(childLookups, fn({ key }, { childNode }))
+					table.insert(childLookups, fn({ key }, { childNode }, "Key"))
 				end
 			end
 
@@ -491,34 +522,46 @@ export type function ValueType(T)
 					-- Array node: the indexer makes `arr[i]` an accessor node, which is
 					-- the only way to reach a Scribe.ArrayOf element field.
 					local elemNode = build(indexer.readresult, false, depth + 1)
-					table.insert(childLookups, fn({ indexer.index }, { elemNode }))
+					table.insert(childLookups, fn({ indexer.index }, { elemNode }, "Key"))
 					indexerSpec = {
 						index = indexer.index,
 						readresult = elemNode,
 						writeresult = elemNode,
 					}
-					add("Insert", fn({ elementIn, optNumber, optBool }, {}))
+					add("Insert", fn({ elementIn, optNumber, optBool }, {}, "Insert"))
 					-- Remove returns nil on an empty/missing array (matches RemoveValue).
-					add("Remove", fn({ optNumber, optBool }, { optional(elementType) }))
-					add("RemoveValue", fn({ elementIn, optBool }, { optional(elementType), optNumber }))
-					add("Find", fn({ elementIn }, { optNumber }))
-					add("Has", fn({ elementIn }, { ts.boolean }))
-					add("OnInsert", fn({ fn({ elementType, ts.number }, {}) }, { disconnectType }))
-					add("OnRemove", fn({ fn({ elementType, ts.number }, {}) }, { disconnectType }))
+					add("Remove", fn({ optNumber, optBool }, { optional(elementType) }, "RemoveIndex"))
+					add("RemoveValue", fn({ elementIn, optBool }, { optional(elementType), optNumber }, "Set"))
+					add("Find", fn({ elementIn }, { optNumber }, "Value"))
+					add("Has", fn({ elementIn }, { ts.boolean }, "Value"))
+					add(
+						"OnInsert",
+						fn({ fn({ elementType, ts.number }, {}, "IndexedValue") }, { disconnectType }, "Listener")
+					)
+					add(
+						"OnRemove",
+						fn({ fn({ elementType, ts.number }, {}, "IndexedValue") }, { disconnectType }, "Listener")
+					)
 				else
 					-- Dictionary node: children are accessor nodes.
 					local childNode = build(indexer.readresult, false, depth + 1)
-					table.insert(childLookups, fn({ indexer.index }, { childNode }))
+					table.insert(childLookups, fn({ indexer.index }, { childNode }, "Key"))
 					indexerSpec = {
 						index = indexer.index,
 						readresult = childNode,
 						writeresult = childNode,
 					}
-					add("Remove", fn({ ts.string, optBool }, { optional(elementType) }))
-					add("OnKeyAdded", fn({ fn({ indexer.index, elementType }, {}) }, { disconnectType }))
-					add("OnKeyRemoved", fn({ fn({ indexer.index, elementType }, {}) }, { disconnectType }))
+					add("Remove", fn({ ts.string, optBool }, { optional(elementType) }, "RemoveKey"))
+					add(
+						"OnKeyAdded",
+						fn({ fn({ indexer.index, elementType }, {}, "KeyValue") }, { disconnectType }, "Listener")
+					)
+					add(
+						"OnKeyRemoved",
+						fn({ fn({ indexer.index, elementType }, {}, "KeyValue") }, { disconnectType }, "Listener")
+					)
 				end
-				add("Clear", fn({ optBool }, {}))
+				add("Clear", fn({ optBool }, {}, "Replicate"))
 				add("Count", fn({}, { ts.number }))
 				-- A dynamic container's children are homogeneous, so the key and value
 				-- types here are exact rather than a union over declared fields.
@@ -536,7 +579,10 @@ export type function ValueType(T)
 				local childValue = if #childValues > MAX_CHILD_UNION
 					then optional(anyType)
 					else optional(ts.unionof(table.unpack(childValues)))
-				add("OnChildChanged", fn({ fn({ childKey, childValue, childValue }, {}) }, { disconnectType }))
+				add(
+					"OnChildChanged",
+					fn({ fn({ childKey, childValue, childValue }, {}, "ChildChange") }, { disconnectType }, "Listener")
+				)
 			end
 		end
 
@@ -545,13 +591,20 @@ export type function ValueType(T)
 			-- events and Remove carry the element rather than the whole map.
 			local element = mapElement :: type
 			local childNode = build(mapValue :: type, false, depth + 1)
-			table.insert(childLookups, fn({ mapKey }, { childNode }))
+			table.insert(childLookups, fn({ mapKey }, { childNode }, "Key"))
 			indexerSpec = { index = mapKey, readresult = childNode, writeresult = childNode }
-			add("Remove", fn({ mapKey, optBool }, { optional(element) }))
-			add("OnKeyAdded", fn({ fn({ mapKey, element }, {}) }, { disconnectType }))
-			add("OnKeyRemoved", fn({ fn({ mapKey, element }, {}) }, { disconnectType }))
-			add("OnChildChanged", fn({ fn({ mapKey, optional(element), optional(element) }, {}) }, { disconnectType }))
-			add("Clear", fn({ optBool }, {}))
+			add("Remove", fn({ mapKey, optBool }, { optional(element) }, "RemoveKey"))
+			add("OnKeyAdded", fn({ fn({ mapKey, element }, {}, "KeyValue") }, { disconnectType }, "Listener"))
+			add("OnKeyRemoved", fn({ fn({ mapKey, element }, {}, "KeyValue") }, { disconnectType }, "Listener"))
+			add(
+				"OnChildChanged",
+				fn(
+					{ fn({ mapKey, optional(element), optional(element) }, {}, "ChildChange") },
+					{ disconnectType },
+					"Listener"
+				)
+			)
+			add("Clear", fn({ optBool }, {}, "Replicate"))
 			add("Count", fn({}, { ts.number }))
 		end
 
@@ -562,7 +615,7 @@ export type function ValueType(T)
 		if #childLookups == 1 then
 			add("Child", childLookups[1])
 		elseif #childLookups > 1 then
-			add("Child", fn({ ts.unionof(ts.string, ts.number) }, { anyType }))
+			add("Child", fn({ ts.unionof(ts.string, ts.number) }, { anyType }, "Key"))
 		end
 
 		-- Common node methods.
@@ -578,39 +631,39 @@ export type function ValueType(T)
 				then ts.newtable(nil, { index = mapKey, readresult = mapElement, writeresult = mapElement }, nil)
 				else valueType
 			local writeIn = if mapKey ~= nil then writeType else readOnlyDeep(writeType, depth + 1)
-			add("Set", fn({ writeIn, optBool }, { valueType }))
-			add("Update", fn({ fn({ valueType }, { writeIn }), optBool }, { valueType }))
+			add("Set", fn({ writeIn, optBool }, { valueType }, "Set"))
+			add("Update", fn({ fn({ valueType }, { writeIn }, "Value"), optBool }, { valueType }, "Update"))
 		end
 		add("Clone", fn({}, { valueType }))
 		add("Default", fn({}, { valueType }))
 		-- (new, old) on every node. On a container it reports state, coalesced to one
 		-- fire per batch or received frame; which child moved is OnChildChanged's job.
-		add("Changed", fn({ fn({ valueType, valueType }, {}) }, { disconnectType }))
-		add("Observe", fn({ fn({ valueType }, {}) }, { disconnectType }))
+		add("Changed", fn({ fn({ valueType, valueType }, {}, "Change") }, { disconnectType }, "Listener"))
+		add("Observe", fn({ fn({ valueType }, {}, "Value") }, { disconnectType }, "Listener"))
 
 		if t:is("number") then
 			-- Min/Max read the declared bounds, so they stay on a derived field; the
 			-- two mutators do not.
 			if not isDerived then
-				add("Increment", fn({ ts.number, anyType }, { ts.number }))
-				add("Decrement", fn({ ts.number, anyType }, { ts.number }))
+				add("Increment", fn({ ts.number, anyType }, { ts.number }, "Increment"))
+				add("Decrement", fn({ ts.number, anyType }, { ts.number }, "Increment"))
 			end
 			add("Min", fn({}, { optNumber }))
 			add("Max", fn({}, { optNumber }))
 		elseif t:is("boolean") and not isDerived then
-			add("Toggle", fn({ optBool }, { ts.boolean }))
+			add("Toggle", fn({ optBool }, { ts.boolean }, "Replicate"))
 		end
 
 		if isBig then
 			-- Every entry point, Set included, takes a number, a numeric string, or
 			-- another big value, so the operand type is the same union everywhere.
 			local operand = ts.unionof(ts.number, ts.string, valueType)
-			add("Set", fn({ operand, optBool }, { valueType }))
-			add("Update", fn({ fn({ valueType }, { operand }), optBool }, { valueType }))
-			add("Increment", fn({ operand, anyType }, { valueType }))
-			add("Decrement", fn({ operand, anyType }, { valueType }))
-			add("Multiply", fn({ operand, optBool }, { valueType }))
-			add("Divide", fn({ operand, optBool }, { valueType }))
+			add("Set", fn({ operand, optBool }, { valueType }, "Set"))
+			add("Update", fn({ fn({ valueType }, { operand }, "Value"), optBool }, { valueType }, "Update"))
+			add("Increment", fn({ operand, anyType }, { valueType }, "Increment"))
+			add("Decrement", fn({ operand, anyType }, { valueType }, "Increment"))
+			add("Multiply", fn({ operand, optBool }, { valueType }, "Set"))
+			add("Divide", fn({ operand, optBool }, { valueType }, "Set"))
 			-- A big bound past the double range is only expressible as a numeric string,
 			-- so these return the same union the declarator accepts.
 			local optBound = optional(ts.unionof(ts.number, ts.string))
@@ -623,25 +676,25 @@ export type function ValueType(T)
 			local setIndexer = t:indexer()
 			local element = if setIndexer ~= nil then widen(setIndexer.readresult) else anyType
 			local elementIn = readOnlyDeep(element, depth + 1)
-			add("Add", fn({ elementIn, optBool }, { ts.boolean }))
-			add("Remove", fn({ elementIn, optBool }, { ts.boolean }))
-			add("Has", fn({ elementIn }, { ts.boolean }))
+			add("Add", fn({ elementIn, optBool }, { ts.boolean }, "Set"))
+			add("Remove", fn({ elementIn, optBool }, { ts.boolean }, "Set"))
+			add("Has", fn({ elementIn }, { ts.boolean }, "Value"))
 			add("Count", fn({}, { ts.number }))
-			add("Clear", fn({ optBool }, {}))
+			add("Clear", fn({ optBool }, {}, "Replicate"))
 		end
 
 		if isFlags then
 			-- Named-member surface. Get/Set still take the whole { string } set.
-			add("Enable", fn({ ts.string, optBool }, {}))
-			add("Disable", fn({ ts.string, optBool }, {}))
-			add("Has", fn({ ts.string }, { ts.boolean }))
-			add("Toggle", fn({ ts.string, optBool }, { ts.boolean }))
-			add("Clear", fn({ optBool }, {}))
+			add("Enable", fn({ ts.string, optBool }, {}, "FlagWrite"))
+			add("Disable", fn({ ts.string, optBool }, {}, "FlagWrite"))
+			add("Has", fn({ ts.string }, { ts.boolean }, "Flag"))
+			add("Toggle", fn({ ts.string, optBool }, { ts.boolean }, "FlagWrite"))
+			add("Clear", fn({ optBool }, {}, "Replicate"))
 		end
 
 		if isTimed then
-			add("SetTimed", fn({ valueType, ts.number, optBool }, {}))
-			add("ExtendTimed", fn({ ts.number, optBool }, {}))
+			add("SetTimed", fn({ valueType, ts.number, optBool }, {}, "SetTimed"))
+			add("ExtendTimed", fn({ ts.number, optBool }, {}, "ExtendTimed"))
 			add("Active", fn({}, { ts.boolean, optNumber }))
 		end
 
@@ -656,6 +709,12 @@ export type function ValueType(T)
 	end
 
 	return build(T, true, 0)
+end
+
+-- Keep the original type-function arity for existing callers.
+-- selene: allow(undefined_variable)
+export type function ValueType(T)
+	return BuildValueType(T, nil)
 end
 
 -- Union of every static rankable leaf path in the template, dot-joined ("Coins",
@@ -818,16 +877,21 @@ end
 -- Grant callbacks receive the typed accessor tree when a template type is supplied,
 -- and stay `any` for the untyped default so un-annotated configs stay clean.
 -- selene: allow(undefined_variable)
-export type function GrantDataType(T)
+type function BuildGrantDataType(T, Names: type?)
 	if T:is("any") or T:is("unknown") then
 		return types.any
 	end
-	return ValueType(T)
+	return BuildValueType(T, Names)
+end
+
+-- selene: allow(undefined_variable)
+export type function GrantDataType(T)
+	return BuildGrantDataType(T, nil)
 end
 
 -- Store proxies expose declared roots, without the root accessor's methods.
 -- selene: allow(undefined_variable)
-type function StoreDataType(S: type): type
+type function StoreDataType(S: type, Names: type?): type
 	local ts = types
 	if not S:is("table") then
 		return ts.any
@@ -846,7 +910,7 @@ type function StoreDataType(S: type): type
 			names[key] = alias
 		end
 	end
-	local nodes = ValueType(fields)
+	local nodes = BuildValueType(fields, Names)
 	local roots = ts.newtable(nil, nodes:indexer(), nil)
 	for key, alias in names do
 		roots:setproperty(key, nodes:readproperty(alias))
@@ -858,7 +922,7 @@ end
 -- rather than `ValueType<T> & { ... }`, because normalizing an intersection over a
 -- large accessor tree exceeds the solver's budget at the Scribe() call site.
 -- selene: allow(undefined_variable)
-type function BuildClientDataType(T, S)
+type function BuildClientDataType(T, S, Names: type?)
 	local ts = types
 
 	local function optional(t: type): type
@@ -903,7 +967,7 @@ type function BuildClientDataType(T, S)
 	saveInfoProps[ts.singleton("Size")] = optional(ts.number)
 	local saveInfo = ts.newtable(saveInfoProps, nil, nil)
 
-	local out = ts.copy(ValueType(StripServerOnly(T)))
+	local out = ts.copy(BuildValueType(StripServerOnly(T), Names))
 	local function add(name: string, ty: type)
 		out:setproperty(ts.singleton(name), ty)
 	end
@@ -954,24 +1018,24 @@ type function BuildClientDataType(T, S)
 		ts.newfunction({ head = { ts.string, ts.newfunction({ tail = ts.any }, { tail = ts.any }) } }, { head = {} })
 	)
 	add("Raw", ts.any)
-	add("ServerStore", StoreDataType(StripServerOnly(S)))
+	add("ServerStore", StoreDataType(StripServerOnly(S), Names))
 
 	return out
 end
 
 -- selene: allow(undefined_variable)
 export type function ClientDataType(T)
-	return BuildClientDataType(T, types.any)
+	return BuildClientDataType(T, types.any, nil)
 end
 
 -- The server `Data` API. P is the Player class type, passed in as a type argument
 -- because class types are not constructible inside a type function. A type function
 -- for the same complexity-budget reason as ClientDataType.
 -- selene: allow(undefined_variable)
-type function BuildServerDataType(T, P, S)
+type function BuildServerDataType(T, P, S, Names: type?)
 	local ts = types
 
-	local node = ValueType(T)
+	local node = BuildValueType(T, Names)
 
 	local function optional(t: type): type
 		return ts.unionof(t, ts.singleton(nil))
@@ -1211,14 +1275,14 @@ type function BuildServerDataType(T, P, S)
 	add("SendMessage", fn({ ts.number, ts.any }, { ts.boolean }))
 	add("ProfileStore", ts.any)
 	add("Raw", ts.any)
-	add("ServerStore", StoreDataType(S))
+	add("ServerStore", StoreDataType(S, Names))
 
 	return ts.newtable(props, { index = P, readresult = node, writeresult = node }, nil)
 end
 
 -- selene: allow(undefined_variable)
 export type function ServerDataType(T, P)
-	return BuildServerDataType(T, P, types.any)
+	return BuildServerDataType(T, P, types.any, nil)
 end
 
 --------------------------------------------------------------------------------
@@ -1321,7 +1385,7 @@ export type LeaderboardConfig<T = any> = {
 export type ProductConfig<T = any> = {
 	Id: number,
 	Category: string?,
-	Grant: ((data: GrantDataType<T>) -> ())?,
+	Grant: ((data: BuildGrantDataType<T, NodeFunctionNames>) -> ())?,
 	Grants: string?,
 }
 
@@ -1329,7 +1393,7 @@ export type PurchaseSpec<T = any> = {
 	Cost: { Path: StatPathsType<T, false>, Amount: number },
 	Category: string?,
 	ItemId: string,
-	Grant: ((data: GrantDataType<T>) -> ())?,
+	Grant: ((data: BuildGrantDataType<T, NodeFunctionNames>) -> ())?,
 	Meta: { [string]: any }?,
 }
 
@@ -1500,15 +1564,15 @@ export type ScribeOptions<T, S = any> = {
 	StudioHook: boolean?, -- default false: the Studio debug hooks the Scribe Studio plugin reads
 }
 
-export type ServerData<T, S = any> = BuildServerDataType<T, Player, S>
+export type ServerData<T, S = any> = BuildServerDataType<T, Player, S, NodeFunctionNames>
 
-export type ClientData<T, S = any> = BuildClientDataType<T, S>
+export type ClientData<T, S = any> = BuildClientDataType<T, S, NodeFunctionNames>
 
 -- One player's typed accessor tree: the type of `Data[player]`, `Data.Get(player)` and
 -- the client's `Data.Get()`. A plain alias because a type function cannot be invoked
 -- across a module boundary: `Scribe.ValueType<T>` silently resolves to `any` rather than
 -- erroring, so this is the only way a consumer can name the type.
-export type PlayerData<T> = ValueType<T>
+export type PlayerData<T> = BuildValueType<T, NodeFunctionNames>
 
 export type Bundle<T, S = any> = {
 	Server: ServerData<T, S>,
