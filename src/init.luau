@@ -2960,10 +2960,11 @@ end
 	compact packed buffer; `Get`/`Set` convert at the boundary, so your code only
 	ever sees the real `Vector3`.
 
-	All 17 datatype declarators share this shape:
+	All 23 datatype declarators share this shape:
 	`Vector3`, `Vector2`, `Vector3int16`, `Vector2int16`, `CFrame`, `Color3`,
 	`BrickColor`, `UDim`, `UDim2`, `Rect`, `NumberRange`, `NumberSequence`,
-	`ColorSequence`, `DateTime`, `EnumItem`, `Font`, `PhysicalProperties`.
+	`ColorSequence`, `DateTime`, `EnumItem`, `Font`, `PhysicalProperties`,
+	`Ray`, `Region3`, `Region3int16`, `Faces`, `Axes`, `Content`.
 ]=]
 -- Declares Vector3 data, packed for storage and replication.
 function Scribe.Vector3(default: Vector3): Vector3
@@ -3018,6 +3019,23 @@ function Scribe.CFrame(default: CFrame, meta: CFrameMeta?): CFrame
 	return datatypeMarker("CFrame", default, if meta then meta.Precision else nil)
 end
 
+--[=[
+	@within Scribe
+	@tag Field Types
+	@function Content
+	@param default Content
+	@return Content
+	Declares a `Content` field (`Content.fromUri` or `Content.none`), for a
+	player-chosen texture, image or mesh reference.
+ 
+	A default (or any later `Set`) built with `Content.fromObject` is refused:
+	it wraps a live `Instance`, which cannot survive a DataStore round trip or
+	a server restart. Store an asset id/URI instead.
+]=]
+function Scribe.Content(default: Content): Content
+	return datatypeMarker("Content", default)
+end
+
 function Scribe.Color3(default: Color3): Color3
 	return datatypeMarker("Color3", default)
 end
@@ -3066,11 +3084,31 @@ function Scribe.PhysicalProperties(default: PhysicalProperties): PhysicalPropert
 	return datatypeMarker("PhysicalProperties", default)
 end
 
+function Scribe.Ray(default: Ray): Ray
+	return datatypeMarker("Ray", default)
+end
+
+function Scribe.Region3(default: Region3): Region3
+	return datatypeMarker("Region3", default)
+end
+
+function Scribe.Region3int16(default: Region3int16): Region3int16
+	return datatypeMarker("Region3int16", default)
+end
+
+function Scribe.Faces(default: Faces): Faces
+	return datatypeMarker("Faces", default)
+end
+
+function Scribe.Axes(default: Axes): Axes
+	return datatypeMarker("Axes", default)
+end
+
 --[=[
 	@within Scribe
 	@tag Field Types
 	@prop Datatypes table
-	Low-level helpers for the 17 Roblox datatypes, exposed so a migration can convert
+	Low-level helpers for the 23 Roblox datatypes, exposed so a migration can convert
 	a legacy representation into the packed form.
 
 	| Call | Returns |
