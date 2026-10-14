@@ -13,7 +13,7 @@ Copy `addons/leaderstats/ScribeLeaderstats.luau` into `ServerScriptService`.
 The core Scribe package does not load or include it automatically.
 
 For roblox-ts, use the separate `@rbxts/scribe-leaderstats` package described below.
-See [roblox-ts](roblox-ts.md) for package publication status and the shared data setup.
+See [roblox-ts](roblox-ts.md) for installation and the shared data setup.
 
 ## Choose the columns
 
@@ -61,7 +61,7 @@ not change or save Scribe data.
 
 ## roblox-ts
 
-After npm publication, install the addon alongside the core:
+Install the addon alongside the core:
 
 ```sh
 npm install @rbxts/scribe @rbxts/scribe-leaderstats

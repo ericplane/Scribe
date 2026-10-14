@@ -72,7 +72,7 @@ A few settings belong to the whole game rather than to one bundle, because they 
 Scribe.Configure({ AutoSaveInterval = 60 })
 ```
 
-`AutoSaveInterval` is the autosave cadence. The per-bundle `SaveInterval` option still works and still wins where it is set, but ProfileStore's `AUTO_SAVE_PERIOD` is a module-wide constant. It applies to every Scribe bundle and to any direct ProfileStore use in the same game. If two bundles ask for different cadences only the later one wins, and Scribe logs `SAVE_INTERVAL_CONFLICT`.
+`AutoSaveInterval` is the autosave cadence. The per-bundle `SaveInterval` option still works and still wins where it is set, but ProfileStore's `AUTO_SAVE_PERIOD` is a module-wide constant. It applies to every Scribe bundle and to any direct ProfileStore use in the same game. If two bundles ask for different cadences only the later one wins, and Scribe logs `SAVE_INTERVAL_CONFLICT`. Either way the interval is clamped to between 15 and 300 seconds.
 
 ## Core
 
@@ -85,7 +85,7 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | `ServerStore` | store template? | none | One tree for the whole server, never saved, replicated to everyone by default. Fields and accessors are inferred from this template. See [The Server Store](./server-store). |
 | `Economy` | `EconomyConfig?` | none | Per-currency labels, custom field declarations, and resolvers for Roblox's economy dashboard. See [Economy Analytics](./economy). |
 | `ImportLegacyData` | `((player, userId, migration) -> table?)?` | none | Adopts data from another library, once, before reconcile and before migrations. The third argument is a [`MigrationContext`](/api/types#migrationcontext): `migration.AwaitBudget(requestType, count?, timeout?)` paces reads on the DataStore budget and returns `(granted, release)`. See [Migrating to Scribe](./migrating). |
-| `OnPlayerInit` | `((player, rawData, isNewProfile, migration) -> ())?` | none | Runs once per player right after their profile loads, against the raw data table. The fourth argument is the same [`MigrationContext`](/api/types#migrationcontext), so `AwaitBudget` is available here too, for a game already on Scribe with stores left to move. See [Session Lifecycle](./lifecycle#onplayerinit). |
+| `OnPlayerInit` | `((player, rawData, isNewProfile, migration) -> ())?` | none | Runs once per player right after their profile loads, against the raw data table without the `_Scribe` ledger. The fourth argument is the same [`MigrationContext`](/api/types#migrationcontext), so `AwaitBudget` is available here too, for a game already on Scribe with stores left to move. See [Session Lifecycle](./lifecycle#onplayerinit). |
 | `MigrationConcurrency` | `number?` | 2 | How many `ImportLegacyData` hooks may run at once. The only hard bound on what a migrating server spends, because `AwaitBudget` is cooperative. |
 | `OnPlayerLeaving` | `((player, data, reason) -> ())?` | none | Runs once per player as they leave, **before** the final save, so anything it writes persists. |
 
@@ -100,8 +100,8 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | --- | --- | --- | --- |
 | `ProfileStoreIndex` **(required)** | `string` | none | The DataStore name profiles live under, passed straight to `ProfileStore.New`. |
 | `ProfileKeyPrefix` **(required)** | `string` | none | Concatenated with the user id to form each key. `""` is valid and means a bare user id. |
-| `SaveInterval` | `number?` | 300 | Seconds between automatic saves. Values below 15 are raised to 15. It sets ProfileStore's global period, so it affects every bundle. |
-| `ProfileStore` | `any?` | auto-discovered | An explicit ProfileStore module or ModuleScript. Set it only when auto-discovery fails or you need a specific build. |
+| `SaveInterval` | `number?` | 300 | Seconds between automatic save attempts per profile, clamped to 15–300. It sets ProfileStore's global period and affects every bundle. See [Saving](./lifecycle#saving) for timing and failure limits. |
+| `ProfileStore` | `any?` | bundled fork | Replaces Scribe's patched ProfileStore 1.0.3 fork with a compatible build or test double. Scribe does not search your game for one. |
 | `ResetData` | `boolean?` | off | Wipes each loaded profile back to template defaults and logs a reset warning. Deliberate destruction, so leave it off. |
 | `LoadTimeout` | `number?` | 120 | Seconds one session attempt may take before `LoadFailurePolicy` applies. Floored at 60. |
 | `EraseJoinTimeout` | `number?` | 10 | Seconds a join waits for a `Data.Erase` of that user running on this server before it is refused with the reason `erasing`. The erase keeps running either way. |
@@ -285,7 +285,7 @@ The full list of shapes Scribe refuses to start on, and why each one is unsafe t
 | Option | Type | Default | What it does |
 | --- | --- | --- | --- |
 | `CommandRateLimit` | `number?` | 20 | Command RPCs per second per player, as a token bucket that refills at this rate and caps at it. |
-| `RequestTimeout` | `number?` | 10 | Seconds a client request waits for a reply before resolving with `false` and `"timeout"`. |
+| `RequestTimeout` | `number?` | 10 | Seconds a client request waits before returning `false` and `"timeout"`. Also used by the server for `RequestOnce` caching and repair waits; set the same value on both sides. |
 | `MaxInboundBytes` | `number?` | 8192 | Largest inbound frame the server accepts. Anything larger is dropped and logged as `INBOUND_OVERSIZE`. |
 | `MaxInboundRetainedBytes` | `number?` | 131072 | How much memory a single inbound frame may **materialise** before it is refused with `INBOUND_WORK_LIMIT`. |
 | `MaxOutboundBytes` | `number?` | 65536 | The largest buffer handed to the transport in one call. Anything larger is fragmented and reassembled transparently. |

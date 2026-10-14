@@ -362,7 +362,7 @@ showToast(player, "Lantern purchased and saved!")
 
 If the player has 200 coins, nothing happens at all: no debit, no lantern, and `reason` is `"insufficient funds"`. If the `Grant` throws, the debit rolls back with it. There is no window in which the coins are gone and the item is missing.
 
-`Cost.Path` names any numeric field in your template, and that field's declarator does the work. `Coins` is a `Scribe.Int` with `Min = 0`, so a fractional `Amount` is refused and the balance can never go below zero. A path that names no declared field returns `(false, "invalid cost path")` rather than debiting somewhere unexpected. A path that names a field which exists but is not a spendable number -- a `Scribe.Big`, a string, an enum, a container -- is refused too, with `(false, "cost path is not a spendable number")`, so the two mistakes do not read the same. `Scribe.Big` is the one worth calling out: it holds a balance, but `Cost` does plain arithmetic on a plain number, so a Big field cannot be spent from directly.
+`Cost.Path` names any numeric field in your template, and that field's declarator does the work. `Coins` is a `Scribe.Int` with `Min = 0`, so a fractional `Amount` is refused and the balance can never go below zero. A path that names no declared field returns `(false, "invalid cost path")` rather than debiting somewhere unexpected. A path that names a field which exists but is not a spendable number -- a string, an enum, a container -- is refused too, with `(false, "cost path is not a spendable number")`, so the two mistakes do not read the same.
 
 `Cost.Path` may also point into a typed container, such as a `Scribe.DictOf` key like `"Wallet.Gold"`, and the element's own `Min` floor and int rule apply to the debit exactly as a plain currency field's would. A dictionary accepts any key, though, so a typo there does **not** report an invalid cost path: `"Wallet.Glod"` resolves, spends the element default as a balance nobody granted, and leaves the phantom key behind. Point costs at declared fields unless the currency set is genuinely open-ended.
 
@@ -401,6 +401,32 @@ The grant uses a whole-element `Update` so a repeat purchase adds to the existin
     `Get()` on an unwritten key is `nil` and reading never creates the key, so the check costs nothing. The rule generalises: inside a `Grant`, treat any id that came from a client or from stored data as unresolved until you have checked it. On the receipt path the same mistake costs Robux instead of coins, and the receipt still settles as `PurchaseGranted`.
 
     In DevMode Scribe warns about the first shape with [`GRANT_SEEDED_ELEMENT`](./log-codes#monetization), naming the product and the path. It is a warning and not a refusal because Scribe cannot tell a dangling id from one you just minted.
+
+### Spending a big currency
+
+`Cost.Path` may name a [`Scribe.Big`](./big-numbers) field. The funds check and debit use big arithmetic, including balances beyond `1.8e308`. `Amount` accepts a number, a numeric string of at most 256 bytes, or a big value from another field's `Get()`.
+
+```lua
+Data.Purchase(player, {
+    Cost = { Path = "Essence", Amount = "2.5e120" },
+    Category = "Prestige",
+    ItemId = "AscensionSigil",
+    Grant = function(data)
+        data.Sigils.Increment(1) -- with Sigils = Scribe.Int(0) in the template
+    end,
+})
+```
+
+The `InGame` log stores `Amount` as a `{ mantissa, exponent }` pair: `{ 2.5, 120 }` here. This preserves the big value without converting it to a plain number. At runtime [`Scribe.Short`](/api/Scribe#Short) and big operations accept that pair; roblox-ts callers currently need a cast because those input types do not list the tuple.
+
+The types allow these amounts on any `Cost.Path` to keep type checking manageable. At runtime, a string or big amount on an ordinary number field returns `"invalid Cost spec"`.
+
+!!! warning "A big keeps 15 significant digits, and so does its price"
+    A small price against a huge balance can round away: `1e20 - 1` stays `1e20`, and the purchase still succeeds. At that balance, a price of 49,000 reduces it by 100,000 after rounding. Choose prices that fit your currency's scale.
+
+    A balance exactly at its `Min` cannot spend anything. Scribe also refuses a debit that would round below `Min`.
+
+    Economy analytics receive the requested price and new balance as plain numbers, even when rounding changed the actual debit. Values beyond the number range convert to `inf`, so those events cannot represent the full big value.
 
 ### Making a purchase idempotent
 

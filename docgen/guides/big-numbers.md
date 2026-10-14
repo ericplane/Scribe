@@ -138,6 +138,8 @@ if data.Essence.Get():ToNumber() >= price then
 end
 ```
 
+For a shop, [`Data.Purchase`](./monetization#spending-a-big-currency) checks funds, debits and grants in one transaction. It uses big arithmetic, so you do not need `:ToNumber()`. The guide explains how prices round against very large balances.
+
 ??? note "Why `Pow` beats a chain of `Multiply` calls"
     `Pow` is exact to the module's 15 digits. A chain of `Multiply` calls is not, because each one rounds. At the default leaderboard `SigFigs`, a repeated-multiply square can produce a different ranking key from the true value from about the fourth power onward. If a result has to rank, raise it in one call.
 

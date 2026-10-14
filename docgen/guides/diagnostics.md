@@ -130,19 +130,22 @@ The window is why `Count` in `GetMetrics` and the percentiles disagree. `Count` 
 
 ## What a failing DataStore looks like
 
-`DataStoreErrors` counts every failed attempt, and it is joined by one `DataStoreErrors_<Class>` counter per class: `Throttled`, `Failed`, `Unresolved` and `Rejected`. Those four are a reporting dimension. They tell **you** what to do, and with one exception they change nothing about what Scribe does.
+`DataStoreErrors` counts every reported failed attempt. `DataStoreErrors_<Class>` splits them into `Throttled`, `Failed`, `Unresolved` and `Rejected` to help you decide what to do.
 
 | Class | Sent by Roblox as | What it means for you |
 | --- | --- | --- |
-| `Throttled` | `3xx` | The request was dropped because the throttle queue overflowed. Ask less often. |
-| `Failed` | `502`, `503`, anything unrecognised | Transient service-side failure. A retry may work. |
-| `Unresolved` | `504` | The call timed out and the write **may have landed**. This is the one class you cannot safely retry on the assumption it did not. |
+| `Throttled` | `3xx`, or a named throttle such as `StandardWriteExperienceThrottled` | The request was refused before it ran. Reduce the request rate. Scribe also recognises these after a `DataStoreService:` prefix. |
+| `Failed` | `502`, `503`, anything unrecognised | A retry may work, but the class does not prove a write failed to land. A `502` wrapping `HTTP 429` or "Too many requests" stays in this class. |
+| `Unresolved` | `504` | The call timed out and the write **may have landed**. Do not retry on the assumption that nothing changed. |
 | `Rejected` | `1xx`, oversize payloads, metadata caps | Permanently invalid. Every retry fails identically and something has to change. |
 
-??? note "Why only Throttled changes Scribe's behaviour"
-    `Throttled` collapses every throttled key into a single shared problem, so a join rush cannot walk a server to `Outage` on what is really one condition.
+??? note "Where the class changes what Scribe does"
+    - **Service health.** Throttles, including those wrapped in a `502`, count as one shared problem rather than one per key. Other failures count per key.
+    - **Kick messages.** Throttled loads use the busy-service message; other failures use the generic message.
+    - **Gift credits.** A failed delivery refunds its credit only if every attempt was `Throttled` or `Rejected`. `Failed` and `Unresolved` may have written, so they cannot safely refund it.
+    - **Leaderboards.** A `Rejected` write is dropped with `LB_WRITE_DROPPED` and is not retried until the score changes.
 
-    `Failed`, `Unresolved` and `Rejected` are counted and logged and branch nowhere. Scribe treats them identically. It is your response that differs, which is the whole reason they are told apart in the first place. In particular Scribe does not retry `Failed` and skip `Rejected`, and ProfileStore's own retry policy knows nothing about the classification.
+    Everything else treats the classes alike. In particular ProfileStore's own save retries do not depend on the class.
 
     Note also that `DataStoreErrors_Throttled` is not a general throttling signal. Ordinary budget exhaustion makes a request **wait** rather than fail, so a heavily throttled server can show zero here. Use [`Scribe.GetBudgetSnapshot()`](/api/Scribe#GetBudgetSnapshot) for that.
 
@@ -189,6 +192,7 @@ These describe what Scribe is putting on the wire. Reach for them when the Ember
     | `FramesReassembled`, `FragmentsRefused` | counter | Client side: frames rebuilt from fragments, and fragments discarded unused |
     | `InitSendFailed`, `FragmentedSendFailed` | counter | A snapshot that never reached the transport, and a frame whose fragments only partly landed |
     | `MirrorResyncs` | counter | Clients whose mirror was rebuilt because a frame addressed to them did not reach the transport |
+    | `CommandRepliesHeld`, `CommandReplyHoldsExpired` | counter | Command replies held for that rebuild, and held replies released at their deadline rather than by a rebuild attempt |
     | `MalformedFrames`, `InboundOversize`, `InboundRateLimited`, `InboundWorkLimited` | counter | Rejected inbound frames, see the [Transport codes](./log-codes) |
     | `ProtocolMismatch`, `SchemaMismatch`, `ReInitThrottled` | counter | Handshakes refused |
 
@@ -196,7 +200,9 @@ These describe what Scribe is putting on the wire. Reach for them when the Ember
 
     A non-zero `FragmentsRefused` on a reliable ordered transport is a bug and not a network condition, because the transport contract forbids the loss and reordering that would otherwise explain it.
 
-    `InitSendFailed` is the one that matters operationally: that client is left unloaded and will keep asking, which is why it is paired with the `INIT_UNDELIVERED` warning rather than retried silently forever. `MirrorResyncs` is the only signal that a mirror ever went stale, because a loaded client cannot ask for a resync itself.
+    `InitSendFailed` counts failed snapshots and is paired with `INIT_UNDELIVERED`. A client awaiting its first snapshot remains unloaded and keeps asking. `MirrorResyncs` counts repairs after a loaded client's data send fails.
+
+    `CommandReplyHoldsExpired` should stay at zero. It means a reply reached its deadline before the scheduled repair was attempted, so the reply went out ahead of the handler's data. A failed repair or an ended session also releases replies early, without increasing this counter; failed repairs count under `InitSendFailed`.
 
     `InboundWorkLimited` counts frames refused for how much they would **allocate**, not for how large they are.
 
@@ -251,7 +257,7 @@ Both fail closed. On that client `Data.WaitForData()` returns `false` after its 
 
 ## Integrity guards
 
-Every save is compared against the last good one. If top-level keys vanish or the payload collapses in size, `WIPE_GUARD_TRIPPED` fires and so does [`OnAnomaly`](/api/Server#OnAnomaly).
+Every save is compared against the last good one. Missing top-level keys, a large drop in size, missing `_Scribe` ledger sections or a lower schema version trigger `WIPE_GUARD_TRIPPED` and [`OnAnomaly`](/api/Server#OnAnomaly). The ledger check also covers profiles under 1 KB, which the size check skips.
 
 - `WipeGuardPolicy = "Warn"` is the default. The trip is logged and the save goes through, because a reset is sometimes legitimate.
 - `WipeGuardPolicy = "Block"` persists the last good snapshot instead, until you push the live data through with `Data.Flush(player, { Force = true })`.

@@ -105,7 +105,7 @@ Watchlisted = Scribe.Derived(false, { "Suspicion" }, function(s) return s >= 80 
 That is a deliberate **projection**: the client learns something about a value it can never read. Often that is exactly what you want, but be deliberate about how much the projection gives away. [Security](./security) covers the reasoning.
 
 ??? tip "Client writes move a derived field immediately"
-    Client writes are optimistic and local only, so a client-side `data.Xp.Set(9000)` recomputes the local `Level` on the spot. That is fine for responsive UI, and the server's value still wins on the next diff. A field the server transmits instead updates only when the server's op lands. See [Commands & Requests](./commands) for the authoritative path.
+    Client writes are optimistic and local only, so a client-side `data.Xp.Set(9000)` recomputes the local `Level` on the spot. That is fine for responsive UI, and the server's value still wins on the next diff. A field reading a `ServerOnly` input updates only when the server's op lands, because the client cannot compute it. See [Commands & Requests](./commands) for the authoritative path.
 
 ## When it recomputes
 
@@ -115,10 +115,15 @@ A recompute is an ordinary write, so everything you already know applies. It val
 | --- | --- |
 | a plain `Set` or `Increment` on an input | immediately |
 | a [`Data.Batch`](/api/Server#Batch) of several input writes | **once**, at the end of the batch |
-| a [`Data.Transaction`](/api/Server#Transaction) | once, inside it, committing or rolling back with its inputs |
+| a [`Data.Transaction`](/api/Server#Transaction) | once, inside it, on commit; once, after every field is restored, on rollback |
+| a `Set`, `Update` or `Clear` of its containing record | after the write; removing its containing record removes the field too |
 | a client receiving a diff frame | once per frame |
 | a profile load | once, before the session is Ready |
 | [`Data.Mock`](/api/Client#Mock) in a storybook | once, after the seed |
+
+When you replace a record, its derived fields keep their previous values until they recompute. This avoids a temporary `nil` and extra `Changed` calls. Values you supply for those fields are validated, then ignored. If the record write removes a containing sub-record, its derived fields go too.
+
+If recomputing after a record replacement throws, the affected derived field is removed. This differs from an ordinary input write, where a failed compute keeps the previous value.
 
 Reads settle first, so a derived field can never hand you a value its inputs have already moved past. That holds mid-batch too:
 
@@ -135,7 +140,7 @@ Reading a derived field mid-batch is the one case that fires its `Changed` befor
 ??? note "What `compute` must not do"
     `compute` must be pure. It must not yield, and it must not write. Scribe calls it once per realm at startup to seed the field's default, so a function that throws or returns the wrong type fails the template rather than the first write.
 
-    At runtime a throwing function is contained. The field keeps its previous value, [`DERIVED_ERROR`](./log-codes) is logged once for that field, and the write that triggered the recompute still succeeds.
+    At runtime a throwing function is contained. [`DERIVED_ERROR`](./log-codes) is logged once for that field, and the triggering write still succeeds. The field keeps its previous value unless its containing record was replaced, as described above.
 
     `os.time()`, `math.random`, and anything else that differs per call or per realm are what "pure" excludes. In Studio, Scribe cross-checks: the server sends its own value for fields the client computes locally, and a disagreement logs `DERIVED_MISMATCH`. That check costs nothing in production, where the value is not sent at all.
 
@@ -165,10 +170,10 @@ Reading a derived field mid-batch is the one case that fires its `Changed` befor
     Data.Level.Get()  --> 13
     ```
 
-    Seeding the derived field itself is a write, so it fails exactly as a write would.
+    Seeding a root-level derived field is a write, so it fails exactly as a write would. A value seeded for one inside a record is ignored: the field keeps its own value and recomputes from its inputs.
 
 ??? note "Converting a stored field into a derived one"
-    If Emberfall shipped with `Level` as a stored `Scribe.Int` and you are converting it now, the old key stays behind in every existing profile. Delete it in a [migration](./profiles#migrations), or it lingers forever and turns up in the unknown-root-key warning:
+    If Emberfall previously stored `Level` as a `Scribe.Int`, converting it to a derived field leaves the old value in existing profiles. The unknown-root-key warning does not catch it because `Level` is still declared. Remove it in a [migration](./profiles#migrations):
 
     ```lua
     Migrations = {

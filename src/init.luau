@@ -1066,7 +1066,8 @@ type function BuildServerDataType(T, P, S, Names: type?)
 	)
 	bigScoreProps[ts.singleton("ToNumber")] = ts.newfunction({ head = { ts.any } }, { head = { ts.number } })
 	bigScoreProps[ts.singleton("Log10")] = ts.newfunction({ head = { ts.any } }, { head = { ts.number } })
-	entryProps[ts.singleton("Score")] = ts.unionof(ts.number, ts.newtable(bigScoreProps, nil, nil))
+	local bigScore = ts.newtable(bigScoreProps, nil, nil)
+	entryProps[ts.singleton("Score")] = ts.unionof(ts.number, bigScore)
 	local leaderboardEntry = ts.newtable(entryProps, nil, nil)
 	local entryArray =
 		ts.newtable(nil, { index = ts.number, readresult = leaderboardEntry, writeresult = leaderboardEntry }, nil)
@@ -1199,10 +1200,10 @@ type function BuildServerDataType(T, P, S, Names: type?)
 	-- Purchase spec: Cost.Path is the template's numeric-leaf path union and
 	-- Grant receives the typed accessor tree.
 	local costProps: { [type]: type } = {}
-	-- false: a cost path must be a plain number balance. Monetization refuses a
-	-- non-number at runtime, so this rejects a Scribe.Big path at author time.
-	costProps[ts.singleton("Path")] = StatPathsType(T, ts.singleton(false))
-	costProps[ts.singleton("Amount")] = ts.number
+	-- Include Big currency paths.
+	costProps[ts.singleton("Path")] = StatPathsType(T, ts.singleton(true))
+	-- Validate path/amount pairs at runtime to avoid a costly per-path type union.
+	costProps[ts.singleton("Amount")] = ts.unionof(ts.number, ts.string, bigScore)
 	local purchaseProps: { [type]: type } = {}
 	purchaseProps[ts.singleton("Cost")] = ts.newtable(costProps, nil, nil)
 	purchaseProps[ts.singleton("Category")] = optional(ts.string)
@@ -1390,7 +1391,8 @@ export type ProductConfig<T = any> = {
 }
 
 export type PurchaseSpec<T = any> = {
-	Cost: { Path: StatPathsType<T, false>, Amount: number },
+	-- Strings and BigValue amounts require a Big currency.
+	Cost: { Path: StatPathsType<T, true>, Amount: number | string | BigValue },
 	Category: string?,
 	ItemId: string,
 	Grant: ((data: BuildGrantDataType<T, NodeFunctionNames>) -> ())?,
@@ -1765,7 +1767,7 @@ export type Bundle<T, S = any> = {
 
 --[=[
 	@interface PurchaseSpec
-	.Cost { Path: string, Amount: number } -- the numeric field to debit, and by how much
+	.Cost { Path: string, Amount: number | string | BigValue } -- the numeric field to debit, and by how much
 	.ItemId string -- what is being bought; recorded on the log entry
 	.Category string? -- a grouping label of your choosing, for filtering later
 	.Grant ((data) -> ())? -- runs inside the same transaction as the debit
@@ -1776,6 +1778,10 @@ export type Bundle<T, S = any> = {
 	and the Grant either both happen or neither does, so a Grant that throws
 	leaves the balance exactly where it was. A refused purchase claims nothing,
 	which is why retrying after one still works even with a key.
+
+	For a [Scribe.Big] currency, `Amount` accepts a number, a numeric string up to
+	256 bytes, or a [BigValue](bigvalue.md). Other currencies require a number.
+	This is checked at runtime; the types accept every form on every cost path.
 	See [Monetization](../monetization.md).
 ]=]
 
@@ -3180,7 +3186,8 @@ end
 	ProfileStore's `AUTO_SAVE_PERIOD` is a module-wide constant that also covers any
 	direct ProfileStore use in the same game. The per-bundle `SaveInterval` option
 	still wins where it is set, and two bundles asking for different cadences logs
-	`SAVE_INTERVAL_CONFLICT`. Values below 15 seconds clamp up to it.
+	`SAVE_INTERVAL_CONFLICT`. Values clamp to 15–300 seconds. The ceiling leaves
+	time for a failed save before another server considers the session dead at 630 seconds.
 
 	Calling this twice with different values, or after a bundle exists, is an error,
 	because the value may already have been applied.

@@ -134,7 +134,7 @@ Scribe validates every write against the declared template and fires [`OnAnomaly
 
     The abuse-shaped signals are the transport ones, malformed frames, oversize frames and frame rate, because a real Scribe client cannot produce any of them.
 
-The wipe guard is the same idea at profile scale. Every save is compared against the last good one, and a collapse in size or a vanished top-level key fires `WIPE_GUARD_TRIPPED`. Under `WipeGuardPolicy = "Block"` the last good snapshot persists instead.
+The wipe guard checks the whole profile against its last good save. A large drop in size, a missing top-level key or missing `_Scribe` ledger sections trigger `WIPE_GUARD_TRIPPED`. Under `WipeGuardPolicy = "Block"`, the last good snapshot is saved instead. See [Integrity guards](./diagnostics#integrity-guards).
 
 ## What Scribe deliberately does not do
 
@@ -142,7 +142,7 @@ The wipe guard is the same idea at profile scale. Every save is compared against
 - **No anti-cheat.** Scribe sees the data layer. Speed hacks, teleports, aimbots and exploit GUIs are invisible to it. Treat it as one high-quality signal feeding your anti-cheat, never as the anti-cheat.
 - **No per-viewer visibility.** `Shared` is all or nothing to every client. Anything conditional, such as party-only or team-only, has to go through a Command.
 - **No ban list.** Banning is irreversible and needs an appeals process. That decision belongs to you.
-- **No sandbox against your own server code.** The `_Scribe` root refuses every write from game code and hands back a detached copy on read, which makes the receipt ring, perks and gift credits safe from being cleared *by accident* through a `Get()`. That is what the guard is for. It is not a boundary against deliberate reflection: server code can `require` Scribe's internals directly, and `pairs()` over an accessor ignores metatables and reaches the same state. Closing that would not be a security win, because nothing stops the `require`. The accidental route is closed, and it is the one that bites: iterating an accessor now raises with the fix in the message, because the old fallback silently deleted the container.
+- **No sandbox against your own server code.** Accessors refuse writes to `_Scribe` and `_ScribeSession` and return detached copies on read. This protects receipts, perks, gift credits and the ownership cache from accidental edits. It does not stop server code from requiring internal modules or deliberately inspecting accessor internals. Use public methods to change this state, and iterate `accessor.Get()` rather than the accessor itself.
 
 ### Knobs
 

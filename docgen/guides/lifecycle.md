@@ -88,6 +88,8 @@ end
 
 Scribe autosaves each profile every `SaveInterval` seconds, 300 by default. Lower it to shrink the window of progress a crash can cost. It also saves when a player leaves and on `BindToClose`.
 
+Scribe checks once a second for profiles overdue for a save attempt, so players leaving cannot leave the remaining profiles waiting on a slower rotation. A large group joining together can also become due together on its first interval. The interval is clamped to 15–300 seconds to leave room for a retry before the 630-second dead-session threshold. This schedules save attempts; DataStore delays or failures can still prevent a save from completing.
+
 After a successful grant, request a save and check whether Scribe can confirm it:
 
 ```lua
@@ -165,6 +167,10 @@ Scribe({
 ```
 
 `isNewProfile` is true for a genuinely new profile, a `ResetData` wipe, and a first-session crash recovery, so you can run starter kits and welcome flows without keeping your own sentinel field. An error thrown here is caught and logged rather than blocking the load.
+
+The table excludes Scribe's `_Scribe` ledger, protecting receipt IDs, perks and gift credits. Assigning `_Scribe` is discarded and logs `ON_PLAYER_INIT_LEDGER`.
+
+Nested edits apply directly. Top-level assignments and removals apply when the hook returns, and before any save while it yields. Finish your edits inside the hook; do not keep its table for later writes. Removed keys are excluded from the wipe guard's missing-key check, but a large drop in size can still trigger it.
 
 ### Reading legacy stores here
 

@@ -12,9 +12,7 @@ to map runtime error lines back to the matching release source.
 
 ## Install
 
-The npm packages are prepared for initial publication. Repository owners must complete
-the release setup in `CONTRIBUTING.md` before these registry installs are available.
-After publication, install the core in an existing roblox-ts project:
+Install the core in an existing roblox-ts project:
 
 ```sh
 npm install @rbxts/scribe
@@ -369,7 +367,7 @@ a compatible 0.3 implementation does not need to install the 0.2 package.
 
 ## Telemetry
 
-Install the separate optional package after publication:
+Install the separate optional package:
 
 ```sh
 npm install @rbxts/scribe-telemetry
@@ -387,7 +385,7 @@ for setup and delivery behavior.
 ## Leaderstats
 
 The optional `@rbxts/scribe-leaderstats` package mirrors selected data into Roblox's
-player list. Install it separately after publication:
+player list. Install it separately:
 
 ```sh
 npm install @rbxts/scribe-leaderstats

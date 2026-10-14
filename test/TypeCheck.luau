@@ -545,6 +545,24 @@ local function bigOperators(player: Player)
 	local exponent: number = data.Wealth.Get():Log10()
 	data.Wealth.Set(data.Wealth.Get():Pow(2))
 
+	-- Big purchases accept number, string and Big amounts.
+	local boughtWithText: boolean = bigOpsBundle.Server.Purchase(player, {
+		Cost = { Path = "Wealth", Amount = "1e10" },
+		ItemId = "Crown",
+	})
+	local boughtWithBig: boolean = bigOpsBundle.Server.Purchase(player, {
+		Cost = { Path = "Other", Amount = data.Wealth.Get() },
+		ItemId = "Crown",
+	})
+	local boughtWithNumber: boolean = bigOpsBundle.Server.Purchase(player, {
+		Cost = { Path = "Wealth", Amount = 5 },
+		ItemId = "Crown",
+	})
+	local bigSpec: Scribe.PurchaseSpec<typeof(bigOpsTemplate)> = {
+		Cost = { Path = "Wealth", Amount = data.Other.Get() },
+		ItemId = "Crown",
+	}
+
 	-- A WHOLE-SUBTREE read must show the value, not the declarator's internal label.
 	-- Scribe.Big's label lives in its metatable rather than in its fields precisely
 	-- so this works: a label written as a field travels with the type into every
@@ -576,7 +594,11 @@ local function bigOperators(player: Player)
 		viaOther,
 		viaClone,
 		raised,
-		exponent
+		exponent,
+		boughtWithText,
+		boughtWithBig,
+		boughtWithNumber,
+		bigSpec
 end
 
 -- Scribe.ServerOnly wrapping a declarator gets its own template, again for the

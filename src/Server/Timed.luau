@@ -131,7 +131,7 @@ function Timed.new(ctx: any)
 		local fieldId = visibleFields[pathKey]
 		if fieldId and tree then
 			-- Session metadata shares normal replication and transaction rollback.
-			tree.Accessor.Child(Template.SESSION_ROOT).Child("Timed").Child(fieldId).Set(value, replicate)
+			tree.ReservedSession.Child("Timed").Child(fieldId).Set(value, replicate)
 		end
 	end
 
@@ -484,7 +484,7 @@ function Timed.new(ctx: any)
 					visible[fieldId] = expiry
 				end
 			end
-			entry.Tree.Accessor.Child(Template.SESSION_ROOT).Child("Timed").Set(visible)
+			entry.Tree.ReservedSession.Child("Timed").Set(visible)
 		end
 		if store ~= nil and next(store) ~= nil then
 			watch(entry)

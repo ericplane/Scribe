@@ -164,7 +164,9 @@ A second paid gift of the **same** product by the same sender is refused with `A
 ??? note "Why gifting grants a perk rather than a pass"
     There is no API to transfer a game pass, so a "gift VIP" product is a developer product whose `Grants` names a perk. Scribe treats perks and passes as one ownership namespace, so `Owns(ben, "VIP")` is true either way and the rest of your game needs no special case. See [Checking what a player owns](./monetization#checking-what-a-player-owns).
 
-    The consequence to plan for is that a renamed or deleted product strands any gift credits keyed to its old name. Scribe warns at load with `GIFT_CREDIT_UNKNOWN_PRODUCT` and never deletes them, because a credit is money the player already paid. Restore the product entry or rename the key in a migration.
+    Gift credits use the product's name. Keep a removed product in `RetiredProducts` with its original name, ID and grant so players can still redeem them. Otherwise Scribe logs `GIFT_CREDIT_UNKNOWN_PRODUCT` on load and keeps the credits untouched.
+
+    Renaming outstanding credits is not supported. A migration cannot change their keys: edits to `_Scribe` are discarded and log `MIGRATION_RESERVED_DISCARDED`.
 
 ## Where to next
 

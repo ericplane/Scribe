@@ -5,8 +5,7 @@
 --   Failed      transient service-side; a retry may work
 --   Unresolved  timed out and the write may have landed; never retry blindly
 --   Rejected    permanently invalid; every retry fails identically
--- Only the numeric prefix of the error string is read; the prose is not a contract.
--- An unrecognised code classifies as Failed, with the code in the log context.
+-- Classify by numeric code or throttle name; unknown codes default to Failed.
 
 local Health = require(script.Parent.Health)
 local Log = require(script.Parent.Log)
@@ -46,6 +45,12 @@ local function byFamily(code: number): Class
 	return "Failed"
 end
 
+-- Strip known engine prefixes before reading the leading code or throttle name.
+local function withoutEnginePrefix(message: string): string
+	local rest = string.match(message, "^%s*HTTP %d+ %b()%s*(.*)$") or message
+	return string.match(rest, "^%s*DataStoreService:%s*(.*)$") or rest
+end
+
 --- The numeric code a DataStore error message carries, or nil if it carries none.
 --- Anchored on purpose: a loose search for digits-then-colon would eventually match a
 --- number inside a key name and report a confident wrong class. nil classifies as
@@ -54,14 +59,43 @@ function Failure.CodeOf(message: any): number?
 	if type(message) ~= "string" then
 		return nil
 	end
-	return tonumber(string.match(message, "^%s*(%d+):"))
+	return tonumber(string.match(withoutEnginePrefix(message), "^%s*(%d+):"))
+end
+
+-- Named throttles have no numeric code. Anchor to avoid matching key names.
+function Failure.IsNamedThrottle(message: any): boolean
+	if type(message) ~= "string" then
+		return false
+	end
+	return string.match(withoutEnginePrefix(message), "^%s*%a+Throttled?:") ~= nil
+end
+
+-- Lowercase markers for backend throttles wrapped in a 502.
+local WRAPPED_THROTTLE_MARKERS = { "http 429", "too many requests", "request rate exceeds" }
+
+-- Treat wrapped throttles as throttling for health and kick messages only.
+-- Classify keeps 502 as Failed: gift refunds require proof that nothing was written.
+function Failure.IsThrottleLike(message: any): boolean
+	if Failure.Classify(message) == "Throttled" then
+		return true
+	end
+	if Failure.CodeOf(message) ~= 502 then
+		return false
+	end
+	local text = string.lower(message)
+	for _, marker in WRAPPED_THROTTLE_MARKERS do
+		if string.find(text, marker, 1, true) then
+			return true
+		end
+	end
+	return false
 end
 
 --- Classify a DataStore error message.
 function Failure.Classify(message: any): Class
 	local code = Failure.CodeOf(message)
 	if code == nil then
-		return "Failed"
+		return if Failure.IsNamedThrottle(message) then "Throttled" else "Failed"
 	end
 	return EXPLICIT[code] or byFamily(code)
 end
@@ -106,7 +140,9 @@ function Failure.Report(report: Report): (Class, boolean)
 	local classified = report.Error ~= nil or report.Class ~= nil
 	local class: Class = report.Class or Failure.Classify(report.Error)
 
-	local counted, folded = Health.ReportFailure(report.Subsystem, report.Key, class)
+	-- Fold wrapped throttles in health without changing the reported class.
+	local healthClass = if class ~= "Throttled" and Failure.IsThrottleLike(report.Error) then "Throttled" else class
+	local counted, folded = Health.ReportFailure(report.Subsystem, report.Key, healthClass)
 
 	local metric = report.Metric
 	if metric ~= nil then

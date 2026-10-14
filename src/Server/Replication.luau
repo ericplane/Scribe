@@ -19,7 +19,9 @@ local Replication = {}
 
 local HANDSHAKE_TIMEOUT = 10
 local MAX_OPS_PER_FRAME = 60000
-local REINIT_COOLDOWN = 5 -- seconds between full snapshots for repeated Hellos
+local REINIT_COOLDOWN = 5 -- seconds between snapshots to one client
+-- Per-client cap; excess replies send immediately.
+local MAX_HELD_REPLIES = 64
 local MALFORMED_LOG_INTERVAL = 1 -- seconds; throttle malformed-frame logs/anomalies per player
 local MALFORMED_MAX = 32 -- after this many malformed frames, ignore all further inbound from the player
 -- Its own budget rather than counting toward MALFORMED_MAX: a malformed frame
@@ -240,13 +242,23 @@ function Replication.new(ctx: any)
 	-- Defined below, but needed by markResync's driver in the flush loop above it.
 	local sendInit: (entry: any) -> ()
 
+	-- Shared by the repair loop and reply hold checks.
+	local function repairPending(entry: any): boolean
+		return entry.ResyncPending == true and entry.State == "Ready" and not entry.TornDown
+	end
+	local function nextResyncAt(entry: any): number
+		return (entry.LastResyncAt or -math.huge) + REINIT_COOLDOWN
+	end
+
 	-- A frame did not reach the transport, so this client's mirror is now a value the
 	-- server never had: Insert, Remove and Clear are not idempotent, so every later
 	-- op lands on the wrong base, and a loaded client never Hellos again. Repair is a
 	-- fresh Init, not a replay: re-broadcasting a SharedDiff would double-apply an
 	-- Insert on the other recipients.
 	local function markResync(entry: any, what: string)
-		if entry.ResyncPending then
+		local already = entry.ResyncPending == true
+		-- Already closed: nothing reaches this mirror until the snapshot.
+		if already and not entry.HandshakeReady then
 			return
 		end
 		entry.ResyncPending = true
@@ -258,6 +270,10 @@ function Replication.new(ctx: any)
 		entry.QueueOpen = false
 		entry.Queue = {}
 		entry.QueueIndex = {}
+		if already then
+			-- Reclose after a partial repair, but count and log this episode only once.
+			return
+		end
 		Metrics.Add("MirrorResyncs")
 		Log.Warn(
 			"Replication",
@@ -336,6 +352,108 @@ function Replication.new(ctx: any)
 		return true
 	end
 
+	-- Held command replies ------------------------------------------------------
+	-- Handler writes travel in the repair snapshot; replies wait for its attempt.
+
+	-- No queue flush: the snapshot carries the writes.
+	local function releaseReplies(entry: any)
+		local held = entry.HeldReplies
+		if held == nil then
+			return
+		end
+		entry.HeldReplies = nil
+		entry.HeldDeadline = nil
+		-- Failed replies are logged and dropped; they do not trigger mirror repairs.
+		for _, bytes in held do
+			sendBuffer(entry, bytes)
+		end
+	end
+
+	-- Release after the whole handshake, even if it throws. Failed snapshots disable holds.
+	local function afterSnapshotAttempt(entry: any)
+		entry.ResyncFailed = not entry.HandshakeReady
+		releaseReplies(entry)
+	end
+
+	--- Hold a handler's reply if a repair is due by holdUntil. Refusals use SendTo.
+	function self.SendReply(entry: any, bytes: buffer, holdUntil: number)
+		local held = entry.HeldReplies
+		if
+			not stopped
+			and repairPending(entry)
+			and not entry.HandshakeReady
+			and not entry.ResyncFailed
+			and (held == nil or #held < MAX_HELD_REPLIES)
+			and nextResyncAt(entry) <= holdUntil
+		then
+			local now = Clock.Monotonic()
+			if held == nil then
+				held = {}
+				entry.HeldReplies = held
+			end
+			table.insert(held, bytes)
+			Metrics.Add("CommandRepliesHeld")
+			if holdUntil < (entry.HeldDeadline or math.huge) then
+				entry.HeldDeadline = holdUntil
+				-- Wake at the deadline; the flush loop attempts any due repair before releasing.
+				Clock.Delay(math.max(0, holdUntil - now), markDirty, entry)
+			end
+			return
+		end
+		sendBuffer(entry, bytes)
+	end
+
+	-- Connected players without a session, and whether they have a snapshot for store Diffs.
+	-- Weak keys; leaving or receiving a new snapshot removes them.
+	local lingering: { [any]: boolean } = setmetatable({}, { __mode = "k" }) :: any
+
+	-- A replacement entry (e.g. SimulateLoadFailure) must receive Init before taking over.
+	local function stillLingering(player: any): boolean
+		local current = ctx.Persistence.Entries[player]
+		if player.Parent == nil or (current ~= nil and current.HandshakeReady) then
+			lingering[player] = nil
+			return false
+		end
+		return true
+	end
+
+	-- Status needs no snapshot. Skip replacement entries already reached by the main loop.
+	local function reachLingering(frames: { buffer }, everyone: boolean)
+		for player, hasSnapshot in lingering do
+			if not stillLingering(player) then
+				continue
+			end
+			if everyone then
+				if ctx.Persistence.Entries[player] ~= nil then
+					continue
+				end
+			elseif not hasSnapshot then
+				continue
+			end
+			-- Excluded from FramesSent, matching broadcast session accounting.
+			for _, frame in frames do
+				if not pcall(transport.SendToClient, transport, player, frame) then
+					break
+				end
+			end
+		end
+	end
+
+	-- Store Diffs need a snapshot; loading clients receive current store data in Init.
+	local function everyClientReady(): boolean
+		for _, entry in ctx.Persistence.Entries do
+			if not entry.HandshakeReady then
+				return false
+			end
+		end
+		for player, hasSnapshot in lingering do
+			if not hasSnapshot and stillLingering(player) then
+				return false
+			end
+		end
+		return true
+	end
+
 	-- One frame, to every ready client except `exceptEntry`. Returns the entries the
 	-- frame did not reach, or nil when every recipient got it; the only place that
 	-- knows which clients were missed.
@@ -343,7 +461,13 @@ function Replication.new(ctx: any)
 	-- BytesOutPerSend is observed once here, not once per recipient: per-recipient
 	-- sampling cost O(N^2) reservoir writes a frame and skewed the distribution toward
 	-- the fanout. FramesSent still counts every hand-off to the transport.
-	local function broadcastBuffer(bytes: buffer, exceptEntry: any?, alsoExcept: any?): { any }?
+	-- Store frames also reach session-ended clients with snapshots; Status reaches everyone.
+	local function broadcastBuffer(
+		bytes: buffer,
+		exceptEntry: any?,
+		alsoExcept: any?,
+		kind: ("store" | "status")?
+	): { any }?
 		-- Split once, before the recipient loop and before the fast-path branch: the
 		-- split depends only on the buffer, and the fast path never reaches `deliver`,
 		-- so a fragmenter placed there would let every broadcast out unsplit.
@@ -354,7 +478,12 @@ function Replication.new(ctx: any)
 			return true
 		end) ~= nil
 
-		if transport.SendToAllClients and exceptEntry == nil and alsoExcept == nil then
+		if
+			transport.SendToAllClients
+			and exceptEntry == nil
+			and alsoExcept == nil
+			and (kind ~= "store" or everyClientReady())
+		then
 			-- No per-recipient attribution on this path: one raise means the frame
 			-- reached NOBODY, so every ready client is a missed recipient.
 			local function everyReady(): { any }
@@ -400,7 +529,7 @@ function Replication.new(ctx: any)
 		local accepted = 0
 		local missed: { any }? = nil
 		for _, entry in ctx.Persistence.Entries do
-			if entry.HandshakeReady and entry ~= exceptEntry and entry ~= alsoExcept then
+			if (entry.HandshakeReady or kind == "status") and entry ~= exceptEntry and entry ~= alsoExcept then
 				local complete = true
 				if not split then
 					complete = deliver(entry, bytes)
@@ -439,6 +568,9 @@ function Replication.new(ctx: any)
 		end
 		if accepted > 0 then
 			countBytesOut(bytes, accepted)
+		end
+		if kind ~= nil then
+			reachLingering(if split then parts else { bytes }, kind == "status")
 		end
 		return missed
 	end
@@ -536,7 +668,8 @@ function Replication.new(ctx: any)
 		sendSharedOps(entry, detachSharedQueue(entry))
 	end
 
-	function self.FlushEntry(entry: any)
+	--- Flush before a command reply; keep Shared updates batched for other clients.
+	function self.FlushOwnerQueue(entry: any)
 		local queue: { Wire.Op } = entry.Queue
 		if #queue > 0 and entry.HandshakeReady then
 			entry.Queue = {}
@@ -570,7 +703,10 @@ function Replication.new(ctx: any)
 			entry.Queue = {}
 			entry.QueueIndex = {}
 		end
+	end
 
+	function self.FlushEntry(entry: any)
+		self.FlushOwnerQueue(entry)
 		flushSharedQueue(entry)
 	end
 
@@ -589,6 +725,8 @@ function Replication.new(ctx: any)
 	local hasStore = compiled.Views.Store ~= nil
 
 	--- Queue a store op. Same visibility rule as a player op: ServerOnly never leaves.
+	local storeOpsQueued = 0
+
 	function self.PushStoreOp(op: Wire.Op, schema: Template.SchemaNode?)
 		local visibility = if schema then schema.Visibility else Template.VisibilityOf(compiled, op.Path)
 		if visibility == "ServerOnly" then
@@ -596,6 +734,7 @@ function Replication.new(ctx: any)
 		end
 		stripServerOnly(op, schema)
 		Metrics.Add("OpsQueued")
+		storeOpsQueued += 1
 		-- compactOps reads _pk unconditionally. The semicolon is load-bearing: a line opening
 		-- with `(` after a call is ambiguous to Luau.
 		local pathKey = Util.pathKey(op.Path);
@@ -613,7 +752,7 @@ function Replication.new(ctx: any)
 			local ok, bytesOrErr = pcall(Wire.EncodeOpsFrame, Wire.Frames.Diff, compiled, chunk)
 			if ok then
 				-- An ordinary Diff against the full compiled: no new frame kind needed.
-				local missed = broadcastBuffer(bytesOrErr, except)
+				local missed = broadcastBuffer(bytesOrErr, except, nil, "store")
 				Metrics.Add("OpsSent", #chunk)
 				sentOps += #chunk
 				if missed ~= nil then
@@ -629,6 +768,11 @@ function Replication.new(ctx: any)
 			offset += MAX_OPS_PER_FRAME
 		end
 		return sentOps
+	end
+
+	--- Cumulative count: queue length may shrink while a command handler yields.
+	function self.StoreOpsQueued(): number
+		return storeOpsQueued
 	end
 
 	function self.FlushStoreQueue(except: any?): number
@@ -654,9 +798,9 @@ function Replication.new(ctx: any)
 			-- would have flushed this frame is already in it. Throttled on the previous
 			-- attempt, not on LastInitAt, whose clock starts at the join: gating on that
 			-- would leave a client that lost a frame just after its handshake stale.
-			if entry.ResyncPending and entry.State == "Ready" and not entry.TornDown then
+			if repairPending(entry) then
 				local now = Clock.Monotonic()
-				if now - (entry.LastResyncAt or -math.huge) >= REINIT_COOLDOWN then
+				if now >= nextResyncAt(entry) then
 					entry.LastResyncAt = now
 					entry.ResyncPending = false
 					-- pcall for the reason onHello gives: a throw escaping here would take
@@ -669,7 +813,14 @@ function Replication.new(ctx: any)
 						entry.ResyncPending = true
 						markDirty(entry)
 					end
+					afterSnapshotAttempt(entry)
 				end
+			end
+			-- Bound the wait even if no repair ran; these replies may precede their data.
+			local held = entry.HeldReplies
+			if held ~= nil and Clock.Monotonic() >= entry.HeldDeadline then
+				Metrics.Add("CommandReplyHoldsExpired", #held)
+				releaseReplies(entry)
 			end
 			-- Counted before the flush, because FlushEntry replaces both queues. Ops
 			-- pending, not ops sent: compaction shrinks it on the way to the wire.
@@ -792,7 +943,7 @@ function Replication.new(ctx: any)
 		end
 		-- A missed broadcast Status is not mirror state: the next Health transition
 		-- rebroadcasts, and a resync re-sends it as part of the handshake.
-		broadcastBuffer(bytes)
+		broadcastBuffer(bytes, nil, nil, "status")
 		return true
 	end
 
@@ -800,25 +951,24 @@ function Replication.new(ctx: any)
 	local lastInitBytes: number? = nil
 
 	function sendInit(entry: any)
-		-- Sent after the snapshot is taken, so a write made inside Send lands past the boundary.
-		local pending: { Wire.Op }? = nil
-		if hasStore and #storeQueue > 0 then
-			pending = compactOps(storeQueue)
-			storeQueue = {}
-		end
 		-- Open the queue in the same breath as taking the snapshot, with no yield
 		-- between them, so every write from here on is either in this clone or in the
 		-- queue behind it. The clear drops what the snapshot supersedes.
 		entry.Queue = {}
 		entry.QueueIndex = {}
 		entry.QueueOpen = true
+		-- A failed snapshot must not leave the client ready with dropped ops.
+		entry.HandshakeReady = false
 		-- A repair is an Init for a client that already has a snapshot.
 		local repair = entry.InitDelivered == true
 		-- Stamped at the start of the snapshot: measuring from completion would let a
 		-- slow encode widen its own cooldown.
 		entry.LastInitAt = Clock.Monotonic()
 		local ops = ownerSnapshotOps(entry)
-		if pending ~= nil then
+		-- Detach after the snapshot builds successfully. Writes during Send stay queued.
+		if hasStore and #storeQueue > 0 then
+			local pending = compactOps(storeQueue)
+			storeQueue = {}
 			sendStoreOps(pending, entry)
 		end
 		-- Per-root byte spans, filled by the encode, so the oversize warning can name
@@ -891,10 +1041,7 @@ function Replication.new(ctx: any)
 			entry.Queue = {}
 			entry.QueueIndex = {}
 			entry.QueueOpen = false
-			-- On a re-Init these matter as much as the clear above: HandshakeReady is still
-			-- true from the first snapshot, and (ready, not open) is the state in which
-			-- PushOp silently discards every owner op forever. ResyncPending asks again,
-			-- since a loaded client has no Hello left to send.
+			-- Retry here: a loaded client never sends another Hello.
 			entry.HandshakeReady = false
 			entry.ResyncPending = true
 			markDirty(entry)
@@ -1006,7 +1153,11 @@ function Replication.new(ctx: any)
 			if not okInit then
 				Log.Error("Replication", "INIT_SEND_FAIL", tostring(initErr), { Player = entry.Player })
 				Metrics.Add("InitSendFailed")
+				-- Retry the whole handshake if anything after Init throws.
+				entry.ResyncPending = true
+				markDirty(entry)
 			end
+			afterSnapshotAttempt(entry)
 		end
 	end
 
@@ -1019,6 +1170,9 @@ function Replication.new(ctx: any)
 			if not okInit then
 				Log.Error("Replication", "INIT_SEND_FAIL", tostring(initErr), { Player = entry.Player })
 				Metrics.Add("InitSendFailed")
+				-- Retry the whole handshake, as in onHello.
+				entry.ResyncPending = true
+				markDirty(entry)
 			end
 		end
 		-- Broadcast this player's Shared snapshot. The queue is cleared before the send: what
@@ -1068,6 +1222,21 @@ function Replication.new(ctx: any)
 
 	function self.OnEntryRemoved(entry: any)
 		dirty[entry] = nil
+		-- No repair can follow teardown; release replies only to connected clients.
+		local held = entry.HeldReplies
+		if held ~= nil then
+			entry.HeldReplies = nil
+			entry.HeldDeadline = nil
+			if entry.Player ~= nil and entry.Player.Parent ~= nil then
+				for _, bytes in held do
+					sendBuffer(entry, bytes)
+				end
+			end
+		end
+		-- Departed players are removed when lingering is next read.
+		if entry.Player ~= nil then
+			lingering[entry.Player] = entry.HandshakeReady == true
+		end
 		entry.HandshakeReady = false
 		-- Symmetry rather than a fix: a removed entry's tree is already dead, so
 		-- nothing can push to it.
@@ -1117,9 +1286,43 @@ function Replication.new(ctx: any)
 
 	-- Inbound dispatch -------------------------------------------------
 
+	-- Refuse commands after session end; use a separate limiter since the entry is gone.
+	local commandRate: number = ctx.Options.CommandRateLimit or 20
+	local sessionlessTokens: { [any]: { Tokens: number, At: number } } = setmetatable({}, { __mode = "k" }) :: any
+
+	local function refuseSessionless(player: any, bytes: buffer)
+		if lingering[player] == nil or not stillLingering(player) then
+			return
+		end
+		if buffer.len(bytes) < 5 or buffer.readu8(bytes, 0) ~= Wire.Frames.Command then
+			return
+		end
+		local now = Clock.Monotonic()
+		local bucket = sessionlessTokens[player]
+		if bucket == nil then
+			bucket = { Tokens = commandRate, At = now }
+			sessionlessTokens[player] = bucket
+		end
+		bucket.Tokens = math.min(commandRate, bucket.Tokens + (now - bucket.At) * commandRate)
+		bucket.At = now
+		if bucket.Tokens < 1 then
+			return
+		end
+		bucket.Tokens -= 1
+		local read, correlation = pcall(function()
+			local reader = Wire.NewReader(bytes)
+			Wire.RU8(reader)
+			return Wire.RU32(reader)
+		end)
+		if read then
+			pcall(transport.SendToClient, transport, player, ctx.Commands.EncodeNotReady(correlation))
+		end
+	end
+
 	transport:ListenServer(function(player: Player, bytes: buffer)
 		local entry = ctx.Persistence.Entries[player]
 		if not entry then
+			refuseSessionless(player, bytes)
 			return
 		end
 		if entry.MalformedBlocked or entry.OversizeBlocked then
@@ -1238,6 +1441,12 @@ function Replication.new(ctx: any)
 	-- discarded bundle keeps flushing against a dead Persistence forever.
 	function self.Stop()
 		stopped = true
+		-- No further repairs can release these replies.
+		if ctx.Persistence then
+			for _, entry in ctx.Persistence.Entries do
+				pcall(releaseReplies, entry)
+			end
+		end
 		for _, connection in connections do
 			pcall(function()
 				connection:Disconnect()

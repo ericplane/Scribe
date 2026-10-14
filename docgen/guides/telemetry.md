@@ -19,8 +19,7 @@ Before you begin:
 ## roblox-ts
 
 Telemetry has its own optional `@rbxts/scribe-telemetry` package; installing the
-core does not include it. See [roblox-ts](roblox-ts.md) for publication status.
-After publication:
+core does not include it. See [roblox-ts](roblox-ts.md) for the shared setup. Install both:
 
 ```sh
 npm install @rbxts/scribe @rbxts/scribe-telemetry

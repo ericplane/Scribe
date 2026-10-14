@@ -346,7 +346,7 @@ function Leaderboards.new(ctx: any)
 		if write ~= nil and commit then
 			local tree = entry.Tree
 			if tree ~= nil and not tree.Dead then
-				tree.Reserved.Boards[board.Name].Set(write)
+				tree.Reserved.Boards.Child(board.Name).Set(write)
 			else
 				records[board.Name] = write
 			end
@@ -749,7 +749,7 @@ function Leaderboards.new(ctx: any)
 			local ok, value = pcall(function()
 				local accessor = tree.Accessor
 				for _, segment in board.StatPath do
-					accessor = accessor[segment]
+					accessor = accessor.Child(segment)
 				end
 				return accessor.Get()
 			end)
@@ -1741,7 +1741,7 @@ function Leaderboards.new(ctx: any)
 			local ok, err = pcall(function()
 				local accessor = entry.Tree.Accessor
 				for _, segment in board.StatPath do
-					accessor = accessor[segment]
+					accessor = accessor.Child(segment)
 				end
 				local value = accessor.Get()
 				if board.IsBig or type(value) == "number" then

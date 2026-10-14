@@ -32,6 +32,8 @@ export type TreeParams = {
 	IsServer: boolean,
 	Label: string,
 	OnOp: ((op: Op, schema: SchemaNode?) -> ())?,
+	-- Notify persistence even when replication is disabled.
+	OnUnreplicatedOp: ((op: Op, schema: SchemaNode?) -> ())?,
 	OnAnomaly: ((path: { string | number }, value: any, reason: string) -> ())?,
 	BoundsPolicy: ("Clamp" | "Reject")?,
 	DevMode: boolean?,
@@ -74,6 +76,8 @@ export type Tree = typeof(setmetatable(
 		-- The library's handle on the reserved `_Scribe` root: the only accessor
 		-- permitted to write there, and never returned by any public API.
 		Reserved: any,
+		-- Private write handle for `_ScribeSession`.
+		ReservedSession: any,
 		Dead: boolean,
 		_listeners: { [string]: { [string]: { [any]: (...any) -> () } } },
 		-- Path array per listened pathKey; the pathKey string is lossy and cannot be
@@ -94,10 +98,14 @@ export type Tree = typeof(setmetatable(
 		-- Set only while a failed transaction rolls back: dispatch is queued here and
 		-- drained once the tree is whole again. See `fire` and `rollbackTransaction`.
 		_fireQueue: { { any } }?,
+		-- Defer recomputes until rollback finishes restoring the tree.
+		_restoring: boolean,
+		-- Provisional values carried through a record write; discard if recompute throws.
+		_carried: { [SchemaNode]: true }?,
 		_txn: {
 			Snapshots: { [string]: { Path: { string | number }, Value: any } },
 			Below: { [string]: { [string]: boolean } },
-			Ops: { { Op: Op, Schema: SchemaNode? } },
+			Ops: { { Op: Op, Schema: SchemaNode?, Unreplicated: boolean } },
 			Created: { { string | number } },
 			Seeded: { { string | number } },
 			Economy: { { Path: { string | number }, Delta: number, New: number, Tags: { [string]: any } } },
@@ -123,10 +131,8 @@ local F_KEY = {} :: any
 local F_SCHEMA = {} :: any
 local F_CHILDREN = {} :: any
 
--- The accessors permitted to write under Template.RESERVED_ROOT. A module upvalue
--- rather than a field, so no object a caller can reach can rawset the capability onto
--- a public accessor. Weak-keyed: a collected child accessor is rebuilt from its
--- parent, which re-grants it.
+-- Private write capability for both reserved roots. An upvalue prevents rawset forgery;
+-- weak keys let child accessors be collected and rebuilt from privileged parents.
 local PRIVILEGED: { [any]: true } = setmetatable({}, { __mode = "k" }) :: any
 
 -- The ONE tree whose transaction is open right now, or nil. `Tree._txn` is per-tree,
@@ -197,6 +203,7 @@ function Node.NewTree(params: TreeParams): Tree
 		Compiled = params.Compiled,
 		Accessor = nil :: any,
 		Reserved = nil :: any,
+		ReservedSession = nil :: any,
 		Dead = false,
 		_listeners = {},
 		_paths = {},
@@ -206,6 +213,8 @@ function Node.NewTree(params: TreeParams): Tree
 		_pendingAncestors = nil,
 		_pendingAncestorOrder = nil,
 		_fireQueue = nil,
+		_restoring = false,
+		_carried = nil,
 		_txn = nil,
 		_derivedDirty = nil,
 		_derivedSettling = false,
@@ -220,6 +229,12 @@ function Node.NewTree(params: TreeParams): Tree
 		self,
 		{ Template.RESERVED_ROOT },
 		if rootChildren then rootChildren[Template.RESERVED_ROOT] else nil,
+		true
+	)
+	self.ReservedSession = newAccessor(
+		self,
+		{ Template.SESSION_ROOT },
+		if rootChildren then rootChildren[Template.SESSION_ROOT] else nil,
 		true
 	)
 	return self
@@ -504,6 +519,8 @@ local function checkContainerKey(
 	end
 end
 
+local markDerivedDirty: (tree: Tree, pathKey: string) -> ()
+
 -- Resolves the container holding path's last segment, materializing missing
 -- intermediates when `create`. `schema` is the LAST segment's schema; the
 -- per-segment ones come from walking its Parent chain, which mirrors the path.
@@ -570,10 +587,13 @@ local function resolveContainer(
 			local segHad = container[seg] ~= nil
 			container[seg] = nextContainer
 			noteKeyDelta(container, seg, segHad, true)
+			local createdPath = table.move(path, 1, i, 1, table.create(i) :: { string | number })
+			-- Recreated records need their previously skipped derived fields recomputed.
+			markDerivedDirty(tree, Util.pathKey(createdPath))
 			-- Recorded so a rollback can prune containers that never existed pre-txn.
 			local txn = tree._txn
 			if txn then
-				txn.Created[#txn.Created + 1] = table.move(path, 1, i, 1, table.create(i) :: { string | number })
+				txn.Created[#txn.Created + 1] = createdPath
 			end
 		elseif type(nextContainer) ~= "table" then
 			if not create then
@@ -1396,15 +1416,17 @@ type WriteOpts = {
 }
 
 local function emitOp(tree: Tree, op: Op, schema: SchemaNode?, opts: WriteOpts)
-	if opts.NoOp or opts.FromRemote or opts.Replicate == false then
+	if opts.NoOp or opts.FromRemote then
 		return
 	end
-	local onOp = tree.Params.OnOp
+	-- Unreplicated writes still need to mark the profile dirty.
+	local unreplicated = opts.Replicate == false
+	local onOp = if unreplicated then tree.Params.OnUnreplicatedOp else tree.Params.OnOp
 	if onOp == nil then
 		return
 	end
 	if tree._txn then
-		table.insert(tree._txn.Ops, { Op = op, Schema = schema })
+		table.insert(tree._txn.Ops, { Op = op, Schema = schema, Unreplicated = unreplicated })
 	else
 		onOp(op, schema)
 	end
@@ -1422,7 +1444,7 @@ local MAX_SETTLE_PASSES = 4
 -- Assigned below applyClear: settling writes through applySet.
 local settleDerived: (tree: Tree) -> ()
 
-local function markDerivedDirty(tree: Tree, pathKey: string)
+markDerivedDirty = function(tree: Tree, pathKey: string)
 	local dependents = tree.Compiled.DerivedByWrite[pathKey]
 	if dependents == nil then
 		return
@@ -1438,9 +1460,7 @@ local function markDerivedDirty(tree: Tree, pathKey: string)
 end
 
 -- A write settles immediately unless something else is already going to settle for
--- it: inside a batch the flush does, inside a transaction the commit does, during a
--- replay ReplayFire does (once, after the whole snapshot has landed), and inside a
--- settle pass the pass itself does.
+-- it: batch flush, transaction commit, ReplayFire, rollbackTransaction or runSettle.
 local function settleAfterWrite(tree: Tree)
 	if
 		tree._derivedDirty == nil
@@ -1448,6 +1468,7 @@ local function settleAfterWrite(tree: Tree)
 		or tree._batchDepth > 0
 		or tree._txn ~= nil
 		or tree._replaying
+		or tree._restoring
 	then
 		return
 	end
@@ -1766,6 +1787,53 @@ local function canonicalStoredEquals(schema: SchemaNode?, old: any, new: any): b
 	return false
 end
 
+-- Carry derived values through record replacement until recompute. Local writes
+-- cannot supply them; remote writes and restores fill only gaps. Missing parents stay gone.
+local function carryDerived(
+	tree: Tree,
+	below: { SchemaNode },
+	depth: number,
+	old: any,
+	new: { [any]: any },
+	overwrite: boolean,
+	remote: boolean
+)
+	for _, node in below do
+		-- A missing transmitted field is absent on the server; do not fill a stale default.
+		if remote and not (node.Derived :: any).ClientComputes then
+			continue
+		end
+		local out = node.Path
+		local last = #out
+		local parent: any = new
+		for i = depth + 1, last - 1 do
+			parent = parent[out[i]]
+			if type(parent) ~= "table" then
+				break
+			end
+		end
+		if type(parent) == "table" and (overwrite or parent[out[last]] == nil) then
+			local was: any = old
+			for i = depth + 1, last do
+				if type(was) ~= "table" then
+					was = nil
+					break
+				end
+				was = was[out[i]]
+			end
+			parent[out[last]] = was
+			if was ~= nil then
+				local carried = tree._carried
+				if carried == nil then
+					carried = {}
+					tree._carried = carried
+				end
+				(carried :: any)[node] = true
+			end
+		end
+	end
+end
+
 function applySet(tree: Tree, path: { string | number }, schema: SchemaNode?, value: any, opts: WriteOpts): any
 	-- validateWrite rebuilds tables entry-by-entry (no aliasing); unvalidated
 	-- table writes are cloned explicitly instead.
@@ -1844,6 +1912,21 @@ function applySet(tree: Tree, path: { string | number }, schema: SchemaNode?, va
 	end
 
 	local pathKey = Util.pathKey(path)
+	-- Carry before emitOp so transmitted fields travel with the record.
+	if type(newValue) == "table" then
+		local below = tree.Compiled.DerivedBelow[pathKey]
+		if below ~= nil then
+			carryDerived(
+				tree,
+				below,
+				#path,
+				old,
+				newValue,
+				not opts.NoValidate and not opts.FromRemote,
+				opts.FromRemote == true
+			)
+		end
+	end
 	-- After the no-op early-out, so an unchanged write never triggers a recompute,
 	-- and before the fires, so a listener reading a derived field sees it settled.
 	markDerivedDirty(tree, pathKey)
@@ -2139,15 +2222,52 @@ local function applyClear(tree: Tree, path: { string | number }, schema: SchemaN
 		noteKeyDelta(container, key, false, true)
 	end
 	local pathKey = Util.pathKey(path)
-	-- Clear accepts any table node, a static record included, so this is the one
-	-- non-Set path that can blank a derived input.
+	-- Clear can remove derived inputs and outputs from static records too.
 	markDerivedDirty(tree, pathKey)
 	snapshotForTxn(tree, path, pathKey, value)
 	local descendantOlds = snapshotDescendants(tree, pathKey)
+	-- Keep direct derived fields until recompute; nested records stay cleared.
+	-- Alternating node/value pairs.
+	local kept: { any }? = nil
+	local below = tree.Compiled.DerivedBelow[pathKey]
+	if below ~= nil then
+		local depth = #path + 1
+		for _, node in below do
+			local was = if #node.Path == depth then value[node.Path[depth]] else nil
+			if was ~= nil then
+				local list = kept or {}
+				kept = list
+				list[#list + 1] = node
+				list[#list + 1] = was
+			end
+		end
+	end
 	table.clear(value)
 	noteContainerCleared(value)
+	if kept ~= nil then
+		local carried = tree._carried
+		if carried == nil then
+			carried = {}
+			tree._carried = carried
+		end
+		for i = 1, #kept, 2 do
+			local name = kept[i].Path[#path + 1]
+			value[name] = kept[i + 1]
+			noteKeyDelta(value, name, false, true);
+			(carried :: any)[kept[i]] = true
+		end
+	end
 
 	emitOp(tree, { Kind = "Clear", Path = table.clone(path) }, schema, opts)
+	if kept ~= nil then
+		-- Shared mirrors lost these fields to Clear; resend server-computed values.
+		for i = 1, #kept, 2 do
+			local node = kept[i]
+			if (node.Derived :: any).Transmit then
+				emitOp(tree, { Kind = "Set", Path = table.clone(node.Path) :: any, Value = kept[i + 1] }, node, opts)
+			end
+		end
+	end
 	-- Bulk semantics: the parent Changed fires once and per-entry key events do not. A
 	-- descendant leaf listener is not a per-entry event: its value really did change.
 	-- Descendants come BEFORE the container's own state, the only order both paths can
@@ -2180,6 +2300,16 @@ local function runSettle(tree: Tree)
 		for _, node in ordered do
 			if dirty[node] then
 				dirty[node] = nil
+				-- Recompute must not recreate a removed parent record.
+				local carried = tree._carried
+				local wasCarried = carried ~= nil and (carried :: any)[node] == true
+				if wasCarried then
+					(carried :: any)[node] = nil
+				end
+				local outPath = node.Path
+				if #outPath > 1 and type(readValue(tree, table.move(outPath, 1, #outPath - 1, 1, {}))) ~= "table" then
+					continue
+				end
 				local spec = node.Derived :: any
 				local inputs = spec.Inputs
 				local count = #inputs
@@ -2200,6 +2330,12 @@ local function runSettle(tree: Tree)
 						Replicate = spec.Transmit or devMode,
 					})
 				else
+					if wasCarried then
+						-- Carried values may be uncomputed snapshot defaults; discard on failure.
+						applySet(tree, node.Path :: any, node, nil, {
+							Replicate = spec.Transmit or devMode,
+						})
+					end
 					Metrics.Add("DerivedErrors")
 					-- Never rethrow: a Set on an input must not fail because a compute
 					-- function has a typo. Logged once per field per tree, or the throw
@@ -2511,9 +2647,21 @@ local function rollbackTransaction(self: Tree, txn: any)
 		for i = dynStart, #snapshot.Path do
 			exactSchema = if exactSchema then Template.ChildSchema(exactSchema, snapshot.Path[i]) else nil
 		end
+		local derived = if exactSchema then exactSchema.Derived else nil
 		applySet(self, snapshot.Path, exactSchema, snapshot.Value, {
 			NoValidate = true,
+			-- Restore derived fields with the same replication rule as recompute.
+			Replicate = if derived then derived.Transmit or self.Params.DevMode == true else nil,
 		})
+		if derived and exactSchema then
+			-- A settle inside the transaction may have consumed an earlier dirty mark.
+			local dirty = self._derivedDirty
+			if dirty == nil then
+				dirty = {}
+				self._derivedDirty = dirty
+			end
+			(dirty :: any)[exactSchema] = true
+		end
 	end
 	-- Restore raw store writes that bypassed applySet; a nil pre-txn value restores
 	-- by removing the key.
@@ -2563,9 +2711,7 @@ local function rollbackTransaction(self: Tree, txn: any)
 			end
 		end
 	end
-	-- The restores above settle as they go, since the transaction is closed by now.
-	-- This is the backstop for a body that dirtied a field where every restore was a
-	-- no-op, leaving marks unclaimed until the next unrelated write.
+	-- Recompute once from the restored tree, including marks left by no-op restores.
 	settleDerived(self)
 end
 
@@ -2647,9 +2793,11 @@ function Tree.RunTransaction(
 
 	if ok then
 		local onOp: ((op: Op, schema: SchemaNode?) -> ())? = self.Params.OnOp
-		if onOp then
-			for _, entry in txn.Ops :: { { Op: Op, Schema: SchemaNode? } } do
-				onOp(entry.Op, entry.Schema)
+		local onUnreplicatedOp: ((op: Op, schema: SchemaNode?) -> ())? = self.Params.OnUnreplicatedOp
+		for _, entry in txn.Ops :: { { Op: Op, Schema: SchemaNode?, Unreplicated: boolean } } do
+			local callback = if entry.Unreplicated then onUnreplicatedOp else onOp
+			if callback then
+				callback(entry.Op, entry.Schema)
 			end
 		end
 		local onEconomy: ((path: { string | number }, delta: number, newValue: number, tags: { [string]: any }) -> ())? =
@@ -2687,7 +2835,10 @@ function Tree.RunTransaction(
 	-- the listener that wrote it.
 	local queue: { { any } } = {}
 	self._fireQueue = queue
+	self._restoring = true
 	local rolledBack, rollbackErr = pcall(rollbackTransaction, self, txn)
+	-- Resume normal recomputes even if rollback threw.
+	self._restoring = false
 	self._fireQueue = nil
 	for _, entry in queue do
 		local args = entry[3]
@@ -3511,12 +3662,77 @@ local function cloneUnpack(schema: SchemaNode?, value: any): any
 	return out
 end
 
--- Is this accessor GAME CODE's handle on Scribe's own ledger? Shared by both
--- reserved-root guards: the write refusal in accessorIndex and the copy-on-read below.
--- Neither term can change for a given accessor, so callers evaluate this once when a
--- method is built.
+-- Guard the written path, including children named by Remove(key).
+-- `level` points to the caller's frame.
+local function refuseWrite(
+	tree: Tree,
+	path: { string | number },
+	schema: SchemaNode?,
+	privileged: boolean,
+	level: number
+)
+	-- Only Tree.Reserved may write the ledger; ServerOnly alone does not protect it.
+	if path[1] == Template.RESERVED_ROOT and not privileged then
+		error(
+			`Scribe: "{Util.pathString(path)}" is inside the reserved "{Template.RESERVED_ROOT}" root `
+				.. `and cannot be written; it is Scribe's own ledger -- processed receipt ids, perks, `
+				.. `gift credits, pending gifts, purchase logs, timers and the schema version. Read it `
+				.. `with the typed readers (Owns, GetGiftCredits, GetPurchases) and change it through `
+				.. `the APIs that own it (GrantPerk, RevokePerk, Purchase, PromptGift)`,
+			level
+		)
+	end
+	-- Protect the ownership cache, save info and timers too.
+	if path[1] == Template.SESSION_ROOT and not privileged then
+		error(
+			`Scribe: "{Util.pathString(path)}" is inside the reserved "{Template.SESSION_ROOT}" root `
+				.. `and cannot be written; it is Scribe's per-session state -- the pass ownership cache, `
+				.. `the save info and the timers. Read it with Owns, OwnsAsync and GetSaveInfo`,
+			level
+		)
+	end
+	-- Both views share the client's tree, so foreign-root writes would corrupt it.
+	local root = path[1]
+	local foreign = tree.Compiled.ForeignRoots
+	if foreign ~= nil and type(root) == "string" and foreign[root] then
+		if tree.Params.IsServerStore then
+			error(
+				`Scribe: "{Util.pathString(path)}" is inside the per-player root "{root}" and cannot be `
+					.. `written on the ServerStore; store writes reach every client, so this one would `
+					.. `overwrite each player's own copy. Write it on that player's data instead`,
+				level
+			)
+		end
+		error(
+			`Scribe: "{Util.pathString(path)}" is inside the ServerStore root "{root}" and cannot be `
+				.. `written on a player's data; each client keeps the store and its own data in one `
+				.. `tree, so the write would overwrite that player's copy of the store. Write the store `
+				.. `through Data.ServerStore.{root}, and remove a "{root}" key an earlier version saved `
+				.. `into a profile with a migration`,
+			level
+		)
+	end
+	local derived = if schema then schema.Derived else nil
+	if derived then
+		local inputs = table.create(#derived.InputPaths)
+		for i, segments in derived.InputPaths do
+			inputs[i] = table.concat(segments, ".")
+		end
+		error(
+			`Scribe: "{Util.pathString(path)}" is a derived field and cannot be written; `
+				.. `it is computed from {table.concat(inputs, ", ")}`,
+			level
+		)
+	end
+end
+
+local function isReservedRoot(key: any): boolean
+	return key == Template.RESERVED_ROOT or key == Template.SESSION_ROOT
+end
+
+-- Public reserved-root reads must return copies. Fixed for an accessor's lifetime.
 local function isPublicReserved(accessor: Accessor): boolean
-	return accessorPath(accessor)[1] == Template.RESERVED_ROOT and not PRIVILEGED[accessor]
+	return isReservedRoot(accessorPath(accessor)[1]) and not PRIVILEGED[accessor]
 end
 
 -- The independent copy Clone() hands back: unpack-and-deep-clone when anything below
@@ -3683,10 +3899,17 @@ METHOD_FACTORIES.Set = function(accessor)
 	end
 end
 
+-- Reject before calling the callback: the root read exposes the live saved table.
+local ROOT_UPDATE_REFUSAL = "Scribe: Update cannot be called on the root of the data: it would hand your "
+	.. "function the saved table itself. Call Update on one of its fields"
+
 METHOD_FACTORIES.Update = function(accessor)
 	return function(fn: (any) -> any, replicate: boolean?)
 		local tree = accessorTree(accessor)
 		assertAlive(tree)
+		if #accessorPath(accessor) == 0 then
+			error(ROOT_UPDATE_REFUSAL, 2)
+		end
 		local schema = accessorSchema(accessor)
 		local current = unpackRead(schema, readValue(tree, accessorPath(accessor)))
 		local stored = applySet(tree, accessorPath(accessor), schema, fn(current), { Replicate = replicate })
@@ -4154,6 +4377,8 @@ METHOD_FACTORIES.Remove = function(accessor)
 			table.insert(path, posOrKey)
 			local schema = accessorSchema(accessor)
 			local childSchema = if schema then Template.ChildSchema(schema, posOrKey) else nil
+			-- accessorIndex checked the parent; Remove must guard the child too.
+			refuseWrite(tree, path, childSchema, PRIVILEGED[accessor] == true, 3)
 			local container, key = resolveContainer(tree, path, false)
 			local old = if container then container[key] else nil
 			if old ~= nil then
@@ -4259,11 +4484,7 @@ end
 for _, event in { "OnInsert", "OnRemove", "OnKeyAdded", "OnKeyRemoved", "OnChildChanged" } do
 	METHOD_FACTORIES[event] = function(accessor)
 		local guarded = isPublicReserved(accessor)
-		-- The root accessor's own path is empty, so isPublicReserved answers false for it,
-		-- but these events carry a CHILD and one of the root's children IS the reserved
-		-- root: without this, binding data.OnChildChanged hands game code the live ledger
-		-- by reference. The PRIVILEGED term is unreachable today and stays, so a
-		-- privileged root added later does not silently start receiving copies.
+		-- Root child events also need copies when they carry a reserved root.
 		local rootGuard = #accessorPath(accessor) == 0 and not PRIVILEGED[accessor]
 		return function(fn: (...any) -> ())
 			local tree = accessorTree(accessor)
@@ -4281,7 +4502,7 @@ for _, event in { "OnInsert", "OnRemove", "OnKeyAdded", "OnKeyRemoved", "OnChild
 				-- disappearance has no successor.
 				wrapped = function(key: any, newValue: any, oldValue: any)
 					local childSchema = if schema then Template.ChildSchema(schema, key) else nil
-					local g = guarded or (rootGuard and key == Template.RESERVED_ROOT)
+					local g = guarded or (rootGuard and isReservedRoot(key))
 					inner(
 						key,
 						entryValueForListener(g, childSchema, newValue),
@@ -4295,7 +4516,7 @@ for _, event in { "OnInsert", "OnRemove", "OnKeyAdded", "OnKeyRemoved", "OnChild
 					-- created with the tree and never appears or disappears
 					-- (RootChildLedgerGuard.spec pins that), but kept so the sibling wrappers
 					-- do not differ for no reason.
-					local g = guarded or (rootGuard and key == Template.RESERVED_ROOT)
+					local g = guarded or (rootGuard and isReservedRoot(key))
 					inner(key, entryValueForListener(g, childSchema, value))
 				end
 			end
@@ -4386,35 +4607,13 @@ local function accessorIndex(accessor: Accessor, key: any, childOnly: boolean?):
 			if OPEN_TXN_TREE ~= nil then
 				assertSameTreeWrite(accessorTree(accessor), Util.pathString(accessorPath(accessor)), 3)
 			end
-			-- The reserved root is Scribe's own ledger, and ServerOnly only keeps it off the
-			-- wire. Clearing ProcessedPurchaseIds makes the next retried receipt grant a
-			-- second time; dropping Version re-runs every migration against migrated data.
-			-- Refused by CALLER, not by object: the library writes these paths through
-			-- Tree.Reserved, which holds the capability.
-			local path = accessorPath(accessor)
-			if path[1] == Template.RESERVED_ROOT and not PRIVILEGED[accessor] then
-				error(
-					`Scribe: "{Util.pathString(path)}" is inside the reserved "{Template.RESERVED_ROOT}" root `
-						.. `and cannot be written; it is Scribe's own ledger -- processed receipt ids, perks, `
-						.. `gift credits, pending gifts, purchase logs, timers and the schema version. Read it `
-						.. `with the typed readers (Owns, GetGiftCredits, GetPurchases) and change it through `
-						.. `the APIs that own it (GrantPerk, RevokePerk, Purchase, PromptGift)`,
-					2
-				)
-			end
-			local schema = accessorSchema(accessor)
-			local derived = if schema then schema.Derived else nil
-			if derived then
-				local inputs = table.create(#derived.InputPaths)
-				for i, segments in derived.InputPaths do
-					inputs[i] = table.concat(segments, ".")
-				end
-				error(
-					`Scribe: "{Util.pathString(accessorPath(accessor))}" is a derived field and cannot be written; `
-						.. `it is computed from {table.concat(inputs, ", ")}`,
-					2
-				)
-			end
+			refuseWrite(
+				accessorTree(accessor),
+				accessorPath(accessor),
+				accessorSchema(accessor),
+				PRIVILEGED[accessor] == true,
+				3
+			)
 			-- Cached under a module-private identity rather than under `key`, so every
 			-- `x.Set` keeps going through __index and past the guards. A plain rawset under
 			-- `key`, as the non-mutator branch below does, would be satisfied off the
@@ -4504,6 +4703,9 @@ local function accessorCall(accessor: Accessor, ...: any): any
 	end
 	local first = ...
 	if type(first) == "function" then
+		if #accessorPath(accessor) == 0 then
+			error(ROOT_UPDATE_REFUSAL, 2)
+		end
 		return accessor.Update(first, select(2, ...))
 	end
 	-- `node(nil, nil)` is what a generalized `for` used to produce before __iter

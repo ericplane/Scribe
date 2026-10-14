@@ -1,22 +1,5 @@
 --!nonstrict
--- "invalid cost path" has to mean the path is invalid.
---
--- `Data.Purchase` refuses with that string in two very different situations. One
--- is a typo: the accessor walk throws because nothing is declared there, and the
--- message is exactly right. The other is a path that RESOLVED to a real declared
--- field whose value simply is not a spendable number -- a `Scribe.Big`, a
--- `Scribe.String`, an enum -- and there the message sends the developer hunting
--- for a misspelling that does not exist.
---
--- `Scribe.Big` is the one that actually bites: it is the library's own big-number
--- currency type, its whole purpose is holding a balance, and `Cost.Path` naming
--- one is the most reasonable mistake in the API. The guide says `Cost.Path` "names
--- any numeric field", so the refusal is correct -- Purchase does plain arithmetic
--- and a Big is a table -- but the REASON was not.
---
--- This changes only which of two refusal strings comes back. Nothing that was
--- accepted is now refused, and nothing that was refused is now accepted, which is
--- why the accept-side controls below matter as much as the reason assertions.
+-- Distinguish invalid paths from unspendable fields. Big currencies are spendable.
 local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
 local describe = JestGlobals.describe
 local it = JestGlobals.it
@@ -81,25 +64,20 @@ describe("Purchase cost-path refusals", function()
 		harness.Cleanup()
 	end)
 
-	it("says the path is not SPENDABLE for a declared Scribe.Big", function()
-		-- The defect. The field exists, is declared, holds a balance, and the
-		-- refusal blamed the path for not existing.
+	it("spends from a declared Scribe.Big, which is no longer refused at all", function()
+		-- Big currencies must pass both path and spendability checks.
 		local harness = makeHarness()
 		local player, entry = harness.Join(94003)
 
 		local ok, reason = buy(harness, player, "Prestige")
-		expect(ok).toBe(false)
-		expect(reason).toBe(NOT_SPENDABLE)
-		-- And nothing was debited on the way to saying so.
-		expect(tostring(harness.Data.Get(player).Prestige.Get())).toBe("1000")
-		expect(entry.Tree.Dead).toBe(false)
-
+		local observed = `ok={tostring(ok)} reason={tostring(reason)} `
+			.. `prestige={tostring(harness.Data.Get(player).Prestige.Get())} dead={tostring(entry.Tree.Dead)}`
 		harness.Cleanup()
+		expect(observed).toBe("ok=true reason=nil prestige=990 dead=false")
 	end)
 
-	it("says the same for other declared non-numeric fields", function()
-		-- Big is the case that bites, but the conflation is general, and a fix
-		-- keyed on the Big declarator alone would leave the rest lying.
+	it("says the path is not SPENDABLE for declared non-numeric fields", function()
+		-- Check each supported nonnumeric field type.
 		local harness = makeHarness()
 		local player = harness.Join(94004)
 

@@ -46,7 +46,9 @@ Data.Purchase(player, {
 -- Sink, currency "Coins", amount 250, SKU "EmberLantern"
 ```
 
-The currency is the `Cost.Path` field. The transaction type and the item SKU both come from `ItemId`, with the transaction type falling back to `Category` when there is no `ItemId`. Custom fields are filled from your `Resolve` functions as usual. The one thing a purchase event cannot carry is a per-call `Fields` dimension, because there is no call site to put one on.
+The currency is the `Cost.Path` field. The transaction type and item SKU come from `ItemId`; the transaction type falls back to `Category` when there is no `ItemId`. Custom fields come from your `Resolve` functions. `Purchase` has no per-call `Fields` option.
+
+A [`Scribe.Big`](./big-numbers) purchase reports the requested price and new balance as plain numbers. Rounding can make the actual debit differ, and values beyond the number range become `inf`. See [Spending a big currency](./monetization#spending-a-big-currency) before relying on these events for exact totals.
 
 ## Robux grants do not emit
 

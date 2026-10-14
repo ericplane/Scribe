@@ -5,9 +5,7 @@
 -- id space and one schema hash. That is what makes a store safe on the wire: a field id
 -- cannot collide, and store drift fails the Hello handshake like any other drift.
 --
--- The views are the other half. Node reads only Root, DerivedByWrite, DerivedNodes and
--- Template.Resolve, which walks Root, so scoping a tree to a set of roots costs nothing
--- in Node itself.
+-- Each view scopes roots and derived indexes. ServerStoreDerived.spec covers recomputes.
 
 local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
 local describe = JestGlobals.describe

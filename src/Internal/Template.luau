@@ -82,6 +82,7 @@ export type SchemaNode = {
 		InputPaths: { { string } },
 		Compute: (...any) -> any,
 		Transmit: boolean, -- server computes and REPLICATES (an input the audience cannot see)
+		ClientComputes: boolean, -- field and inputs are visible to the client
 		OfflineComputable: boolean, -- root-level, and every input persists
 		Label: string,
 	}?,
@@ -128,12 +129,16 @@ export type Compiled = {
 	HasShared: boolean,
 	DynamicNodes: { SchemaNode }, -- fields with a Scribe.Dynamic factory, in id order
 	DerivedNodes: { SchemaNode }, -- Scribe.Derived fields in topological order
-	-- pathKey of an input (or any ancestor of one) -> the fields to recompute. A
-	-- write looks up its own pathKey and finds every dependent in one hop.
+	-- Written pathKey -> fields to recompute, including record replacements.
 	DerivedByWrite: { [string]: { SchemaNode } },
-	-- Root views. Player is the compiled itself when no store is declared; views share
-	-- everything but Root, RootOrder and HasShared by reference.
+	-- Ancestor pathKey -> derived fields to carry across record replacements.
+	-- Includes transmitted fields on the client.
+	DerivedBelow: { [string]: { SchemaNode } },
+	-- Views scope roots and derived indexes; everything else is shared.
+	-- Without a store, Player is the full compile.
 	Views: { Player: Compiled, Store: Compiled? },
+	-- Other view's roots, forbidden for writes. Nil on the full compile.
+	ForeignRoots: { [string]: boolean }?,
 	Config: CompileConfig,
 }
 
@@ -1185,6 +1190,41 @@ function Template.CoerceMapKeys(compiled: Compiled, data: any)
 	walk(compiled.Root, data, 0)
 end
 
+-- Copy and filter the index; empty entries would still trigger a settle.
+local function scopeIndex(
+	index: { [string]: { SchemaNode } },
+	keep: (SchemaNode) -> boolean
+): { [string]: { SchemaNode } }
+	local keptIndex: { [string]: { SchemaNode } } = {}
+	for pathKey, nodes in index do
+		local kept: { SchemaNode } = {}
+		for _, node in nodes do
+			if keep(node) then
+				table.insert(kept, node)
+			end
+		end
+		if #kept > 0 then
+			keptIndex[pathKey] = kept
+		end
+	end
+	return keptIndex
+end
+
+-- Preserve topological order without mutating the shared compile.
+local function scopeDerived(
+	nodes: { SchemaNode },
+	byWrite: { [string]: { SchemaNode } },
+	keep: (SchemaNode) -> boolean
+): ({ SchemaNode }, { [string]: { SchemaNode } })
+	local keptNodes: { SchemaNode } = {}
+	for _, node in nodes do
+		if keep(node) then
+			table.insert(keptNodes, node)
+		end
+	end
+	return keptNodes, scopeIndex(byWrite, keep)
+end
+
 function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 	local cfg: CompileConfig = config or {}
 	if type(userTemplate) ~= "table" then
@@ -1356,9 +1396,10 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 	-- Before the hash fold, which folds the result.
 	local derivedNodes: { SchemaNode } = {}
 	local derivedByWrite: { [string]: { SchemaNode } } = {}
+	local derivedBelow: { [string]: { SchemaNode } } = {}
 	if #pendingDerived > 0 then
 		local reservedRoots = { [RESERVED_ROOT] = true, [SESSION_ROOT] = true }
-		derivedNodes, derivedByWrite =
+		derivedNodes, derivedByWrite, derivedBelow =
 			DerivedModule.Resolve(root, pendingDerived :: any, reservedRoots, compileError :: any)
 		DerivedModule.SeedDefaults(derivedNodes :: any, compileError :: any)
 
@@ -1550,13 +1591,12 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		DynamicNodes = dynamicNodes,
 		DerivedNodes = derivedNodes,
 		DerivedByWrite = derivedByWrite,
+		DerivedBelow = derivedBelow,
 		Views = nil :: any,
 		Config = cfg,
 	}
 
-	-- A view is the compiled with its root scoped to a subset of the children. Node reads
-	-- only Root, DerivedByWrite, DerivedNodes and Template.Resolve, so this costs nothing
-	-- in Node itself.
+	-- Scope each tree's roots and derived indexes without copying the full schema.
 	local function makeView(keys: { string }): Compiled
 		local viewChildren: { [string]: SchemaNode } = {}
 		local viewOrdinal: { [string]: number } = {}
@@ -1580,6 +1620,22 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		view.Root = viewRoot
 		view.RootOrder = keys
 		view.HasShared = viewShared
+
+		-- Each tree computes only its own fields; cross-view inputs are already rejected.
+		local function onViewRoot(node: SchemaNode): boolean
+			return viewChildren[node.Path[1]] ~= nil
+		end
+		view.DerivedNodes, view.DerivedByWrite = scopeDerived(derivedNodes, derivedByWrite, onViewRoot)
+		view.DerivedBelow = scopeIndex(derivedBelow, onViewRoot)
+
+		-- Clients share one tree, so foreign-root writes would overwrite the other store.
+		local foreign: { [string]: boolean } = {}
+		for key in children do
+			if viewChildren[key] == nil then
+				foreign[key] = true
+			end
+		end
+		view.ForeignRoots = table.freeze(foreign)
 		return view
 	end
 
@@ -1597,6 +1653,20 @@ function Template.Compile(userTemplate: any, config: CompileConfig?): Compiled
 		compiled.Views = { Player = makeView(playerKeys), Store = makeView(table.clone(storeOrder)) }
 	end
 	return compiled
+end
+
+-- Recompute only client-visible fields. Keep DerivedBelow for carrying transmitted
+-- values across record writes. Edit mode uses the full compile for Data.Mock.
+function Template.ClientView(compiled: Compiled): Compiled
+	local view: Compiled = table.clone(compiled)
+	view.DerivedNodes, view.DerivedByWrite = scopeDerived(
+		compiled.DerivedNodes,
+		compiled.DerivedByWrite,
+		function(node: SchemaNode): boolean
+			return (node.Derived :: any).ClientComputes == true
+		end
+	)
+	return view
 end
 
 -- Shared with Node, whose read paths all have to agree on which nodes need an unpack.

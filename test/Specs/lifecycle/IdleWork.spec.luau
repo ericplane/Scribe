@@ -113,8 +113,8 @@ describe("Leaderboards", function()
 		end)
 		data.Wins.Set(3)
 		local awake = not lb.Workers().PacerParked
-		-- Advance past the write interval.
-		now += 30
+		-- Advance past the 30 s write interval.
+		now += 31
 		local parkedAgain = within(200, function()
 			return lb.Workers().PacerParked
 		end)

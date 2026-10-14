@@ -7,7 +7,7 @@ For roblox-ts, each addon is a separate optional npm package: `@rbxts/scribe-rea
 `@rbxts/scribe-vide`, `@rbxts/scribe-fusion`, `@rbxts/scribe-telemetry`, and
 `@rbxts/scribe-leaderstats`. The core package includes none of their runtime files,
 declarations, or framework dependencies. See the [roblox-ts guide](../docgen/guides/roblox-ts.md)
-for installation and publication status. All packages use the same Scribe version.
+for installation. All packages use the same Scribe version.
 
 | Folder | What it is | Runs on |
 | --- | --- | --- |

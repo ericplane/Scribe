@@ -207,6 +207,7 @@ export type LogCode =
     | "DYNAMIC_DEFAULT_FAILED"
     | "LISTENER_ERROR"
     | "ON_PLAYER_INIT_ERROR"
+    | "ON_PLAYER_INIT_LEDGER"
     | "PLAYER_LEAVING_HOOK_SLOW"
     | "SANDBOXED"
     | "SERVER_STARTED"
@@ -282,7 +283,8 @@ export interface PurchaseEntry extends UnknownRecord {
     PurchaseId?: string;
     PriceInRobux?: number;
     Currency?: string;
-    Amount?: number;
+    /** Big currencies use [mantissa, exponent]. */
+    Amount?: number | [number, number];
     Meta?: UnknownRecord;
 }
 export interface PurchaseLogOptions { RobuxCap?: number; InGameCap?: number; ReplicateRobux?: boolean; ReplicateInGame?: boolean; PurchaseLogCategories?: ReadonlyArray<string>; }

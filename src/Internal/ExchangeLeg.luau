@@ -126,7 +126,7 @@ local function accessorAt(ctx: any, path: { string | number }): any
 	local accessor = ctx.Tree.Accessor
 	for _, segment in path do
 		local ok, child = pcall(function()
-			return accessor[segment]
+			return accessor.Child(segment)
 		end)
 		if not ok or child == nil then
 			fail(`no accessor at "{Util.pathString(path)}"`)
@@ -267,7 +267,7 @@ end
 --- How many the element at `key` holds, and the leaf accessor that counts it. One reader
 --- for both element shapes, so no caller branches on `Count` being nil.
 local function stackCount(ctx: any, leg: Leg, plan: Plan, stored: any): (number, any)
-	local entryAccessor = accessorAt(ctx, leg.Path)[leg.Key]
+	local entryAccessor = accessorAt(ctx, leg.Path).Child(leg.Key)
 	if entryAccessor == nil then
 		fail(`stack leg at "{Util.pathString(leg.Path)}" has no accessor at "{tostring(leg.Key)}"`)
 	end
@@ -276,7 +276,7 @@ local function stackCount(ctx: any, leg: Leg, plan: Plan, stored: any): (number,
 	if type(held) ~= "number" or held ~= held or held % 1 ~= 0 then
 		fail(`stack leg at "{Util.pathString(leg.Path)}" holds no integer count at "{tostring(leg.Key)}"`)
 	end
-	return held, if countField == nil then entryAccessor else entryAccessor[countField]
+	return held, if countField == nil then entryAccessor else entryAccessor.Child(countField)
 end
 
 --- Reject a Stack amount before anything reads a balance against it.
@@ -449,7 +449,7 @@ local function takeKey(ctx: any, leg: Leg, node: any, kind: string): ()
 		end
 	else
 		assertUsableKey(leg.Key, node)
-		if accessor[leg.Key].Get() == nil then
+		if accessor.Child(leg.Key).Get() == nil then
 			fail(`key leg at "{Util.pathString(leg.Path)}" does not hold "{tostring(leg.Key)}"`)
 		end
 		-- Remove, never Set(nil): Set(nil) returns nil on a hit AND on a miss, so it
@@ -457,7 +457,7 @@ local function takeKey(ctx: any, leg: Leg, node: any, kind: string): ()
 		if accessor.Remove(leg.Key) == nil then
 			fail(`key leg at "{Util.pathString(leg.Path)}" Remove reported a miss`)
 		end
-		if accessor[leg.Key].Get() ~= nil then
+		if accessor.Child(leg.Key).Get() ~= nil then
 			fail(`key leg at "{Util.pathString(leg.Path)}" key survived Remove`)
 		end
 	end
@@ -510,12 +510,12 @@ local function giveKey(ctx: any, leg: Leg, node: any, kind: string): ()
 		assertUsableKey(leg.Key, node)
 		-- I2. Vacancy is what makes both proofs bite: an occupied key either no-ops
 		-- (scalar element) or silently clobbers (record element).
-		if accessor[leg.Key].Get() ~= nil then
+		if accessor.Child(leg.Key).Get() ~= nil then
 			fail(`key leg at "{Util.pathString(leg.Path)}" destination key "{tostring(leg.Key)}" is occupied`)
 		end
 		-- The whole element at the key, never a leaf field: a leaf write materialises
 		-- the element from its defaults first and then no-ops if it equals the default.
-		local returned = accessor[leg.Key].Set(leg.Value)
+		local returned = accessor.Child(leg.Key).Set(leg.Value)
 		-- Non-nil only. Set returns the UNPACKED form, a fresh table of real datatypes
 		-- for a packed element, so comparing it to a packed payload fails on exactly
 		-- the elements the packed payload exists to carry.
