@@ -268,6 +268,154 @@ codecs.CFrame = {
 	end,
 }
 
+-- Spatial ------------------------------------------------------------------------
+-- Ray: 24 bytes, Origin (3xf32) then Direction (3xf32). Direction is packed at
+-- full magnitude, not renormalized - it carries both heading and cast length,
+-- and Ray.new(origin, direction) expects that back unchanged.
+codecs.Ray = {
+	Pack = function(value: Ray): buffer
+		local origin, direction = value.Origin, value.Direction
+		local b = buffer.create(24)
+		wf32(b, 0, origin.X)
+		wf32(b, 4, origin.Y)
+		wf32(b, 8, origin.Z)
+		wf32(b, 12, direction.X)
+		wf32(b, 16, direction.Y)
+		wf32(b, 20, direction.Z)
+		return b
+	end,
+	Unpack = function(b: buffer): Ray
+		checkLen(b, 24, "Ray")
+		return Ray.new(
+			Vector3.new(buffer.readf32(b, 0), buffer.readf32(b, 4), buffer.readf32(b, 8)),
+			Vector3.new(buffer.readf32(b, 12), buffer.readf32(b, 16), buffer.readf32(b, 20))
+		)
+	end,
+}
+
+-- Region3: 24 bytes, Center (3xf32) then Size (3xf32). Region3 only exposes
+-- .CFrame (center, axis-aligned) and .Size, not the original min/max corners,
+-- so center+size is the only lossless round trip; Region3.new(min, max) is
+-- rebuilt from it on Unpack.
+codecs.Region3 = {
+	Pack = function(value: Region3): buffer
+		local center, size = value.CFrame.Position, value.Size
+		local b = buffer.create(24)
+		wf32(b, 0, center.X)
+		wf32(b, 4, center.Y)
+		wf32(b, 8, center.Z)
+		wf32(b, 12, size.X)
+		wf32(b, 16, size.Y)
+		wf32(b, 20, size.Z)
+		return b
+	end,
+	Unpack = function(b: buffer): Region3
+		checkLen(b, 24, "Region3")
+		local center = Vector3.new(buffer.readf32(b, 0), buffer.readf32(b, 4), buffer.readf32(b, 8))
+		local size = Vector3.new(buffer.readf32(b, 12), buffer.readf32(b, 16), buffer.readf32(b, 20))
+		local half = size * 0.5
+		return Region3.new(center - half, center + half)
+	end,
+}
+
+-- Region3int16: 12 bytes, Min then Max, 3xi16 each. Unlike Region3, this type
+-- exposes Min/Max directly, so it's an exact round trip, not a reconstruction.
+codecs.Region3int16 = {
+	Pack = function(value: Region3int16): buffer
+		local min, max = value.Min, value.Max
+		local b = buffer.create(12)
+		buffer.writei16(b, 0, min.X)
+		buffer.writei16(b, 2, min.Y)
+		buffer.writei16(b, 4, min.Z)
+		buffer.writei16(b, 6, max.X)
+		buffer.writei16(b, 8, max.Y)
+		buffer.writei16(b, 10, max.Z)
+		return b
+	end,
+	Unpack = function(b: buffer): Region3int16
+		checkLen(b, 12, "Region3int16")
+		return Region3int16.new(
+			Vector3int16.new(buffer.readi16(b, 0), buffer.readi16(b, 2), buffer.readi16(b, 4)),
+			Vector3int16.new(buffer.readi16(b, 6), buffer.readi16(b, 8), buffer.readi16(b, 10))
+		)
+	end,
+}
+
+-- Flags ---------------------------------------------------------------------------
+
+local FACE_BITS = {
+	{ name = "Right", bit = 1 },
+	{ name = "Top", bit = 2 },
+	{ name = "Back", bit = 4 },
+	{ name = "Left", bit = 8 },
+	{ name = "Bottom", bit = 16 },
+	{ name = "Front", bit = 32 },
+}
+
+codecs.Faces = {
+	Pack = function(value: Faces): buffer
+		local mask = 0
+		for _, face in FACE_BITS do
+			if (value :: any)[face.name] then
+				mask = bit32.bor(mask, face.bit)
+			end
+		end
+		local b = buffer.create(1)
+		buffer.writeu8(b, 0, mask)
+		return b
+	end,
+	Unpack = function(b: buffer): Faces
+		checkLen(b, 1, "Faces")
+		local mask = buffer.readu8(b, 0)
+		if mask >= 64 then
+			error("Scribe: malformed packed Faces")
+		end
+		local members = {}
+		for _, face in FACE_BITS do
+			if bit32.btest(mask, face.bit) then
+				table.insert(members, (Enum.NormalId :: any)[face.name])
+			end
+		end
+		return Faces.new(table.unpack(members))
+	end,
+}
+
+codecs.Axes = {
+	Pack = function(value: Axes): buffer
+		local mask = 0
+		if value.X then
+			mask = bit32.bor(mask, 1)
+		end
+		if value.Y then
+			mask = bit32.bor(mask, 2)
+		end
+		if value.Z then
+			mask = bit32.bor(mask, 4)
+		end
+		local b = buffer.create(1)
+		buffer.writeu8(b, 0, mask)
+		return b
+	end,
+	Unpack = function(b: buffer): Axes
+		checkLen(b, 1, "Axes")
+		local mask = buffer.readu8(b, 0)
+		if mask >= 8 then
+			error("Scribe: malformed packed Axes")
+		end
+		local members = {}
+		if bit32.btest(mask, 1) then
+			table.insert(members, Enum.Axis.X)
+		end
+		if bit32.btest(mask, 2) then
+			table.insert(members, Enum.Axis.Y)
+		end
+		if bit32.btest(mask, 4) then
+			table.insert(members, Enum.Axis.Z)
+		end
+		return Axes.new(table.unpack(members))
+	end,
+}
+
 -- Colors ------------------------------------------------------------------------
 -- Layout: [u8 mode] then 3xu8 (mode 0, exact fromRGB colors) or 3xf32 (mode 1).
 
@@ -595,6 +743,48 @@ codecs.PhysicalProperties = {
 			buffer.readf32(b, 12),
 			buffer.readf32(b, 16)
 		)
+	end,
+}
+
+-- Content -----------------------------------------------------------------------
+
+local CONTENT_NONE = 0
+local CONTENT_URI = 1
+
+codecs.Content = {
+	Pack = function(value: Content): buffer
+		if value.SourceType == Enum.ContentSourceType.None then
+			local b = buffer.create(1)
+			buffer.writeu8(b, 0, CONTENT_NONE)
+			return b
+		elseif value.SourceType == Enum.ContentSourceType.Uri then
+			local uri = value.Uri :: string
+			if #uri > 255 then
+				error("Scribe: Content URI too long")
+			end
+			local b = buffer.create(2 + #uri)
+			buffer.writeu8(b, 0, CONTENT_URI)
+			writeShortString(b, 1, uri)
+			return b
+		else
+			error(
+				"Scribe: cannot persist a Content built from an Instance (SourceType == Object) - "
+					.. "it cannot survive a DataStore round trip. Store an asset id/URI instead."
+			)
+		end
+	end,
+	Unpack = function(b: buffer): Content
+		checkLen(b, 1, "Content")
+		local tag = buffer.readu8(b, 0)
+		if tag == CONTENT_NONE then
+			return Content.none
+		elseif tag == CONTENT_URI then
+			checkLen(b, 2, "Content")
+			local uri = readShortString(b, 1)
+			return Content.fromUri(uri)
+		else
+			error(`Scribe: malformed packed Content (unknown tag {tag})`)
+		end
 	end,
 }
 
