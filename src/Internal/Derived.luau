@@ -108,14 +108,14 @@ end
 	{ Node, InputPaths (dotted strings), Compute }. `fail` is Template's compileError,
 	passed in so the error text keeps one format.
 
-	Returns the topologically ordered node list and the write index.
+	Returns the topologically ordered node list, the write index and the below index.
 ]]
 function Derived.Resolve(
 	root: any,
 	pending: { { Node: any, InputPaths: { string }, Compute: (...any) -> any } },
 	reservedRoots: { [string]: boolean },
 	fail: (path: { string }, message: string) -> ()
-): ({ any }, { [string]: { any } })
+): ({ any }, { [string]: { any } }, { [string]: { any } })
 	-- Resolve and validate every input before ordering: a cycle message is only
 	-- useful once the edges it names are known to be real fields.
 	for _, entry in pending do
@@ -197,6 +197,7 @@ function Derived.Resolve(
 			InputPaths = inputPaths,
 			Compute = entry.Compute,
 			Transmit = false, -- decided below, once the graph is ordered
+			ClientComputes = false,
 			OfflineComputable = false,
 			Label = table.concat(node.Path, "."),
 		}
@@ -256,6 +257,17 @@ function Derived.Resolve(
 		end
 		node.Derived.Transmit = transmit
 
+		-- Clients compute only visible fields with visible inputs. Transmitted inputs
+		-- arrive before their dependents recompute.
+		local clientComputes = node.Visibility ~= "ServerOnly"
+		for _, input in node.Derived.Inputs do
+			if input.Visibility == "ServerOnly" then
+				clientComputes = false
+				break
+			end
+		end
+		node.Derived.ClientComputes = clientComputes
+
 		-- Offline reads see stored data only, so a root-level field whose every input
 		-- persists can be computed over a snapshot. A derived input never persists but
 		-- is filled in first (both passes run in topological order), so it counts as
@@ -273,11 +285,10 @@ function Derived.Resolve(
 		node.Derived.OfflineComputable = offline
 	end
 
-	-- Write index: a write at path W must recompute a dependent on input I when
-	-- W == I or W is an ancestor of I (a whole-root Set from an init snapshot, say).
-	-- Inputs are leaves, so no other relationship exists and one exact lookup per
-	-- write is complete.
+	-- Recompute on input writes or ancestor replacement. Exclude the output itself
+	-- to avoid recursion. `below` lists fields to carry across record replacements.
 	local byWrite: { [string]: { any } } = {}
+	local below: { [string]: { any } } = {}
 	for _, node in ordered do
 		for _, segments in node.Derived.InputPaths do
 			local prefix: { string | number } = {}
@@ -301,9 +312,28 @@ function Derived.Resolve(
 				end
 			end
 		end
+		local outPrefix: { string | number } = {}
+		for i = 1, #node.Path - 1 do
+			table.insert(outPrefix, node.Path[i])
+			local key = Util.pathKey(outPrefix)
+			local list = byWrite[key]
+			if list == nil then
+				list = {}
+				byWrite[key] = list
+			end
+			if table.find(list, node) == nil then
+				table.insert(list, node)
+			end
+			local under = below[key]
+			if under == nil then
+				under = {}
+				below[key] = under
+			end
+			table.insert(under, node)
+		end
 	end
 
-	return ordered, byWrite
+	return ordered, byWrite, below
 end
 
 -- Validates a computed value against the output declarator, at the one place that

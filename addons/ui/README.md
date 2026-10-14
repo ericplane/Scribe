@@ -8,7 +8,7 @@ from the [release page](https://github.com/ericplane/Scribe/releases) and keep t
 **roblox-ts users:** install the separate `@rbxts/scribe-react`, `@rbxts/scribe-vide`,
 or `@rbxts/scribe-fusion` package alongside the framework you use. Each wraps these
 same Luau files with declarations that preserve the accessor value type. The
-[roblox-ts guide](../../docgen/guides/roblox-ts.md) has publication status, installation,
+[roblox-ts guide](../../docgen/guides/roblox-ts.md) has installation steps
 and examples. Fusion 0.2 uses the native Value shape; the scoped overload accepts a
 separately supplied typed Fusion 0.3 implementation without installing Fusion 0.2.
 

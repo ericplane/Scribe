@@ -68,6 +68,50 @@ describe("classifier", function()
 		})
 	end)
 
+	it("reads a named throttle as throttled", function()
+		-- Named limits must count as shared throttles, not per-key failures.
+		local cases = {}
+		for _, name in
+			{
+				"GetVersionAsyncThrottle",
+				"GetVersionAtTimeAsyncThrottle",
+				"ListDataStoresAsyncThrottle",
+				"ListKeysAsyncThrottle",
+				"ListVersionsAsyncThrottle",
+				"RemoveVersionAsyncThrottle",
+			}
+		do
+			cases[`{name}: request was throttled.`] = "Throttled"
+		end
+		for _, kind in { "Standard", "Ordered" } do
+			for _, op in { "Read", "Write", "List", "Remove" } do
+				for _, scope in { "Experience", "GameServer" } do
+					cases[`{kind}{op}{scope}Throttled: {kind}{op} request was throttled by {string.lower(scope)} limits.`] =
+						"Throttled"
+				end
+			end
+		end
+		classifies(cases)
+		-- Only a leading throttle name is trusted.
+		classifies({
+			["InvalidTimestamp: the timestamp is not valid."] = "Failed",
+			["Error: StandardReadExperienceThrottled: wrapped"] = "Failed",
+		})
+	end)
+
+	it("reads a code or a name behind the engine's own prefix", function()
+		-- Accept engine prefixes without losing the underlying error class.
+		classifies({
+			["DataStoreService: SetAsyncThrottle: SetAsync request dropped. Request was throttled, but throttled request queue was full."] = "Throttled",
+			["DataStoreService: StandardWriteGameServerThrottled: StandardWrite request was throttled by game server limits. API: SetAsync, Data Store: Players"] = "Throttled",
+			["DataStoreService: 504: Datastore request timed out"] = "Unresolved",
+			["DataStoreService: InternalServerError: An internal server error occurred. API: GetAsync, Data Store: Players"] = "Failed",
+			["HTTP 403 (Forbidden) DataStoreService: AccessForbidden: Access forbidden."] = "Failed",
+			["HTTP 429 (Too Many Requests) DataStoreService: KeyThrottled: Key throttled."] = "Throttled",
+		})
+		expect(Failure.CodeOf("DataStoreService: 302: SetAsync request dropped.")).toBe(302)
+	end)
+
 	it("falls back to the code family for a code it has never seen", function()
 		-- So a code Roblox adds later is classified sensibly instead of landing
 		-- in whatever the default happens to be.

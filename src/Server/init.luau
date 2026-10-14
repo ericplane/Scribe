@@ -399,9 +399,11 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		player on this server, it clones the live data. Otherwise it reads the
 		last saved data, which may be older than another server's live session.
 
-		**Returns:** the data table, or `nil` if the profile is missing or the read
-		failed. Check the `OFFLINE_READ_FAIL` log before treating `nil` as proof
-		that no profile exists. Use [Server.UpdateOffline] to save an offline edit.
+		**Returns:** the data table, or `nil` if no snapshot is available. The bundled
+		store retries DataStore read errors until success or shutdown, with backoff
+		up to 20 seconds. Give support tools a timeout and watch `PROFILE_STORE_ERROR`.
+		An error thrown by the store logs `OFFLINE_READ_FAIL` and returns `nil`.
+		Use [Server.UpdateOffline] to save an offline edit.
 	]=]
 	-- Clones local Ready data or reads the last persisted snapshot.
 	function Data.GetOffline(userId: number)
@@ -465,8 +467,10 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		These refusals write nothing. For the changed-profile refusal, call again
 		to prepare the edit from fresh data. Keep external side effects out of the
 		callback so repeating it does not repeat a payment or other unrelated action.
-		A session on this server, validation errors, callback errors, and store
-		failures also return `false`; the examples above are not an exhaustive list.
+		A session on this server, validation errors, callback errors, and a failed
+		write also return `false`; the examples above are not an exhaustive list.
+		The bundled store retries DataStore read errors until success or shutdown,
+		so give support tools their own timeout.
 
 		A session whose last write is older than the store's dead-session threshold
 		counts as dead and the write proceeds, so a crashed server cannot lock a
@@ -486,7 +490,9 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param userId number
 		@param limit number?
 		@return { { VersionId: string, CreatedAt: number, Size: number? } }
-		Lists a profile's DataStore version history, for support/rollback tools.
+		Lists a profile's DataStore version history for support tools. Page-fetch
+		failures can return a partial list without a Scribe log or health update.
+		Errors thrown to Scribe log `VERSION_QUERY_FAIL`.
 	]=]
 	-- Lists saved profile versions for support tools.
 	function Data.ListVersions(userId: number, limit: number?)
@@ -500,7 +506,9 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param userId number
 		@param versionId string
 		@return { [string]: any }?
-		Reads the raw data of a specific historical version.
+		Reads a historical version's raw data. The bundled store returns `nil` for
+		a missing version or a DataStore version-read error, without a Scribe log.
+		Errors thrown to Scribe log `VERSION_READ_FAIL` and also return `nil`.
 	]=]
 	-- Reads a specific historical profile snapshot.
 	function Data.GetVersion(userId: number, versionId: string)
@@ -1108,6 +1116,10 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		and int rule apply to the debit. An unresolvable path returns
 		`(false, "invalid cost path")`, but a [Scribe.DictOf] accepts any key, so a typo
 		there spends the element default as a balance nobody granted.
+
+		`Cost.Path` also accepts a [Scribe.Big] field. Its `Amount` accepts a number,
+		numeric string or [BigValue](bigvalue.md). The debit uses Big arithmetic and
+		the log stores the amount as `{ mantissa, exponent }`.
 
 		An optional `IdempotencyKey` (up to 64 bytes, valid UTF-8) makes the purchase a
 		once-guard: a repeat under that key answers what the first call answered and

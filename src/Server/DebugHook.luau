@@ -668,7 +668,7 @@ function DebugHook.Attach(Data: any, ctx: any): (() -> ())?
 	local function accessorAt(entry: any, path: { string | number }): any
 		local accessor = entry.Tree.Accessor
 		for _, seg in path do
-			accessor = accessor[seg]
+			accessor = accessor.Child(seg)
 		end
 		return accessor
 	end

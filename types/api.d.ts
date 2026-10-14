@@ -1,4 +1,4 @@
-import type { Accessor, PlayerData, ValueOf, InputOf, ClientSchema, SharedSchema, ReadonlyAccessor, NumericPaths, Disconnect, Datatype, BigValue } from "./schema";
+import type { Accessor, PlayerData, ValueOf, InputOf, ClientSchema, SharedSchema, ReadonlyAccessor, NumericPaths, Disconnect, Datatype, BigValue, BigOperand } from "./schema";
 import type { UnknownRecord, ScribeTransport, Signal, LifecycleReason, SessionState, LoadPhase, Status, ProductState, RequestFailure, RequestFailedMarker, OperationResult, SaveInfo, SaveEvent, Anomaly, GiftReceived, VersionRecord, SchemaViolation, FlushOptions, UpdateOfflineOptions, RestoreOptions, CooldownOptions, MigrationContext, LeaderboardEntry, LeaderboardStatusInfo, PassConfig, PurchaseFilter, PurchaseEntry, PurchaseLogOptions, ProductInfo, PolicyInfo, ReceiptInfo, EconomyConfig, ExchangeableSpec, ExchangeAPI, LogLevel, StatusThresholds, PeriodResetOptions, MockState } from "./common";
 
 export interface LeaderboardConfig<T = unknown> {
@@ -23,7 +23,8 @@ export interface ProductConfig<T = unknown> {
     PaidRandom?: boolean;
 }
 export interface PurchaseSpec<T = unknown> {
-    Cost: { Path: NumericPaths<T, false>; Amount: number };
+    /** Strings and BigValue amounts require a Big currency. */
+    Cost: { Path: NumericPaths<T, true>; Amount: BigOperand };
     Category?: string;
     ItemId: string;
     Grant?: (this: void, data: PlayerData<T>) => void;

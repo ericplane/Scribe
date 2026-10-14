@@ -229,6 +229,7 @@ export type LogCode =
 	| "DYNAMIC_DEFAULT_FAILED"
 	| "LISTENER_ERROR"
 	| "ON_PLAYER_INIT_ERROR"
+	| "ON_PLAYER_INIT_LEDGER"
 	| "PLAYER_LEAVING_HOOK_SLOW"
 	| "SANDBOXED"
 	| "SERVER_STARTED"
@@ -396,7 +397,8 @@ export type PassConfig = {
 }
 
 export type PurchaseSpec = {
-	Cost: { Path: string, Amount: number },
+	-- Strings and Big amounts require a Big currency.
+	Cost: { Path: string, Amount: number | string | { M: number, E: number } },
 	Category: string?,
 	ItemId: string,
 	Grant: ((data: any) -> ())?,

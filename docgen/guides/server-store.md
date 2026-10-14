@@ -38,8 +38,12 @@ export type ClientData = Scribe.ClientData<typeof(template), typeof(serverStore)
 
 Use that same `serverStore` table as the `ServerStore` option. `Scribe.Bundle` and `Scribe.ScribeOptions` accept the same two template types when you need to name those types too.
 
-!!! note "Upgrading from 2.4.0"
-    Version 2.4.0 ignored the public `ServerStore` option. Version 2.5.0 creates the store correctly. If your configuration already declares one, deploy the server and client together: those fields now form part of the compiled schema.
+!!! note "Upgrading from 2.5.0 or earlier"
+    Versions 2.2.0–2.4.0 ignored `ServerStore`. If upgrading from those versions, deploy the server and client together because store fields now form part of the schema.
+
+    Version 2.5.0 created the store but mixed its derived fields with the player's. This could run computes with missing inputs or save store fields into player profiles. It also allowed a player write under a store root's name to overwrite that client's store copy. Version 2.6.0 fixes both.
+
+    Use a migration to remove any stray store roots from saved profiles. Deploy it with 2.6.0 or later; old servers can recreate those keys. Player accessors now refuse writes and removals under store root names.
 
 ## Reading and writing it
 

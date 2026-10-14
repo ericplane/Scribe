@@ -130,7 +130,7 @@ end
 -- of silently shrinking its own coverage. Loud is the correct failure.
 --
 -- Keep published historical codes typeable after their behavior is removed.
-local historical = { PURCHASE_ID_EVICTED = true, GIFT_AIM_EXPIRED = true }
+local historical = { PURCHASE_ID_EVICTED = true, GIFT_AIM_EXPIRED = true, EXCHANGE_INIT_TAMPER = true }
 local deadUnion: { string } = {}
 local deadDocs: { string } = {}
 for code in declared do

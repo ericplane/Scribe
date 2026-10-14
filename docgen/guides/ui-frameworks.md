@@ -14,7 +14,7 @@ local coins = useScribe(Data.Coins)
 The adapters are separate optional packages: `@rbxts/scribe-react`,
 `@rbxts/scribe-vide`, and `@rbxts/scribe-fusion`. Install only the adapter and
 framework your game uses. The core package includes none of these dependencies.
-See [roblox-ts](roblox-ts.md) for publication status and all three installation examples.
+See [roblox-ts](roblox-ts.md) for all three installation examples.
 
 ```ts
 import React from "@rbxts/react";

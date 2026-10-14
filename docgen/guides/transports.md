@@ -63,13 +63,19 @@ export type ScribeTransport = {
 
 Scribe checks the members it needs for the current realm at startup, so a missing one fails loudly with `Scribe: custom transport is missing "..."` rather than going quiet. On the server that is `SendToClient` and `ListenServer`. On the client it is `SendToServer` and `ListenClient`. `Release` is optional: [`Data.Stop`](/api/Client#Stop) on the client calls it if present, so an adapter that implements it is torn down cleanly by a storybook or a test.
 
-`SendToAllClients` is an optional fast path for frames that go to every connected client, which today means the service-status broadcast. `Scribe.Shared` frames are not among them, because [they deliberately skip the owner's own client](./visibility), so those always go out through `SendToClient`. Omit the method and Scribe loops `SendToClient` for everything.
+`SendToAllClients` is an optional fast path for service-status broadcasts and [server store](./server-store) diffs. Omit it and Scribe loops over `SendToClient` instead. Fragmented frames call either method once per fragment.
+
+Status frames use the fast path whenever it exists. Store diffs use it only when every connected client has been sent a snapshot; otherwise they go individually to clients ready to apply them. Clients kept connected after their session ends still receive store diffs if they already had a snapshot. Store changes sent during a handshake use individual sends too.
+
+`Scribe.Shared` frames always use `SendToClient` because [they skip the owner's client](./visibility).
 
 ## The five rules
 
 **Deliver `buffer` payloads only.** Your listeners are the type gate. Check `typeof(bytes) == "buffer"` and drop anything else, on both realms. A RemoteEvent lets a client fire any type it likes, and Scribe measures an inbound frame with `buffer.len` before the `pcall` that guards decoding, so a non-buffer payload throws inside your own connection instead of being counted and throttled as a [`MALFORMED_FRAME`](./log-codes#transport).
 
 **The channel must be reliable and ordered.** Scribe sends diffs that build on each other, so a dropped or reordered packet corrupts the client mirror. Use a reliable RemoteEvent or your library's reliable channel, never an unreliable one.
+
+A send method that raises can trigger a full snapshot repair, limited to once every five seconds per client. Command replies may wait for that repair; [Commands](./commands) explains the limits. Non-data frames, such as replies and status broadcasts, are not retried. A lost reply leaves its `Request` to time out.
 
 **The send methods must not yield.** `FireClient` and its equivalents return immediately, so a thin adapter satisfies this without trying. One that awaits a delivery acknowledgement, rate limits by sleeping, or routes through a promise library does not. Scribe calls `SendToClient` from inside the handshake and from the per-frame flush, and a send that parks there stalls the rest of that frame's work for every player. Buffer internally and return instead.
 

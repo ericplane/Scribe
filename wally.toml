@@ -1,7 +1,7 @@
 [package]
 name = "ericplane/scribe"
 description = "Persistent, fully-typed, automatically-replicated player data for Roblox Luau, built on ProfileStore."
-version = "2.5.0"
+version = "2.6.0"
 license = "MIT"
 authors = ["ericplane"]
 registry = "https://github.com/UpliftGames/wally-index"
@@ -13,6 +13,6 @@ include = ["src", "src/*", "licenses", "licenses/*", "default.project.json", "wa
 exclude = ["**"]
 
 [dev-dependencies]
-Jest = "roblox/jest@=3.20.0"
-JestGlobals = "roblox/jest-globals@=3.20.0"
+Jest = "roblox/jest@=3.20.1"
+JestGlobals = "roblox/jest-globals@=3.20.1"
 Promise = "roblox/promise@=3.5.2"

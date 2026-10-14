@@ -384,6 +384,8 @@ local JobId = game.JobId
 
 local AutoSaveIndex = 1 -- Next profile to auto save
 local LastAutoSave = os.clock()
+-- SCRIBE PATCH: last liveness sweep.
+local LastLivenessSweep = os.clock()
 
 local LoadIndex = 0
 
@@ -830,6 +832,9 @@ local function SaveProfileAsync(profile, is_ending_session, is_overwriting, last
 	if type(profile.Data) ~= "table" then
 		error(`[{script.Name}]: Developer code likely set "Profile.Data" to a non-table value! (STORE:{profile.ProfileStore.Name}; KEY:{profile.Key})`)
 	end
+
+	-- SCRIBE PATCH: track all save attempts for the liveness sweep.
+	profile.scribe_save_started = os.clock()
 
 	-- SCRIBE PATCH: a context owned by THIS call, handed to OnSave and returned to
 	-- the caller, so a handler can record something about the save it is running
@@ -2924,6 +2929,22 @@ RunService.Heartbeat:Connect(function()
 			-- Perform save call:
 			if profile ~= nil then
 				task.spawn(SaveProfileAsync, profile) -- Auto save profile in new thread
+			end
+		end
+	end
+
+	-- SCRIBE PATCH: departures can stretch the rotation past ASSUME_DEAD. Bound each
+	-- profile's save gap, leaving time for one retry before its session looks dead.
+	local liveness_clock = os.clock()
+	if liveness_clock - LastLivenessSweep >= 1 and ProfileStore.IsClosing == false then
+		LastLivenessSweep = liveness_clock
+		local cap = math.min(AUTO_SAVE_PERIOD, ASSUME_DEAD / 2)
+		for _, profile in ipairs(table.clone(AutoSaveList)) do
+			-- Earlier save handlers may have ended another session in this sweep.
+			if liveness_clock - (profile.scribe_save_started or profile.load_timestamp) >= cap and profile:IsActive() then
+				RemoveProfileFromAutoSave(profile)
+				AddProfileToAutoSave(profile)
+				task.spawn(SaveProfileAsync, profile)
 			end
 		end
 	end

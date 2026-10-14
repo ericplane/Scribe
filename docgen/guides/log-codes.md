@@ -76,7 +76,7 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `PROFILE_VERSION_AHEAD` | Error / Warn | The stored profile's version is newer than this server's code knows about. It fires as `Error` and kicks under `VersionAheadPolicy = "Kick"`, or as `Warn` and proceeds under `"Allow"`. Either way it signals a mixed or staged deploy. |
 | `PROFILE_SCHEMA_VIOLATION` | Error / Warn | The opt-in `SchemaPolicy` check found the stored profile does not match the compiled template: a wrong type, a value outside a declared bound, an over-length string, a value outside an enum, invalid UTF-8, an undeclared key, or a container whose shape or caps changed. |
 | `EXPORT_ENCODE_FAIL` | Warn | A data export could not JSON-encode a player's profile, so `Export` returns nil instead of a payload. |
-| `OFFLINE_READ_FAIL` | Warn | An offline read of a non-active user's profile errored, so `GetOffline` returns nil. This is a retryable read failure and not a genuinely missing profile. |
+| `OFFLINE_READ_FAIL` | Warn | An offline read threw, for example on an invalid key, so `GetOffline` returns nil. The bundled store retries backend read failures instead and reports `PROFILE_STORE_ERROR`. See [Offline profiles](./profiles). |
 | `OFFLINE_WRITE_FAIL` | Warn | `UpdateOffline` could not complete because the DataStore call itself failed, so nothing was stored. A refused write, such as a live session elsewhere or a key that changed under the update, is the compare-and-set working and does not fire this. |
 | `NOSAVE_WRITE_REFUSED` | Warn | `UpdateOffline`, `RestoreVersion`, `Erase`, `SendMessage` or an offline gift delivery ran on a `Mode = "NoSave"` bundle, which never writes the store. Nothing was written. `Context.Verb` names the call. |
 | `PROFILE_ERASED` | Warn | A profile was permanently removed through the erase path. The log records the audit context and whether the leaderboard keys were cleared too. |
@@ -95,7 +95,7 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `PROFILE_STORE_SIGNAL_MISSING` | Warn | ProfileStore's error or critical-state signal could not be connected, so save-failure observability for this bundle is off. |
 | `PROFILE_TOO_LARGE` | Error | A save failed while the profile is already over the 3.5 MB warning threshold, so the cause is the 4 MB ceiling rather than a throttle. It will not recover on retry. Every later save, including the leave save, keeps failing until the profile is trimmed. |
 | `MODE_OVERRIDES_LEGACY` | Warn | `Mode` was set alongside a legacy persistence flag. `Mode` wins and the legacy flag is ignored. Remove the flag to silence this. |
-| `SAVE_INTERVAL_CLAMPED` | Warn | The requested `SaveInterval` was below the throttling floor and was raised to it. |
+| `SAVE_INTERVAL_CLAMPED` | Warn | `SaveInterval` was clamped to 15–300 seconds. The floor limits request pressure; the ceiling leaves time for another save attempt before a session can be treated as dead. |
 | `SAVE_INTERVAL_CONFLICT` | Warn | Two bundles asked for different autosave cadences. ProfileStore's autosave period is process wide, so the later value wins. Set it once with `Scribe.Configure`. |
 | `HEALTH_THRESHOLDS_CONFLICT` | Warn | Two bundles asked for different `StatusThresholds`. The health machine is a library-level singleton, so the thresholds are process wide and the later value wins -- which means one bundle can loosen the Outage gate that refuses Robux for every other bundle. Emitted once per field. Set them once, identically, in every bundle. |
 | `SAVE_INTERVAL_FAIL` | Warn | Applying the configured `SaveInterval` threw, so the autosave cadence was not changed. |
@@ -106,8 +106,8 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `SIM_SESSION_STEAL` | Warn | _(Studio only.)_ The Studio plugin force-ended an active session to exercise the session-lock path. |
 | `STATUS_CHANGED` | Warn / Info | The health machine moved between Healthy, Degraded and Outage. `Info` when returning to Healthy, `Warn` when degrading. Also fires `OnStatusChanged`. |
 | `UNKNOWN_ROOT_KEYS` | Warn | In DevMode, a loaded profile carried top-level keys the template does not declare. That is schema drift a migration should remove. |
-| `VERSION_QUERY_FAIL` | Warn | Enumerating a profile's version history failed, so `ListVersions` returns whatever partial results it gathered. |
-| `VERSION_READ_FAIL` | Warn | Reading a specific historical version errored, so `GetVersion` returns nil. This is a retryable read failure and not a missing version. |
+| `VERSION_QUERY_FAIL` | Warn | A version query threw, so `ListVersions` returns what it gathered. Backend errors caught by the bundled store can return a partial list without this code. |
+| `VERSION_READ_FAIL` | Warn | A version read threw, so `GetVersion` returns nil. The bundled store catches backend version-read failures and returns nil without this code, just as for a missing version. |
 | `DATASTORE_RECOVERED` | Info | The DataStore backend left its critical state, so the earlier outage has cleared. |
 | `MIGRATED` | Info | A stored profile was upgraded through one or more migration steps and committed. |
 | `PROFILE_LOADED` | Info | A profile finished loading and reached `Ready`, so the data tree is live. |
@@ -119,7 +119,7 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | Code | Level | Meaning |
 | --- | --- | --- |
 | `PROFILE_OVERWRITTEN` | Error | ProfileStore could not recognise the stored value for a key as a profile and replaced it with a fresh template. The session starts from defaults and the previous data is gone. The overwritten profile comes back at load count 1, so it is otherwise indistinguishable from a first-time player. |
-| `WIPE_GUARD_TRIPPED` | Error | Just before a save, the wipe guard detected an implausible collapse in the data. Also fires `OnAnomaly`. |
+| `WIPE_GUARD_TRIPPED` | Error | A save lost top-level keys, dropped sharply in size, lost `_Scribe` ledger sections or lowered its schema `Version`. Also fires `OnAnomaly`. |
 | `ANOMALY` | Warn | An implausible or suspicious write was detected at a specific path. Often an exploit attempt, sometimes a logic bug. `OutOfBounds` and `OverMaxLength` follow `BoundsPolicy`. Also fires `OnAnomaly`. |
 | `PROFILE_TOO_DEEP` | Warn | The stored data is nested deeper than the 24-level write limit. Those leaves load and read correctly, and every write to them is refused at runtime. Flatten the shape or migrate it. |
 | `TIMED_SWEEP_FAIL` | Warn | The periodic sweep errored while resetting a lapsed `Scribe.Timed` field, so that field may be left stale. |
@@ -297,7 +297,7 @@ Every one of these is about an exchange in progress. None of them means value wa
 
 | Code | Level | Meaning |
 | --- | --- | --- |
-| `EXCHANGE_INIT_TAMPER` | Error | `OnPlayerInit` or a `Scribe.Dynamic` factory changed the in-flight exchange ledger. Those hooks receive the profile directly, before the tree exists, so the usual refusal has nothing to refuse through. The change is reverted; find the line that writes into `_Scribe`. |
+| `EXCHANGE_INIT_TAMPER` | Error | Historical: through 2.5.0, reported and reverted load-hook edits to the exchange ledger. No longer emitted in 2.6.0; see `ON_PLAYER_INIT_LEDGER`. |
 | `EXCHANGE_PARKED` | Warn | A delivery could not be applied, usually because the destination is full or the key is taken. The item is waiting in the player's inbox and is retried on every load and on the sweep. Nothing is lost. |
 | `EXCHANGE_REGISTRATION_REFUSED` | Error | A `Exchangeable` declaration names a path that cannot be moved safely. Raised at startup, by name; see [Exchange](./exchange). |
 | `EXCHANGE_RESET_REFUSED` | Error | `ResetData` was asked to wipe a profile holding an in-flight or undelivered exchange. Refused, because the wipe would take the escrow with it and leave nothing to return. Resolve or discard the exchange first. |
@@ -322,6 +322,7 @@ A derived compute runs on both realms, which is what makes Emberfall's `Level` f
 | --- | --- | --- |
 | `LISTENER_ERROR` | Error | A listener or callback you supplied threw while processing a data change. Scribe caught it and reported it. |
 | `ON_PLAYER_INIT_ERROR` | Error | The `OnPlayerInit` callback threw while initializing a newly loaded profile. |
+| `ON_PLAYER_INIT_LEDGER` | Error | `OnPlayerInit` assigned `_Scribe`. The assignment was discarded and Scribe's ledger kept intact. Use the purchase, perk and gift APIs to change their state. |
 | `DYNAMIC_DEFAULT_FAILED` | Error | A `Scribe.Dynamic` factory threw while seeding a field on a brand-new profile, so that field keeps its declaration-time baseline. |
 | `PROFILE_UNPERSISTABLE` | Error | A value in the loaded profile cannot be stored and would fail the whole save: invalid UTF-8, an unserializable value, a table mixing array indices with string keys, or a table nested past 64 levels. Scribe logs the exact path and leaves the value in place for you to fix. Also fires `OnAnomaly`. |
 | `SUBSYSTEM_HOOK_ERROR` | Error | An internal load hook for Timed, Monetization, Leaderboards or Replication errored when a player's entry became ready. |

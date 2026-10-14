@@ -61,6 +61,35 @@ describe("the load path", function()
 		expect(kicked).toBe(THROTTLED)
 	end)
 
+	it("says RATE LIMITED when the store named a throttle instead of numbering it", function()
+		local harness = TestCtx.make({ Template = template })
+		local kicked = kickOnFailedLoad(
+			harness,
+			70004,
+			"StandardWriteGameServerThrottled: StandardWrite request was throttled by game server limits."
+		)
+		harness.Cleanup()
+		expect(kicked).toBe(THROTTLED)
+	end)
+
+	it("says RATE LIMITED for a named throttle behind the engine's prefix", function()
+		local harness = TestCtx.make({ Template = template })
+		local kicked = kickOnFailedLoad(
+			harness,
+			70005,
+			"DataStoreService: StandardReadExperienceThrottled: StandardRead request was throttled by experience limits. API: GetAsync, Data Store: Default"
+		)
+		harness.Cleanup()
+		expect(kicked).toBe(THROTTLED)
+	end)
+
+	it("says RATE LIMITED for a throttle Roblox reported inside a 502", function()
+		local harness = TestCtx.make({ Template = template })
+		local kicked = kickOnFailedLoad(harness, 70006, "502: API Services rejected request with error. HTTP 429.")
+		harness.Cleanup()
+		expect(kicked).toBe(THROTTLED)
+	end)
+
 	it("does NOT say rate limited for a 5xx, which is the service failing rather than throttling", function()
 		local harness = TestCtx.make({ Template = template })
 		local kicked = kickOnFailedLoad(harness, 70003, "502: API Services rejected request")

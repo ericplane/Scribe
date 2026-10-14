@@ -133,7 +133,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 	local purchaseRequestPending = false
 
 	local tree = Node.NewTree({
-		Compiled = compiled,
+		-- Decoding, defaults and Shared mirrors still use the full compile.
+		Compiled = if editMode then compiled else Template.ClientView(compiled),
 		Stores = { Persist = mirror, Session = mirror },
 		IsServer = false,
 		Label = "LocalPlayer",
@@ -962,7 +963,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 					Sched.Resume(thread)
 				end
 			end
-			disconnect = tree.Accessor[Template.SESSION_ROOT].OwnsSynced.Changed(function(v)
+			disconnect = tree.ReservedSession.OwnsSynced.Changed(function(v)
 				if v == true then
 					wake()
 				end
@@ -1022,13 +1023,11 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		ownsWatched = true
 		waitForLoaded()
 		scanOwnership(true) -- baseline: current ownership is not a "change"
-		local accessor = tree.Accessor
-		-- Through the privileged handle, not the public child: a public read of the
-		-- reserved root hands back a detached deep copy (readOut in Node.luau).
+		-- Public reserved-root reads return copies; these handles keep live values.
 		tree.Reserved.Perks.Changed(function()
 			scanOwnership()
 		end)
-		accessor[Template.SESSION_ROOT].OwnsCache.Changed(function()
+		tree.ReservedSession.OwnsCache.Changed(function()
 			scanOwnership()
 		end)
 	end
@@ -1057,10 +1056,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				Sched.Spawn(callback, owned)
 			end
 		end
-		local accessor = tree.Accessor
-		-- Privileged handle: see the note in ensureOwnershipWatched.
 		local disconnectPerk = tree.Reserved.Perks.Changed(push)
-		local disconnectCache = accessor[Template.SESSION_ROOT].OwnsCache.Changed(push)
+		local disconnectCache = tree.ReservedSession.OwnsCache.Changed(push)
 		push()
 		return function()
 			disconnectPerk()
@@ -1684,7 +1681,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		local loadedConn = if loaded then nil else loadedSignal:Connect(push)
 		table.insert(policyObservers, push)
 		local disconnectPerk = tree.Reserved.Perks.Changed(push)
-		local disconnectCache = tree.Accessor[Template.SESSION_ROOT].OwnsCache.Changed(push)
+		local disconnectCache = tree.ReservedSession.OwnsCache.Changed(push)
 		push()
 		return function()
 			if loadedConn ~= nil then
@@ -1837,7 +1834,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			if values then
 				for key, value in values do
 					local current = mirror[key]
-					tree.Accessor[key].Set(deepMerge(current, value))
+					tree.Accessor.Child(key).Set(deepMerge(current, value))
 				end
 			end
 			if scribeState then
@@ -1846,7 +1843,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				local reservedAccessor = tree.Reserved
 				if scribeState.Perks then
 					for _, perk in scribeState.Perks :: { string } do
-						reservedAccessor.Perks[perk].Set(true)
+						reservedAccessor.Perks.Child(perk).Set(true)
 					end
 				end
 				if scribeState.GiftCredits then

@@ -10,7 +10,7 @@ Wally package.
 **roblox-ts users:** `@rbxts/scribe-leaderstats` is a separate optional package using
 the same Luau implementation. It infers valid display paths from your server schema,
 including nested fields, and rejects misspelled paths, containers, optional fields,
-and Big values. See [roblox-ts](../../docgen/guides/roblox-ts.md) for publication status
+and Big values. See [roblox-ts](../../docgen/guides/roblox-ts.md) for installation
 and [the leaderstats guide](../../docgen/guides/leaderstats.md#roblox-ts) for an example.
 Use `display.Stop()` in TypeScript; the compiler supplies the method receiver.
 

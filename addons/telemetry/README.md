@@ -12,7 +12,7 @@ Keep webhook configuration in a server script even when the package itself is re
 **roblox-ts users:** the separate optional `@rbxts/scribe-telemetry` package includes
 the same implementation with typed configuration, destination names, preview kinds,
 and statistics, including the leaderboard monitor. See [roblox-ts](../../docgen/guides/roblox-ts.md)
-for publication status and [the telemetry guide](../../docgen/guides/telemetry.md#roblox-ts)
+for installation and [the telemetry guide](../../docgen/guides/telemetry.md#roblox-ts)
 for a TypeScript example. Import it from a server script and keep endpoint URLs there.
 
 ## Install

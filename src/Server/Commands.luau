@@ -78,10 +78,13 @@ function Commands.new(ctx: any)
 	local self = {} :: any
 	local options = ctx.Options
 	local rateLimit: number = options.CommandRateLimit or 20
+	local requestTimeout: number = tonumber(options.RequestTimeout) or 10
 	-- How long a settled idempotency record answers repeats. Derived rather than
 	-- configured: the window only has to outlast the client's own retry window, which
 	-- RequestTimeout defines. The floor keeps a short RequestTimeout from undercutting it.
-	local idempotencyTTL: number = math.max(120, (tonumber(options.RequestTimeout) or 10) * 4)
+	local idempotencyTTL: number = math.max(120, requestTimeout * 4)
+	-- Leave half the request window for transport and snapshot delivery.
+	local holdBudget: number = requestTimeout / 2
 
 	local registry: { [string]: Registered } = {}
 	-- The longest name any command is registered under, floored so an ordinary typo still
@@ -225,8 +228,13 @@ function Commands.new(ctx: any)
 		return Wire.Finish(w)
 	end
 
-	-- Send one reply frame; returns the bytes sent.
-	local function reply(entry: any, correlation: number, ok: boolean, results: { any }): buffer
+	--- Encodes the refusal for a connected player whose session ended.
+	function self.EncodeNotReady(correlation: number): buffer
+		return encodeReply(correlation, false, { "not-ready" })
+	end
+
+	-- Returns encoded bytes. Handler replies may wait for a repair until holdUntil.
+	local function reply(entry: any, correlation: number, ok: boolean, results: { any }, holdUntil: number?): buffer
 		-- encodeReply clamps to MAX_RETURNS, and the caller just sees trailing nils, so
 		-- say so. Only meaningful on success; failure replies are single-value.
 		local resultCount = (results :: any).n or #results
@@ -245,16 +253,20 @@ function Commands.new(ctx: any)
 			Log.Warn("Commands", "COMMAND_REPLY_ENCODE_FAIL", tostring(bytes), { Player = entry.Player })
 			bytes = encodeReply(correlation, false, { "reply-encode-failed" })
 		end
-		ctx.Replication.SendTo(entry, bytes)
+		if holdUntil ~= nil then
+			ctx.Replication.SendReply(entry, bytes, holdUntil)
+		else
+			ctx.Replication.SendTo(entry, bytes)
+		end
 		return bytes
 	end
 
-	-- A copy of a settled reply with the header's correlation overwritten.
-	local function replay(entry: any, correlation: number, bytes: buffer)
+	-- Replays a settled reply with this request's correlation and repair deadline.
+	local function replay(entry: any, correlation: number, bytes: buffer, holdUntil: number)
 		local copy = buffer.create(buffer.len(bytes))
 		buffer.copy(copy, 0, bytes)
 		buffer.writeu32(copy, 1, correlation)
-		ctx.Replication.SendTo(entry, copy)
+		ctx.Replication.SendReply(entry, copy, holdUntil)
 	end
 
 	-- Idempotency cache --------------------------------------------------------
@@ -277,7 +289,7 @@ function Commands.new(ctx: any)
 
 	-- Finish an in-flight record: answer every duplicate parked on it, and decide
 	-- whether it survives to answer later retries.
-	local function settleIdempotent(entry: any, record: IdemRecord?, ok: boolean, bytes: buffer)
+	local function settleIdempotent(entry: any, record: IdemRecord?, ok: boolean, bytes: buffer, holdUntil: number)
 		if record == nil then
 			return
 		end
@@ -296,7 +308,7 @@ function Commands.new(ctx: any)
 			end
 		end
 		for _, correlation in waiters do
-			replay(entry, correlation, bytes)
+			replay(entry, correlation, bytes, holdUntil)
 		end
 	end
 
@@ -622,7 +634,8 @@ function Commands.new(ctx: any)
 			if existing ~= nil then
 				if existing.Done then
 					Metrics.Add("CommandsDeduped")
-					replay(entry, correlation, existing.Reply :: buffer)
+					-- A repair snapshot also carries the cached handler's writes.
+					replay(entry, correlation, existing.Reply :: buffer, now + holdBudget)
 				elseif #existing.Waiters < MAX_IDEMPOTENT_WAITERS then
 					-- Still running, so park this correlation on it; settleIdempotent
 					-- answers every duplicate when the handler returns.
@@ -687,6 +700,7 @@ function Commands.new(ctx: any)
 		local active = (activeByName[name] or 0) + 1
 		activeByName[name] = active
 		Metrics.Set(registered.ActiveMetric, active)
+		local storeMark = ctx.Replication.StoreOpsQueued()
 		local startedAt = Clock.Monotonic()
 		local ok, err = xpcall(function()
 			results = table.pack(registered.Handler(entry.Player, table.unpack(args, 1, argc))) :: any
@@ -698,6 +712,14 @@ function Commands.new(ctx: any)
 		active = activeByName[name] - 1
 		activeByName[name] = active
 		Metrics.Set(registered.ActiveMetric, active)
+		-- Send owner writes before the reply, even on error. Shared writes still batch.
+		ctx.Replication.FlushOwnerQueue(entry)
+		-- Broadcast early only if store writes were queued during this handler.
+		if ctx.Replication.StoreOpsQueued() ~= storeMark then
+			ctx.Replication.FlushStoreQueue()
+		end
+		-- A repair carries writes from a closed queue; handler time counts toward its wait.
+		local holdUntil = startedAt + holdBudget
 		if not ok then
 			Metrics.Add("CommandErrors")
 			Metrics.Add(registered.ErrorMetric)
@@ -715,11 +737,11 @@ function Commands.new(ctx: any)
 					Suppressed = if suppressed > 0 then suppressed else nil,
 				})
 			end
-			settleIdempotent(entry, record, false, reply(entry, correlation, false, { "error" }))
+			settleIdempotent(entry, record, false, reply(entry, correlation, false, { "error" }, holdUntil), holdUntil)
 			return
 		end
 		Metrics.Add("CommandsHandled")
-		settleIdempotent(entry, record, true, reply(entry, correlation, true, results))
+		settleIdempotent(entry, record, true, reply(entry, correlation, true, results, holdUntil), holdUntil)
 	end
 
 	return self

@@ -17,6 +17,7 @@ local Clock = require(Internal.Clock)
 local Sched = require(Internal.Sched)
 local Rng = require(Internal.Rng)
 local Failure = require(Internal.Failure)
+local Big = require(Internal.Big)
 -- For MAX_IDEMPOTENCY_KEY_BYTES only. Wire's own requires are Internal leaves, so
 -- this adds no module to the bundle and no cycle.
 local Wire = require(Internal.Wire)
@@ -42,6 +43,8 @@ local PURCHASE_IDEM_PREFIX = "@pi|"
 -- eviction can let a retry apply a purchase twice (PURCHASE_CLAIM_EVICTED). A game that
 -- outruns it should shorten PurchaseClaimTTL rather than raise this.
 local PURCHASE_CLAIM_CAP = 1000
+-- Literal zero always parses.
+local BIG_ZERO = Big.from(0) :: Big.Big
 
 function Monetization.new(ctx: any)
 	local self = {} :: any
@@ -318,6 +321,11 @@ function Monetization.new(ctx: any)
 	-- `Tree.Accessor[RESERVED_ROOT]` refuses every mutator; these ledgers are Scribe's.
 	local function reservedAcc(entry: any): any
 		return entry.Tree.Reserved
+	end
+
+	-- Internal write access to `_ScribeSession`.
+	local function sessionAcc(entry: any): any
+		return entry.Tree.ReservedSession
 	end
 
 	local function reservedRaw(data: { [string]: any }): { [string]: any }
@@ -799,7 +807,7 @@ function Monetization.new(ctx: any)
 			error("Scribe: GrantPerk requires a Ready player (use Data.WaitForData)", 2)
 		end
 		checkPerkName(key)
-		reservedAcc(entry).Perks[key].Set(true)
+		reservedAcc(entry).Perks.Child(key).Set(true)
 		Log.Info("Monetization", "PERK_GRANTED", `perk "{key}" granted`, { Player = player, Perk = key })
 	end
 
@@ -808,7 +816,7 @@ function Monetization.new(ctx: any)
 		if not entry or entry.State ~= "Ready" then
 			error("Scribe: RevokePerk requires a Ready player", 2)
 		end
-		reservedAcc(entry).Perks[key].Set(nil)
+		reservedAcc(entry).Perks.Child(key).Set(nil)
 		Log.Info("Monetization", "PERK_REVOKED", `perk "{key}" revoked`, { Player = player, Perk = key })
 	end
 
@@ -935,7 +943,7 @@ function Monetization.new(ctx: any)
 
 	local function setOwnsCache(entry: any, key: string, owned: boolean)
 		if entry.Tree and not entry.Tree.Dead then
-			entry.Tree.Accessor[Template.SESSION_ROOT].OwnsCache[key].Set(if owned then true else nil)
+			sessionAcc(entry).OwnsCache.Child(key).Set(if owned then true else nil)
 		end
 	end
 
@@ -944,7 +952,7 @@ function Monetization.new(ctx: any)
 		if not entry.Tree or entry.Tree.Dead then
 			return owned
 		end
-		local kept = owned or entry.Tree.Accessor[Template.SESSION_ROOT].OwnsCache[key].Get() == true
+		local kept = owned or sessionAcc(entry).OwnsCache.Child(key).Get() == true
 		setOwnsCache(entry, key, kept)
 		return kept
 	end
@@ -1008,17 +1016,14 @@ function Monetization.new(ctx: any)
 		if not entry.Tree or entry.Tree.Dead then
 			return
 		end
-		local accessor = entry.Tree.Accessor
 		scanOwnership(entry, true) -- baseline: record current state without firing
 		local function onChange()
 			scanOwnership(entry)
 		end
 		entry.OwnsWatchers = {
-			-- Through the privileged handle, not the public child: a public read hands back
-			-- a detached deep copy (readOut in Node.luau), and this callback ignores the
-			-- value entirely.
+			-- Avoid public-read copies; the callback ignores the values.
 			reservedAcc(entry).Perks.Changed(onChange),
-			accessor[Template.SESSION_ROOT].OwnsCache.Changed(onChange),
+			sessionAcc(entry).OwnsCache.Changed(onChange),
 		}
 	end
 
@@ -1043,10 +1048,9 @@ function Monetization.new(ctx: any)
 				Sched.Spawn(callback, owned)
 			end
 		end
-		local accessor = entry.Tree.Accessor
-		-- Privileged handle: see the note in watchOwnership.
+		-- Avoid public-read copies, as in watchOwnership.
 		local disconnectPerk = reservedAcc(entry).Perks.Changed(push)
-		local disconnectCache = accessor[Template.SESSION_ROOT].OwnsCache.Changed(push)
+		local disconnectCache = sessionAcc(entry).OwnsCache.Changed(push)
 		push()
 		return function()
 			disconnectPerk()
@@ -1062,7 +1066,7 @@ function Monetization.new(ctx: any)
 		end
 		entry.OwnershipReady = true
 		if entry.Tree and not entry.Tree.Dead then
-			entry.Tree.Accessor[Template.SESSION_ROOT].OwnsSynced.Set(true)
+			sessionAcc(entry).OwnsSynced.Set(true)
 		end
 	end
 
@@ -1206,7 +1210,7 @@ function Monetization.new(ctx: any)
 			end
 			if product.Grants then
 				checkPerkName(product.Grants)
-				reservedAcc(entry).Perks[product.Grants].Set(true)
+				reservedAcc(entry).Perks.Child(product.Grants).Set(true)
 			end
 		end
 
@@ -1656,7 +1660,7 @@ function Monetization.new(ctx: any)
 			convertToCredit = not delivered
 		end
 		if convertToCredit then
-			local creditsAccessor = reservedAcc(entry).GiftCredits[product.Name]
+			local creditsAccessor = reservedAcc(entry).GiftCredits.Child(product.Name)
 			creditsAccessor.Set((tonumber(creditsAccessor.Get()) or 0) + 1)
 			-- Receipt retries may outlive their original product slot.
 			clearGiftRecord(entry, productIdStr, giftId)
@@ -1836,7 +1840,7 @@ function Monetization.new(ctx: any)
 			-- GrantOrCredit: a no-op grant would burn Robux, so write a durable gift credit.
 			-- A no-intent purchase never stacks onto a pending credit (declined above), but
 			-- an aimed-gift conversion in handleGiftReceipt may, since that money is taken.
-			local creditsAccessor = reservedAcc(entry).GiftCredits[product.Name]
+			local creditsAccessor = reservedAcc(entry).GiftCredits.Child(product.Name)
 			creditsAccessor.Set((creditsAccessor.Get() or 0) + 1)
 			robuxLog(entry, {
 				PurchaseId = purchaseId,
@@ -2637,7 +2641,7 @@ function Monetization.new(ctx: any)
 		local credits = tonumber(reserved.GiftCredits[productName]) or 0
 		if credits > 0 then
 			local giftId = Util.guid()
-			local creditAccessor = reservedAcc(entry).GiftCredits[productName]
+			local creditAccessor = reservedAcc(entry).GiftCredits.Child(productName)
 			-- Refunds re-read the live count instead of restoring the stale pre-read value: a
 			-- receipt retry can issue a credit during the yields below, and an absolute
 			-- restore would erase it. Both steps between the spend and this refund yield, so
@@ -2933,13 +2937,20 @@ function Monetization.new(ctx: any)
 		end
 
 		local cost = spec.Cost
-		if type(cost) ~= "table" or type(cost.Path) ~= "string" or type(cost.Amount) ~= "number" then
+		local amountType = if type(cost) == "table" then type(cost.Amount) else nil
+		if
+			type(cost) ~= "table"
+			or type(cost.Path) ~= "string"
+			or (amountType ~= "number" and amountType ~= "string" and amountType ~= "table")
+		then
 			return false, "invalid Cost spec"
 		end
-		local amount: number = cost.Amount
+		-- Keep existing refusal reasons until the path confirms a Big currency.
+		local amountIsNumber = amountType == "number"
+		local amount: number = if amountIsNumber then cost.Amount else 0
 		-- A non-positive amount would pass the funds check and CREDIT currency while
 		-- still granting the item.
-		if amount <= 0 or amount ~= amount then
+		if amountIsNumber and (amount <= 0 or amount ~= amount) then
 			return false, "invalid Cost amount"
 		end
 		local costPath = Util.parsePath(cost.Path)
@@ -2948,12 +2959,12 @@ function Monetization.new(ctx: any)
 		local walked, costAccessor = pcall(function()
 			local acc = entry.Tree.Accessor
 			for _, segment in costPath do
-				acc = acc[segment]
+				acc = acc.Child(segment)
 			end
 			return acc
 		end)
 		if not walked then
-			return false, "invalid cost path"
+			return false, if amountIsNumber then "invalid cost path" else "invalid Cost spec"
 		end
 		-- Follow the schema the way the accessor above does. Template.Resolve descends
 		-- node.Children only, so a DictOf/ArrayOf element would stop the walk at the
@@ -2965,6 +2976,21 @@ function Monetization.new(ctx: any)
 				break
 			end
 			costSchema = next_
+		end
+		-- Keep Big balances and amounts out of double arithmetic.
+		local bigAmount: Big.Big? = nil
+		local bigFloor: Big.Big = BIG_ZERO
+		if costSchema.ValueType == "big" then
+			-- Invalid table operands may throw; return a refusal instead.
+			local parsedOk, parsed = pcall(Big.from, cost.Amount)
+			bigAmount = if parsedOk then parsed else nil
+			if bigAmount == nil or Big.compare(bigAmount, BIG_ZERO) <= 0 then
+				return false, "invalid Cost amount"
+			end
+			-- Compile already refused a Min that does not parse.
+			bigFloor = Big.from(costSchema.Min or 0) :: Big.Big
+		elseif not amountIsNumber then
+			return false, "invalid Cost spec"
 		end
 		-- A fractional amount on an int currency rounds the debit toward zero, or to no
 		-- debit at all, while the grant still runs.
@@ -2988,10 +3014,21 @@ function Monetization.new(ctx: any)
 		end
 		local function readBalance(): any
 			local value = costAccessor.Get()
-			if value == nil and isElementLeaf and type(costSchema.Default) == "number" then
-				return costSchema.Default
+			if value == nil and isElementLeaf then
+				if type(costSchema.Default) == "number" then
+					return costSchema.Default
+				end
+				-- A big element's default is its stored { mantissa, exponent } pair.
+				if bigAmount ~= nil then
+					return Big.from(costSchema.Default)
+				end
 			end
 			return value
+		end
+		-- Check headroom and remainder: either subtraction can round past a non-zero floor.
+		local function bigAffords(balance: any): boolean
+			return Big.compare(Big.sub(balance, bigFloor), bigAmount :: Big.Big) >= 0
+				and Big.compare(Big.sub(balance, bigAmount :: Big.Big), bigFloor) >= 0
 		end
 
 		-- Already granted under this key? Return the ORIGINAL outcome, matching the receipt
@@ -3007,29 +3044,42 @@ function Monetization.new(ctx: any)
 		end
 
 		local current = readBalance()
-		if type(current) ~= "number" then
-			-- Two different refusals wearing one string. The accessor walk above already
-			-- SUCCEEDED, so the path is not a typo: it resolved to something real that cannot
-			-- be spent, Scribe.Big being the case that bites (stored as a table, while
-			-- Purchase does plain arithmetic). Only for a DECLARED non-numeric type: an
-			-- element of a dynamic container has no ValueType, and there the old string is
-			-- still the honest answer.
+		local spendable = if bigAmount ~= nil then Big.isBig(current) else type(current) == "number"
+		if not spendable then
+			-- Distinguish a declared non-currency from an absent or untyped balance.
 			local valueType = costSchema.ValueType
-			if valueType ~= nil and valueType ~= "any" and valueType ~= "int" and valueType ~= "number" then
+			if
+				valueType ~= nil
+				and valueType ~= "any"
+				and valueType ~= "int"
+				and valueType ~= "number"
+				and valueType ~= "big"
+			then
 				return false, "cost path is not a spendable number"
 			end
 			return false, "invalid cost path"
 		end
-		if current - amount < floor then
+		if bigAmount ~= nil then
+			if not bigAffords(current) then
+				return false, "insufficient funds"
+			end
+		elseif current - amount < floor then
 			return false, "insufficient funds"
 		end
 
 		local ok, err = entry.Tree:RunTransaction(function()
 			local balance = readBalance()
-			if balance - amount < floor then
-				error("insufficient funds")
+			if bigAmount ~= nil then
+				if not bigAffords(balance) then
+					error("insufficient funds")
+				end
+				costAccessor.Set(Big.sub(balance, bigAmount :: Big.Big))
+			else
+				if balance - amount < floor then
+					error("insufficient funds")
+				end
+				costAccessor.Set(balance - amount)
 			end
-			costAccessor.Set(balance - amount)
 			if spec.Grant then
 				(spec.Grant :: (any) -> ())(entry.Tree.Accessor)
 			end
@@ -3057,7 +3107,8 @@ function Monetization.new(ctx: any)
 				Category = spec.Category,
 				ItemId = spec.ItemId,
 				Currency = tostring(costPath[#costPath]),
-				Amount = amount,
+				-- Store the Big pair; conversion to a double can overflow.
+				Amount = if bigAmount ~= nil then Big.toStored(bigAmount) else amount,
 				Ts = Clock.Now(),
 				Meta = spec.Meta,
 			})
@@ -3070,7 +3121,12 @@ function Monetization.new(ctx: any)
 		end
 
 		-- Analytics only after commit so a rollback emits no event.
-		ctx.Analytics.Economy(player, costPath, -amount, costAccessor.Get(), {
+		local delta, newValue = -amount, costAccessor.Get()
+		if bigAmount ~= nil then
+			-- Analytics uses doubles. The grant may have removed the balance.
+			delta, newValue = -Big.toNumber(bigAmount), if Big.isBig(newValue) then Big.toNumber(newValue) else nil
+		end
+		ctx.Analytics.Economy(player, costPath, delta, newValue, {
 			Source = spec.ItemId or spec.Category or "Purchase",
 			Flow = "Sink",
 			Item = spec.ItemId,
@@ -3104,8 +3160,10 @@ function Monetization.new(ctx: any)
 				Log.Warn(
 					"Gifting",
 					"GIFT_CREDIT_UNKNOWN_PRODUCT",
-					`player holds {tostring(count)} gift credit(s) for "{tostring(creditName)}", which is not in Products; `
-						.. "they are unspendable until the product returns or a migration renames the credit key",
+					`player holds {tostring(count)} gift credit(s) for "{tostring(creditName)}", which is in neither `
+						.. "Products nor RetiredProducts; they stay unspendable until that name is declared again. For a "
+						.. "removed product, add it to RetiredProducts with its original Id and grant. A migration cannot "
+						.. "move them: the reserved root is library-owned and migration edits to it are discarded",
 					{ Player = entry.Player, Product = tostring(creditName) }
 				)
 			end

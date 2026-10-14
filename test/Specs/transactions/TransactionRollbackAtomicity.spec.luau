@@ -124,14 +124,8 @@ describe("rollback fires listeners only once the tree is whole", function()
 		expect(table.find(log, "add:Old") ~= nil).toBe(true)
 		harness.Cleanup()
 	end)
-	-- The queue is held on the tree, so the rollback MUST clear it and drain even
-	-- when it throws part-way; a tree left with `_fireQueue` set never notifies
-	-- anyone again for the rest of the session. The throw here is not injected:
-	-- a derived recompute writes through a VALIDATING applySet, so an output the
-	-- declarator refuses under BoundsPolicy = "Reject" throws out of the restore
-	-- loop -- the case settleDerived's own comment already names. Without the
-	-- pcall around the rollback this test is the only thing in the suite that
-	-- fails.
+	-- A validation error during rollback recompute must still drain the listener queue.
+	-- TransactionRollbackDerivedSettle.spec covers errors during the restore loop.
 	it("keeps firing listeners after a rollback that throws part-way", function()
 		local mult = 1
 		local harness = TestCtx.make({

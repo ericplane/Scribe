@@ -42,6 +42,13 @@ print("Music enabled:", musicOn) -- false: the server accepted the setting
 
 [`Data.Request`](/api/Client#Request) waits for a reply and returns the handler's result. Here, `false` is a successful result: music is off. The third return value distinguishes a request failure from that valid boolean. Your existing `Observe` listeners can display the updated setting.
 
+The handler's writes to the caller's data normally arrive before its reply, so `Get` reads the new value when `Request` returns. The same applies to [`Data.ServerStore`](./server-store) writes made by that handler. Other players' copies of [`Scribe.Shared`](./visibility) fields wait for the next frame. `Batch`, `Transaction` and `Purchase` keep their usual flush when they finish.
+
+??? note "When a failed send delays the data"
+    If a data send fails, Scribe repairs that client's data with a fresh snapshot and holds the reply until the snapshot attempt. This usually takes one frame; repeated failures can add a five-second cooldown.
+
+    The reply goes out ahead of the data if the repair would take too long, the previous repair failed, or 64 replies are already waiting. The wait ends no later than half `RequestTimeout` after the handler started. Ending the session or stopping Scribe also releases waiting replies, so a reply is not proof that a failed transport has recovered.
+
 The `player` passed to the handler is the real sender. For player-owned actions, use that Player rather than trusting a user ID supplied by the client. [Failure handling](#what-the-caller-gets-back-on-failure) explains timeouts and other outcomes.
 
 ## Registering
@@ -68,10 +75,9 @@ The spec table reads exactly two keys: `Args`, covered next, and `Idempotent`, c
 
 A `nil` in that list is refused at registration. `{ "number", nil, "string" }` counts as three arguments to the arity check but only two to the validation loop, so the middle one would reach your handler unchecked. Write `"any"` when you mean "anything goes here".
 
-A **non-finite** number argument is refused too, whatever the spec says, `"any"` included. `typeof(0/0)`
-is `"number"`, so a bare `"number"` would otherwise hand NaN straight to your handler, where every
-comparison against it is false: a guard written as `if amount > 0 then ... else ... end` takes neither
-branch you expect. No number Scribe can store is non-finite, so one is never a legitimate argument.
+A **non-finite** number argument is refused too, even with `"any"`. `typeof(0/0)` is `"number"`,
+but NaN makes comparisons such as `amount <= 0` return false, bypassing a check that rejects
+nonpositive amounts. Scribe rejects it before your handler runs.
 
 | Spec entry | Accepts |
 | --- | --- |
@@ -185,7 +191,7 @@ Every framework failure resolves `Data.Request` as three values: `false`, one se
 | --- | --- | --- |
 | `"rate-limited"` | server | the player is over `CommandRateLimit`. The handler never ran. |
 | `"unknown-command"` | server | nothing is registered under that name, usually a client on an older build. |
-| `"not-ready"` | server | the caller's profile is not `Ready`, so it is still loading or the session already ended. |
+| `"not-ready"` | server | the caller's profile is still loading or its session ended, including a player kept connected with `KickOnSessionEnd = false`. Replies remain rate-limited. |
 | `"bad-args"` | server | the call did not match the `Args` spec, or it carried more arguments than declared. |
 | `"bad-idempotency-key"` | server | the key and the command disagree, or the key was empty, over 64 bytes, or not valid UTF-8. The handler never ran. |
 | `"error"` | server | the handler threw. The traceback goes to the `COMMAND_ERROR` log and is never sent to the client. |
@@ -277,7 +283,7 @@ Each player gets a token bucket, sized and refilled at `CommandRateLimit` per se
     4. **`Args` arity**, if the command declared a spec. More arguments than declared is caught here, from the header alone.
     5. **`Args` types**, once the arguments have been decoded.
     6. **The handler**, inside an `xpcall`. A throw is logged as `COMMAND_ERROR` and answered `error`.
-    7. **The reply**, encoded and sent.
+    7. **The reply**, encoded and sent after the caller's pending changes, subject to the repair limits above. A handler's writes before a throw still stand and are sent too.
 
 ## In edit mode
 

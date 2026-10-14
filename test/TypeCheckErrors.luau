@@ -4,7 +4,7 @@
 -- exactly EXPECTED_ERRORS diagnostics: if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
--- EXPECTED_ERRORS: 38
+-- EXPECTED_ERRORS: 39
 
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -165,10 +165,9 @@ local bigBoards: { [string]: Scribe.LeaderboardConfig<BigT> } = {
 	Typo = { Stat = "Coinz" }, -- TypeError: not a template path
 }
 
--- 19) A purchase cost path must be a plain number balance. Monetization refuses a
--- non-number at runtime, so a big path is rejected here rather than at the till.
+-- 19) Big purchase amounts still reject booleans.
 local bigCost: Scribe.PurchaseSpec<BigT> = {
-	Cost = { Path = "Coins", Amount = 5 }, -- TypeError: a big is not a cost path
+	Cost = { Path = "Coins", Amount = true }, -- TypeError: a boolean is not an amount
 	ItemId = "Hat",
 }
 
@@ -193,6 +192,13 @@ local function badMapContainer(player: Player)
 	-- 21) And the element's own methods must not leak onto the container.
 	data.Tags.Increment(5) -- TypeError: Increment is not on a map node
 	return data.Tags.Get()
+end
+
+local function bigPurchase(player: Player)
+	-- 27) A mixed template keeps the path union narrow; this Big path must typecheck.
+	local bought = bigBundle.Server.Purchase(player, { Cost = { Path = "Coins", Amount = "1e3" }, ItemId = "Hat" })
+	bigBundle.Server.Purchase(player, { Cost = { Path = "Gems", Amount = false }, ItemId = "Hat" }) -- TypeError: a boolean is not an amount
+	return bought
 end
 
 local function badDerived(player: Player)
@@ -231,4 +237,5 @@ return {
 	bigCost,
 	badMapContainer,
 	badScore,
+	bigPurchase,
 }

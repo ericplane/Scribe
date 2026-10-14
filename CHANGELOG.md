@@ -1,5 +1,161 @@
 # Changelog
 
+## 2.6.0
+
+Released 2026-10-14.
+
+Big currencies in purchases, safer saves and session cleanup, and fixes for derived fields,
+server stores, and command replies arriving ahead of their data.
+
+### Behaviour changes
+
+- Player-data writes under a `ServerStore` root's name now raise. `Remove` also rejects
+  reserved roots and derived fields, and `Update` on a player's whole data raises before
+  calling its function. Writes to `_ScribeSession` now raise too, and reads return copies.
+  Use public perk and ownership APIs instead of editing the internal ownership cache.
+
+- `OnPlayerInit` receives game data without `_Scribe`. Top-level assignments and removals
+  are copied back when the hook returns and before saves made while it yields. Do not keep
+  the hook's table for later top-level writes. Assigning `_Scribe` is discarded and logs
+  `ON_PLAYER_INIT_LEDGER`; `EXCHANGE_INIT_TAMPER` remains a historical code but is no longer emitted.
+
+- `SaveInterval` and `Scribe.Configure`'s `AutoSaveInterval` are capped at 300 seconds,
+  logging `SAVE_INTERVAL_CLAMPED` when clamped. Overdue profiles also get a save attempt
+  outside the normal rotation. This can add requests as players leave or group attempts
+  one interval after a burst of joins. Throttling and service failures can still delay saves.
+
+- The wipe guard now checks for previously saved `_Scribe` tables disappearing or becoming
+  non-tables, and a schema `Version` moving backwards, even below 1 KB.
+  `WipeGuardPolicy = "Block"` holds those saves.
+
+- Purchase types now accept Big currency paths and `number | string | BigValue` amounts.
+  Only Big currencies accept string or Big amounts at runtime. The roblox-ts
+  `PurchaseEntry.Amount` is now `number | [number, number]`; narrow it before treating it
+  as a number. Big fields also count toward Luau's 32-path union cap, after which
+  `Cost.Path` falls back to `string`.
+
+- Command handlers flush their writes to the caller before replying. A handler that writes
+  `Data.ServerStore` also flushes store changes to ready clients before its reply; other
+  players' `Scribe.Shared` updates still combine per frame. During snapshot repair, replies
+  may wait up to the five-second cooldown, bounded by half the `RequestTimeout` from the
+  handler's start. Failed snapshots, queue limits, expired deadlines and session shutdown
+  can release a reply before the data arrives.
+
+### Added
+
+- `Data.Purchase` can spend a `Scribe.Big` currency, including typed dictionary elements.
+  `Cost.Amount` accepts a positive, finite number, numeric string of at most 256 bytes,
+  or Big value. Funds checks and debits use Big arithmetic and respect the field's `Min`
+  (or 0), with the existing bounds, listeners, replication, idempotency and grant rollback.
+  Includes Luau and roblox-ts types.
+
+  Big values retain 15 significant digits, so small debits can round away or up at large
+  balances: spending 1 from `1e20` leaves `1e20`, while spending 49,000 removes 100,000.
+  Choose prices with that precision in mind.
+  `InGame` history stores Big amounts as `{ mantissa, exponent }`; economy events still
+  report plain numbers, which become `inf` beyond their range.
+
+- Added `CommandRepliesHeld` and `CommandReplyHoldsExpired` metrics for replies waiting on
+  snapshot repair. The latter counts replies released at their deadline rather than by a
+  snapshot attempt.
+
+### Fixed
+
+- Player and server-store trees now run only their own derived fields. In 2.5.0, declaring
+  a `ServerStore` could run player computations against store data and vice versa, causing
+  nil-input errors, stray store keys in saved profiles, or incorrect player snapshots.
+
+  Existing stray keys remain readable and are reported by `UNKNOWN_ROOT_KEYS` in `DevMode`.
+  Remove them with a migration deployed alongside this fix; validated offline updates
+  cannot remove them. A 2.5.0 server can recreate them, so with
+  `VersionAheadPolicy = "Allow"`, wait until all old servers are gone before migrating.
+
+- Player writes under store-root names no longer overwrite the owner's client copy of
+  `Data.ServerStore`. Parent `Remove(key)` calls can no longer bypass reserved or derived
+  field guards, and root `Update` no longer exposes the live profile to an in-place edit.
+
+- Clients no longer recompute hidden derived fields or fields whose inputs they cannot
+  see. They keep the server's transmitted value instead of replacing it with a result
+  computed from nil inputs. Edit-mode mocks can still compute from seeded `ServerOnly` data.
+
+- Transaction rollback restores every field before recomputing derived values. Listeners
+  and shared clients no longer receive values computed from a partly restored tree, and
+  rollback inside a batch no longer leaves derived values stale after a read.
+
+- Replacing a record now preserves its derived values until recompute, including session
+  and store records, client Init/resync, and transaction rollback. Unchanged values no
+  longer fire temporary nil changes, and values supplied by `Set`, `Update` or `Data.Mock`
+  are ignored. Removed sub-records stay removed; carried values are dropped if recompute fails.
+
+- Writes with `replicate = false` now mark saved data dirty. `Data.Flush` and `GetSaveInfo`
+  no longer report those changes as saved while the DataStore still holds the old values.
+
+- Departing players no longer stretch a remaining profile's autosave rotation beyond the
+  session takeover threshold. The per-profile backstop and interval ceiling keep attempts
+  scheduled while a server empties, without relying on another player joining.
+
+- `OnPlayerInit` can no longer clear receipts, perks or gift credits through `_Scribe`.
+  Its top-level game-data changes are preserved during yielding hooks. Intentional removals
+  no longer trip the wipe guard's missing-key check; the size-shrink guard still applies.
+
+- Saves started during migrations or `OnPlayerInit` no longer decrement a later save's
+  in-flight count or discard the wipe guard's baseline. `Data.Flush` waits for its save
+  correctly, and later save failures remain recorded.
+
+- Command replies now follow the handler's data changes, including writes made before a
+  handler throws and store changes made by that handler. Replies wait for a pending repair
+  snapshot when it can arrive within their deadline. Players kept connected after an
+  unexpected session end receive a rate-limited `"not-ready"` reply instead of timing out.
+
+- Snapshot failures now retry the full handshake on joins and repeated Hello frames too.
+  Diffs wait until Init is sent, and each subsequent lost frame closes the queue even if
+  repair is already pending. A snapshot-building failure also preserves queued store
+  changes for the next flush instead of losing them for every client.
+
+- Store diffs no longer reach clients before their first snapshot. While anyone is still
+  loading, Scribe sends to ready clients individually instead of broadcasting. A player
+  kept connected after their session ends continues receiving store changes if they had
+  received Init. Status updates still reach loading clients, including on transports
+  without `SendToAllClients`.
+
+- Named DataStore throttles and errors behind the engine's `DataStoreService:` prefix now
+  receive the correct failure class. Throttles share one health subject and use the
+  busy-service load message instead of making each affected key look like a separate outage.
+  Wrapped `502` errors containing `HTTP 429` or `Too many requests` also share that health
+  treatment, but remain `Failed` for logs and gift-refund decisions because a write may
+  have landed.
+
+- Names such as `Count`, `Get`, `Max` and `Clear` no longer resolve to accessor methods
+  inside ownership caches, perk and gift-credit ledgers, periodic leaderboards, purchase
+  and leaderboard paths, exchange legs, or edit-mode mocks. These names previously caused
+  failed grants and trades, stalled ownership syncs, unranked boards, or leaked sessions.
+
+- A subsystem unload error no longer stops the remaining cleanup. Each unload runs in
+  isolation, logs `SUBSYSTEM_HOOK_ERROR` on failure, and allows session removal to finish.
+
+### Changed
+
+- Updated development tools to Lune 0.11.0, StyLua 2.6.0, selene 0.32.0 and Rojo 7.7.1,
+  with Jest and JestGlobals 3.20.1.
+
+### Documentation
+
+- Clarified offline-read retries and version-history failures. Ordinary offline reads
+  retry during an outage; failed version reads can return nil as missing versions do,
+  and version lists can end early. The guide and API docs distinguish store failures
+  from errors that reach the `OFFLINE_READ_FAIL`, `VERSION_READ_FAIL` and `VERSION_QUERY_FAIL` wrappers.
+
+- Updated diagnostics with the effects of failure classes on health, load messages,
+  gift refunds and leaderboard writes.
+
+- Added a migration warning against pointing Scribe at keys holding raw DataStore data:
+  the first join can replace those values before `ImportLegacyData` runs. Stranded gift
+  credits now point to `RetiredProducts`, since migrations discard `_Scribe` edits.
+
+- Clarified that Scribe ships its ProfileStore fork and when store updates use transport
+  broadcasts. Updated the README and addon guides for published npm packages, and restored
+  `test/Sim/SCOPE.md` with the simulation's coverage and limitations.
+
 ## 2.5.0
 
 Released 2026-09-24.

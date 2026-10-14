@@ -1,15 +1,5 @@
 --!nonstrict
--- L4: an exchange survives the two things that rewrite a profile at load time.
---
--- A migration reshapes game data. `OnPlayerInit` and `Scribe.Dynamic` factories write
--- into the profile directly. Both run BEFORE the tree exists, so neither passes the
--- accessor refusal that protects the reserved root everywhere else, and both are handed
--- `profile.Data` itself.
---
--- That matters more here than anywhere else in Scribe. A receipt id or a perk surviving
--- a migration is bookkeeping; an in-flight exchange surviving one is the difference between
--- a player getting their item back and it ceasing to exist, because the matching hole in
--- their inventory has already been saved.
+-- Migrations and OnPlayerInit must preserve in-flight exchanges.
 
 local JestGlobals = require(game:GetService("ReplicatedStorage").ScribeDev.DevPackages.JestGlobals)
 local it = JestGlobals.it
@@ -118,30 +108,24 @@ it("PARKS rather than loses a delivery whose destination the migration deleted",
 	first.Cleanup()
 end)
 
-it("REVERTS an exchange ledger edited by OnPlayerInit, and says so", function()
-	-- OnPlayerInit is handed profile.Data itself, before the tree exists, so the
-	-- accessor refusal that guards the reserved root has nothing to refuse through.
-	-- A starter kit that clears `_Scribe` to "start clean" would destroy an in-flight
-	-- exchange silently, with the matching hole in the inventory already saved.
+it("keeps the exchange ledger out of OnPlayerInit's reach, and reports an attempt", function()
+	-- The hook cannot read or replace the ledger before exchange recovery.
 	local first = stakedOnV1()
-	local tampered = false
+	local sawLedger
 	local second = TestCtx.make({
 		Template = V1,
 		Fake = first.Fake,
 		Options = {
 			OnPlayerInit = function(_player, data)
-				if type(data[RESERVED]) == "table" then
-					tampered = true
-					data[RESERVED].Exchange = {}
-					data[RESERVED].ExchangeInbox = {}
-				end
+				sawLedger = type(data[RESERVED])
+				data[RESERVED] = { Exchange = {}, ExchangeInbox = {} }
 			end,
 		},
 	})
 
 	local reported = false
 	local conn = Scribe.OnIssue:Connect(function(entry)
-		if entry.Code == "EXCHANGE_INIT_TAMPER" then
+		if entry.Code == "ON_PLAYER_INIT_LEDGER" then
 			reported = true
 		end
 	end)
@@ -149,20 +133,17 @@ it("REVERTS an exchange ledger edited by OnPlayerInit, and says so", function()
 	conn:Disconnect()
 	local data = second.Data.Get(player)
 
-	-- The hook really did fire and really did try, and it was REPORTED rather than
-	-- quietly undone: a developer whose starter kit is eating exchanges needs telling.
-	expect(`tried={tostring(tampered)} reported={tostring(reported)}`).toBe("tried=true reported=true")
-	-- ...and the relic came back anyway, because the edit was reverted before the
-	-- tree was built and the load hook then resolved the exchange normally.
+	-- Report the attempted replacement without exposing the ledger.
+	expect(`saw={sawLedger} reported={tostring(reported)}`).toBe("saw=nil reported=true")
+	-- Recovery still returns the escrowed item.
 	expect(`relic={tostring(data.Inventory["relic"].Get() ~= nil)}`).toBe("relic=true")
 
 	second.Cleanup()
 	first.Cleanup()
 end)
 
-it("leaves an untouched ledger alone, so the guard is not rewriting every load", function()
-	-- The control. A guard that restored a snapshot unconditionally would pass the
-	-- case above while quietly undoing legitimate work on every single load.
+it("lets an ordinary hook through quietly, with its own writes kept", function()
+	-- Ordinary hook writes must survive without a warning.
 	local first = stakedOnV1()
 	local second = TestCtx.make({
 		Template = V1,
@@ -174,12 +155,10 @@ it("leaves an untouched ledger alone, so the guard is not rewriting every load",
 		},
 	})
 
-	-- And it must stay QUIET. Restoring the snapshot unconditionally leaves the data
-	-- identical and cries wolf on every load, which is the version of this guard that
-	-- survives a data-only assertion.
+	-- Data checks alone would miss a warning on every load.
 	local reported = false
 	local conn = Scribe.OnIssue:Connect(function(entry)
-		if entry.Code == "EXCHANGE_INIT_TAMPER" then
+		if entry.Code == "ON_PLAYER_INIT_LEDGER" then
 			reported = true
 		end
 	end)

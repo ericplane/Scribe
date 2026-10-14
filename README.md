@@ -8,12 +8,12 @@
 ```toml
 # wally.toml
 [dependencies]
-Scribe = "ericplane/scribe@2.5.0"
+Scribe = "ericplane/scribe@2.6.0"
 ```
 
-roblox-ts support is prepared as `@rbxts/scribe`, with inferred schema and API types
-over the same Luau runtime. npm publication requires the initial registry setup;
-see the [roblox-ts guide](docgen/guides/roblox-ts.md) for installation and examples.
+roblox-ts users install `@rbxts/scribe` from npm (`npm install @rbxts/scribe`), with
+inferred schema and API types over the same Luau runtime; see the
+[roblox-ts guide](docgen/guides/roblox-ts.md) for installation and examples.
 
 - **Fully typed.** A type-solver-generated accessor tree types your data end to end (`data.Coins.Increment(50)`, nested containers, arrays, and datatype fields), checked at compile time.
 - **Schemas all the way down.** `Scribe.ArrayOf` and `Scribe.DictOf` give array and dictionary *entries* a schema, so `data.Plots[1].Origin` is a typed `CFrame` that packs to 13 bytes, with per-element bounds and size caps.

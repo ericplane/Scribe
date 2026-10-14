@@ -26,8 +26,12 @@ end
 
 [Derived fields](./derived) are calculated when all their inputs are saved fields. Emberfall's `Level` uses saved `Xp`, so it appears in the snapshot too.
 
-!!! warning "A missing result does not prove the profile is missing"
-    `GetOffline` and `GetVersion` return `nil` for both missing data and a failed read. Check the logs for `OFFLINE_READ_FAIL` or `VERSION_READ_FAIL` before deciding what happened. `ListVersions` can return a partial or empty list after an error; check for `VERSION_QUERY_FAIL`.
+!!! warning "Read failures can look like missing data"
+    With the bundled ProfileStore, `GetOffline` and the initial read in `UpdateOffline` retry DataStore failures until they succeed or the server shuts down. The delay between attempts grows to 20 seconds. Give support tools their own waiting limit; that limit does not cancel the underlying call, so do not start a second write while the first is still running. Failures log `PROFILE_STORE_ERROR`, with repeated logs folded; `DataStoreErrors` counts every failed attempt.
+
+    Version reads behave differently. `GetVersion` returns `nil` for both a missing version and a failed read, and `RestoreVersion` can report `version not found` in either case. `ListVersions` can return a partial list. These store errors do not reach Scribe's logs or service health, though ProfileStore may print a warning. Retry later or check the key's version history in Creator Hub before treating a result as missing.
+
+    `OFFLINE_READ_FAIL`, `VERSION_READ_FAIL` and `VERSION_QUERY_FAIL` cover errors that escape the store call, such as an invalid key; they do not reliably identify a backend read failure.
 
     If the player is Ready on this server, `GetOffline` copies their current data. If they are playing on another server, it reads their last saved data. `Export` follows the same rule.
 
@@ -95,7 +99,7 @@ For a support ticket: have the player leave, make the change, then let them rejo
 ??? note "How an offline write avoids a racing join"
     For `UpdateOffline` and `RestoreVersion`, the lock check and write happen in one conditional store operation (a compare-and-set). A new session cannot slip between the check and the write.
 
-    All three write operations treat a session whose last write is older than the store's 630-second dead-session threshold as dead. That lets an operation proceed after the owning server crashes. The default autosave interval is 300 seconds, so the threshold exceeds two missed autosaves.
+    All three write operations treat a session whose last write is over 630 seconds old as dead, allowing work to continue after its server crashes. Successful saves renew that stamp. The autosave interval is capped at 300 seconds to leave room for another attempt after one fails, but prolonged DataStore delays or failures can still exceed the threshold.
 
 ??? note "How `Erase` keeps a join out while it runs"
     Removing leaderboard history can take minutes. Because DataStore deletion cannot be conditional, Scribe coordinates the sweep with a saved marker:

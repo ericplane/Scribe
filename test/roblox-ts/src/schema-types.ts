@@ -97,6 +97,8 @@ type LargeTemplate = { [K in Keys]: { Value: number; Label: string } };
 export type PathAndLargeAssertions = [
     Assert<Equal<Scribe.NumericPaths<PathsTemplate>, "Coins" | "Stats.Wins" | "Secret" | "Derived" | "Timer">>,
     Assert<Equal<Scribe.NumericPaths<PathsTemplate, true>, "Coins" | "Stats.Wins" | "Secret" | "Derived" | "Timer" | "Wealth">>,
+    Assert<Equal<Scribe.PurchaseSpec<PathsTemplate>["Cost"]["Path"], Scribe.NumericPaths<PathsTemplate, true>>>,
+    Assert<Equal<Scribe.PurchaseSpec<PathsTemplate>["Cost"]["Amount"], Scribe.BigValue | number | string>>,
     Assert<Equal<Scribe.NumericPaths<LargeTemplate>, `${Keys}.Value`>>,
     Assert<Equal<GetValue<Scribe.PlayerData<LargeTemplate>["K49"]["Value"]>, number>>,
     Assert<Equal<IsAny<GetValue<Scribe.PlayerData<LargeTemplate>>>, false>>,

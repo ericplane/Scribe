@@ -25,6 +25,11 @@ The prefix must match your existing keys **exactly**, because it is concatenated
 
 Your template's field names must match the keys already in the stored data, or a migration must bridge the difference. So before you point a live game at it, do a dry run.
 
+!!! danger "Never point Scribe at keys holding raw DataStore data"
+    Reusing keys only works for ProfileStore or ProfileService profiles. If a key contains an ordinary table saved with `SetAsync`, the first live load replaces it with template defaults and logs `PROFILE_OVERWRITTEN`. That happens **before** `ImportLegacyData`, so the hook cannot recover the original by reading the same key.
+
+    A `NoSave` dry run does not catch this: it shows template defaults without an overwrite warning. For other formats, choose a different store name or key prefix for Scribe and use [`ImportLegacyData`](#coming-from-anything-else-import-on-first-load) to read the old keys. Recover any overwritten data from the key's version history.
+
 ## The dry run
 
 `Mode = "NoSave"` loads a real profile as a snapshot and never writes it. No session is held, no save path runs, and leaderboard writes go to a mock store. Add `TargetUserId` to pin one specific player.
