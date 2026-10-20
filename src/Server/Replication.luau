@@ -122,7 +122,7 @@ function Replication.new(ctx: any)
 	end
 
 	function self.PushOp(entry: any, op: Wire.Op, schema: Template.SchemaNode?)
-		local visibility = if schema then schema.Visibility else Template.VisibilityOf(compiled, op.Path)
+		local visibility = Template.OpVisibility(compiled, op, schema)
 		if visibility == "ServerOnly" then
 			return
 		end
@@ -728,7 +728,7 @@ function Replication.new(ctx: any)
 	local storeOpsQueued = 0
 
 	function self.PushStoreOp(op: Wire.Op, schema: Template.SchemaNode?)
-		local visibility = if schema then schema.Visibility else Template.VisibilityOf(compiled, op.Path)
+		local visibility = Template.OpVisibility(compiled, op, schema)
 		if visibility == "ServerOnly" then
 			return
 		end

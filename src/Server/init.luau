@@ -1127,7 +1127,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 
 		`reason` is a [Scribe.PurchaseReason] sentence. `InsufficientFunds`, `DataNotLoaded`
 		and the two paid-random members can be shown to the player; the four `Cost`
-		refusals mean the call is wrong, and belong in a log.
+		refusals and `InvalidIdempotencyKey` mean the call is wrong, and belong in a log.
 	]=]
 	-- Debits, grants, and logs atomically; failures roll back the purchase.
 	function Data.Purchase(player: Player, spec: any)

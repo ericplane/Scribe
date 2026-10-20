@@ -8,8 +8,8 @@ local RunService = game:GetService("RunService")
 export type Stats = { [string]: string }
 export type Handle = { Stop: (self: Handle) -> () }
 export type DataAPI = {
-	WaitForData: (player: Player, timeout: number?) -> (any?, string?),
-	SessionEnded: { Connect: (self: any, callback: (player: Player, reason: string) -> ()) -> any },
+	read WaitForData: (player: Player, timeout: number?) -> (any?, string?),
+	read SessionEnded: { read Connect: (self: any, callback: (player: Player, reason: string) -> ()) -> any },
 }
 --- Test dependencies; normal game code omits this argument.
 export type Dependencies = {
@@ -36,6 +36,9 @@ local function scalarClass(value: any): string?
 	return (classes :: any)[type(value)]
 end
 
+--[[
+Mirrors selected Scribe fields into public leaderstats on the server.
+]]
 function ScribeLeaderstats.Start(data: DataAPI, stats: Stats, dependencies: Dependencies?): Handle
 	local deps: Dependencies = dependencies or {}
 	local isServer = deps.IsServer or function()

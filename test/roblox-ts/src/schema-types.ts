@@ -10,6 +10,7 @@ const schemaTemplate = {
     Title: Scribe.Enum("Guest", ["Guest", "Member"]),
     Note: Scribe.Optional(Scribe.String("")),
     Timed: Scribe.Timed(false),
+    Effects: { Shield: Scribe.Timed(false) },
     Wealth: Scribe.Big("1e100"),
     Flags: Scribe.Flags(["Move", "Combat"]),
     Unlocks: Scribe.SetOf(Scribe.Enum("Red", ["Red", "Blue"])),
@@ -48,6 +49,10 @@ export type SchemaAssertions = [
     Assert<Equal<GetValue<Data["Note"]>, string | undefined>>,
     Assert<Equal<GetValue<Data["Timed"]>, boolean>>,
     Assert<Equal<ReturnType<Client["Timed"]["Active"]>, LuaTuple<[boolean, number | undefined]>>>,
+    Assert<Equal<"SetTimed" | "ExtendTimed" extends keyof Data["Timed"] ? true : false, true>>,
+    Assert<Equal<"SetTimed" | "ExtendTimed" extends keyof Data["Effects"]["Shield"] ? true : false, true>>,
+    Assert<Equal<Extract<"SetTimed" | "ExtendTimed", keyof Client["Timed"]>, never>>,
+    Assert<Equal<Extract<"SetTimed" | "ExtendTimed", keyof Client["Effects"]["Shield"]>, never>>,
     Assert<Equal<GetValue<Data["Wealth"]>, Scribe.BigValue>>,
     Assert<Equal<GetValue<Data["Flags"]>, ReadonlyArray<"Move" | "Combat">>>,
     Assert<Equal<GetValue<Data["Unlocks"]>, ReadonlyArray<"Red" | "Blue">>>,
@@ -152,12 +157,16 @@ export function checkSchema(data: Data, client: Client): void {
     const index: number | undefined = data.Unlocks.Find("Blue");
     print(index);
     data.Timed.SetTimed(true, 60);
+    data.Timed.ExtendTimed(30);
+    data.Effects.Shield.SetTimed(true, 30, false);
+    data.Effects.Shield.ExtendTimed(10);
     const [active, remaining] = data.Timed.Active();
     print(active, remaining);
     const [clientActive, clientRemaining] = client.Timed.Active();
     const clientActiveCheck: boolean = clientActive;
     const clientRemainingCheck: number | undefined = clientRemaining;
-    print(clientActiveCheck, clientRemainingCheck);
+    const [shieldActive] = client.Effects.Shield.Active();
+    print(clientActiveCheck, clientRemainingCheck, shieldActive);
     // @ts-expect-error Active returns a boolean, not a numeric flag.
     const invalidActive: number = clientActive;
     // @ts-expect-error Remaining time is numeric or absent.
@@ -264,6 +273,12 @@ export function checkSchema(data: Data, client: Client): void {
     client.Players.Child(1).Hidden.Get();
     // @ts-expect-error Server-only fields nested in shared roots are removed.
     client.Public.Hidden.Get();
+    // @ts-expect-error Only the server sets a timer; the client's SetTimed raises.
+    client.Timed.SetTimed(true, 30);
+    // @ts-expect-error ExtendTimed is server-only as well.
+    client.Timed.ExtendTimed(30);
+    // @ts-expect-error Timed fields nested in client records omit the server-only writers too.
+    client.Effects.Shield.SetTimed(true, 30);
     // @ts-expect-error Roblox datatypes are atomic values, not accessor subtrees.
     data.Position.X.Get();
     // @ts-expect-error Buffers are atomic values, not nominal-type accessor subtrees.

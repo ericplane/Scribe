@@ -82,4 +82,14 @@ return function(player: Player)
 	data.Coins.Increment(1, true)
 	-- named: insert
 	data.Names.Insert("Alice", 1, true)
+	-- named: server-cooldown
+	bundle.Server.OnCooldown(player, "Daily", 60)
+	-- named: server-restore
+	bundle.Server.RestoreVersion(1, "v1")
+	-- named: server-gift
+	bundle.Server.PromptGift(player, "Coins", 1)
+	-- named: client-request
+	bundle.Client.Request("Ping", 1)
+	-- named: client-shared
+	bundle.Client.GetShared(player)
 end

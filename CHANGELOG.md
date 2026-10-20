@@ -1,5 +1,91 @@
 # Changelog
 
+## 2.6.1
+
+Released 2026-10-20.
+
+Server-only array fixes, typing improvements for large templates, named API parameters,
+and typed UI adapters.
+
+### Behaviour changes
+
+- The Luau bundle's `Server` and `Client` fields and named `Data` API members are now
+  read-only types. Accessor writes still work. Use `Scribe.Bundle<T>` or `read` fields for
+  hand-written API types, and build a new table instead of replacing a bundle half.
+  Recopy the leaderstats add-on if yours is from 2.6.0 or earlier. The typed API requires
+  the new Luau solver; roblox-ts bundle fields were already read-only.
+
+- Client types no longer expose `SetTimed` or `ExtendTimed`, which raise on the client.
+  Luau client `ServerStore` types also omit mutators. Ordinary client writes stay local,
+  and `Data.Mock` can still seed store roots in edit mode. Use `Scribe.ClientData<T>` for
+  client helpers and `Scribe.ReadableNode<T>` for fields read from either realm.
+  The roblox-ts `Accessor` type gains a sixth parameter, `Client`.
+
+- `Increment` and `Decrement` types now check their second argument as a replication flag or
+  economy tags. Annotate tags built outside the call as `Scribe.EconomyMeta`; for frozen
+  constants, use `table.freeze({ Flow = "Sink" } :: Scribe.EconomyMeta)`. Unknown replication
+  flags, such as attribute values, need a boolean check such as `== true`.
+
+### Added
+
+- Added Luau `Scribe.ReadableNode<T>` for helpers that read or observe a field. Also
+  exported `Path`, `PathSegment`, `OpKind`, `SessionState`, `Visibility`, `BigScore`,
+  `Disconnect`, `LogFilter`, `Percentiles`, `AddonAction` and `AddonActions`.
+
+- Server and client API functions now show parameter names in signature help, such as
+  `OnCooldown(player, key, seconds, options)`.
+
+- Added `Scribe.PurchaseReason.InvalidIdempotencyKey` for the existing purchase refusal.
+
+### Fixed
+
+- Arrays with `ServerOnly` elements no longer leak values through `Insert` or indices
+  through `Remove` after the initial snapshot. This covers player data, `Shared` watchers
+  and `ServerStore`, including `Scribe.Optional(Scribe.ServerOnly(x))` and nested arrays.
+
+- Luau client types now use `never` for `ArrayOf`, `DictOf`, `MapOf` and `SetOf` elements
+  wrapped in `ServerOnly`, rejecting client writes of element values.
+
+- `Increment` and `Decrement` types now catch invalid economy tag values, such as
+  `Flow = "Sourse"`. Extra or misspelled tag keys can still pass.
+
+- `Scribe.Derived` now infers its value type from the output declarator. An unannotated
+  compute function no longer makes the field `any`.
+
+- Nested `ServerOnly`, `Timed` and `Optional` types now preserve value types and client
+  visibility. Collection reads, writes and events no longer expose internal marker types,
+  and unwrapping elements preserves set and map types.
+
+- Optional number types now expose bounds and arithmetic methods, and optional booleans
+  expose `Toggle`. Set types also expose `Find`. Arithmetic and `Toggle` still raise while
+  the value is nil.
+
+- Luau purchase specs now include `IdempotencyKey` and `PaidRandom`, and product configs
+  include `PaidRandom`. Luau and roblox-ts purchase reasons now include the existing
+  `"invalid IdempotencyKey"` response.
+
+### Changed
+
+- Read-only bundle and API members reduce type-checking work for large templates without
+  changing runtime behaviour. Constructor calls that still exceed the solver's complexity
+  limit can use the wrapper in the template guide.
+
+- Luau UI adapters now infer the accessor's value type: Vide returns `Source<T>`, React
+  returns `T`, and its binding hook returns `Binding<T>`. Fusion values still need your
+  framework's type annotation. Nullable or `any` Vide sources need a getter cast such as
+  `(score :: () -> number?)()`. Recopy the adapters to pick up these type improvements;
+  their runtime behaviour is unchanged.
+
+### Documentation
+
+- Added short hover descriptions to supported Luau APIs and roblox-ts methods without
+  changing their types. Generated Luau accessor descriptions remain limited by tooling.
+
+- Updated template and addon guides with read-only API annotations, client helper types,
+  and typed UI examples. Clarified Fusion and Vide typing limitations.
+
+- Added the missing idempotency refusal to the monetization reference and API docs.
+
 ## 2.6.0
 
 Released 2026-10-14.

@@ -4,7 +4,7 @@
 -- exactly EXPECTED_ERRORS diagnostics: if a change silently loosens the
 -- template-aware config types, this file starts passing and the gate fails.
 --
--- EXPECTED_ERRORS: 39
+-- EXPECTED_ERRORS: 43
 
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -148,6 +148,30 @@ local function serverOnlyOnClient(player: Player)
 	return flagged, onServer, hidden
 end
 
+-- Separate template keeps type complexity down.
+local hiddenElementTemplate = {
+	Audit = Scribe.ArrayOf(Scribe.ServerOnly(Scribe.Int(0))),
+	MaybeAudit = Scribe.ArrayOf(Scribe.Optional(Scribe.ServerOnly(Scribe.Int(0)))),
+	Notes = Scribe.DictOf(Scribe.ServerOnly(Scribe.String(""))),
+	Profile = { Flag = Scribe.Optional(Scribe.ServerOnly(Scribe.Int(0))), Level = Scribe.Int(0) },
+}
+
+local hiddenElementBundle =
+	Scribe({ Template = hiddenElementTemplate, ProfileStoreIndex = "H", ProfileKeyPrefix = "H_", Banner = false })
+
+local function serverOnlyElementsOnClient(player: Player)
+	local Client = hiddenElementBundle.Client
+	-- 28) Hidden elements type as never on clients.
+	Client.Audit.Insert(5) -- TypeError: the element is never
+	Client.MaybeAudit.Insert(5) -- TypeError: Optional(ServerOnly) is ServerOnly too
+	Client.Notes.Child("k").Set("x") -- TypeError: the element is never
+	-- 29) Optional(ServerOnly) fields are also hidden on clients.
+	local flag = Client.Profile.Flag.Get() -- TypeError: Flag is not on the client
+	-- Server access must stay clean.
+	local onServer: { number } = hiddenElementBundle.Server[player].Audit.Get()
+	return flag, onServer
+end
+
 -- Scribe.Big and Scribe.MapOf get their own small template: the one above is
 -- already close to the new solver's complexity budget.
 local bigTemplate = {
@@ -233,6 +257,7 @@ return {
 	badContainers,
 	badLifecycleReason,
 	serverOnlyOnClient,
+	serverOnlyElementsOnClient,
 	bigBoards,
 	bigCost,
 	badMapContainer,

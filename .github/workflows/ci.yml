@@ -178,7 +178,9 @@ jobs:
             test/TypeCheckSignatureB.luau \
             test/TypeCheckInterop.luau \
             test/TypeCheckServerStore.luau \
-            test/TypeCheckNamedParameters.luau
+            test/TypeCheckNamedParameters.luau \
+            test/TypeCheckAddons.luau \
+            test/TypeCheckPrecision.luau
       - name: Check named Luau signatures and callback completions
         run: node scripts/check-luau-completions.mjs
       # Negative gate: each fixture of deliberate type errors must report EXACTLY
@@ -187,7 +189,7 @@ jobs:
       # regression the positive fixture cannot.
       - name: Type-check (negative fixture must report the expected count)
         run: |
-          for fixture in test/TypeCheckErrors.luau test/TypeCheckInteropErrors.luau test/TypeCheckServerStoreErrors.luau; do
+          for fixture in test/TypeCheckErrors.luau test/TypeCheckInteropErrors.luau test/TypeCheckServerStoreErrors.luau test/TypeCheckAddonsErrors.luau test/TypeCheckPrecisionErrors.luau; do
             # grep exits 1 on no match; keep the diagnostic useful under pipefail.
             expected="$(grep -oE 'EXPECTED_ERRORS: [0-9]+' "$fixture" | grep -oE '[0-9]+' || true)"
             if [ -z "$expected" ]; then

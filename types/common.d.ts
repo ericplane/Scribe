@@ -11,22 +11,32 @@ export interface Op { Kind: OpKind; Path: Path; Value?: unknown; Index?: number;
 export interface ScribeTransport {
     readonly Name: string;
     readonly MaxFrameBytes?: number;
+    /** Sends an encoded frame to one client. */
     SendToClient(player: Player, bytes: buffer): void;
+    /** Sends an encoded frame to every client. */
     SendToAllClients?(bytes: buffer): void;
+    /** Registers the server callback for incoming client frames. */
     ListenServer(callback: (this: void, player: Player, bytes: buffer) => void): void;
+    /** Sends an encoded frame to the server. */
     SendToServer(bytes: buffer): void;
+    /** Registers the client callback for incoming server frames. */
     ListenClient(callback: (this: void, bytes: buffer) => void): void;
+    /** Disconnects the client listener when Client.Stop runs. */
     Release?(): void;
 }
 
 export interface Connection {
     readonly Connected: boolean;
+    /** Stops this connection from receiving events. */
     Disconnect(): void;
 }
 /** Read-only event surface. Scribe owns firing and destroying these signals. */
 export interface Signal<Args extends unknown[]> {
+    /** Runs the callback on each event until disconnected. */
     Connect(callback: (this: void, ...args: Args) => void): Connection;
+    /** Runs the callback on the next event only. */
     Once(callback: (this: void, ...args: Args) => void): Connection;
+    /** Yields until the next event and returns its arguments. */
     Wait(): LuaTuple<Args>;
 }
 
@@ -235,7 +245,7 @@ declare const requestFailedBrand: unique symbol;
 export interface RequestFailedMarker { readonly [requestFailedBrand]: true; }
 export type RequestFailure = LuaTuple<[false, RequestReason, RequestFailedMarker]>;
 export type ProductState = "purchasable" | "owned" | "paid-random-restricted" | "policy-pending" | "not-loaded";
-export type PurchaseReason = "player data not loaded" | "invalid Cost spec" | "invalid Cost amount" | "invalid cost path" | "cost path is not a spendable number" | "insufficient funds" | "paid random items are not available for this account" | "cannot check account settings right now; try again in a moment";
+export type PurchaseReason = "player data not loaded" | "invalid Cost spec" | "invalid Cost amount" | "invalid cost path" | "cost path is not a spendable number" | "insufficient funds" | "paid random items are not available for this account" | "cannot check account settings right now; try again in a moment" | "invalid IdempotencyKey";
 export type GiftReason = "buyer data not loaded" | "invalid recipient" | "cannot gift yourself" | "gift cooldown" | "product retired" | "too many pending gifts" | "data services are experiencing issues; try again later" | "recipient already owns this" | "could not reserve gift credit; try again later" | "could not deliver gift; try again later" | "gift delivery could not be confirmed; do not send it again" | "a gift of this item is already pending; try again shortly" | "could not record gift intent; try again later" | "paid random items are not available for this account" | "cannot check account settings right now; try again in a moment";
 export type OperationResult = LuaTuple<[boolean, string | undefined]>;
 
@@ -251,6 +261,7 @@ export interface UpdateOfflineOptions { Validate?: boolean; }
 export interface RestoreOptions { RollBackReserved?: boolean; }
 export interface CooldownOptions { IncludeOfflineTime?: boolean; }
 export interface MigrationContext {
+    /** Waits for request allowance; call the returned release after issuing requests. */
     readonly AwaitBudget: (this: void, requestType: string, count?: number, timeout?: number) => LuaTuple<[boolean, Disconnect]>;
 }
 
@@ -330,10 +341,15 @@ export type ExchangeLeg =
 export interface OpenLeg { Path: Path; Kind: "Key" | "Qty" | "Stack"; Key?: unknown; Amount?: number; }
 export interface OpenExchange { Id: string; State: "Claimed" | "Staked" | "Delivering"; Partner?: number; Staked: OpenLeg[]; Owed: OpenLeg[]; Since?: number; }
 export interface ExchangeAPI {
+    /** Trades baskets between loaded players; a verdict can precede delivery. */
     readonly Attempt: (this: void, playerA: Player, basketA: ReadonlyArray<ExchangeLeg>, playerB: Player, basketB: ReadonlyArray<ExchangeLeg>) => LuaTuple<["Committed" | "Aborted" | undefined, string | undefined]>;
+    /** Lists the player's unfinished exchanges and held value. */
     readonly Open: (this: void, player: Player) => OpenExchange[];
+    /** Drops an unstaked claim only when no verdict exists. */
     readonly Discard: (this: void, exchangeId: string) => OperationResult;
+    /** Settles a stalled exchange; an existing verdict wins. */
     readonly Settle: (this: void, exchangeId: string, verdict: "Commit" | "Abort") => OperationResult;
+    /** Moves a parked delivery to another key in the same container. */
     readonly Redirect: (this: void, exchangeId: string, userId: number, newKey: string) => OperationResult;
 }
 
@@ -342,7 +358,11 @@ export interface MetricObservation { Count: number; Average: number; Max: number
 export type Metrics = { [name: string]: number | MetricObservation };
 export interface Percentiles { P50: number; P90: number; P99: number; Samples: number; Age: number; Window: number; }
 export type PercentileSnapshot = { [name: string]: Percentiles };
-export interface AddonAction { Run: (this: void, args: unknown) => unknown; Writes?: boolean; }
+export interface AddonAction {
+    /** Runs the action with arguments from the Studio plugin. */
+    Run: (this: void, args: unknown) => unknown;
+    Writes?: boolean;
+}
 export type AddonActions = { [name: string]: AddonAction };
 export interface ConfigureOptions { AutoSaveInterval?: number; }
 export interface StatusThresholds { FailWindow?: number; FailCount?: number; RecoverStreak?: number; }

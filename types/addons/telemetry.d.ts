@@ -132,10 +132,15 @@ declare namespace ScribeTelemetry {
 		Leaderboards: LeaderboardStats;
 	}
 	interface Handle<Destination extends string = string> {
+		/** Queues a test message; returns false and a reason if refused. */
 		Test(destination: Destination): LuaTuple<[boolean, string | undefined]>;
+		/** Queues sample embeds without mentions or real incidents; defaults to all previews. */
 		Preview(destination: Destination, kind?: PreviewKind): LuaTuple<[boolean, string | undefined]>;
+		/** Waits up to five seconds by default; returns whether the queues drained. */
 		Flush(timeout?: number): boolean;
+		/** Returns reporting, delivery and queue statistics. */
 		GetStats(): Stats<Destination>;
+		/** Stops reporting and discards queued reports; safe to repeat. */
 		Stop(): void;
 	}
 	type ScribeModule = Pick<typeof Scribe,
@@ -143,7 +148,7 @@ declare namespace ScribeTelemetry {
 	> & { readonly OnStatusChanged: Pick<typeof Scribe.OnStatusChanged, "Connect"> }
 	& Partial<Pick<typeof Scribe, "Version" | "GetBudgetSnapshot" | "GetLeaderboardSnapshot" | "GetProfileKeyPrefix" | "RegisterAddon">>;
 
-	/** One handle may run per Scribe module. Stop the previous handle before starting another. */
+	/** Starts webhook reporting; stop any existing handle for this Scribe module first. */
 	function Start<Destination extends string>(scribe: ScribeModule, options: Options<Destination>): Handle<Destination>;
 }
 

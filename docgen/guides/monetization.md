@@ -472,7 +472,7 @@ The claim is persisted, so it survives a rejoin, and it is taken inside the tran
 
 ### Reading the refusal
 
-`Purchase` returns `(false, reason)` for eight fixed refusals, and Scribe exports them as a frozen table so you can branch on them without pasting strings. Four are for the player; the other four say the call itself is wrong, and belong in a log rather than a toast:
+`Purchase` returns `(false, reason)` when refused. Its nine fixed reasons are in `Scribe.PurchaseReason`, so you can branch without copying strings. Four describe the player's situation; the other five mean the call is wrong and belong in a log:
 
 | `Scribe.PurchaseReason` member | The string | For |
 | --- | --- | --- |
@@ -484,6 +484,7 @@ The claim is persisted, so it survives a rejoin, and it is taken inside the tran
 | `InsufficientFunds` | `"insufficient funds"` | the player |
 | `PaidRandomRestricted` | `"paid random items are not available for this account"` | the player |
 | `PolicyPending` | `"cannot check account settings right now; try again in a moment"` | the player |
+| `InvalidIdempotencyKey` | `"invalid IdempotencyKey"` | the developer |
 
 ```lua
 local ok, reason = Data.Purchase(player, spec)
@@ -496,7 +497,7 @@ if not ok then
 end
 ```
 
-Anything outside that table can be your `Grant`'s own error text. Log it for investigation and show a general failure message. The four `Cost` refusals describe mistakes in the purchase definition; the other four describe a player's current ability to buy. Map those to suitable UI text rather than displaying every returned string directly.
+Show suitable UI text for the four player reasons; log the rest. Anything outside the table can be your `Grant`'s error text, so log it and show a general failure message.
 
 ## Purchase history
 

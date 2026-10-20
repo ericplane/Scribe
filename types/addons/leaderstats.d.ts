@@ -3,6 +3,7 @@ import type Scribe from "@rbxts/scribe";
 /** Optional server-side bridge to Roblox's built-in player list. */
 declare namespace ScribeLeaderstats {
 	interface DataAPI {
+		/** Waits for player data; returns undefined and a reason if unavailable. */
 		readonly WaitForData: (this: void, player: Player, timeout?: number) => LuaTuple<[
 			{ readonly Get: (this: void) => unknown } | undefined,
 			string | undefined,
@@ -35,7 +36,7 @@ declare namespace ScribeLeaderstats {
 		IsServer?: (this: void) => boolean;
 		Warn?: (this: void, message: string) => void;
 	}
-	/** Every selected stat is public to every client, including ServerOnly/Session paths. */
+	/** Mirrors selected fields into leaderstats; all are public, including ServerOnly/Session paths. */
 	function Start<Data extends DataAPI>(data: Data, stats: Stats<NoInfer<Data>>, dependencies?: Dependencies): Handle;
 }
 

@@ -600,12 +600,16 @@ codecs.PhysicalProperties = {
 
 --------------------------------------------------------------------------------
 
+--[[
+Returns whether Scribe has a codec for this datatype.
+]]
 function Datatypes.IsSupported(name: string): boolean
 	return codecs[name] ~= nil
 end
 
---- The Precision values `name` accepts, sorted, or nil when it accepts none.
---- The template compiler reads this to refuse a bad declaration at startup.
+--[[
+Returns the supported precision options, or nil when none exist.
+]]
 function Datatypes.PrecisionValues(name: string): { string }?
 	local codec = codecs[name]
 	local accepted = codec and codec.Precisions
@@ -620,10 +624,9 @@ function Datatypes.PrecisionValues(name: string): { string }?
 	return out
 end
 
---- Packs `value` as `name`. `precision` is optional; omitted, every datatype packs its
---- default form. Validated here rather than inside each codec so a codec with no
---- Precision option gets the refusal for free, and so a typo is reported instead of
---- quietly yielding the default form.
+--[[
+Encodes a supported Roblox datatype into a buffer.
+]]
 function Datatypes.Pack(name: string, value: any, precision: (string | number)?): buffer
 	local codec = codecs[name]
 	if not codec then
@@ -642,6 +645,9 @@ function Datatypes.Pack(name: string, value: any, precision: (string | number)?)
 	return codec.Pack(value, precision)
 end
 
+--[[
+Decodes a packed buffer into its Roblox datatype.
+]]
 function Datatypes.Unpack(name: string, b: buffer): any
 	local codec = codecs[name]
 	if not codec then

@@ -178,21 +178,22 @@ A numeric `Precision` is a **fixed-point step**. The field travels as the index 
 !!! warning "Narrowing is a wire change"
     `Precision` is folded into the schema hash and the wire protocol version, so a client and a server that disagree about it refuse the handshake rather than mis-decoding. Adding or changing `Precision` needs both realms deployed together, like any other template change.
 
-## Names Scribe will not let you use
+<a id="names-scribe-will-not-let-you-use"></a>
 
-Two sets of names are off limits, and both are reported at startup rather than discovered later.
+## Names to avoid
 
-**Method names.** A field called `Count`, `Get`, `Set`, `Insert`, or any other accessor method name is shadowed by the method and unreachable through the typed API, at any depth. Scribe logs `API_NAME_COLLISION` naming the field.
+These names hide ordinary field access. Choose another name, or use `Child`:
 
-**Root fields that collide with a client API name.** On the client you read a root field as `Data.Coins`, so a root named after a client method or property becomes unreachable by that name. Examples include `Owns`, `Request`, `Mock`, `Raw`, `IsReady`, and `Stop`; check the [client API](/api/Client) when choosing a name. This rule applies to root fields, since nested fields are reached through their parent. Accessor method names remain reserved at every depth.
+- **Accessor methods**, such as `Get`, `Set`, `Count` or `Insert`, hide a field of the same name at any depth. Use `data.Record.Child("Get")` to reach it. Scribe logs `API_NAME_COLLISION` when `DevMode` is enabled (the default in Studio).
+- **Client API names**, such as `Owns`, `Request`, `Raw` or `Stop`, hide a root field on the client. Use `Data.Child("Owns")` to reach it, or choose another name. See the [client API](/api/Client) for the full list.
 
-The `_Scribe` root is reserved outright, along with any root name beginning with it, and the template refuses to compile if you declare one.
+Root names beginning with `_Scribe` or `@cd` are reserved for Scribe. Declaring one prevents the template from compiling.
 
 ## Naming the accessor type
 
 This section is for adding type annotations to your own modules. Ordinary reads and writes do not need these annotations.
 
-Scribe calls the object returned by `WaitForData` an **accessor tree**: each field provides methods such as `Get` and `Set`. Its type is `Scribe.PlayerData<T>`, also returned by `Data.Get(player)` on the server and `Data.Get()` on the client:
+Scribe calls the object returned by `WaitForData` an **accessor tree**: each field provides methods such as `Get` and `Set`. On the server its type is `Scribe.PlayerData<T>`, which `Data.Get(player)` also returns:
 
 ```lua
 export type Template = typeof(template) -- from the module that calls Scribe()
@@ -204,13 +205,21 @@ local function newSession(player: Player, data: EmberfallData)
 end
 ```
 
-Use `Scribe.ServerData<T>` and `Scribe.ClientData<T>` when you need to name the whole `Data` object rather than one player's tree.
+On the client, `Data` is the accessor tree; its type is `Scribe.ClientData<T>`. `Data.Get()` returns plain values. Client types omit `Scribe.ServerOnly` fields and the timer methods `SetTimed` and `ExtendTimed`, so use the client type rather than `Scribe.PlayerData<T>`.
+
+Use `Scribe.ServerData<T>` to name the whole server `Data` object rather than one player's tree.
+
+For a helper that only reads or observes one field, use `Scribe.ReadableNode<T>`. It provides `Get`, `Observe` and `Changed` with the field's value type, on either side.
+
+Luau treats `bundle.Server`, `bundle.Client` and named `Data` API members as read-only. Change values through accessors as usual.
+
+For test doubles, create a new table: `{ Server = fake, Client = bundle.Client }`. Use `Scribe.Bundle<T>` for its type, or declare `read` fields in your own type.
 
 If you use `ServerStore`, add its template as the second type parameter to keep its autocomplete: `Scribe.ServerData<T, S>` or `Scribe.ClientData<T, S>`. See [Types and autocomplete](./server-store#types-and-autocomplete) for an example.
 
 ### If Luau says the code is too complex
 
-On a large template the `Scribe({ ... })` call can report "Code is too complex to typecheck", and Luau then silently stops checking the whole file. The accessor trees are not the cost. What the solver cannot afford is instantiating both halves of the bundle inside one call, so name the options, cast the call, and annotate the half you use:
+If a large template reports "Code is too complex to typecheck" at `Scribe({ ... })`, separate the checked options from the constructor call and annotate the side you use:
 
 ```lua
 local options: Scribe.ScribeOptions<typeof(template)> = {
@@ -221,7 +230,7 @@ local options: Scribe.ScribeOptions<typeof(template)> = {
 local Data = (Scribe :: any)(options).Server :: Scribe.ServerData<typeof(template)>
 ```
 
-The options literal is still checked against your template, `Data` is the same type the bundle would have given you, and every diagnostic inside is unchanged. Measured with the analyzer CI runs, a template of distinct five-field records checks to 32 roots through the plain call and past 256 this way; one of `DictOf` containers moves from 16 to past 256.
+The options literal is still checked against your template, and `Data` keeps the same type. This avoids inferring both halves in the constructor call. The limit still depends on your template's shape and Luau version.
 
 ## Where to next
 

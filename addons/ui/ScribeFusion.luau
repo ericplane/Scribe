@@ -2,18 +2,38 @@
 -- Fusion adapter. Copy into your game; not part of the Scribe package.
 --   local useScribe = require(path.to.ScribeFusion)(Fusion, scope)  -- 0.3
 --   local useScribe = require(path.to.ScribeFusion)(Fusion)         -- 0.2
---   local coins, disconnect = useScribe(Data.Coins)
--- With a scope the disconnect is also registered in it, so doCleanup(scope) runs it.
+--   local coins: Fusion.Value<number>, disconnect = useScribe(Data.Coins)
+-- Annotate the value with your Fusion version's type.
 
 export type Disconnect = () -> ()
 
---- `scope` selects the calling convention: pass it on 0.3, omit it on 0.2.
-return function(Fusion: any, scope: any?)
-	--- A Value tracking one accessor. The disconnect is returned either way; with a
-	--- scope it is registered there too, and a second call is a no-op.
-	return function(accessor: any): (any, Disconnect)
+export type Readable<T> = {
+	--[[
+	Returns the current value.
+	]]
+	read Get: () -> T,
+	--[[
+	Runs now and on each change; returns a disconnect function.
+	]]
+	read Observe: (callback: (value: T) -> ()) -> Disconnect,
+}
+
+export type Fusion = {
+	read Value: (...any) -> any,
+}
+
+export type Adapter = <T>(accessor: Readable<T>) -> (any, Disconnect)
+
+--[[
+Creates a Fusion adapter; pass a scope for Fusion 0.3.
+]]
+return function(Fusion: Fusion, scope: { any }?): Adapter
+	--[[
+	Tracks an accessor and registers cleanup with the supplied scope.
+	]]
+	return function<T>(accessor: Readable<T>): (any, Disconnect)
 		local value = if scope ~= nil then Fusion.Value(scope, accessor.Get()) else Fusion.Value(accessor.Get())
-		-- Observe, not Changed: it delivers the current value before returning.
+		-- Observe delivers the current value immediately.
 		local disconnect = accessor.Observe(function(new)
 			value:set(new)
 		end)

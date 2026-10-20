@@ -21,13 +21,30 @@ export type ScribeTransport = {
 	-- framing changes the arithmetic, such as base64 inflating by 4/3.
 	MaxFrameBytes: number?,
 	-- Server
+	--[[
+	Sends a frame to one client.
+	]]
 	SendToClient: (self: any, player: Player, bytes: buffer) -> (),
+	--[[
+	Sends a frame to every client, when supported.
+	]]
 	SendToAllClients: ((self: any, bytes: buffer) -> ())?,
+	--[[
+	Registers the server callback for incoming client frames.
+	]]
 	ListenServer: (self: any, callback: (player: Player, bytes: buffer) -> ()) -> (),
 	-- Client
+	--[[
+	Sends a frame to the server.
+	]]
 	SendToServer: (self: any, bytes: buffer) -> (),
+	--[[
+	Registers the client callback for incoming server frames.
+	]]
 	ListenClient: (self: any, callback: (bytes: buffer) -> ()) -> (),
-	-- Optional. Client.Stop calls it to disconnect what ListenClient connected.
+	--[[
+	Disconnects the client listener when Client.Stop runs.
+	]]
 	Release: ((self: any) -> ())?,
 }
 
@@ -304,6 +321,7 @@ export type PurchaseReason =
 	| "insufficient funds"
 	| "paid random items are not available for this account"
 	| "cannot check account settings right now; try again in a moment"
+	| "invalid IdempotencyKey"
 
 -- The fixed refusals of Data.PromptGift. Two more are interpolated (`unknown
 -- product "<name>"` and `purchase prompt failed: <err>`) and cannot be members.
@@ -344,8 +362,17 @@ export type Visibility = "Replicated" | "ServerOnly" | "Shared"
 export type BigScore = {
 	M: number,
 	E: number,
+	--[[
+	Formats the value with a compact suffix.
+	]]
 	Short: (self: any, decimals: number?) -> string,
+	--[[
+	Converts to a Luau number; large values may overflow.
+	]]
 	ToNumber: (self: any) -> number,
+	--[[
+	Returns the base-10 logarithm of a positive value.
+	]]
 	Log10: (self: any) -> number,
 }
 

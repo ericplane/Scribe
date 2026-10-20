@@ -638,6 +638,34 @@ local function serverOnlyWrappers(player: Player)
 	data.Shield.SetTimed(true, 30)
 	return members, wealth, flags, boosted, tags
 end
+
+-- Separate template keeps type complexity down; hidden elements type as never on clients.
+local hiddenElementTemplate = {
+	Audit = Scribe.ArrayOf(Scribe.ServerOnly(Scribe.Int(0))),
+	MaybeAudit = Scribe.ArrayOf(Scribe.Optional(Scribe.ServerOnly(Scribe.Int(0)))),
+	Notes = Scribe.DictOf(Scribe.ServerOnly(Scribe.String(""))),
+	Profile = { Flag = Scribe.Optional(Scribe.ServerOnly(Scribe.Int(0))), Level = Scribe.Int(0) },
+}
+
+local hiddenElementBundle = Scribe({
+	Template = hiddenElementTemplate,
+	ProfileStoreIndex = "H",
+	ProfileKeyPrefix = "H_",
+	Banner = false,
+})
+
+local function serverOnlyElements(player: Player)
+	local client = hiddenElementBundle.Client
+	local audit: { never } = client.Audit.Get()
+	local maybeAudit: { never } = client.MaybeAudit.Get()
+	local notes: { [string]: never } = client.Notes.Get()
+	local auditCount: number = client.Audit.Count()
+	local level: number = client.Profile.Level.Get()
+	local data = hiddenElementBundle.Server[player]
+	data.Notes.Child("k").Set("x")
+	local onServer: { number } = data.Audit.Get()
+	return audit, maybeAudit, notes, auditCount, level, onServer
+end
 local function clientUsage()
 	local ready: boolean = ClientData.IsReady()
 	if ClientData.WaitForData(10) then
@@ -945,6 +973,7 @@ return {
 	containerDeclarators = containerDeclarators,
 	narrowedFloats = narrowedFloats,
 	serverOnlyWrappers = serverOnlyWrappers,
+	serverOnlyElements = serverOnlyElements,
 	bigOperators = bigOperators,
 	signalSurface = signalSurface,
 	recoveryDiagnostics = recoveryDiagnostics,

@@ -38,6 +38,24 @@ disconnect in the same way. Its scoped 0.3 overload accepts your typed framework
 implementation and preserves its additional Value members; it does not require
 installing the 0.2 framework. Cleanup behavior is the same as in the Luau examples.
 
+## Types in Luau
+
+All three accept typed accessors in strict Luau. Vide and React preserve the field's type; Fusion needs an annotation:
+
+| Adapter | Result for `Data.Coins` |
+| --- | --- |
+| Vide | `Source<number>` and a `Disconnect` |
+| React | `number` from `useScribe`, `Binding<number>` from `useScribeBinding` |
+| Fusion | a Fusion `Value`, typed `any`, and a `Disconnect` |
+
+Each module exports `Readable<T>` and `Disconnect` for helpers. Annotate Fusion's result with the type from your installed version:
+
+```lua
+local coins: Fusion.Value<number>, disconnect = useScribe(Data.Coins)
+```
+
+Copy older adapters again to get the updated types.
+
 ## Vide
 
 ```lua
@@ -51,6 +69,15 @@ local function CoinLabel()
             return `{coins()} coins`
         end,
     })
+end
+```
+
+Vide sources have getter and setter overloads. For optional or `any`-typed values, Luau may find a call with no arguments ambiguous. Cast to a getter when reading one:
+
+```lua
+local score = useScribe(Data.Score) -- a Scribe.Optional field
+local text = function()
+    return `{(score :: () -> number?)() or 0} points`
 end
 ```
 
@@ -81,10 +108,10 @@ It is built on `useState`, `useEffect` and `useBinding`, the three hooks jsdotlu
 ## Fusion
 
 ```lua
-local useScribe = require(path.to.ScribeFusion)(Fusion, scope)  -- 0.3, which takes a scope
-local useScribe = require(path.to.ScribeFusion)(Fusion)         -- 0.2, which does not
+local useScribe = require(path.to.ScribeFusion)(Fusion, scope)  -- 0.3
+local useScribe = require(path.to.ScribeFusion)(Fusion)         -- 0.2
 
-local coins, disconnect = useScribe(Data.Coins)
+local coins: Fusion.Value<number>, disconnect = useScribe(Data.Coins)
 ```
 
 On 0.3 the disconnect is registered in the scope as well as returned, so `doCleanup(scope)` stops the Scribe listener with everything else, and calling the returned one early is safe. On 0.2 there is no scope, so call it yourself when the UI goes away.

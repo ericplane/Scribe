@@ -1,33 +1,74 @@
 --!strict
 -- React adapter. Copy into your game; not part of the Scribe package.
 --   local Scribe = require(path.to.ScribeReact)(React)
---   local coins = Scribe.useScribe(Data.Coins)          -- re-renders
---   local coins = Scribe.useScribeBinding(Data.Coins)   -- property only
---
--- useState + useEffect, not useSyncExternalStore: that is React 18 and jsdotlua
--- React 17.2.1 does not export it.
+--   local coins = Scribe.useScribe(Data.Coins)          -- number; re-renders
+--   local coins = Scribe.useScribeBinding(Data.Coins)   -- Binding<number>; property only
+-- Uses jsdotlua React 17.2.1 hooks.
 
-return function(React: any)
-	local Adapter = {}
+export type Disconnect = () -> ()
 
-	--- State tracking one accessor. Re-renders on every change.
-	function Adapter.useScribe(accessor: any): any
-		local value, setValue = React.useState(accessor.Get)
+export type Readable<T> = {
+	--[[
+	Returns the current value.
+	]]
+	read Get: () -> T,
+	--[[
+	Runs on future changes and returns a disconnect function.
+	]]
+	read Changed: (callback: (new: T, old: T) -> ()) -> Disconnect,
+}
+
+-- Matches react-lua's binding type.
+type CoreBinding<T> = {
+	--[[
+	Returns the current binding value.
+	]]
+	getValue: (self: CoreBinding<T>) -> T,
+	_source: string?,
+}
+type BindingMap = {
+	--[[
+	Creates a binding that transforms this binding's value.
+	]]
+	map: <T, U>(self: CoreBinding<T> & BindingMap, (T) -> U) -> BindingMap & CoreBinding<U>,
+}
+export type Binding<T> = CoreBinding<T> & BindingMap
+
+export type React = {
+	read useState: (initialState: any) -> (any, any),
+	read useEffect: (create: any, deps: any) -> (),
+	read useBinding: (initialValue: any) -> (any, any),
+}
+
+export type Adapter = {
+	--[[
+	Tracks an accessor and re-renders when it changes.
+	]]
+	useScribe: <T>(accessor: Readable<T>) -> T,
+	--[[
+	Updates a bound property without re-rendering.
+	]]
+	useScribeBinding: <T>(accessor: Readable<T>) -> Binding<T>,
+}
+
+--[[
+Creates React hooks for Scribe accessors.
+]]
+return function(React: React): Adapter
+	local function useScribe<T>(accessor: Readable<T>): T
+		local state: T, setValue: (T) -> () = React.useState(accessor.Get)
 		React.useEffect(function()
-			-- Re-read before subscribing: a write landing between render and effect is
-			-- otherwise missed, and the UI sits on the stale first value forever.
+			-- Catch writes between render and the effect.
 			setValue(accessor.Get())
 			return accessor.Changed(function(new)
 				setValue(new)
 			end)
 		end, { accessor })
-		return value
+		return state
 	end
 
-	--- A binding instead of state: updates the property without re-rendering. Prefer it
-	--- for a value that only feeds Text or Size.
-	function Adapter.useScribeBinding(accessor: any): any
-		local binding, setBinding = React.useBinding(accessor.Get())
+	local function useScribeBinding<T>(accessor: Readable<T>): Binding<T>
+		local binding: Binding<T>, setBinding: (T) -> () = React.useBinding(accessor.Get())
 		React.useEffect(function()
 			setBinding(accessor.Get())
 			return accessor.Changed(function(new)
@@ -37,5 +78,8 @@ return function(React: any)
 		return binding
 	end
 
-	return Adapter
+	return {
+		useScribe = useScribe,
+		useScribeBinding = useScribeBinding,
+	}
 end

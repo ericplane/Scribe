@@ -5,7 +5,8 @@ player list. Scribe remains the source of truth: the addon never saves data or w
 leaderstat changes back into your profile.
 
 Copy `ScribeLeaderstats.luau` into `ServerScriptService`. It is not included in the core
-Wally package.
+Wally package. If upgrading from 2.6.0 or earlier, copy the addon again to accept
+read-only `Data` members. This changes types only.
 
 **roblox-ts users:** `@rbxts/scribe-leaderstats` is a separate optional package using
 the same Luau implementation. It infers valid display paths from your server schema,

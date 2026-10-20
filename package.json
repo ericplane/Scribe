@@ -1,6 +1,6 @@
 {
   "name": "@rbxts/scribe",
-  "version": "2.6.0",
+  "version": "2.6.1",
   "description": "Persistent, schema-typed, automatically replicated Roblox data.",
   "main": "dist/npm/src/init.luau",
   "types": "types/index.d.ts",

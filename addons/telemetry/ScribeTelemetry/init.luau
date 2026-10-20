@@ -27,10 +27,25 @@ export type Stats = Transport.Stats & {
 	Leaderboards: { State: string, Monitored: number, Omitted: number, SnapshotAge: number?, LastError: string? },
 }
 export type Handle = {
+	--[[
+	Queues a test message; returns false and a reason if refused.
+	]]
 	Test: (self: Handle, destination: string) -> (boolean, string?),
+	--[[
+	Queues sample reports without triggering real failures or mentions.
+	]]
 	Preview: (self: Handle, destination: string, kind: PreviewKind?) -> (boolean, string?),
+	--[[
+	Waits for queued reports to drain, up to the timeout in seconds.
+	]]
 	Flush: (self: Handle, timeout: number?) -> boolean,
+	--[[
+	Returns delivery, queue and monitoring statistics.
+	]]
 	GetStats: (self: Handle) -> Stats,
+	--[[
+	Stops monitoring and discards queued reports; safe to call twice.
+	]]
 	Stop: (self: Handle) -> (),
 }
 export type LogEntry = {
@@ -166,6 +181,9 @@ end
 local Handle = {}
 Handle.__index = Handle
 
+--[[
+Starts Discord webhook reporting for this Scribe module.
+]]
 function ScribeTelemetry.Start(Scribe: ScribeModule, options: Options): Handle
 	for _, name in { "AddLogSink", "GetStatus", "GetMetrics", "GetPercentiles" } do
 		if type(Scribe) ~= "table" or type((Scribe :: any)[name]) ~= "function" then

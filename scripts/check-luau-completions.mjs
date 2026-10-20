@@ -95,8 +95,13 @@ const cases = {
     "array-child-changed": "(newValue: string, oldValue: string) -> ()",
     "store-changed": "(newValue: number, oldValue: number) -> ()",
     "set": "(value: number, replicate: boolean?)",
-    "increment": "(delta: number, tagsOrReplicate: any)",
+    "increment": "(delta: number, tagsOrReplicate: (({ read Currency: string?",
     "insert": "(value: string, index: number?, replicate: boolean?)",
+    "server-cooldown": "(player: Player, key: string, seconds: number, options: ",
+    "server-restore": "(userId: number, versionId: string, options: ",
+    "server-gift": "(buyer: Player, productName: string, recipientUserId: number)",
+    "client-request": "(name: string, ...: any)",
+    "client-shared": "(playerOrUserId: any)",
 };
 const probes = source.split(/\r?\n/).flatMap((line, index, lines) => {
     const marker = /-- named: ([\w-]+)/.exec(line);

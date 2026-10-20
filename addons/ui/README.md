@@ -26,8 +26,16 @@ local coins = useScribe(Data.Coins)
 | `ScribeFusion.luau` | `require(...)(Fusion, scope?)` then `useScribe(accessor) -> (Value, disconnect)` |
 
 React targets jsdotlua **17.2.1**: `useState`, `useEffect` and `useBinding` only, never
-`useSyncExternalStore` (React 18, absent from the port). Fusion takes a `scope` on 0.3 and
-omits it on 0.2.
+`useSyncExternalStore` (React 18, absent from the port). Fusion takes a `scope` on 0.3
+and omits it on 0.2.
+
+All three accept typed accessors in strict Luau. Vide returns `Source<T>`; React returns
+`T` or `Binding<T>`. Fusion returns `any`; annotate it with your installed version's type:
+`local coins: Fusion.Value<number>, disconnect = useScribe(Data.Coins)`.
+Each module exports `Readable<T>` and `Disconnect` for your own helpers.
+
+Optional or `any`-typed Vide sources may need a getter cast, such as
+`(score :: () -> number?)()`. Copy older adapters again to get the updated types.
 
 Full documentation, including the three client-mirror properties these rely on and why
 another player's `Scribe.Shared` roots cannot use them:

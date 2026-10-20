@@ -1735,6 +1735,24 @@ function Template.VisibilityOf(compiled: Compiled, path: { string | number }): V
 	return node.Visibility
 end
 
+-- Insert/Remove must not expose server-only element values or indices.
+function Template.OpVisibility(
+	compiled: Compiled,
+	op: { Kind: string, Path: { string | number } },
+	schema: SchemaNode?
+): Visibility
+	if schema == nil then
+		return Template.VisibilityOf(compiled, op.Path)
+	end
+	if op.Kind == "Insert" or op.Kind == "Remove" then
+		local element = Template.ChildSchema(schema, 1)
+		if element ~= nil and element.Visibility == "ServerOnly" then
+			return "ServerOnly"
+		end
+	end
+	return schema.Visibility
+end
+
 -- The persistence axis, for callers that only have a path. Separate from
 -- VisibilityOf because a field can be Session (never saves) AND ServerOnly or
 -- Shared (who receives it) at the same time.

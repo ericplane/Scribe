@@ -8,15 +8,36 @@
 -- MIT-licensed. Trimmed to new / Connect / Once / Fire / Wait / DisconnectAll / Destroy.
 
 export type Connection = {
+	--[[
+	Disconnects this handler; repeated calls do nothing.
+	]]
 	Disconnect: (self: Connection) -> (),
+	--[[
+	Whether this handler is still connected.
+	]]
 	Connected: boolean,
 }
 
 export type Signal<T...> = {
+	--[[
+	Runs the callback on each fire and returns a connection.
+	]]
 	Connect: (self: Signal<T...>, fn: (T...) -> ()) -> Connection,
+	--[[
+	Runs the callback on the next fire, then disconnects.
+	]]
 	Once: (self: Signal<T...>, fn: (T...) -> ()) -> Connection,
+	--[[
+	Calls connected handlers with these arguments.
+	]]
 	Fire: (self: Signal<T...>, T...) -> (),
+	--[[
+	Yields until the next fire and returns its arguments.
+	]]
 	Wait: (self: Signal<T...>) -> T...,
+	--[[
+	Disconnects all handlers; the signal can still be reused.
+	]]
 	Destroy: (self: Signal<T...>) -> (),
 }
 
