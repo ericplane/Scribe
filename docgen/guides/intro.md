@@ -80,7 +80,7 @@ local function onPlayerAdded(player: Player)
 
     data.Coins.Increment(50)
     print("Server coins:", data.Coins.Get())
-    print("Music enabled:", data.Settings.Music.Get())
+    print("Music enabled:", data.Settings.Has("Music"))
 end
 
 Players.PlayerAdded:Connect(onPlayerAdded)
@@ -111,7 +111,7 @@ end)
 `Observe` calls your function immediately, then again when the value changes. Before the server's first update arrives, that value can be the template default, `0`.
 
 !!! important "Keep the LocalScript"
-    The client must require `GameData` to start receiving updates. Requiring it only on the server is not enough.
+The client must require `GameData` to start receiving updates. Requiring it only on the server is not enough.
 
 ## 5. Play and check the result
 
@@ -152,10 +152,10 @@ To change saved data from a client button, follow [Commands and Requests](./comm
 For options beyond this tutorial, use the [Configuration reference](./configuration). You can leave optional systems at their defaults until you need them.
 
 ??? tip "Autocomplete and types"
-    Scribe's typed API uses Luau's new type solver. If your Studio version exposes `Workspace.UseNewLuauTypeSolver`, set it to `Enabled`; in an external editor, enable the new solver in your Luau LSP settings. Scribe can run without these generated types, but field-specific autocomplete needs them. See [template types](./templates#naming-the-accessor-type) when you need type annotations in your own modules.
+Scribe's typed API uses Luau's new type solver. If your Studio version exposes `Workspace.UseNewLuauTypeSolver`, set it to `Enabled`; in an external editor, enable the new solver in your Luau LSP settings. Scribe can run without these generated types, but field-specific autocomplete needs them. See [template types](./templates#naming-the-accessor-type) when you need type annotations in your own modules.
 
 ??? note "A one-time client read after loading"
-    `Observe` is convenient for UI because it updates when real data arrives. If startup code needs the loaded value just once, first check `Data.WaitForData()` and handle `false`. It waits up to 30 seconds by default. The [client API](/api/Client#WaitForData) and [Session Lifecycle](./lifecycle) explain the loading states.
+`Observe` is convenient for UI because it updates when real data arrives. If startup code needs the loaded value just once, first check `Data.WaitForData()` and handle `false`. It waits up to 30 seconds by default. The [client API](/api/Client#WaitForData) and [Session Lifecycle](./lifecycle) explain the loading states.
 
 ??? note "If your game already uses ProfileStore"
-    Keep your existing package. Scribe uses its own patched copy, which reports save results; it does not adopt a ProfileStore module from elsewhere in your game.
+Keep your existing package. Scribe uses its own patched copy, which reports save results; it does not adopt a ProfileStore module from elsewhere in your game.
