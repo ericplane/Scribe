@@ -23,6 +23,7 @@ local Root = script.Parent.Parent.Parent.Parent
 local ScribeRoot = Root.Scribe
 local Wire = require(ScribeRoot.Internal.Wire)
 local Metrics = require(ScribeRoot.Internal.Metrics)
+local Clock = require(ScribeRoot.Internal.Clock)
 local Scribe = require(ScribeRoot) :: any
 local Client = require(ScribeRoot.Client)
 local TestCtx = require(Root.Test.Helpers.TestCtx)
@@ -258,6 +259,41 @@ describe("duplicates that overlap", function()
 		expect(attempts).toBe(2)
 		expect(replies(harness, player)[3].Results[1]).toBe("recovered")
 		harness.Cleanup()
+	end)
+
+	it("keeps the key for the TTL after a handler slower than the TTL returns", function()
+		local now = 5000
+		Clock.Install({
+			Monotonic = function()
+				return now
+			end,
+		})
+		local harness, _player, entry = makeHarness()
+		local runs = 0
+		local release
+		harness.Data.Command("Slow", { Idempotent = true }, function()
+			runs += 1
+			local handlerThread = coroutine.running()
+			release = function()
+				task.spawn(handlerThread)
+			end
+			coroutine.yield()
+			return runs
+		end)
+
+		task.spawn(send, harness, entry, 1, "Slow", "k")
+		now += 121
+		release()
+		-- A retry that runs the handler again will yield.
+		task.spawn(send, harness, entry, 2, "Slow", "k")
+		local afterReturn = runs
+		now += 121
+		task.spawn(send, harness, entry, 3, "Slow", "k")
+		local afterExpiry = runs
+		release()
+		Clock.Reset()
+		harness.Cleanup()
+		expect(`{afterReturn}/{afterExpiry}`).toBe("1/2")
 	end)
 end)
 

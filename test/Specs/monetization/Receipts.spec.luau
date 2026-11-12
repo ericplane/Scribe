@@ -9,6 +9,7 @@ local expect = JestGlobals.expect
 
 local Root = script.Parent.Parent.Parent.Parent
 local Scribe = require(Root.Scribe)
+local Log = require(Root.Scribe.Internal.Log)
 local TestCtx = require(Root.Test.Helpers.TestCtx)
 
 local GRANTED = Enum.ProductPurchaseDecision.PurchaseGranted
@@ -416,6 +417,22 @@ it("handles receipts with no gift intent: grant to buyer, or a gift credit when 
 	expect(harness.Data.GetGiftCredits(buyer).GiftVIP).toBe(nil)
 
 	harness.Cleanup()
+end)
+
+it("logs an ordinary perk purchase as Info, not as a warning", function()
+	local harness = makeHarness({ LogRingLevel = "Info" })
+	local buyer = harness.Join(3101)
+	local decision = harness.Data.HandleReceipt(receipt(3101, 222, "ni-level"))
+	local level
+	for _, entry in Log.GetRecent({ Code = "GIFT_NO_INTENT" }) do
+		if entry.Context and entry.Context.Player == buyer then
+			level = entry.Level
+		end
+	end
+	Log.SetRingLevel(nil)
+	harness.Cleanup()
+	expect(decision).toBe(GRANTED)
+	expect(level).toBe("Info")
 end)
 
 it("declines a no-intent purchase while an unused gift credit is pending", function()

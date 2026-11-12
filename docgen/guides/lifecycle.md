@@ -130,11 +130,11 @@ end)
 local info = Data.GetSaveInfo(player)   -- { LastSaveAt, LastResult, Dirty, Size }
 ```
 
-??? note "Reads that answer with a default while a profile is loading"
-    `Owns`, `GetPurchases`, `GetGiftCredits` and `GetSaveInfo` answer with `false`, `{}` and `{ Dirty = false }` respectively while a profile is still Loading. Gate ownership logic behind `WaitForData` so a VIP owner is not treated as a non-owner on join.
+??? note "Reads before the first snapshot"
+    On the server, `Owns` returns `false` while the profile loads, `GetPurchases` and `GetGiftCredits` return `{}`, and `GetSaveInfo` defaults to `{ Dirty = false }`. Wait for Ready before using those values to make decisions. On the client, these four reads yield until the first snapshot arrives.
 
 ??? note "Writing a burst of changes at once"
-    Several writes in a row each replicate on their own frame. [`Data.Batch`](/api/Server#Batch) coalesces them into one flush, and [`Data.Transaction`](/api/Server#Transaction) additionally makes them all-or-nothing. Both are covered in [Cross-Key Transactions](./transactions), along with what "atomic" does and does not mean here.
+    Writes normally queue for the next frame. [`Data.Batch`](/api/Server#Batch) groups the writes for one flush when it finishes. [`Data.Transaction`](/api/Server#Transaction) also rolls them back together on failure. See [Cross-Key Transactions](./transactions).
 
 ## Session end
 
@@ -169,6 +169,8 @@ Scribe({
 `isNewProfile` is true for a genuinely new profile, a `ResetData` wipe, and a first-session crash recovery, so you can run starter kits and welcome flows without keeping your own sentinel field. An error thrown here is caught and logged rather than blocking the load.
 
 The table excludes Scribe's `_Scribe` ledger, protecting receipt IDs, perks and gift credits. Assigning `_Scribe` is discarded and logs `ON_PLAYER_INIT_LEDGER`.
+
+The hook also leaves out `Scribe.Session` roots. Assigning one here logs `ON_PLAYER_INIT_SESSION` and leaves its live value at the session default. Set it through its accessor once the player is Ready. If an older save contains a stray key of the same name, the hook hides and preserves that stored value.
 
 Nested edits apply directly. Top-level assignments and removals apply when the hook returns, and before any save while it yields. Finish your edits inside the hook; do not keep its table for later writes. Removed keys are excluded from the wipe guard's missing-key check, but a large drop in size can still trigger it.
 

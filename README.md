@@ -8,7 +8,7 @@
 ```toml
 # wally.toml
 [dependencies]
-Scribe = "ericplane/scribe@2.6.1"
+Scribe = "ericplane/scribe@2.7.0"
 ```
 
 roblox-ts users install `@rbxts/scribe` from npm (`npm install @rbxts/scribe`), with

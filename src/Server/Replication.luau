@@ -18,6 +18,7 @@ local Profile = require(Internal.Profile)
 local Replication = {}
 
 local HANDSHAKE_TIMEOUT = 10
+local HANDSHAKE_TIMEOUT_LIVE = 60
 local MAX_OPS_PER_FRAME = 60000
 local REINIT_COOLDOWN = 5 -- seconds between snapshots to one client
 -- Per-client cap; excess replies send immediately.
@@ -121,6 +122,36 @@ function Replication.new(ctx: any)
 		end
 	end
 
+	-- Return true when a scalar Set replaces an earlier Set on the same path.
+	local function enqueue(queue: { Wire.Op }, index: { [string]: number }, op: Wire.Op, pathKey: string): boolean
+		if op.Kind == "Set" and op.Value ~= nil and type(op.Value) ~= "table" then
+			local existing = index[pathKey]
+			if
+				existing
+				and queue[existing]
+				and queue[existing].Kind == "Set"
+				and (queue[existing] :: any)._pk == pathKey
+			then
+				queue[existing] = op
+				return true
+			end
+			table.insert(queue, op)
+			index[pathKey] = #queue
+			return false
+		end
+		-- Later writes to this path or its children must stay after this op.
+		table.insert(queue, op)
+		index[pathKey] = nil
+		local descendantPrefix = pathKey .. "\31"
+		local prefixLen = #descendantPrefix
+		for k in index do
+			if string.sub(k, 1, prefixLen) == descendantPrefix then
+				index[k] = nil
+			end
+		end
+		return false
+	end
+
 	function self.PushOp(entry: any, op: Wire.Op, schema: Template.SchemaNode?)
 		local visibility = Template.OpVisibility(compiled, op, schema)
 		if visibility == "ServerOnly" then
@@ -136,43 +167,15 @@ function Replication.new(ctx: any)
 		(op :: any)._pk = pathKey
 		if entry.QueueOpen then
 			markDirty(entry)
-			local queue: { Wire.Op } = entry.Queue
-			if op.Kind == "Set" and op.Value ~= nil and type(op.Value) ~= "table" then
-				-- Scalar leaf Set: coalesce consecutive writes to the same path in place.
-				-- Supersession by whole-container writes is resolved at flush (compactOps).
-				local existing = entry.QueueIndex[pathKey]
-				if
-					existing
-					and queue[existing]
-					and queue[existing].Kind == "Set"
-					and (queue[existing] :: any)._pk == pathKey
-				then
-					queue[existing] = op
-					Metrics.Add("OpsCoalesced")
-				else
-					table.insert(queue, op)
-					entry.QueueIndex[pathKey] = #queue
-				end
-			else
-				-- Whole-container writes (table Set, nil Set, Clear) and array ops append,
-				-- and break scalar coalescing here and below: a later child Set would
-				-- otherwise collapse into a preceding slot and be dropped as superseded.
-				table.insert(queue, op)
-				entry.QueueIndex[pathKey] = nil
-				local descendantPrefix = pathKey .. "\31"
-				local prefixLen = #descendantPrefix
-				for k in entry.QueueIndex do
-					if string.sub(k, 1, prefixLen) == descendantPrefix then
-						entry.QueueIndex[k] = nil
-					end
-				end
+			if enqueue(entry.Queue, entry.QueueIndex, op, pathKey) then
+				Metrics.Add("OpsCoalesced")
 			end
 		end
 		-- Before the snapshot is taken there is nothing to diff against: the snapshot
 		-- about to be cloned carries this value, so queueing it would send it twice.
 
 		if visibility == "Shared" then
-			table.insert(entry.SharedQueue, op)
+			enqueue(entry.SharedQueue, entry.SharedIndex, op, pathKey)
 			markDirty(entry)
 		end
 	end
@@ -634,6 +637,7 @@ function Replication.new(ctx: any)
 	local function detachSharedQueue(entry: any): { Wire.Op }
 		local shared: { Wire.Op } = entry.SharedQueue
 		entry.SharedQueue = {}
+		entry.SharedIndex = {}
 		return shared
 	end
 
@@ -720,6 +724,7 @@ function Replication.new(ctx: any)
 	--- frame cost can be timed around it.
 	-- One queue for the whole server: a single writer, one frame to every ready client.
 	local storeQueue: { Wire.Op } = {}
+	local storeIndex: { [string]: number } = {}
 	-- Lets flushFrame skip the drain entirely. Read from the compiled, not from
 	-- ctx.ServerStore, which is assigned after this constructor returns.
 	local hasStore = compiled.Views.Store ~= nil
@@ -739,7 +744,9 @@ function Replication.new(ctx: any)
 		-- with `(` after a call is ambiguous to Luau.
 		local pathKey = Util.pathKey(op.Path);
 		(op :: any)._pk = pathKey
-		storeQueue[#storeQueue + 1] = op
+		if enqueue(storeQueue, storeIndex, op, pathKey) then
+			Metrics.Add("OpsCoalesced")
+		end
 	end
 
 	--- Encode whatever the store queued and broadcast it to every ready client.
@@ -781,6 +788,7 @@ function Replication.new(ctx: any)
 		end
 		local queue = compactOps(storeQueue)
 		storeQueue = {}
+		storeIndex = {}
 		return sendStoreOps(queue, except)
 	end
 
@@ -969,6 +977,7 @@ function Replication.new(ctx: any)
 		if hasStore and #storeQueue > 0 then
 			local pending = compactOps(storeQueue)
 			storeQueue = {}
+			storeIndex = {}
 			sendStoreOps(pending, entry)
 		end
 		-- Per-root byte spans, filled by the encode, so the oversize warning can name
@@ -1051,6 +1060,10 @@ function Replication.new(ctx: any)
 		-- handed a diff it has no mirror to apply to. broadcastBuffer skips unready
 		-- entries, which is also what kept the Shared drain above safe.
 		entry.HandshakeReady = true
+		if not repair then
+			-- An initial snapshot sent before OnEntryReady has zero wait.
+			Metrics.Observe("HandshakeDuration", if entry.ReadyAt then Clock.Monotonic() - entry.ReadyAt else 0)
+		end
 		entry.InitDelivered = true
 		-- Any pending repair request is met by this snapshot.
 		entry.ResyncPending = false
@@ -1109,6 +1122,9 @@ function Replication.new(ctx: any)
 
 	-- Handshake ---------------------------------------------------------------
 
+	-- Any accepted Hello lowers later timeout reports to Debug.
+	local helloSeen = false
+
 	local function onHello(entry: any, reader: Wire.Reader)
 		local schemaHash = Wire.RU32(reader)
 		-- The client sends its wire PROTOCOL_VERSION after the hash. A mismatch means
@@ -1116,11 +1132,14 @@ function Replication.new(ctx: any)
 		-- closed, unlike the hash check below which the value-mode prefix keeps safe.
 		local protocolVersion = Wire.RU8(reader)
 		if protocolVersion ~= Wire.PROTOCOL_VERSION then
-			-- Metered as well as logged, so every refusal is countable.
+			-- Count each refusal and log the first mismatch per session.
 			Metrics.Add("ProtocolMismatch")
-			Log.Warn("Replication", "PROTOCOL_MISMATCH", "client wire protocol version differs from the server", {
-				Player = entry.Player,
-			})
+			if not entry.HelloRefused then
+				entry.HelloRefused = true
+				Log.Warn("Replication", "PROTOCOL_MISMATCH", "client wire protocol version differs from the server", {
+					Player = entry.Player,
+				})
+			end
 			return
 		end
 		if schemaHash ~= compiled.Hash % 4294967296 then
@@ -1129,15 +1148,19 @@ function Replication.new(ctx: any)
 			-- a server op lands on the wrong client key. The value-mode prefix keeps value
 			-- decoding safe, not path remapping.
 			Metrics.Add("SchemaMismatch")
-			Log.Warn(
-				"Replication",
-				"SCHEMA_MISMATCH",
-				"client derived a different schema than the server; refusing to replicate (template drift)",
-				{ Player = entry.Player }
-			)
+			if not entry.HelloRefused then
+				entry.HelloRefused = true
+				Log.Warn(
+					"Replication",
+					"SCHEMA_MISMATCH",
+					"client derived a different schema than the server; refusing to replicate (template drift)",
+					{ Player = entry.Player }
+				)
+			end
 			return
 		end
 		entry.HelloReceived = true
+		helloSeen = true
 		if entry.State == "Ready" then
 			-- A repeated Hello re-Inits (client-driven resync), but a full snapshot
 			-- encode is expensive, so throttle floods.
@@ -1161,7 +1184,47 @@ function Replication.new(ctx: any)
 		end
 	end
 
+	local function checkHandshake(entry: any, final: boolean)
+		if stopped or entry.TornDown or entry.HandshakeReady then
+			return
+		end
+		if entry.HelloReceived then
+			Log.Warn(
+				"Replication",
+				"INIT_UNDELIVERED",
+				"the client sent Hello but its snapshot never reached the transport; check MaxOutboundBytes against what this transport will carry",
+				{
+					Player = entry.Player,
+				}
+			)
+		elseif entry.HelloRefused then
+			return -- mismatch already logged
+		elseif not final then
+			local remaining = entry.ReadyAt + HANDSHAKE_TIMEOUT_LIVE - Clock.Monotonic()
+			Clock.Delay(math.max(remaining, 0), checkHandshake, entry, true)
+		else
+			Metrics.Add("HandshakeTimeouts")
+			local context = { Player = entry.Player, Waited = Clock.Monotonic() - entry.ReadyAt }
+			if helloSeen then
+				Log.Debug(
+					"Replication",
+					"CLIENT_HANDSHAKE_TIMEOUT",
+					"client has not sent Hello, though other clients of this server have; it is still loading or has stalled, and is answered when it asks",
+					context
+				)
+			else
+				Log.Warn(
+					"Replication",
+					"CLIENT_HANDSHAKE_TIMEOUT",
+					"no client has sent Hello to this server, so replication never started; require the Scribe bundle on the client (a LocalScript), or check a custom client transport adapter",
+					context
+				)
+			end
+		end
+	end
+
 	function self.OnEntryReady(entry: any)
+		entry.ReadyAt = Clock.Monotonic()
 		-- QueueOpen, not HandshakeReady: the question is whether a snapshot has already
 		-- been started, which is the same question the re-Init throttle asks. The two
 		-- reading different flags is how the gap opened.
@@ -1179,6 +1242,7 @@ function Replication.new(ctx: any)
 		-- was queued is in the snapshot, and a write made during the send is the next flush's.
 		local sharedOps = sharedSnapshotOps(entry)
 		entry.SharedQueue = {}
+		entry.SharedIndex = {}
 		if #sharedOps > 0 then
 			local ok, bytes = pcall(Wire.EncodeOpsFrame, Wire.Frames.SharedInit, compiled, sharedOps, function(w)
 				Wire.F64(w, entry.UserId)
@@ -1192,32 +1256,8 @@ function Replication.new(ctx: any)
 				end
 			end
 		end
-		Clock.Delay(HANDSHAKE_TIMEOUT, function()
-			if not entry.TornDown and not entry.HandshakeReady then
-				if entry.HelloReceived then
-					-- A different failure with the same symptom: the client did ask and the
-					-- answer could not be delivered. MaxOutboundBytes is named because a
-					-- transport refusing a payload this size is the one innocent cause.
-					Log.Warn(
-						"Replication",
-						"INIT_UNDELIVERED",
-						"the client sent Hello but its snapshot never reached the transport; check MaxOutboundBytes against what this transport will carry",
-						{
-							Player = entry.Player,
-						}
-					)
-				else
-					Log.Warn(
-						"Replication",
-						"CLIENT_HANDSHAKE_TIMEOUT",
-						"client never sent Hello, so replication never started; require the Scribe bundle on the client (a LocalScript), or check a custom client transport adapter",
-						{
-							Player = entry.Player,
-						}
-					)
-				end
-			end
-		end)
+		-- Live clients get a second check for a missing Hello.
+		Clock.Delay(HANDSHAKE_TIMEOUT, checkHandshake, entry, ctx.DevMode == true)
 	end
 
 	function self.OnEntryRemoved(entry: any)

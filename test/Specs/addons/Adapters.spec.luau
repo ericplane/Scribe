@@ -27,6 +27,8 @@ local itRunning = if RunService:IsRunning() then it else it.skip
 local template = {
 	Coins = Scribe.Int(0, { Min = 0 }),
 	Pets = Scribe.SetOf(Scribe.String("")),
+	Bag = Scribe.ArrayOf(Scribe.String("")),
+	Stats = { Level = Scribe.Int(1) },
 }
 
 --- A live client mirror plus the server accessor that drives it.
@@ -36,6 +38,17 @@ local function make()
 	harness.Transport.LocalPlayer = player
 	local client = Client.new(harness.Options, harness.Compiled)
 	return harness, data, client
+end
+
+--- Request a full snapshot during the repeat-Hello cooldown.
+local function resync(harness): boolean
+	local before = Scribe.GetMetrics().Handshakes or 0
+	local entry = harness.Ctx.Persistence.EntryFor(harness.Transport.LocalPlayer)
+	harness.Ctx.Replication.RequestResync(entry, "test")
+	harness.StepUntil(function()
+		return false
+	end, 6)
+	return (Scribe.GetMetrics().Handshakes or 0) - before == 1
 end
 
 -- Fakes ---------------------------------------------------------------------------
@@ -91,12 +104,17 @@ local function fakeReact()
 		if slots[slot] == nil then
 			slots[slot] = { value = if type(init) == "function" then init() else init }
 		end
-		return slots[slot].value, function(new)
-			slots[slot].value = new
-			if mounted then
-				render()
+		-- React skips renders when state keeps the same reference.
+		return slots[slot].value,
+			function(new)
+				if rawequal(slots[slot].value, new) then
+					return
+				end
+				slots[slot].value = new
+				if mounted then
+					render()
+				end
 			end
-		end
 	end
 
 	function R.useBinding(initial)
@@ -319,6 +337,36 @@ describe("React", function()
 		).toBe("first=2 changed=6 afterUnmount=6 rerendered=true rendersAfterUnmount=0")
 	end)
 
+	itRunning("re-renders when a container changes in place", function()
+		local harness, data, client = make()
+		local R, mount, unmount = fakeReact()
+		local adapter = require(Adapters.ScribeReact)(R)
+		local renders, bag, stats = 0, nil, nil
+		mount(function()
+			renders += 1
+			bag = adapter.useScribe(client.Bag)
+			stats = adapter.useScribe(client.Stats)
+			return nil
+		end)
+		local firstBag, firstStats, atMount = bag, stats, renders
+
+		data.Bag.Insert("Sword")
+		harness.StepUntil(function()
+			return #client.Bag.Get() == 1
+		end, 8)
+		local afterInsert = renders
+		data.Stats.Level.Set(2)
+		harness.StepUntil(function()
+			return client.Stats.Level.Get() == 2
+		end, 8)
+
+		local seen = `bag={#bag} level={stats.Level} rerendered={afterInsert > atMount},{renders > afterInsert} `
+			.. `newReference={bag ~= firstBag},{stats ~= firstStats}`
+		unmount()
+		harness.Cleanup()
+		expect(seen).toBe("bag=1 level=2 rerendered=true,true newReference=true,true")
+	end)
+
 	itRunning("updates a binding WITHOUT re-rendering, which is why it exists", function()
 		local harness, data, client = make()
 		local R, mount, unmount = fakeReact()
@@ -354,27 +402,24 @@ describe("React", function()
 			return nil
 		end)
 
-		harness.SendHello(harness.Transport.LocalPlayer)
-		harness.StepUntil(function()
-			return false
-		end, 6)
+		local resynced = resync(harness)
 
 		data.Coins.Set(77)
 		harness.StepUntil(function()
 			return lastSeen == 77
 		end, 8)
 
-		local seen = tostring(lastSeen)
+		local seen = `resynced={resynced} seen={lastSeen}`
 		unmount()
 		harness.Cleanup()
-		expect(seen).toBe("77")
+		expect(seen).toBe("resynced=true seen=77")
 	end)
 end)
 
 -- The property every adapter rests on -----------------------------------------------
 
 describe("the contract the adapters depend on", function()
-	itRunning("Get is referentially stable, including across a resync", function()
+	itRunning("Get is referentially stable between changes, and a resync rebuilds containers", function()
 		-- Not decoration. A fresh table per Get would make a React memo or a Vide
 		-- derived recompute forever, and it is invisible until a UI is built on it.
 		local harness, data, client = make()
@@ -385,14 +430,19 @@ describe("the contract the adapters depend on", function()
 
 		local before = client.Pets.Get()
 		local stableBefore = client.Pets.Get() == client.Pets.Get()
+		local coinFires, petFires = 0, 0
+		client.Coins.Changed(function()
+			coinFires += 1
+		end)
+		client.Pets.Changed(function()
+			petFires += 1
+		end)
 
-		harness.SendHello(harness.Transport.LocalPlayer)
-		harness.StepUntil(function()
-			return false
-		end, 6)
+		local resynced = resync(harness)
 
 		local stableAfter = client.Pets.Get() == client.Pets.Get()
 		local sameAcross = client.Pets.Get() == before
+		local fired = `{coinFires},{petFires}`
 
 		data.Pets.Add("Griffin")
 		harness.StepUntil(function()
@@ -402,9 +452,11 @@ describe("the contract the adapters depend on", function()
 
 		harness.Cleanup()
 		expect(
-			`stableBefore={stableBefore} stableAfter={stableAfter} `
-				.. `sameAcrossResync={sameAcross} movedOnChange={movedOnChange}`
-		).toBe("stableBefore=true stableAfter=true sameAcrossResync=true movedOnChange=true")
+			`resynced={resynced} stableBefore={stableBefore} stableAfter={stableAfter} `
+				.. `sameAcrossResync={sameAcross} firedAcrossResync={fired} movedOnChange={movedOnChange}`
+		).toBe(
+			"resynced=true stableBefore=true stableAfter=true sameAcrossResync=false firedAcrossResync=0,1 movedOnChange=true"
+		)
 	end)
 
 	itRunning("one frame of writes is one notification, so no adapter needs debouncing", function()

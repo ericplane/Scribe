@@ -18,7 +18,7 @@ Examples use the [Emberfall template](./emberfall). Keep grants on the server, a
 
 ## Selling a coin pack
 
-Declare your products and passes in the shared module, next to the template. A product's `Grant` receives the buyer's accessor tree.
+Declare your products and passes in the shared module, next to the template. Here `Grant` only needs the accessor tree to credit the coins.
 
 ```lua
 Products = {
@@ -38,6 +38,23 @@ Passes = { VIP = { Id = 987654321 } },
 ```
 
 That is the entire setup. When a server script first requires the shared module, Scribe takes over `MarketplaceService.ProcessReceipt`: it grants the coins, writes a Robux purchase-log entry, and waits for the save to confirm before answering `PurchaseGranted`. If it cannot finish, it answers `NotProcessedYet` and leaves the receipt pending. Roblox can retry when the buyer rejoins or starts another developer-product purchase; there is no timed retry loop. See [Roblox's receipt documentation](https://create.roblox.com/docs/reference/engine/classes/MarketplaceService#ProcessReceipt).
+
+### Reaching the player
+
+`Grant(data, player)` receives the player whose data it writes. For an ordinary purchase that's the buyer. For a gift it's the recipient. Use the second argument when the grant needs their character or Backpack.
+
+```lua
+SpeedCoil = {
+    Id = 1234567891,
+    Category = "Item",
+    Grant = function(_data, player)
+        local tools = game:GetService("ServerStorage").Tools
+        tools.SpeedCoil:Clone().Parent = player.Backpack
+    end,
+},
+```
+
+A tool placed in the Backpack survives a grant rollback, so a receipt retry can give another copy. Respawning can also clear the Backpack. For a permanent tool, record ownership in `Grant` and equip it from that saved state when the character spawns.
 
 ### External purchases
 
@@ -125,7 +142,7 @@ The reason this matters is not the session cache, which heals itself. It is the 
 The meta table on `Increment` is optional. It makes the grant show up in Roblox's economy dashboard, which is worth having for your largest source of currency. See [Economy Analytics](./economy).
 
 ???+ warning "A `Grant` must never yield"
-    No `task.wait`, no DataStore call, no `MarketplaceService` call inside a `Grant`. Scribe runs the callback inside a transaction so that a `Grant` which throws part-way is rolled back completely, and a transaction cannot survive a yield.
+    Keep the callback synchronous. A `task.wait`, DataStore call or yielding `MarketplaceService` call interrupts the transaction. If the callback throws, its writes to Scribe data roll back. Changes to the player's character or Backpack survive.
 
     A product `Grant` that yields is logged as `GRANT_FAIL` and then run anyway, without rollback, because refusing it forever would mean taking the player's Robux and never delivering. If it throws after yielding you get `GRANT_PARTIAL` instead: the writes it already made stand, the receipt settles once, and an operator has to compensate by hand.
 
@@ -276,7 +293,7 @@ Data.OnOwnershipChanged:Connect(function(player, key, owned)
 end)
 ```
 
-For a single key with the current value delivered up front, use [`ObserveOwned`](/api/Server#ObserveOwned). It needs a Ready profile on the server, so put it behind [`WaitForData`](/api/Server#WaitForData). Both signals exist on the client too, and the client versions are the easy way to hide a "buy VIP" button the instant the sale completes.
+On the server, [`ObserveOwned`](/api/Server#ObserveOwned) needs a Ready profile and delivers the current value when you subscribe. Call it after [`WaitForData`](/api/Server#WaitForData). On the client, [`Data.ObserveOwned(key, callback)`](/api/Client#ObserveOwned) returns its disconnect immediately. The callback first runs when the snapshot arrives, or immediately if data has already loaded, then whenever ownership changes.
 
 ??? note "The key is the NAME you registered, and it has to be a string"
     `Owns`, `OwnsAsync` and `ObserveOwned` take the name a pass, perk or product grant was
@@ -302,7 +319,7 @@ For a single key with the current value delivered up front, use [`ObserveOwned`]
 ??? note "Which monetization calls need a Ready player"
     Four of them error if the profile is not Ready: [`GrantPerk`](/api/Server#GrantPerk), [`RevokePerk`](/api/Server#RevokePerk), [`ObserveOwned`](/api/Server#ObserveOwned), and [`RecordPurchase`](/api/Server#RecordPurchase). Wire those behind [`WaitForData`](/api/Server#WaitForData) rather than calling them straight out of `PlayerAdded`.
 
-    The reading calls are tolerant instead. `Owns`, `OwnsAsync`, `GetPurchases` and `GetGiftCredits` answer `false` or an empty table, and `Purchase` and `PromptGift` refuse with a reason. Tolerant is not the same as correct: a VIP owner reads as a non-owner until their profile lands, so gate ownership logic on readiness too.
+    On the server, `Owns`, `OwnsAsync`, `GetPurchases` and `GetGiftCredits` answer `false` or an empty table before Ready, and `Purchase` and `PromptGift` refuse with a reason. Gate ownership logic on readiness. On the client, `GetPurchases` and `GetGiftCredits` wait for the first snapshot.
 
 ## Granting a perk yourself
 
@@ -323,7 +340,7 @@ With the list present, Scribe logs `UNDECLARED_PERK` for a perk name outside it,
 
 ## Soft-currency purchases
 
-[`Purchase`](/api/Server#Purchase) is the shop-side twin of a product: it debits a currency, runs a grant, and writes a log entry, all or nothing.
+[`Purchase`](/api/Server#Purchase) debits a currency, runs a grant and writes a log entry in one transaction. Its `Grant(data, player)` receives the buyer's accessor tree and the buyer. A grant that only uses `data` can omit the second parameter.
 
 ```lua
 local ok, reason = Data.Purchase(player, {

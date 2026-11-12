@@ -1,5 +1,86 @@
 # Changelog
 
+## 2.7.0
+
+Unreleased.
+
+Purchase grants now receive the player. This update also improves client ownership
+observers, edit-mode mocks and replication diagnostics.
+
+### Behaviour changes
+
+- `Data.Mock` replaces arrays, sets and flags instead of merging them by index. Pass the
+  whole list; `{}` clears it. Omitted fields in a replacement array element take their
+  defaults. Records, dictionaries and maps still merge by key; use `Set({})` to clear
+  a dictionary or map.
+
+- Client `Data.ObserveOwned` returns its disconnect function immediately. If data hasn't
+  loaded yet, read the initial ownership in the callback when the snapshot arrives.
+
+- Repeated scalar writes to one `Shared` or `ServerStore` field now send only the last
+  value before a flush, just like writes to the owner's data. Client listeners can skip
+  intermediate values.
+
+- Array arguments in a command's `Args` must have consecutive keys starting at 1.
+  This applies to `{ spec }`, `ArrayOf`, `SetOf` and `Flags`; other keys or gaps give
+  `"bad-args"`.
+
+### Added
+
+- Products and `Data.Purchase` now pass the player to `Grant(data, player)`: the buyer
+  for a purchase or the recipient for a gift. Existing one-argument grants still work.
+  Includes Luau and roblox-ts types.
+
+- `HandshakeDuration` measures seconds from a profile becoming Ready until the server
+  sends that player's first snapshot. `HandshakeTimeouts` counts clients still silent at the deadline.
+
+### Fixed
+
+- `OnPlayerInit` no longer sees or writes `Scribe.Session` roots in the saved profile.
+  Assigning one logs `ON_PLAYER_INIT_SESSION` and leaves existing saved data alone.
+  Set session fields through their accessors once the player is Ready.
+
+- A `Timed` field under a `Session` root no longer carries an old deadline into a new
+  session. Its value and timer now reset together.
+
+- A retry just after a slow idempotent command finished could run the handler again.
+  The cached reply's lifetime now starts when the handler finishes.
+
+- The React adapter's `useScribe` now re-renders after an insert, removal or child write
+  changes a container in place. Recopy the adapter if you installed it manually.
+
+- `Scribe.Short` and `BigValue:Short()` now use the next suffix when rounding crosses a
+  boundary: 999,995 displays as `1.00M` instead of `1000.00K`.
+
+- Luau now accepts `Scribe.MapOf("integer", shape, { MaxKeys = n })` without a cast.
+  `ArrayOpts`, `SetOpts` and `DictOpts` have read-only fields.
+
+### Changed
+
+- `CLIENT_HANDSHAKE_TIMEOUT` now waits 60 seconds outside `DevMode` (10 in `DevMode`).
+  Once the server has accepted a Hello from any client, it logs later timeouts at
+  `Debug` instead of `Warn`. The first check for an undelivered snapshot stays at 10 seconds.
+
+- Only the first schema or protocol mismatch logs a warning per player session.
+  `SchemaMismatch` and `ProtocolMismatch` still count every refusal.
+
+- Buying a perk product for yourself now logs `GIFT_NO_INTENT` at `Info` instead of
+  `Warn`.
+
+- Updated Lune to 0.11.1. The Luau completion check now builds its own test sourcemap.
+
+### Documentation
+
+- Clarified command argument types, when retries reuse a reply, and why a handler that
+  throws can run again with its earlier writes still in place.
+
+- Clarified when container listeners fire, how React reads container values after a resync,
+  and which entries reach log sinks and `GetRecentLogs`. Fixed the music setting in the
+  getting-started example.
+
+- The client API now marks `GetSaveInfo`, `GetGiftCredits` and `GetPurchases` as yielding
+  until data has loaded.
+
 ## 2.6.1
 
 Released 2026-10-20.

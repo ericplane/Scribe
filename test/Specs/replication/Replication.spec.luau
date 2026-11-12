@@ -471,6 +471,31 @@ describe("inbound hard rules", function()
 		expect(#harness.FramesFor(player, Wire.Frames.Init)).toBe(1)
 		expect((Scribe.GetMetrics().ProtocolMismatch or 0) - before).toBe(2)
 	end)
+
+	it("warns once per session for a client whose Hello keeps being refused", function()
+		local function refused(code, hashOffset, versionOffset)
+			local player = harness.Join()
+			for _ = 1, 3 do
+				local w = Wire.NewWriter(8)
+				Wire.U8(w, Wire.Frames.Hello)
+				Wire.U32(w, (harness.Compiled.Hash + hashOffset) % 4294967296)
+				Wire.U8(w, Wire.PROTOCOL_VERSION + versionOffset)
+				harness.Transport:InjectToServer(player, Wire.Finish(w))
+			end
+			local warned = 0
+			for _, logged in Log.GetRecent({ Code = code }) do
+				if logged.Context and logged.Context.Player == player then
+					warned += 1
+				end
+			end
+			return warned
+		end
+		local schemaBefore = Scribe.GetMetrics().SchemaMismatch or 0
+		local protocolBefore = Scribe.GetMetrics().ProtocolMismatch or 0
+		expect(`{refused("SCHEMA_MISMATCH", 1, 0)},{refused("PROTOCOL_MISMATCH", 0, 1)}`).toBe("1,1")
+		expect((Scribe.GetMetrics().SchemaMismatch or 0) - schemaBefore).toBe(3)
+		expect((Scribe.GetMetrics().ProtocolMismatch or 0) - protocolBefore).toBe(3)
+	end)
 end)
 describe("the Shared queue at handshake", function()
 	it("does not re-broadcast, as a diff, ops the SharedInit snapshot already carries", function()

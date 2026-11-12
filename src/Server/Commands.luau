@@ -298,6 +298,8 @@ function Commands.new(ctx: any)
 		record.Done = true
 		record.Ok = ok
 		record.Reply = bytes
+		-- Start the replay window when the handler finishes.
+		record.At = Clock.Monotonic()
 		if not ok then
 			-- Dropped before the parked duplicates are answered. A handler that threw did
 			-- not happen, so the key stays retryable, and a synchronous transport can
@@ -338,6 +340,16 @@ function Commands.new(ctx: any)
 		end
 		seen[code] = now
 		Log.Warn("Commands", code, message, context)
+	end
+
+	-- A sparse table's length can equal its key count. Check each index.
+	local function isSequence(value: { [any]: any }, count: number): boolean
+		for index = 1, count do
+			if value[index] == nil then
+				return false
+			end
+		end
+		return true
 	end
 
 	-- Does one argument match its spec? A spec is one of three things:
@@ -384,12 +396,14 @@ function Commands.new(ctx: any)
 		local elementSpec = expected[1]
 		if elementSpec ~= nil then
 			-- Array form: every element matches and no extra keys hide alongside them.
+			local count = 0
 			for key, item in value do
 				if type(key) ~= "number" or not specMatches(elementSpec, item, depth + 1) then
 					return false
 				end
+				count += 1
 			end
-			return true
+			return isSequence(value, count)
 		end
 		for key, fieldSpec in expected do
 			if not specMatches(fieldSpec, value[key], depth + 1) then
@@ -450,7 +464,7 @@ function Commands.new(ctx: any)
 				end
 				count += 1
 			end
-			return count == #value
+			return isSequence(value, count)
 		end
 		if kind == "ArrayOf" or kind == "SetOf" then
 			if type(value) ~= "table" then
@@ -463,7 +477,7 @@ function Commands.new(ctx: any)
 				end
 				count += 1
 			end
-			if count ~= #value then
+			if not isSequence(value, count) then
 				return false -- holes or string keys hiding in an array
 			end
 			return meta.MaxItems == nil or count <= meta.MaxItems

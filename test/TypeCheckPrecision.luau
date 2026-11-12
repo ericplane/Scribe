@@ -45,6 +45,7 @@ local template = {
 	Ledger = Scribe.MapOf("integer", { Note = Scribe.String(""), Audit = Scribe.ServerOnly(Scribe.Int(0)) }),
 	HiddenSet = Scribe.SetOf(Scribe.ServerOnly(Scribe.Int(0))),
 	HiddenMap = Scribe.MapOf("integer", Scribe.ServerOnly(Scribe.Int(0))),
+	Slots = Scribe.MapOf("integer", Scribe.String(""), { MaxKeys = 8 }),
 }
 
 local boards: { [string]: Scribe.LeaderboardConfig<typeof(template)> } = {
@@ -55,7 +56,16 @@ local bundle = Scribe({
 	Template = template,
 	ServerStore = { Wave = Scribe.Int(0), Pool = Scribe.ArrayOf(Scribe.Int(0)) },
 	Leaderboards = boards,
-	Products = { Pack = { Id = 1, PaidRandom = true } },
+	Products = {
+		Pack = { Id = 1, PaidRandom = true },
+		Tool = {
+			Id = 2,
+			Grant = function(data, player)
+				local _name: string = player.Name
+				data.Coins.Increment(1)
+			end,
+		},
+	},
 	ProfileStoreIndex = "TypeCheckPrecision",
 	ProfileKeyPrefix = "PLAYER_",
 })
@@ -118,6 +128,10 @@ return function(player: Player)
 		ItemId = "Sword",
 		IdempotencyKey = "k1",
 		PaidRandom = false,
+		Grant = function(grantData, buyer)
+			local _id: number = buyer.UserId
+			grantData.Coins.Increment(1)
+		end,
 	})
 	local refusedKey: boolean = reason == Scribe.PurchaseReason.InvalidIdempotencyKey
 

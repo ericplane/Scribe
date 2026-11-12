@@ -619,12 +619,11 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		end)
 		```
 
-		`Idempotent = true` makes the command require a caller-supplied key, sent with
-		[Client.RequestOnce]. The handler then runs **at most once per key**, and every
-		repeat, including one arriving while the first is still yielding, is answered
-		with the original reply. The requirement is symmetric: a key sent to a command
-		without `Idempotent`, or a plain [Client.Request] to one with it, is refused
-		with `"bad-idempotency-key"`.
+		`Idempotent = true` requires a key from [Client.RequestOnce]. Concurrent retries
+		share the handler's reply. Later retries replay it until the record expires or is
+		evicted. The replay window starts at completion. A handler that throws keeps its
+		writes and releases its key for retry. A missing or unexpected key returns
+		`"bad-idempotency-key"`.
 
 		[Commands & Requests](../commands.md) covers `Args` and every refusal reason.
 	]=]

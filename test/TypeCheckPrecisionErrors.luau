@@ -1,5 +1,5 @@
 --!strict
--- EXPECTED_ERRORS: 29
+-- EXPECTED_ERRORS: 30
 -- Each invalid write, argument or wrapped-value use must report one type error.
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -41,6 +41,12 @@ bundle.Client.Raw = nil -- 5: on both sides
 local _spec: Scribe.PurchaseSpec<typeof(template)> =
 	{ Cost = { Path = "Coins", Amount = 1 }, ItemId = "a", IdempotencyKey = 5 } -- 24
 local _product: Scribe.ProductConfig<typeof(template)> = { Id = 1, PaidRandom = "yes" } -- 25
+local _granted: Scribe.ProductConfig<typeof(template)> = {
+	Id = 2,
+	Grant = function(_data, player)
+		local _wrong: number = player.Name -- 30: the player is a Player, not any
+	end,
+}
 
 return function(player: Player)
 	local data = bundle.Server[player]

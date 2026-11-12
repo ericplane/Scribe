@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -13,9 +13,15 @@ const options = Object.fromEntries(process.argv.slice(2).map(arg => {
 const fixture = path.join(root, "test/TypeCheckNamedParameters.luau");
 const source = readFileSync(fixture, "utf8");
 const uri = pathToFileURL(fixture).href;
+// The default project omits the completion fixture.
+const sourcemap = options.sourcemap ?? ".cache/luau-completions-sourcemap.json";
+if (!options.sourcemap) {
+    mkdirSync(path.join(root, ".cache"), { recursive: true });
+    execFileSync(options.rojo ?? "rojo", ["sourcemap", "test.project.json", "-o", sourcemap], { cwd: root, stdio: ["ignore", "ignore", "inherit"] });
+}
 const config = {
     platform: { type: "roblox" },
-    sourcemap: { enabled: true, autogenerate: false, sourcemapFile: options.sourcemap ?? "sourcemap.json" },
+    sourcemap: { enabled: true, autogenerate: false, sourcemapFile: sourcemap },
     diagnostics: { workspace: false },
     completion: { autocompleteEnd: true },
 };

@@ -247,6 +247,7 @@ export type LogCode =
 	| "LISTENER_ERROR"
 	| "ON_PLAYER_INIT_ERROR"
 	| "ON_PLAYER_INIT_LEDGER"
+	| "ON_PLAYER_INIT_SESSION"
 	| "PLAYER_LEAVING_HOOK_SLOW"
 	| "SANDBOXED"
 	| "SERVER_STARTED"
@@ -413,7 +414,7 @@ export type LeaderboardConfig = {
 export type ProductConfig = {
 	Id: number,
 	Category: string?,
-	Grant: ((data: any) -> ())?,
+	Grant: ((data: any, player: Player) -> ())?,
 	Grants: string?,
 	PaidRandom: boolean?,
 }
@@ -428,7 +429,7 @@ export type PurchaseSpec = {
 	Cost: { Path: string, Amount: number | string | { M: number, E: number } },
 	Category: string?,
 	ItemId: string,
-	Grant: ((data: any) -> ())?,
+	Grant: ((data: any, player: Player) -> ())?,
 	Meta: { [string]: any }?,
 	-- Optional. Two calls carrying the same key apply once: the repeat returns the
 	-- original outcome without debiting or granting again. A FAILED purchase claims

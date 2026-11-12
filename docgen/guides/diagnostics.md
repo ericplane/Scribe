@@ -173,6 +173,7 @@ These describe what Scribe is putting on the wire. Reach for them when the Ember
     | `FramesSent` | counter | Frames handed to the transport, counted per **delivery**, so a broadcast to 40 clients counts 40 |
     | `BytesOutPerSend` | distribution | Bytes per outbound **frame**, sampled once per frame produced rather than once per recipient |
     | `JoinBytes` | distribution | Bytes delivered to one client to complete one handshake |
+    | `HandshakeDuration` | distribution | Seconds from the profile becoming Ready to the server sending the first owner snapshot successfully. Sampled once per player session. |
     | `FlushEntriesPerFrame`, `FlushQueuedPerFrame` | distribution | Players flushed in one `PostSimulation` pass, and ops queued across them |
 
     `FramesSent` is what makes a `Shared` fanout visible: it grows with the square of the player count while `DiffFlushes` grows linearly. A transport that implements `SendToAllClients` counts one per broadcast, since Scribe hands over a single buffer and never learns the recipient count.
@@ -195,6 +196,7 @@ These describe what Scribe is putting on the wire. Reach for them when the Ember
     | `CommandRepliesHeld`, `CommandReplyHoldsExpired` | counter | Command replies held for that rebuild, and held replies released at their deadline rather than by a rebuild attempt |
     | `MalformedFrames`, `InboundOversize`, `InboundRateLimited`, `InboundWorkLimited` | counter | Rejected inbound frames, see the [Transport codes](./log-codes) |
     | `ProtocolMismatch`, `SchemaMismatch`, `ReInitThrottled` | counter | Handshakes refused |
+    | `HandshakeTimeouts` | counter | Clients still connected without a Hello 10 seconds after Ready in `DevMode`, or 60 seconds otherwise. Each counts once and logs `CLIENT_HANDSHAKE_TIMEOUT`. |
 
     Both fragmentation counters staying at zero means every frame your game emits already fits, which is the ordinary case. A rising `FramesFragmented` says some profile or diff has grown past the budget.
 

@@ -1039,15 +1039,12 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@param key string
 		@param callback (owned: boolean) -> ()
 		@return () -> ()
-		Calls `callback` with the current ownership and again whenever it changes.
-		Returns a disconnect function. Ideal for reactively toggling "buy" buttons.
+		Returns a disconnect function immediately. Calls `callback` with current
+		ownership once data has loaded and whenever ownership changes.
 	]=]
 	-- Reports current ownership and later changes; returns a disconnect.
 	function Data.ObserveOwned(key: string, callback: (owned: boolean) -> ()): () -> ()
 		assertOwnsKey(key, "ObserveOwned")
-		if not editMode then
-			waitForLoaded()
-		end
 		local last: boolean? = nil
 		local function push()
 			local owned = ownsFromMirror(key)
@@ -1058,10 +1055,18 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		end
 		local disconnectPerk = tree.Reserved.Perks.Changed(push)
 		local disconnectCache = tree.ReservedSession.OwnsCache.Changed(push)
-		push()
+		local untilLoaded: any = nil
+		if loaded then
+			push()
+		else
+			untilLoaded = loadedSignal:Once(push)
+		end
 		return function()
 			disconnectPerk()
 			disconnectCache()
+			if untilLoaded then
+				untilLoaded:Disconnect()
+			end
 		end
 	end
 
@@ -1700,10 +1705,11 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@within Client
 		@tag Reads
 		@client
+		@yields
 		@return SaveInfo
 		The owner's replicated save state (`{ LastSaveAt, LastResult, Dirty, Size }`)
 		for "Saving… / Saved ✓" UI. `Size` is the approximate byte size of the last
-		successful save (nil before the first).
+		successful save (nil before the first). Yields until data has loaded.
 	]=]
 	-- Reads the owner's replicated save status.
 	function Data.GetSaveInfo(): { [string]: any }
@@ -1719,8 +1725,9 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@within Client
 		@tag Monetization
 		@client
+		@yields
 		@return { [string]: number }
-		The local player's unassigned gift credits by product name.
+		Yields until data has loaded, then returns unassigned gift credits by product name.
 	]=]
 	-- Reads unassigned gift credits from the local mirror.
 	function Data.GetGiftCredits(): { [string]: number }
@@ -1736,10 +1743,11 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@within Client
 		@tag Monetization
 		@client
+		@yields
 		@param filter PurchaseFilter?
 		@return { table }
-		The local player's purchase history for history UI. Only returned if the
-		game opts into replicating purchase logs (`PurchaseLog.ReplicateRobux`).
+		Yields until data has loaded, then returns the purchase logs enabled by
+		`PurchaseLog.ReplicateRobux` or `PurchaseLog.ReplicateInGame`.
 
 		`PurchaseFilter` is `{ Kind: ("Robux" | "InGame")?, Category: string?,
 		ItemId: string?, Since: number?, Limit: number? }`, exported as
@@ -1801,13 +1809,41 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		end
 	end
 
-	local function deepMerge(base: any, over: any): any
+	-- Infer lists in untyped mock data from the key count and array length.
+	local function isSequence(t: { [any]: any }): boolean
+		local count = 0
+		for _ in t do
+			count += 1
+		end
+		return count == #t
+	end
+
+	local function mockMerge(base: any, over: any, schema: Template.SchemaNode?): any
 		if type(base) ~= "table" or type(over) ~= "table" then
+			return Util.deepClone(over)
+		end
+		if schema ~= nil and (schema.Kind == "leaf" or schema.ValueType == "flags" or schema.Container == "Array") then
+			return Util.deepClone(over)
+		end
+		local untyped = schema == nil
+			or schema.Kind == "any"
+			or (schema.Container == nil and (schema.Children == nil or next(schema.Children) == nil))
+		if untyped and isSequence(over) and (#over > 0 or isSequence(base)) then
 			return Util.deepClone(over)
 		end
 		local out = Util.deepClone(base)
 		for key, value in over do
-			out[key] = deepMerge(out[key], value)
+			-- ChildSchema can cache an undeclared key on the shared schema.
+			local child: Template.SchemaNode? = nil
+			if schema ~= nil then
+				if type(key) == "string" and schema.Children ~= nil then
+					child = schema.Children[key]
+				end
+				if child == nil and schema.Container == "Dict" then
+					child = schema.AnyChild
+				end
+			end
+			out[key] = mockMerge(out[key], value, child)
 		end
 		return out
 	end
@@ -1821,9 +1857,10 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		Seeds mock data for a storybook / edit mode. **Errors outside edit mode.**
 		Use it to render Scribe-backed components with realistic state.
 
-		`values` holds template fields to seed and is deep-merged into the mirror,
-		so you only pass the fields your component reads. `scribeState` seeds the
-		monetization and leaderboard state those APIs read.
+		`values` merges records, dictionaries and maps by key. Use the field's `Set`
+		to remove entries. Pass arrays and sets as complete lists with contiguous
+		indices. For Flags, pass all enabled names as values. `{}` clears any of
+		these lists. `scribeState` seeds monetization and leaderboard state.
 	]=]
 	-- Seeds local mirror data in edit mode only.
 	function Data.Mock(values: { [string]: any }?, scribeState: { [string]: any }?)
@@ -1834,7 +1871,8 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			if values then
 				for key, value in values do
 					local current = mirror[key]
-					tree.Accessor.Child(key).Set(deepMerge(current, value))
+					local rootSchema = if compiled.Root.Children then compiled.Root.Children[key] else nil
+					tree.Accessor.Child(key).Set(mockMerge(current, value, rootSchema))
 				end
 			end
 			if scribeState then

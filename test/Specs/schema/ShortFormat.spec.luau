@@ -40,6 +40,19 @@ describe("it renders a plain number", function()
 	it("keeps a small number intact, because the units tier is empty", function()
 		expect(`{Scribe.Short(0)} {Scribe.Short(42)}`).toBe("0 42")
 	end)
+
+	it("moves up a tier when rounding reaches 1000", function()
+		restore()
+		expect(`{Scribe.Short(999995)} {Scribe.Short(999999, 0)} {Scribe.Short(999.995)} {Scribe.Short(-999999)}`).toBe(
+			"1.00M 1M 1.00K -1.00M"
+		)
+		expect(`{Scribe.Short(999994)} {Scribe.Short(999.994)}`).toBe("999.99K 999.99")
+	end)
+
+	it("renders in full when rounding passes the last suffix", function()
+		restore()
+		expect(Scribe.Short(Big.from("999.999e33"))).toBe("1e36")
+	end)
 end)
 
 describe("it renders a Scribe.Big the same way", function()

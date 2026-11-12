@@ -474,8 +474,14 @@ function Timed.new(ctx: any)
 
 	function self.OnLoad(entry: any)
 		restoreDeadlines(entry)
-		sweepEntry(entry)
 		local store = timedStore(entry)
+		-- Session values reset on join, so discard their saved deadlines.
+		for pathKey in store or {} do
+			if not Template.PersistOf(compiled, string.split(pathKey, "\31")) then
+				setTimed(entry, pathKey, nil)
+			end
+		end
+		sweepEntry(entry)
 		if next(visibleFields) ~= nil then
 			local visible: { [string]: number } = {}
 			for pathKey, expiry in store or {} do

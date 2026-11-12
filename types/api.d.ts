@@ -18,7 +18,8 @@ export interface LeaderboardConfig<T = unknown> {
 export interface ProductConfig<T = unknown> {
     Id: number;
     Category?: string;
-    Grant?: (this: void, data: PlayerData<T>) => void;
+    /** Runs on the buyer's data, or the recipient's for gifts. */
+    Grant?: (this: void, data: PlayerData<T>, player: Player) => void;
     Grants?: string;
     PaidRandom?: boolean;
 }
@@ -27,7 +28,8 @@ export interface PurchaseSpec<T = unknown> {
     Cost: { Path: NumericPaths<T, true>; Amount: BigOperand };
     Category?: string;
     ItemId: string;
-    Grant?: (this: void, data: PlayerData<T>) => void;
+    /** Runs on the buyer's data. */
+    Grant?: (this: void, data: PlayerData<T>, player: Player) => void;
     Meta?: UnknownRecord;
     IdempotencyKey?: string;
     PaidRandom?: boolean;
@@ -169,7 +171,7 @@ export interface ServerAPI<T, C = {}> {
 }
 export type ServerData<T, S = {}, C = {}> = ServerAPI<T, C> & ServerStoreMember<S>;
 
-/** Partial records for Mock; arrays and Roblox engine datatypes remain whole values. */
+/** Mock merges records, dictionaries and maps by key. Arrays, sets, Flags and engine datatypes replace whole values. */
 export type MockValues<T> = T extends Datatype | buffer | BigValue | ReadonlyArray<unknown> | ReadonlyMap<unknown, unknown> ? T : T extends object ? { [K in keyof T]?: MockValues<T[K]> } : T;
 export interface ClientAPI<T, C = {}> {
     /** Reads snapshot readiness without yielding. */
@@ -200,7 +202,7 @@ export interface ClientAPI<T, C = {}> {
     readonly Owns: (this: void, key: string) => boolean;
     /** Waits for the server's initial ownership sync before reading the mirror. */
     readonly OwnsAsync: (this: void, key: string, timeout?: number) => boolean;
-    /** Reports ownership now and on changes; returns a disconnect function. */
+    /** Returns a disconnect immediately. Reports current ownership once loaded and on changes. */
     readonly ObserveOwned: (this: void, key: string, callback: (this: void, owned: boolean) => void) => Disconnect;
     /** Fires for ownership changes after the initial baseline. */
     readonly OnOwnershipChanged: Signal<[string, boolean]>;
@@ -224,11 +226,11 @@ export interface ClientAPI<T, C = {}> {
     readonly GetProductState: (this: void, name: string) => ProductState;
     /** Reports shop state now and on changes; returns a disconnect function. */
     readonly ObserveProductState: (this: void, name: string, callback: (this: void, state: ProductState) => void) => Disconnect;
-    /** Reads the owner's replicated save status. */
+    /** Waits for load, then reads the owner's replicated save status. */
     readonly GetSaveInfo: (this: void) => SaveInfo;
-    /** Reads unassigned gift credits from the local mirror. */
+    /** Waits for load, then reads unassigned gift credits. */
     readonly GetGiftCredits: (this: void) => { [product: string]: number };
-    /** Reads purchase history only when its replication is enabled. */
+    /** Waits for load, then reads the enabled purchase logs. */
     readonly GetPurchases: (this: void, filter?: PurchaseFilter) => PurchaseEntry[];
     /** Seeds local mirror data in edit mode only. */
     readonly Mock: (this: void, values?: MockValues<InputOf<ClientSchema<T>>>, state?: MockState) => void;

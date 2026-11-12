@@ -162,6 +162,55 @@ describe("a non-finite number argument", function()
 	end)
 end)
 
+describe("an array argument that is not a sequence", function()
+	local Scribe = require(ScribeRoot) :: any
+
+	--- Insertion order can change the length reported for a sparse table.
+	local function keyed(order)
+		local built = {}
+		for _, key in order do
+			built[key] = "x"
+		end
+		return built
+	end
+
+	local function reaches(spec, value): boolean
+		local harness = TestCtx.make({})
+		local reached = false
+		harness.Data.Command("Probe", { Args = { spec } }, function()
+			reached = true
+		end)
+		local _player, entry = harness.Join(97301)
+		send(harness, entry, "Probe", value)
+		harness.Cleanup()
+		return reached
+	end
+
+	local function verdicts(spec): string
+		local out = {}
+		for _, order in { { -1 }, { 1, 3 }, { 1.5 }, { 2, 3, 4, -1 }, { 2, 3, 4, 100 } } do
+			table.insert(out, tostring(reaches(spec, keyed(order))))
+		end
+		return table.concat(out, ",")
+	end
+
+	it("REFUSES one through the array shape", function()
+		expect(verdicts({ "string" })).toBe("false,false,false,false,false")
+	end)
+
+	it("REFUSES one through ArrayOf, SetOf and Flags, whose length can agree with the key count", function()
+		expect(verdicts(Scribe.ArrayOf(Scribe.String("")))).toBe("false,false,false,false,false")
+		expect(verdicts(Scribe.SetOf(Scribe.String("")))).toBe("false,false,false,false,false")
+		expect(verdicts(Scribe.Flags({ "x" }))).toBe("false,false,false,false,false")
+	end)
+
+	it("CONTROL: a real sequence still arrives, empty included", function()
+		expect(`{reaches({ "string" }, { "a", "b" })},{reaches({ "string" }, {})}`).toBe("true,true")
+		expect(reaches(Scribe.ArrayOf(Scribe.String("")), { "a", "b" })).toBe(true)
+		expect(reaches(Scribe.Flags({ "x" }), { "x" })).toBe(true)
+	end)
+end)
+
 describe("the same class in Scribe.Derived", function()
 	it("REFUSES a gap in the input list, which used to narrow the field silently", function()
 		-- { "A", nil, "B" } became a TWO-input derived: the resolver skips the hole, so the

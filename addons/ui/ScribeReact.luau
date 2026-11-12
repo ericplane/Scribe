@@ -55,13 +55,20 @@ export type Adapter = {
 Creates React hooks for Scribe accessors.
 ]]
 return function(React: React): Adapter
+	-- Give React a new reference when a container changes in place.
+	local function snapshot<T>(value: T): T
+		return if type(value) == "table" then table.clone(value :: any) else value
+	end
+
 	local function useScribe<T>(accessor: Readable<T>): T
-		local state: T, setValue: (T) -> () = React.useState(accessor.Get)
+		local state: T, setValue: (T) -> () = React.useState(function()
+			return snapshot(accessor.Get())
+		end)
 		React.useEffect(function()
 			-- Catch writes between render and the effect.
-			setValue(accessor.Get())
+			setValue(snapshot(accessor.Get()))
 			return accessor.Changed(function(new)
-				setValue(new)
+				setValue(snapshot(new))
 			end)
 		end, { accessor })
 		return state

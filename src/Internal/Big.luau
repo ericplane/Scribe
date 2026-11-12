@@ -366,15 +366,23 @@ function Big.toShort(a: Big, decimals: number?): string
 		if string.match(text, "[1-9]") == nil then
 			return Big.toString(a)
 		end
-		return text
+		if math.abs(tonumber(text) :: number) < 1000 then
+			return text
+		end
 	end
 	local tier = math.floor(a.E / 3)
+	local scaled = a.M * 10 ^ (a.E - tier * 3)
+	local text = string.format(`%.{places}f`, scaled)
+	-- Carry a rounded 1000 into the next tier.
+	if math.abs(tonumber(text) :: number) >= 1000 then
+		tier += 1
+		text = string.format(`%.{places}f`, scaled / 1000)
+	end
 	local suffix = SUFFIXES[tier + 1]
 	if suffix == nil then
 		return Big.toString(a)
 	end
-	local scaled = a.M * 10 ^ (a.E - tier * 3)
-	return string.format(`%.{places}f{suffix}`, scaled)
+	return text .. suffix
 end
 
 -- Coerce an operand of an arithmetic metamethod, erroring at level 3 so the blame

@@ -55,7 +55,7 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 
     The console filters separately. The built-in sink forwards entries to Roblox's structured `LogService` output keyed by `Code`, so Creator Analytics aggregates by code rather than by message text, and it forwards only entries at or above the `LogLevel` option. That defaults to `Warn` on a live server and `Debug` in Studio.
 
-    Entries below the threshold are still written to the ring buffer and still reach your own sinks, so `GetRecentLogs` sees them even when the console does not.
+    `GetRecentLogs` reads the ring, whose `LogRingLevel` defaults to `Warn` in production and `Debug` in Studio. Each sink uses `LogLevel` unless you set its own minimum. For example, `AddLogSink(callback, { Level = "Info" })` receives `PROFILE_LOADED` on a live server with the default console settings.
 
 ## Persistence
 
@@ -139,20 +139,20 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `INIT_APPLIED` | Debug | The client finished applying the initial snapshot, so its mirror now matches the server. This is the normal end of the join handshake and needs no action. |
 | `INIT_SENT` | Debug | The server sent a player their initial snapshot. Pair it with `INIT_APPLIED` on the client to see a join complete end to end. |
 | `INIT_SEND_FAIL` | Error | The initial snapshot for one player was refused by the transport. The player is deliberately not marked ready, so the client's own retry can still succeed. Counted as `InitSendFailed`. |
-| `CLIENT_HANDSHAKE_TIMEOUT` | Warn | A client never sent its Hello frame within the handshake timeout, so replication never started for them. Most often the bundle was never required on the client. A `LocalScript` has to require it to begin the handshake. |
+| `CLIENT_HANDSHAKE_TIMEOUT` | Warn / Debug | No Hello by 10 seconds after the profile became Ready in `DevMode`, or 60 seconds otherwise. Logs at `Warn` until this server accepts its first Hello, then at `Debug`. A late client can still join. Counted as `HandshakeTimeouts`. |
 | `INIT_UNDELIVERED` | Warn | The client did send Hello, and the snapshot Scribe built in reply never reached the transport. The one innocent cause is a transport refusing a payload this size, so the message names `MaxOutboundBytes`. |
 | `MIRROR_RESYNC` | Warn | A frame addressed to one client could not be delivered, so their mirror no longer matches the server and Scribe is re-sending the whole snapshot. This is a repair rather than a loss, and it names a transport that is refusing frames. |
 | `OUTBOUND_OVERSIZE` | Warn | A single outbound frame needed more fragments than Scribe considers reasonable, which is 16, or roughly a megabyte at the default `MaxOutboundBytes`. The frame is still delivered, so this is a cost report. For an `Init` the message names the largest roots by encoded wire bytes. |
 | `OP_BEFORE_INIT` | Warn | Client side. A diff frame arrived before the initial snapshot was applied, which is a protocol ordering error. The client re-sends Hello to request a fresh snapshot. |
-| `PROTOCOL_MISMATCH` | Warn | A client's wire version differs from the server's, so two different Scribe versions are running. Replication is refused for that client. |
-| `SCHEMA_MISMATCH` | Warn | Same wire version, divergent templates, so the client derived a different schema hash. Replication is refused for that client. |
+| `PROTOCOL_MISMATCH` | Warn | The client's wire version differs from the server's. The server refuses replication and counts each refusal in `ProtocolMismatch`. |
+| `SCHEMA_MISMATCH` | Warn | The wire version matches but the client's template hash differs. The server refuses replication and counts each refusal in `SchemaMismatch`. |
+
+The server logs the first Hello mismatch in each player session. Later mismatches still count toward the corresponding metric.
 
 ??? note "Two codes for the same symptom, and why"
-    `CLIENT_HANDSHAKE_TIMEOUT` and `INIT_UNDELIVERED` both mean a client never got its data, and they are separate codes because the fix is different.
+    A `CLIENT_HANDSHAKE_TIMEOUT` warning means no client has completed a valid Hello on this server. Check that a `LocalScript` requires the shared module and that any custom client transport is working. At `Debug`, another client has already reached the server and this one may still be loading.
 
-    `CLIENT_HANDSHAKE_TIMEOUT` means the client never asked. Check that a `LocalScript` requires the Emberfall shared module, or that a custom client transport adapter is present and working.
-
-    `INIT_UNDELIVERED` means the client asked and the answer never left. Check `MaxOutboundBytes` against what your channel actually accepts, and look at the `JoinBytes` distribution in [`Scribe.GetMetrics`](/api/Scribe#GetMetrics) to see how large the snapshot has grown.
+    `INIT_UNDELIVERED` means the client asked but the snapshot failed to reach the transport. Check `MaxOutboundBytes` against the size your channel accepts. `JoinBytes` in [`Scribe.GetMetrics`](/api/Scribe#GetMetrics) shows sizes for handshakes that succeeded.
 
     `MIRROR_RESYNC` matters more than it looks. A loaded client cannot ask for a resync itself, because every Hello is gated on the client not yet being loaded, so this is the only signal that a mirror ever went stale.
 
@@ -200,7 +200,7 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 ??? note "Why an idempotency mismatch is refused rather than downgraded"
     A caller who believes a command is deduplicated and is wrong is worse off than one who knows it is not, so `COMMAND_BAD_IDEMPOTENCY_KEY` refuses in both directions and never quietly falls back to a plain request. See [Commands & Requests](./commands).
 
-    `COMMAND_IDEM_EVICTED` exists for the same reason. Reaching it needs far more distinct keys in flight than a real client produces, and when it happens the protection is genuinely gone for those keys, so it is reported rather than dropped silently.
+    `COMMAND_IDEM_EVICTED` can happen when a player completes 64 distinct keyed requests within the retention window. After eviction, retrying the dropped key can run its handler again.
 
     `COMMAND_IDEM_SATURATED` is the other end of the same cache. Dropping an in-flight record would strand every duplicate parked on it, so nothing is dropped and the new request is refused instead. Look for a handler that never returns, or a client deliberately holding them open.
 
@@ -259,7 +259,7 @@ Each section heading below **is** the entry's `Category` value, so a row's secti
 | `GIFT_DELIVERY_RETRY` | Warn | Cross-server gift delivery failed, so the receipt returns `NotProcessedYet` and Roblox will retry. Repeated hits point at a DataStore messaging problem. |
 | `GIFT_INTENT_EXPIRED` | Warn | A stored intent names a different product using the same Roblox product ID. It cannot route this product's receipt and is ignored or cleared. Restore the historical product identity rather than reusing IDs; age alone no longer invalidates an unresolved intent. |
 | `GIFT_INVALID_RECIPIENT` | Error | A stored gift intent or aim has a non-positive, fractional, non-finite, or otherwise invalid recipient ID. The receipt stays pending for repair; Scribe does not save a new receipt destination or deliver to that invalid ID. |
-| `GIFT_NO_INTENT` | Warn | A giftable perk was bought with no matching intent and the buyer does not already own it, so the perk was granted to the buyer. An expected fallback. |
+| `GIFT_NO_INTENT` | Info | A perk-only purchase had no gift intent, so Scribe grants it to the buyer. This is the normal path for buying it for yourself. |
 | `GIFT_RECIPIENT_ALREADY_OWNS` | Warn | Between prompt and receipt the recipient acquired the perk anyway, so the purchase became a re-aimable credit for the buyer rather than a wasted grant. Also fires `OnGiftCredit`. |
 | `RECEIPT_DECLINED_PENDING_CREDIT` | Warn | A no-intent perk purchase arrived while the buyer already owns the perk and still holds an unused credit. The receipt stays pending; spending the credit allows a later retry to proceed. This does not issue a refund. |
 | `RECEIPT_HELD` | Warn | A no-intent perk purchase arrived while the buyer already owns the perk under `NoGiftIntentPolicy = "Hold"`, so the receipt is held for retry instead of auto-crediting. |
@@ -323,6 +323,7 @@ A derived compute runs on both realms, which is what makes Emberfall's `Level` f
 | `LISTENER_ERROR` | Error | A listener or callback you supplied threw while processing a data change. Scribe caught it and reported it. |
 | `ON_PLAYER_INIT_ERROR` | Error | The `OnPlayerInit` callback threw while initializing a newly loaded profile. |
 | `ON_PLAYER_INIT_LEDGER` | Error | `OnPlayerInit` assigned `_Scribe`. The assignment was discarded and Scribe's ledger kept intact. Use the purchase, perk and gift APIs to change their state. |
+| `ON_PLAYER_INIT_SESSION` | Warn | `OnPlayerInit` assigned a session root in its raw data table. Scribe discarded the assignment. `Context.Fields` names the affected roots. Set session data through the player's accessor after Ready. |
 | `DYNAMIC_DEFAULT_FAILED` | Error | A `Scribe.Dynamic` factory threw while seeding a field on a brand-new profile, so that field keeps its declaration-time baseline. |
 | `PROFILE_UNPERSISTABLE` | Error | A value in the loaded profile cannot be stored and would fail the whole save: invalid UTF-8, an unserializable value, a table mixing array indices with string keys, or a table nested past 64 levels. Scribe logs the exact path and leaves the value in place for you to fix. Also fires `OnAnomaly`. |
 | `SUBSYSTEM_HOOK_ERROR` | Error | An internal load hook for Timed, Monetization, Leaderboards or Replication errored when a player's entry became ready. |

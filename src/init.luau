@@ -1414,8 +1414,7 @@ type function BuildServerDataType(T, P, S, Names: type?)
 	add("GrantPerk", fn({ P, ts.string }, {}))
 	add("RevokePerk", fn({ P, ts.string }, {}))
 
-	-- Purchase spec: Cost.Path is the template's numeric-leaf path union and
-	-- Grant receives the typed accessor tree.
+	-- Cost.Path accepts numeric leaves. Grant receives the typed tree and player.
 	local costProps: { [type]: type } = {}
 	-- Include Big currency paths.
 	costProps[ts.singleton("Path")] = StatPathsType(T, ts.singleton(true))
@@ -1425,7 +1424,7 @@ type function BuildServerDataType(T, P, S, Names: type?)
 	purchaseProps[ts.singleton("Cost")] = ts.newtable(costProps, nil, nil)
 	purchaseProps[ts.singleton("Category")] = optional(ts.string)
 	purchaseProps[ts.singleton("ItemId")] = ts.string
-	purchaseProps[ts.singleton("Grant")] = optional(fn({ node }, {}))
+	purchaseProps[ts.singleton("Grant")] = optional(fn({ node, P }, {}))
 	purchaseProps[ts.singleton("Meta")] = optAnyTable
 	purchaseProps[ts.singleton("IdempotencyKey")] = optional(ts.string)
 	purchaseProps[ts.singleton("PaidRandom")] = optional(ts.boolean)
@@ -1541,8 +1540,9 @@ export type CFrameMeta = { Precision: "exact"? }
 -- Container declarator options. Not generic in the element type on purpose: an
 -- element-typed option would let Luau infer the element type from it rather than
 -- from `shape`, silently redefining the field.
-export type ArrayOpts = { MaxItems: number?, Evict: ("Front" | "Back")? }
-export type SetOpts = { MaxItems: number? }
+-- Read-only fields accept partial option literals.
+export type ArrayOpts = { read MaxItems: number?, read Evict: ("Front" | "Back")? }
+export type SetOpts = { read MaxItems: number? }
 export type CooldownOptions = { IncludeOfflineTime: boolean? }
 export type MapKeyType = "integer" | "string"
 -- What a Scribe.Big field reads back, which is also what the declarator returns.
@@ -1617,7 +1617,7 @@ type function MapShape(K, V)
 	return out
 end
 export type MapOf<K, V> = MapShape<K, V>
-export type DictOpts = { MaxKeys: number?, MaxKeyLength: number? }
+export type DictOpts = { read MaxKeys: number?, read MaxKeyLength: number? }
 
 -- Template-aware config types. Annotate a config local with one and `Stat` / `Cost.Path`
 -- become the template's numeric leaf-path union while `Grant` receives the typed accessor
@@ -1643,7 +1643,7 @@ export type LeaderboardConfig<T = any> = {
 export type ProductConfig<T = any> = {
 	Id: number,
 	Category: string?,
-	Grant: ((data: BuildGrantDataType<T, NodeFunctionNames>) -> ())?,
+	Grant: ((data: BuildGrantDataType<T, NodeFunctionNames>, player: Player) -> ())?,
 	Grants: string?,
 	PaidRandom: boolean?,
 }
@@ -1653,7 +1653,7 @@ export type PurchaseSpec<T = any> = {
 	Cost: { Path: StatPathsType<T, true>, Amount: number | string | BigValue },
 	Category: string?,
 	ItemId: string,
-	Grant: ((data: BuildGrantDataType<T, NodeFunctionNames>) -> ())?,
+	Grant: ((data: BuildGrantDataType<T, NodeFunctionNames>, player: Player) -> ())?,
 	Meta: { [string]: any }?,
 	IdempotencyKey: string?,
 	PaidRandom: boolean?,
@@ -1680,7 +1680,7 @@ type LeaderboardConfigLoose = {
 type ProductConfigLoose = {
 	read Id: number,
 	read Category: string?,
-	read Grant: ((data: any) -> ())?,
+	read Grant: ((data: any, player: Player) -> ())?,
 	read Grants: string?,
 	read PaidRandom: boolean?,
 }
@@ -2031,7 +2031,7 @@ export type Bundle<T, S = any> = {
 	.Cost { Path: string, Amount: number | string | BigValue } -- the numeric field to debit, and by how much
 	.ItemId string -- what is being bought; recorded on the log entry
 	.Category string? -- a grouping label of your choosing, for filtering later
-	.Grant ((data) -> ())? -- runs inside the same transaction as the debit
+	.Grant ((data, player) -> ())? -- runs inside the same transaction as the debit
 	.Meta { [string]: any }? -- extra fields stored with the log entry
 	.IdempotencyKey string? -- max 64 bytes; two calls carrying the same key apply once
 	.PaidRandom boolean? -- applies paid-random policy checks
@@ -2324,7 +2324,7 @@ export type Bundle<T, S = any> = {
 	@tag Monetization
 	.Id number -- the developer product id
 	.Category string? -- purchase-log category, for [Server.GetPurchases]
-	.Grant ((data) -> ())? -- applies the purchase; runs inside a transaction, so it must not yield
+	.Grant ((data, player) -> ())? -- grants to the buyer or gift recipient inside a transaction. Must not yield.
 	.Grants string? -- name of a perk to set instead of, or as well as, running Grant
 	.PaidRandom boolean? -- a paid random item, refused on every purchase path for a player whose policy restricts them
 	One entry in the `Products` table. See [Monetization](../monetization.md).
@@ -3505,10 +3505,10 @@ Scribe.Datatypes = require(script.Internal.Datatypes)
 	@param value number | BigValue
 	@param decimals number?
 	@return string
-	Renders a quantity the short way a player reads it: `1.5K`, `100M`, `2.4B`.
+	Formats quantities with suffixes such as `1.50K`, `100.00M` and `2.40B`.
 
 	```lua
-	local label = Scribe.Short(data.Coins.Get()) -- "1.5M"
+	local label = Scribe.Short(data.Coins.Get()) -- "1.50M"
 	```
 
 	Takes a plain number or a `Scribe.Big` value, so a balance label does not have to

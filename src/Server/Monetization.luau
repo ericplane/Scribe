@@ -150,7 +150,7 @@ function Monetization.new(ctx: any)
 		Name: string,
 		Id: number,
 		Category: string?,
-		Grant: ((data: any) -> ())?,
+		Grant: ((data: any, player: Player) -> ())?,
 		Grants: string?,
 		PaidRandom: boolean,
 		Retired: boolean,
@@ -1206,7 +1206,8 @@ function Monetization.new(ctx: any)
 		-- rather than silently rolled back.
 		local function apply()
 			if product.Grant then
-				(product.Grant :: (any) -> ())(entry.Tree.Accessor)
+				-- A gift uses the recipient's entry.
+				(product.Grant :: (any, Player) -> ())(entry.Tree.Accessor, entry.Player)
 			end
 			if product.Grants then
 				checkPerkName(product.Grants)
@@ -1864,7 +1865,7 @@ function Monetization.new(ctx: any)
 
 		if product.Grants and not product.Grant then
 			-- A giftable perk product bought without intent: grant to the buyer.
-			Log.Warn("Gifting", "GIFT_NO_INTENT", "perk product purchased with no gift intent; granting to buyer", {
+			Log.Info("Gifting", "GIFT_NO_INTENT", "perk product purchased with no gift intent; granting to buyer", {
 				Player = entry.Player,
 				Product = product.Name,
 			})
@@ -3081,7 +3082,7 @@ function Monetization.new(ctx: any)
 				costAccessor.Set(balance - amount)
 			end
 			if spec.Grant then
-				(spec.Grant :: (any) -> ())(entry.Tree.Accessor)
+				(spec.Grant :: (any, Player) -> ())(entry.Tree.Accessor, entry.Player)
 			end
 			checkCategory(spec.Category)
 			-- Claimed INSIDE the transaction, so a Grant that throws rolls the claim back with

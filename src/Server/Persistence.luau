@@ -81,7 +81,9 @@ export type Entry = {
 	SizeWarned: boolean,
 	TornDown: boolean,
 	-- Replication state (owned by Replication.luau)
+	ReadyAt: number?, -- monotonic time the profile became Ready
 	HelloReceived: boolean,
+	HelloRefused: boolean?, -- first mismatch already logged
 	-- Two flags, deliberately: QueueOpen means a snapshot has been taken, so a write
 	-- belongs in the queue; HandshakeReady means the snapshot is on the wire, so this
 	-- client may be sent frames. One flag left a gap between those two moments in
@@ -104,6 +106,7 @@ export type Entry = {
 	Queue: { any },
 	QueueIndex: { [string]: number },
 	SharedQueue: { any },
+	SharedIndex: { [string]: number },
 	MalformedCount: number,
 	MalformedBlocked: boolean?, -- crossed the malformed-frame limit; inbound frames ignored
 	LastMalformedLog: number?, -- os.clock of the last emitted malformed-frame log/anomaly
@@ -354,6 +357,12 @@ function Persistence.new(ctx: any)
 	-- per-player session store, or the per-player snapshot.
 	local playerCompiled = compiled.Views.Player
 	local persistentDefaults = Template.BuildDefaults(playerCompiled, "Persistent")
+	local sessionRootNames: { [string]: boolean } = {}
+	for name, node in (playerCompiled.Root.Children or {}) :: { [string]: any } do
+		if node.Persist == false then
+			sessionRootNames[name] = true
+		end
+	end
 	local baseStore = ProfileStore.New(storeIndex, persistentDefaults)
 	-- Persistence mode: which store to read, whether to hold a session, whether anything
 	-- saves.
@@ -2107,15 +2116,19 @@ function Persistence.new(ctx: any)
 			local data = profile.Data
 			local view = table.clone(data)
 			view[Template.RESERVED_ROOT] = nil
+			-- Hide legacy Session keys from the hook and preserve them in the profile.
+			for name in sessionRootNames do
+				view[name] = nil
+			end
 			local keysBefore = table.clone(view)
 			local function foldView()
 				for key in data do
-					if key ~= Template.RESERVED_ROOT and view[key] == nil then
+					if key ~= Template.RESERVED_ROOT and not sessionRootNames[key] and view[key] == nil then
 						data[key] = nil
 					end
 				end
 				for key, value in view do
-					if key ~= Template.RESERVED_ROOT then
+					if key ~= Template.RESERVED_ROOT and not sessionRootNames[key] then
 						data[key] = value
 					end
 				end
@@ -2135,6 +2148,25 @@ function Persistence.new(ctx: any)
 						.. "assignment was discarded and Scribe's ledger kept. That root holds receipt ids, perks "
 						.. "and gift credits, and is changed only through the APIs that own it",
 					{ Player = player }
+				)
+			end
+			local sessionWrites: { string } = {}
+			for name in sessionRootNames do
+				if view[name] ~= nil then
+					table.insert(sessionWrites, name)
+				end
+			end
+			if #sessionWrites > 0 then
+				table.sort(sessionWrites)
+				local fields = table.concat(sessionWrites, ", ")
+				Log.Warn(
+					"Lifecycle",
+					"ON_PLAYER_INIT_SESSION",
+					`OnPlayerInit assigned Scribe.Session field(s) {fields}; the assignment was discarded. `
+						.. "A Session field is built fresh each session and never saved, so the hook's table "
+						.. "does not hold it: set it through its accessor once the player is Ready, or declare "
+						.. "a saved field if OnPlayerInit should write it",
+					{ Player = player, Fields = fields }
 				)
 			end
 			foldView()
@@ -2542,6 +2574,7 @@ function Persistence.new(ctx: any)
 			Queue = {},
 			QueueIndex = {},
 			SharedQueue = {},
+			SharedIndex = {},
 			MalformedCount = 0,
 			OversizeCount = 0,
 			FrameTokens = ctx.InboundFrameRate,

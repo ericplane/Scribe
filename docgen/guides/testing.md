@@ -98,6 +98,10 @@ In a real story, keep the observer connected while the component is mounted and 
 
 [`Data.Mock`](/api/Client#Mock) and [`Data.MockCommand`](/api/Client#MockCommand) only work outside play mode. They throw if used in a running game. `Mode = "Mock"` is the separate option for play-tests; it does not enable these edit-mode methods.
 
+`Data.Mock` merges records, dictionaries and maps by key. Omitted entries keep their values, so `{}` leaves a dictionary or map alone. Use the field's `Set({})` to empty it.
+
+Pass an array, set or `Flags` list whole. A shorter list drops the old tail, and `{}` empties it. A sparse array seed such as `{ [2] = "Sword" }` raises. A `Flags` seed supplies all enabled names. When replacing an array of records, omitted fields take their template defaults.
+
 ??? example "Preview inventories, purchases, and leaderboards"
     This larger example uses the [Emberfall module](./emberfall), rather than the tutorial's smaller `GameData` template:
 

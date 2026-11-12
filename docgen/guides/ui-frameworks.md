@@ -92,7 +92,7 @@ local function CoinLabel()
 end
 ```
 
-`useScribe` re-renders the component on every change, which is what you want when the value decides *what* is rendered. When it only feeds a property, `useScribeBinding` updates that property without re-rendering at all:
+Use `useScribe` when the value decides what the component renders. The hook gives React a shallow copy of a table so an `Insert`, `Remove` or child write that changes the mirror in place can trigger a render. If you copied the React adapter from 2.6.1 or earlier, replace it with the current file. For a value that only feeds a property, `useScribeBinding` updates the property without re-rendering the component.
 
 ```lua
 local coins = ScribeReact.useScribeBinding(Data.Coins)
@@ -118,13 +118,11 @@ On 0.3 the disconnect is registered in the scope as well as returned, so `doClea
 
 ## Why they are this short
 
-Three properties of the client mirror do the work. Each is measured and pinned by a spec, so an adapter already pasted into your game keeps working.
+**Reading a field.** Repeated `Get()` calls on an ordinary array, dictionary or record return the same table until the mirror replaces it. A `Scribe.Big` value is rebuilt on read, as is a container whose schema includes a `Big` or a packed Roblox datatype. Reading the whole data root also builds a fresh table. Treat the returned values as read-only.
 
-**`Get()` is referentially stable.** Two calls with nothing changing in between return the same table, for scalars, containers and records alike. A fresh table per call would make a React memo or a Vide derived recompute forever, and it stays invisible until a UI is built on it.
+**Receiving a resync.** The client rebuilds its containers from the snapshot and each observed container fires `Changed` once. An unchanged number, string or boolean stays quiet.
 
-**That survives a resync.** A dropped frame makes the client re-handshake and rebuild its mirror from defaults. The reference is unchanged across that when the value is, so a hiccup costs no spurious re-render and fires no spurious listener.
-
-**One frame of writes is one notification.** Three `Increment` calls inside a [`Data.Batch`](./values) reach the client as a single `Changed`. No adapter needs to debounce.
+**Receiving repeated scalar writes.** Three `Increment` calls on the same field inside a [`Data.Batch`](./values) reach the client as one `Changed` with the final value.
 
 ??? note "Observe rather than Changed, and why it matters here"
     The Vide and Fusion adapters subscribe with `Observe`, not `Changed`. `Observe` delivers the current value before it returns, which closes the gap between reading the initial value and subscribing to later ones. With `Changed` a write landing in that gap is lost and the UI sits on a stale first value.

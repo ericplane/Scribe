@@ -105,6 +105,8 @@ The declarator's constraints come with it: `Min`, `Max`, `MaxLength`, enum membe
 
 Accepted here: `Int`, `Number`, `String`, `Enum`, `Flags`, `Optional`, `ArrayOf`, `SetOf`, `DictOf`, `MapOf`. The rest describe how a field is stored or replicated (`Timed`, `ServerOnly`, `Shared`, `Session`, `Dynamic`) or carry a value the wire cannot represent (`Datatype`, `Big`). Passing one of those is refused at registration, and the error names the declarator.
 
+In an `Args` element spec, a bare string names a type. `Scribe.ArrayOf("string")` accepts an array of strings. With `Scribe.ArrayOf("")`, only the empty array passes because no element has that type. Use `Scribe.ArrayOf(Scribe.String("", { MaxLength = 32 }))` to bound each string. Bare number and boolean element specs such as `Scribe.ArrayOf(0)` raise at registration.
+
 ### Table payloads
 
 A spec entry may also be a **shape table** describing a table argument, nested as deep as eight levels. This is opt-in. A bare `"table"` stays exactly as permissive as it was, and most commands take scalars where a shape would be noise.
@@ -122,11 +124,11 @@ end)
 | --- | --- |
 | `{ Field = spec, ... }` | a table with exactly these keys, each value matching its spec |
 | a declarator | that declarator's type and its constraints |
-| `{ spec }`, a single entry at index `1` | an array whose every element matches `spec` |
+| `{ spec }`, a single entry at index `1` | an array, keyed `1` to `n` with no gaps, whose every element matches `spec` |
 
-Two rules are worth knowing. A shape **rejects undeclared keys**, because a payload carrying a field the command never declared is either version skew or someone probing. And a shape is always **required**: for an optional table argument, declare `"table?"` and check the contents yourself.
+A shape rejects undeclared keys. To make the whole argument optional, wrap the shape in `Scribe.Optional`. The array form, `ArrayOf`, `SetOf` and `Flags` all require consecutive numeric keys starting at `1`. A gap, fractional index or extra key gives `bad-args`.
 
-A malformed spec is rejected at registration rather than on the first client call, so a shape that could never match fails at startup instead of turning every request into `bad-args` in production.
+Malformed shapes raise at registration. Type-name strings are checked against `typeof()` when the command runs, so a misspelled type name can still register.
 
 ??? note "Why a bad argument is rejected and never clamped"
     A template write **clamps** an out-of-range number under the default `BoundsPolicy`, because the server chose that value and losing a little precision beats losing the write entirely.
@@ -175,13 +177,17 @@ end
 
 local ok, reason, failed = claim()
 if failed == Scribe.RequestFailed and reason == Scribe.RequestReason.Timeout then
-    ok, reason = claim() -- same key, so the server replays its first answer
+    ok, reason, failed = claim() -- reuse the key for this reward
 end
 ```
 
-The server runs the handler at most once per key and answers every repeat with the original reply, byte for byte, including a repeat that arrives while the first call is still yielding. Generate the key once per **intent**, not once per attempt, and reuse it for every retry of that intent.
+Generate one key per **intent** and reuse it on each retry. The server tracks keys per player and command. Up to 32 repeats can wait on a running handler. Once it returns, retries get the original result while the reply is cached, even if the handler returned `false`.
 
-The requirement is symmetric and enforced. A key sent to a command that is not registered `Idempotent`, or a plain `Data.Request` to one that is, is refused with `bad-idempotency-key` rather than silently downgraded. Keys must be non-empty, valid UTF-8 and at most 64 bytes. They live for the session and die with it, which is also the lifetime of any request that could still be retried. A key is also scoped to the command name, so the same key used on two different commands is two independent entries.
+A handler that throws releases its key. A retry can run it again, including any writes it made before the error. Put related writes and checks inside a [`Data.Transaction`](./transactions) if they need to roll back together.
+
+Replies expire two minutes after the handler returns, or after four times `RequestTimeout` if that is longer. A player can hold 64 keys across all commands. At capacity, a new key evicts the oldest completed reply and logs `COMMAND_IDEM_EVICTED`. Once a reply expires or is evicted, reusing its key runs the handler again. Leaving ends the cache.
+
+`RequestOnce` requires a non-empty UTF-8 key of at most 64 bytes. Calling an `Idempotent` command with `Request`, or using `RequestOnce` on an ordinary command, gives `bad-idempotency-key`.
 
 ## What the caller gets back on failure
 
@@ -189,7 +195,7 @@ Every framework failure resolves `Data.Request` as three values: `false`, one se
 
 | Sentinel | Raised by | Means |
 | --- | --- | --- |
-| `"rate-limited"` | server | the player is over `CommandRateLimit`. The handler never ran. |
+| `"rate-limited"` | server | The player exceeded `CommandRateLimit`, all 64 idempotency keys are in use by running handlers, or 32 repeats are already waiting on this key. This request did not start a handler. |
 | `"unknown-command"` | server | nothing is registered under that name, usually a client on an older build. |
 | `"not-ready"` | server | the caller's profile is still loading or its session ended, including a player kept connected with `KickOnSessionEnd = false`. Replies remain rate-limited. |
 | `"bad-args"` | server | the call did not match the `Args` spec, or it carried more arguments than declared. |
@@ -206,20 +212,20 @@ Those eleven strings are also available as named constants on [`Scribe.RequestRe
 Three failures produce no sentinel and instead raise on the calling thread, because they are caller bugs rather than runtime conditions: passing more than 16 arguments, passing a value the wire cannot encode, and handing `Data.RequestOnce` a key that is empty, over 64 bytes, or not valid UTF-8. The client checks the key before it sends, so the `bad-idempotency-key` sentinel above reaches you only when the command and the key disagree.
 
 !!! warning "The first two values cannot tell you who refused, but the third can"
-    A handler's return values reach the caller verbatim. A handler that returns `false, "not owned"` hands the client the same two values as any of the eleven sentinels above, and a handler that returns `false, "timeout"` is byte-identical to Scribe's own timeout. A naive `showToast(reason)` will eventually show an Emberfall player the words `rate-limited`.
+    A handler can return `false, "timeout"`, the same first two values as a request timeout. Showing `reason` directly to the player can also expose internal reasons such as `rate-limited`.
 
     **Read the third return value.** Every framework refusal appends `Scribe.RequestFailed`, a frozen table Scribe owns. Handler values never carry it, because they cross the wire and the wire has no representation for a reference, so a handler that returns a table gets a copy on the other side and can never produce this one.
 
     ```lua
     local ok, reason, failed = Data.Request("BuyPotion", "Health", 3)
     if failed == Scribe.RequestFailed then
-        warn(`BuyPotion never ran: {reason}`) -- one of the sentinels above
+        warn(`BuyPotion request failed: {reason}`) -- one of the sentinels above
     elseif not ok then
         showToast(reason)                     -- your handler's reason, safe to show a player
     end
     ```
 
-    The third value is `nil` on success and `nil` whenever the values are the handler's, so a plain `if failed then` is enough unless your own handlers return a third value.
+    If your handler returns a third value, compare `failed` directly with `Scribe.RequestFailed`.
 
 Returning a shape that cannot collide also works, and it is worth it when the handler has more to say than a string. A table is unambiguous on its own, since Scribe's own refusals are always `false` plus a plain string.
 
@@ -235,7 +241,7 @@ end)
 -- client
 local result, reason = Data.Request("EquipItem", "Emberblade")
 if type(result) ~= "table" then
-    warn(`EquipItem never ran: {reason}`)
+    warn(`EquipItem request failed: {reason}`)
     return
 end
 if not result.Ok then
@@ -277,13 +283,15 @@ Each player gets a token bucket, sized and refilled at `CommandRateLimit` per se
 ??? note "The order a request is checked in"
     Each inbound frame runs the same gauntlet on the server. The first gate that rejects sends its sentinel and stops.
 
-    1. **Rate limit.** A token is taken before anything else, so even an unknown name costs one. The arguments are not decoded until every gate below has passed, so a rejected frame costs only its fixed-size header. Arguments are attacker-sized, and decoding one before deciding to reject it is work an exploiter chooses for you.
+    1. **Rate limit.** A token is taken before the command lookup, so even an unknown name costs one. The server reads argument values only after checking readiness, registration, arity and the idempotency key.
     2. **Ready gate.** The caller's profile must be `Ready`, which is why `Data[player]` is safe inside a handler with no `WaitForData` first. A profile still loading, or one whose session ended, gives `not-ready` for **every** name, registered or not, so nobody can enumerate your command surface by watching which names answer differently.
     3. **Registry lookup.** No registration under that name gives `unknown-command`.
     4. **`Args` arity**, if the command declared a spec. More arguments than declared is caught here, from the header alone.
-    5. **`Args` types**, once the arguments have been decoded.
-    6. **The handler**, inside an `xpcall`. A throw is logged as `COMMAND_ERROR` and answered `error`.
-    7. **The reply**, encoded and sent after the caller's pending changes, subject to the repair limits above. A handler's writes before a throw still stand and are sent too.
+    5. **Idempotency key.** The key must match the command's `Idempotent` setting.
+    6. **`Args` types**, once the arguments have been decoded.
+    7. **Idempotency cache.** A matching key replays the reply or waits for the handler already running.
+    8. **The handler**, inside an `xpcall`. A throw is logged as `COMMAND_ERROR` and answered `error`.
+    9. **The reply**, encoded and sent after the caller's pending changes, subject to the repair limits above. A handler's writes before a throw still stand and are sent too.
 
 ## In edit mode
 

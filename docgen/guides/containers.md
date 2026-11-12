@@ -203,11 +203,13 @@ data.Inventory.OnKeyRemoved(function(itemId, entry)
 end)
 ```
 
-`Changed` is coalesced, so a [`Data.Batch`](/api/Server#Batch) writing four entries fires it once, and on the client one replication frame fires it once however many children it carried. `OnChildChanged` is never coalesced: three writes fire it three times, and every ancestor receives its own immediate child.
+A [`Data.Batch`](/api/Server#Batch) writing four entries fires the container's `Changed` once. On the client, writes beneath a container in the same frame also produce one `Changed`. `OnChildChanged` reports each write applied on that side. If the server folds several scalar writes into one replication op, the client sees only the final value.
 
 On a record with more than twelve declared children, `OnChildChanged` types its `key` as `string` and both values as `any?` rather than the exact union. A union that grows with the template is what pushes a large one past the type solver's budget, and losing that narrowing on one listener is the cheaper trade. Smaller records keep the exact types.
 
-All of a container's `OnChildChanged` fires arrive before its `Changed`, so you can accumulate keys and act once at the end. `OnKeyAdded` and `OnKeyRemoved` report a key appearing or disappearing and never one changing, so `OnChildChanged` is the only way to learn that an existing entry's value moved.
+A container's `OnChildChanged` fires before its `Changed`, so you can collect the affected keys and redraw once. `OnKeyAdded` and `OnKeyRemoved` report membership changes. They also report keys added or removed in a nested container when you `Set` its parent.
+
+Calling `Set`, `Update` or `Clear` on the container itself fires its `Changed` without a separate event for each entry. The client's join snapshot, a resync and [`Data.Mock`](/api/Client#Mock) also notify `Changed` listeners without replaying key or array events. Use `Observe` to build a list from the current contents, including when the UI mounts after the data arrived.
 
 !!! warning "Never yield inside a container listener"
 
@@ -230,7 +232,7 @@ All of a container's `OnChildChanged` fires arrive before its `Changed`, so you 
 
     A write that replaces the container's own table is different. A whole-container `Set` or `Update`, and `SetOf` `Add` and `Remove`, and `Flags` `Enable`, `Disable` and `Toggle`, all rewrite the whole value, so they carry a real prior table as `old` and are not coalesced. Collapsing those would throw the prior value away.
 
-    The same rule applies to `OnChildChanged`: `old` is a real prior value when the child is a leaf, and the same reference as `new` when the child is itself a container.
+    `OnChildChanged` gets the prior value when a `Set` replaces the direct child, including a child that is a table. A write farther down mutates that child in place, so both arguments can refer to the same table.
 
 !!! warning "The container `key` argument was removed in 1.3.0"
     A container `Changed` listener used to take a third `key` argument. One fire can now cover several children, so naming one of them would imply the others did not change. Scribe errors at connect time on a container listener that declares a third parameter, rather than passing `nil` forever. Move that logic to `OnChildChanged`. Leaf listeners are unchanged.
