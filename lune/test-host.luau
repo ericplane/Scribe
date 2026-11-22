@@ -601,6 +601,10 @@ return function()
 
 	services.LogService = {} -- no structured methods -> Scribe falls back to print/warn
 
+	-- Jest's runtime asks for this service and probes it for ResolveModulePath. With no
+	-- such method it resolves string requires itself, as it does on an engine without it.
+	services.ScriptService = {}
+
 	services.RunService = {
 		IsStudio = function()
 			return false
