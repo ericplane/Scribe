@@ -135,8 +135,10 @@ export type Entry = {
 	StopLoadWatchdog: (() -> ())?,
 	-- Monetization state
 	GiftLastAt: number,
-	OwnsLast: { [string]: boolean }?, -- last reported effective ownership, for change detection
+	OwnsLast: { [string]: string }?, -- last reported state ("owned" or "trial")
+	OwnsQuiet: string?, -- pass being added to the join baseline
 	OwnsWatchers: { () -> () }?, -- Perks/OwnsCache listeners driving OnOwnershipChanged
+	PassStates: { [string]: { Seen: number, Watch: number? } }?, -- latest applied request and pending trial check
 }
 
 local SIZE_WARN_BYTES = 3.5 * 1024 * 1024 -- warn approaching the ~4 MB DataStore ceiling

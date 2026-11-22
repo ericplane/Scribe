@@ -161,7 +161,8 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 | `PeriodReset` | `{ UtcOffset: number?, WeekStart: string? }?` | `0`, `"Monday"` | The clock periodic boards reset on: hours from UTC (-12 to 14) and the day a week starts. One per bundle. See [Leaderboards](./leaderboards#the-reset-clock). |
 | `OwnReceipts` | `boolean?` | `true` | Whether this bundle installs the single global `ProcessReceipt` callback. Set false on a secondary bundle and route its receipts through `Data.HandleReceipt`. |
 | `PurchaseLog` | table | caps of 100, server-only | Tunes the per-player purchase history rings. |
-| `UserOwnsGamePassAsync` | `((userId, passId) -> boolean)?` | the real service call | A test seam for pass ownership. Leave it unset in production. |
+| `UserOwnsGamePassAsync` | `((userId, passId) -> boolean)?` | the real service call | Use in tests for a yes/no ownership check. Setting this option alone bypasses the trial check for players on this server. Leave it unset in production. |
+| `GetPassOwnershipAsync` | `((player, passId) -> table)?` | the real service call | Use in tests to distinguish a purchase (`Owned = true`) from a [free trial](./monetization#pass-free-trials) (`Owned = false, Active = true`). Set `EndTime` to test expiry. Leave it unset in production. |
 | `GetProductInfoAsync` | `((assetId, infoType) -> table?)?` | the real service call | A test seam for the client's price reads. Leave it unset in production. |
 | `GetPolicyInfoAsync` | `((player) -> table?)?` | the real service call | A test seam for the paid random policy read, on both realms. Leave it unset in production. |
 

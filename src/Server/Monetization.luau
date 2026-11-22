@@ -139,6 +139,18 @@ function Monetization.new(ctx: any)
 		or function(userId: number, passId: number): boolean
 			return MarketplaceService:UserOwnsGamePassAsync(userId, passId)
 		end
+	-- An injected legacy reader overrides engine detection.
+	local getPassOwnership: ((player: Player, passId: number) -> any)? = options.GetPassOwnershipAsync
+	if getPassOwnership == nil and options.UserOwnsGamePassAsync == nil then
+		local found, method = pcall(function()
+			return (MarketplaceService :: any).GetPassOwnershipAsync
+		end)
+		if found and type(method) == "function" then
+			getPassOwnership = function(player: Player, passId: number): any
+				return (MarketplaceService :: any):GetPassOwnershipAsync(player, passId)
+			end
+		end
+	end
 	local getPolicyInfo: (player: Player) -> any = options.GetPolicyInfoAsync
 		or function(player: Player): any
 			return (game:GetService("PolicyService") :: any):GetPolicyInfoForPlayerAsync(player)
@@ -823,22 +835,31 @@ function Monetization.new(ctx: any)
 	-- The ownership predicate: perk flag, cached pass ownership, or Roblox Plus. No DevMode
 	-- warning and no entry lookup, because internal scans legitimately walk keys that were
 	-- never registered.
-	local function ownsInternal(player: Player, entry: any, key: string): boolean
+	local function ownership(player: Player, entry: any, key: string): (boolean, boolean, number?)
 		local reserved = reservedRaw(entry.LiveData)
 		if reserved.Perks[key] == true then
-			return true
+			return true, false, nil
 		end
 		local ownsCache = entry.SessionStore[Template.SESSION_ROOT]
 		ownsCache = if type(ownsCache) == "table" then ownsCache.OwnsCache else nil
-		if type(ownsCache) == "table" and ownsCache[key] == true then
-			return true
+		local cached = if type(ownsCache) == "table" then ownsCache[key] else nil
+		if cached == true then
+			return true, false, nil
 		end
 		if key == "RobloxPlus" then
 			-- Coerce: the property is nil on a player object that predates it, and a nil
 			-- would read as "changed" against a false baseline on every ownership scan.
-			return player.HasRobloxSubscription == true
+			return player.HasRobloxSubscription == true, false, nil
 		end
-		return false
+		if type(cached) == "number" then
+			return true, true, if cached > 0 then cached else nil
+		end
+		return false, false, nil
+	end
+
+	local function ownsOutright(entry: any, key: string): boolean
+		local owned, trial = ownership(entry.Player, entry, key)
+		return owned and not trial
 	end
 
 	-- Paid random items. The policy is per session, read once off the join path;
@@ -911,7 +932,17 @@ function Monetization.new(ctx: any)
 		if not entry or entry.State ~= "Ready" or not entry.LiveData then
 			return false
 		end
-		return ownsInternal(player, entry, key)
+		return (ownership(player, entry, key))
+	end
+
+	function self.GetTrial(player: Player, key: string): { EndsAt: number? }?
+		checkOwnsKey(key, "GetTrial")
+		local entry = ctx.Persistence.EntryFor(player)
+		if not entry or entry.State ~= "Ready" or not entry.LiveData then
+			return nil
+		end
+		local _, trial, trialEnds = ownership(player, entry, key)
+		return if trial then { EndsAt = trialEnds } else nil
 	end
 
 	-- One function behind both the query and the prompt, so they cannot disagree.
@@ -926,7 +957,7 @@ function Monetization.new(ctx: any)
 			end
 		end
 		local ownedKey = if pass then name else product.Grants
-		if ownedKey ~= nil and self.Owns(entry.Player, ownedKey) then
+		if ownedKey ~= nil and ownsOutright(entry, ownedKey) then
 			return "owned"
 		end
 		return "purchasable"
@@ -947,14 +978,179 @@ function Monetization.new(ctx: any)
 		end
 	end
 
-	-- Ownership only gains during a session, so a late answer must not clear a confirmed pass.
-	local function foldOwnsCache(entry: any, key: string, owned: boolean): boolean
-		if not entry.Tree or entry.Tree.Dead then
-			return owned
+	-- Pass ownership ----------------------------------------------------------------
+
+	-- Poll unknown ends every minute and recheck known ends within five minutes.
+	local TRIAL_POLL = 60
+	local TRIAL_RECHECK = 300
+
+	-- Normalize reported ends to Unix seconds. Zero means unknown.
+	local function trialEnd(value: any): number
+		if type(value) == "string" then
+			local parsed, at = pcall(DateTime.fromIsoDate, value)
+			value = if parsed then at else nil
 		end
-		local kept = owned or sessionAcc(entry).OwnsCache.Child(key).Get() == true
-		setOwnsCache(entry, key, kept)
-		return kept
+		if typeof(value) == "DateTime" then
+			value = value.UnixTimestamp
+		end
+		if type(value) ~= "number" or value ~= value or value <= 0 or value == math.huge then
+			return 0
+		end
+		-- Current Unix millisecond timestamps exceed 1e11.
+		return if value > 1e11 then value / 1000 else value
+	end
+
+	local passOwnershipAnswered = false
+	local passOwnershipWarned = false
+
+	-- Returns (purchased, trialEnd). A trial with an unknown end uses 0.
+	local function readPass(player: Player, userId: number, passId: number): (boolean, number?)
+		if getPassOwnership == nil then
+			return userOwnsGamePass(userId, passId) == true, nil
+		end
+		local ok, info = pcall(getPassOwnership, player, passId)
+		if ok and type(info) == "table" and (type(info.Owned) == "boolean" or type(info.Active) == "boolean") then
+			passOwnershipAnswered = true
+			if info.Owned == true then
+				return true, nil
+			end
+			return false, if info.Active == true then trialEnd(info.EndTime) else nil
+		end
+		if passOwnershipAnswered then
+			error(if ok then "GetPassOwnershipAsync returned no ownership" else info, 0)
+		end
+		-- Fall back only until the first detailed response. Legacy reads conflate trials and purchases.
+		local owned = userOwnsGamePass(userId, passId) == true
+		if owned and not passOwnershipWarned then
+			passOwnershipWarned = true
+			Log.Warn(
+				"Monetization",
+				"PASS_TRIAL_READ_FAIL",
+				`GetPassOwnershipAsync has not answered ({tostring(info)}), so pass ownership is read without `
+					.. "free-trial detail and a trial counts as a purchase",
+				{ Player = player, PassId = passId }
+			)
+		end
+		return owned, nil
+	end
+
+	local passAsked = 0
+
+	local function passState(entry: any, name: string): { Seen: number, Watch: number? }
+		local states = entry.PassStates
+		if states == nil then
+			states = {}
+			entry.PassStates = states
+		end
+		local state = states[name]
+		if state == nil then
+			state = { Seen = 0 }
+			states[name] = state
+		end
+		return state
+	end
+
+	local resolvePass: (entry: any, name: string, quiet: boolean?) -> (boolean, boolean)
+
+	-- Roblox sends no expiry event. Recheck even if the reported end is still far away.
+	local function watchTrial(entry: any, name: string, trialEnds: number)
+		local state = passState(entry, name)
+		local left = trialEnds - Clock.Now()
+		local delay = if trialEnds > 0 and left > 0 then math.min(left + 1, TRIAL_RECHECK) else TRIAL_POLL
+		passAsked += 1
+		local token = passAsked
+		state.Watch = token
+		local function onTrial(): boolean
+			return not promptStopped
+				and not entry.TornDown
+				and entry.Tree ~= nil
+				and not entry.Tree.Dead
+				and type(sessionAcc(entry).OwnsCache.Child(name).Get()) == "number"
+		end
+		Clock.Delay(delay, function()
+			-- A superseded Clock.Delay still runs.
+			if state.Watch ~= token then
+				return
+			end
+			state.Watch = nil
+			if not onTrial() then
+				return
+			end
+			-- Keep trial access on failure and retry.
+			if not resolvePass(entry, name) and state.Watch == nil and onTrial() then
+				watchTrial(entry, name, 0)
+			end
+		end)
+	end
+
+	-- A confirmed purchase wins for the session. For trials, the latest request wins.
+	local function applyPass(entry: any, name: string, asked: number, owned: boolean, trialEnds: number?): boolean
+		if not entry.Tree or entry.Tree.Dead then
+			return owned or trialEnds ~= nil
+		end
+		local cache = sessionAcc(entry).OwnsCache.Child(name)
+		local held = cache.Get()
+		if owned or held == true then
+			cache.Set(true)
+			return true
+		end
+		local state = passState(entry, name)
+		if asked < state.Seen then
+			return held ~= nil
+		end
+		state.Seen = asked
+		if trialEnds ~= nil and (trialEnds ~= held or state.Watch == nil) then
+			watchTrial(entry, name, trialEnds)
+		end
+		if trialEnds ~= held then
+			if held == nil then
+				Metrics.Add("PassTrialsStarted")
+				Log.Info("Monetization", "PASS_TRIAL_STARTED", `pass "{name}" is on free trial`, {
+					Player = entry.Player,
+					Pass = name,
+					EndsAt = trialEnds,
+				})
+			elseif trialEnds == nil then
+				Metrics.Add("PassTrialsEnded")
+				Log.Info("Monetization", "PASS_TRIAL_ENDED", `the free trial of pass "{name}" ended`, {
+					Player = entry.Player,
+					Pass = name,
+				})
+			end
+			-- Write last because listeners can recheck ownership.
+			cache.Set(trialEnds)
+		end
+		return trialEnds ~= nil
+	end
+
+	-- Returns (ok, hasAccess). A failed check leaves the cache intact.
+	function resolvePass(entry: any, name: string, quiet: boolean?): (boolean, boolean)
+		local pass = passesByName[name]
+		passAsked += 1
+		local asked = passAsked
+		local ok, owned, trialEnds = pcall(readPass, entry.Player, entry.UserId, pass.Id)
+		if not ok then
+			Metrics.Add("OwnershipCheckFailures")
+			Log.Warn(
+				"Monetization",
+				"OWNERSHIP_CHECK_FAIL",
+				tostring(owned),
+				{ Player = entry.Player, Pass = name, PassId = pass.Id }
+			)
+			return false, false
+		end
+		if entry.TornDown then
+			return true, owned or trialEnds ~= nil
+		end
+		-- Include a late join read in the silent baseline for this pass only.
+		if quiet then
+			entry.OwnsQuiet = name
+		end
+		local owns = applyPass(entry, name, asked, owned, trialEnds)
+		if quiet then
+			entry.OwnsQuiet = nil
+		end
+		return true, owns
 	end
 
 	-- Every key whose ownership is worth tracking: everything registered, plus whatever
@@ -992,20 +1188,18 @@ function Monetization.new(ctx: any)
 			entry.OwnsLast = last
 		end
 		local candidates = ownershipCandidates(entry)
-		-- A key that went away still needs its false. ownershipCandidates is built from
-		-- current state, so a perk revoked under a name outside the Perks registry is listed
-		-- nowhere and its false would never fire. The baseline records what was last
-		-- reported, so unioning it in is exactly the set that could still owe a transition,
-		-- and it cannot grow without bound: a false fired here never fires again.
+		-- Revoked unregistered perks disappear from the candidates. Scan their last
+		-- reported state once more to deliver the loss of access.
 		for key in last do
 			candidates[key] = true
 		end
 		for key in candidates do
-			local owned = ownsInternal(player, entry, key)
-			if owned ~= (last[key] == true) then
-				last[key] = owned
-				if not silent then
-					ctx.Signals.OnOwnershipChanged:Fire(player, key, owned)
+			local owned, trial = ownership(player, entry, key)
+			local state = if trial then "trial" elseif owned then "owned" else nil
+			if state ~= last[key] then
+				last[key] = state
+				if not silent and key ~= entry.OwnsQuiet then
+					ctx.Signals.OnOwnershipChanged:Fire(player, key, owned, trial)
 				end
 			end
 		end
@@ -1031,21 +1225,22 @@ function Monetization.new(ctx: any)
 	-- only real transitions fire. Returns a disconnect. The public doc-comment lives on
 	-- Data.ObserveOwned (Server/init.luau); keep this a plain comment so docgen does not
 	-- emit a duplicate entry.
-	function self.ObserveOwned(player: Player, key: string, callback: (owned: boolean) -> ()): () -> ()
+	function self.ObserveOwned(player: Player, key: string, callback: (owned: boolean, trial: boolean) -> ()): () -> ()
 		checkOwnsKey(key, "ObserveOwned")
 		local entry = ctx.Persistence.EntryFor(player)
 		if not entry or entry.State ~= "Ready" or not entry.Tree or entry.Tree.Dead then
 			error("Scribe: ObserveOwned requires a Ready player (use Data.WaitForData)", 3)
 		end
-		local last: boolean? = nil
+		local lastOwned: boolean? = nil
+		local lastTrial = false
 		local function push()
 			if entry.TornDown or not entry.LiveData then
 				return
 			end
-			local owned = ownsInternal(player, entry, key)
-			if owned ~= last then
-				last = owned
-				Sched.Spawn(callback, owned)
+			local owned, trial = ownership(player, entry, key)
+			if owned ~= lastOwned or trial ~= lastTrial then
+				lastOwned, lastTrial = owned, trial
+				Sched.Spawn(callback, owned, trial)
 			end
 		end
 		-- Avoid public-read copies, as in watchOwnership.
@@ -1084,34 +1279,9 @@ function Monetization.new(ctx: any)
 			markOwnershipReady(entry)
 			return
 		end
-		for name, pass in passesByName do
+		for name in passesByName do
 			Sched.Spawn(function()
-				local ok, owned = pcall(function()
-					return userOwnsGamePass(entry.UserId, pass.Id)
-				end)
-				if ok and not entry.TornDown then
-					-- Fold this resolution into the join baseline before writing it.
-					-- watchOwnership takes its silent baseline while this network round trip
-					-- is still out, so without this every player who already owned a pass got
-					-- a spurious owned=true. OR, never assign: ownership is the union of
-					-- Perks, OwnsCache and RobloxPlus. A nil OwnsLast means the baseline has
-					-- not been taken yet and that scan absorbs this by itself.
-					local last = entry.OwnsLast
-					if last ~= nil and entry.Tree and not entry.Tree.Dead then
-						last[name] = last[name] == true or owned == true
-					end
-					foldOwnsCache(entry, name, owned == true)
-				elseif not ok then
-					-- A throw or throttle leaves this pass unresolved and the cache not-owned.
-					-- Surface it rather than treating a failed check as a confirmed not-owned.
-					Metrics.Add("OwnershipCheckFailures")
-					Log.Warn(
-						"Monetization",
-						"OWNERSHIP_CHECK_FAIL",
-						tostring(owned),
-						{ Player = entry.Player, Pass = name, PassId = pass.Id }
-					)
-				end
+				resolvePass(entry, name, true)
 				pending -= 1
 				if pending <= 0 and not entry.TornDown then
 					markOwnershipReady(entry)
@@ -1131,32 +1301,15 @@ function Monetization.new(ctx: any)
 		if not entry or entry.State ~= "Ready" or not entry.LiveData then
 			return false
 		end
-		-- Ownership only ever gains for the session, so a cached true is already
-		-- verified; skip the query.
-		if self.Owns(player, key) then
+		-- Confirmed purchases stay cached. Trial access can expire.
+		if ownsOutright(entry, key) then
 			return true
 		end
-		-- Not owned per the cache. Verify live with the server-side UserOwnsGamePassAsync:
-		-- this is the exploit-proof check to gate grants on, and the client's Owns/OwnsAsync
-		-- are mirror reads that must never gate one. Refresh the cache while we are here.
-		local pass = passesByName[key]
-		if pass and not entry.TornDown then
-			local ok, owned = pcall(function()
-				return userOwnsGamePass(entry.UserId, pass.Id)
-			end)
+		if passesByName[key] and not entry.TornDown then
+			local ok, owns = resolvePass(entry, key)
 			if ok then
-				if not entry.TornDown then
-					return foldOwnsCache(entry, key, owned == true)
-				end
-				return owned == true
+				return owns
 			end
-			Metrics.Add("OwnershipCheckFailures")
-			Log.Warn(
-				"Monetization",
-				"OWNERSHIP_CHECK_FAIL",
-				tostring(owned),
-				{ Player = entry.Player, Pass = key, PassId = pass.Id }
-			)
 		end
 		return self.Owns(player, key)
 	end
@@ -1536,8 +1689,9 @@ function Monetization.new(ctx: any)
 
 	local function recipientAlreadyOwns(recipientUserId: number, perkKey: string): boolean
 		local recipientEntry = ctx.Persistence.EntryForUserId(recipientUserId)
-		if recipientEntry and recipientEntry.State == "Ready" then
-			if self.Owns(recipientEntry.Player, perkKey) then
+		local present = recipientEntry ~= nil and recipientEntry.State == "Ready"
+		if present then
+			if ownsOutright(recipientEntry, perkKey) then
 				return true
 			end
 		else
@@ -1556,6 +1710,10 @@ function Monetization.new(ctx: any)
 		local pass = passesByName[perkKey]
 		if pass then
 			local ok, owned = pcall(function()
+				-- The trial-aware read requires a local Player.
+				if present then
+					return (readPass(recipientEntry.Player, recipientUserId, pass.Id))
+				end
 				return MarketplaceService:UserOwnsGamePassAsync(recipientUserId, pass.Id)
 			end)
 			if not ok then
@@ -1811,7 +1969,7 @@ function Monetization.new(ctx: any)
 
 		-- No matching intent: NoGiftIntentPolicy. A product with a consumable Grant still
 		-- delivers real value, so the credit path only covers pure perk products.
-		if product.Grants and not product.Grant and self.Owns(entry.Player, product.Grants) then
+		if product.Grants and not product.Grant and ownsOutright(entry, product.Grants) then
 			-- Hold further credits until the existing paid credit is spent. Roblox may retry later.
 			if (tonumber(reservedRaw(entry.LiveData).GiftCredits[product.Name]) or 0) > 0 then
 				Log.Warn(
@@ -2429,13 +2587,13 @@ function Monetization.new(ctx: any)
 		-- session cache would heal on the next join, but robuxLog writes the PERSISTED
 		-- purchase history, so an unconfirmed event falsifies it.
 		Sched.Spawn(function()
-			local ok, owned = pcall(function()
-				return userOwnsGamePass(entry.UserId, passId)
-			end)
+			passAsked += 1
+			local asked = passAsked
+			local ok, owned, trialEnds = pcall(readPass, player, entry.UserId, passId)
 			if entry.TornDown then
 				return
 			end
-			if not ok or owned ~= true then
+			if not ok or (owned ~= true and trialEnds == nil) then
 				-- Self-heals: the join scan re-resolves every declared pass, so a real
 				-- purchase the API had not caught up with is credited on the next load.
 				Metrics.Add("PassPurchasesUnconfirmed")
@@ -2447,7 +2605,11 @@ function Monetization.new(ctx: any)
 				)
 				return
 			end
-			setOwnsCache(entry, passName, true)
+			applyPass(entry, passName, asked, owned, trialEnds)
+			if not owned then
+				-- Trial starts also fire the prompt event. Only purchases enter the paid history.
+				return
+			end
 			robuxLog(entry, {
 				PurchaseId = `pass:{passId}:{Clock.Now()}`,
 				Product = passName,

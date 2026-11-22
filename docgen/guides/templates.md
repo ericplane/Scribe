@@ -211,7 +211,7 @@ Use `Scribe.ServerData<T>` to name the whole server `Data` object rather than on
 
 For a helper that only reads or observes one field, use `Scribe.ReadableNode<T>`. It provides `Get`, `Observe` and `Changed` with the field's value type, on either side.
 
-Luau treats `bundle.Server`, `bundle.Client` and named `Data` API members as read-only. Change values through accessors as usual.
+Luau treats `bundle.Server`, `bundle.Client`, `Data[player]` and named `Data` API members as read-only. Change values through accessors as usual.
 
 For test doubles, create a new table: `{ Server = fake, Client = bundle.Client }`. Use `Scribe.Bundle<T>` for its type, or declare `read` fields in your own type.
 
@@ -219,7 +219,34 @@ If you use `ServerStore`, add its template as the second type parameter to keep 
 
 ### If Luau says the code is too complex
 
-If a large template reports "Code is too complex to typecheck" at `Scribe({ ... })`, separate the checked options from the constructor call and annotate the side you use:
+If Luau reports "Code is too complex to typecheck" at `Scribe({ ... })`, comparing the template types may have exceeded the solver's limit. In luau-lsp 1.70.1, the default is 20,000 steps for one comparison.
+
+Templates with the same field count can use very different amounts of that budget. These examples each add 72 fields to the same template, with one number in each record. Each figure estimates the steps in the file's largest type comparison with Scribe 2.8.0 and luau-lsp 1.70.1.
+
+| Fields added | Steps |
+| --- | ---: |
+| Plain numbers, repeated record shapes, maps of numbers, or sets of numbers | 1,600–1,700 |
+| Records with a different field name in each | 4,300 |
+| Dictionaries or arrays of those different records | 11,900–13,000 |
+| `Scribe.Big` values | 24,100 |
+
+Use `Scribe.Int` for whole numbers that fit within the exact integer range (up to `2^53` in magnitude). Measure your own template before changing its structure. With your project's Rojo sourcemap, Roblox definitions and Luau LSP settings, this command tests whether the file fits within half the default limit.
+
+```bash
+luau-lsp analyze --sourcemap=sourcemap.json --defs=globalTypes.d.luau \
+    --settings=.vscode/settings.json \
+    --flag:LuauSubtypingIterationLimit=10000 src/shared/PlayerData.luau
+```
+
+In a Scribe checkout, check that Luau can resolve the file's imports first. Then run `node scripts/measure-type-budget.mjs <file>` to estimate its largest comparison. For comparison, Scribe's large-template test uses about 17,100 of the default 20,000 steps.
+
+To raise the limit in the Luau LSP editor extension, add this entry to your settings.
+
+```json
+"luau-lsp.fflags.override": { "LuauSubtypingIterationLimit": "40000" }
+```
+
+For Studio, or to stay within the default limit, separate the checked options from the constructor call and annotate the side you use.
 
 ```lua
 local options: Scribe.ScribeOptions<typeof(template)> = {

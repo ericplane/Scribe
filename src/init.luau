@@ -56,6 +56,7 @@ export type LeaderboardStatusInfo = Types.LeaderboardStatusInfo
 export type LeaderboardSnapshotEntry = Types.LeaderboardSnapshotEntry
 export type PassConfig = Types.PassConfig
 export type PurchaseFilter = Types.PurchaseFilter
+export type PassTrial = Types.PassTrial
 export type EconomyMeta = Types.EconomyMeta
 export type EconomyConfig = Types.EconomyConfig
 export type EconomyCurrencyConfig = Types.EconomyCurrencyConfig
@@ -130,7 +131,8 @@ type AmountTags = {
 
 -- selene: allow(undefined_variable) -- `types` is the type-function runtime library
 -- "client" omits timer writes; "clientstore" omits all writes. Defaults to server.
-type function BuildValueType(T, Names: type?, Mode: type?)
+-- "pair" builds T and ClientT with a shared node cache.
+type function BuildNodes(T, Names: type?, Mode: type?, ClientT: type?)
 	local ts = types
 	local mode = if Mode ~= nil and Mode:is("singleton") then Mode:value() else nil
 
@@ -160,6 +162,16 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 	end
 
 	local disconnectType = fn({}, {})
+	-- Share method types so Luau compares each signature once.
+	local clearFn = fn({ optBool }, {}, "Replicate")
+	local countFn = fn({}, { ts.number })
+	local recordChild = fn({ ts.unionof(ts.string, ts.number) }, { anyType }, "Key")
+	local optAny = optional(anyType)
+	local wideChildChanged = fn(
+		{ fn({ ts.string, optAny, optAny }, {}, "ChildChange") },
+		{ disconnectType },
+		"Listener"
+	)
 
 	local function widen(t: type): type
 		if t:is("singleton") then
@@ -244,32 +256,45 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 		return hasMarker(t, "__scribeBig")
 	end
 
+	-- Canonical subtree key and maximum depth.
+	local signed: (t: type) -> (string?, number)
+	local function fits(depth: number, reach: number): boolean
+		return depth + reach + 2 <= MAX_DEPTH
+	end
+
 	-- Timed and ServerOnly read back as a bare T, which may not be a table, so unlike
 	-- the branded declarators their label has to be an ordinary field and a
 	-- whole-subtree read strips it here. This only ever removes a wrapper, which is
 	-- what keeps it cheap enough to run over every node.
 	-- Inputs are read-only so a narrower caller type is accepted; a mutable property is
 	-- invariant. Indexers are copied as is, since the runtime cannot make one read-only.
-	local readOnlyCache: { [type]: type } = {}
+	-- Separate reads of the same shape can return distinct type objects.
+	local readOnlyCache: { [string]: type } = {}
 	local function readOnlyDeep(t: type, depth: number): type
 		if depth > MAX_DEPTH or not t:is("table") then
 			return t
 		end
-		local cached = readOnlyCache[t]
-		if cached ~= nil then
-			return cached
+		local shape, reach = signed(t)
+		local shared = shape ~= nil and fits(depth, reach)
+		if shared then
+			local cached = readOnlyCache[shape :: string]
+			if cached ~= nil then
+				return cached
+			end
 		end
 		local indexer = t:indexer()
 		local spec = if indexer ~= nil
 			then { index = indexer.index, readresult = indexer.readresult, writeresult = indexer.writeresult }
 			else nil
 		local out = ts.newtable(nil, spec, t:metatable())
-		readOnlyCache[t] = out
 		for key, prop in t:properties() do
 			local childType = prop.read or prop.write
 			if childType ~= nil then
 				out:setreadproperty(key, readOnlyDeep(childType, depth + 1))
 			end
+		end
+		if shared then
+			readOnlyCache[shape :: string] = out
 		end
 		return out
 	end
@@ -288,7 +313,7 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 		return marked
 	end
 
-	local unwrapCache: { [type]: type } = {}
+	local unwrapCache: { [string]: type } = {}
 	local function unwrapWrappers(t: type, depth: number): type
 		if depth > MAX_DEPTH then
 			return t
@@ -300,12 +325,18 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 		if not t:is("table") then
 			return t
 		end
-		local cached = unwrapCache[t]
-		if cached ~= nil then
-			return cached
+		local shape, reach = signed(t)
+		local shared = shape ~= nil and fits(depth, reach)
+		if shared then
+			local cached = unwrapCache[shape :: string]
+			if cached ~= nil then
+				return cached
+			end
 		end
 		local function memo(result: type): type
-			unwrapCache[t] = result
+			if shared then
+				unwrapCache[shape :: string] = result
+			end
 			return result
 		end
 		local timed = t:readproperty(ts.singleton("__scribeTimed"))
@@ -324,15 +355,18 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 		if hasMarker(t, "__scribeBig") or hasMarker(t, "__scribeFlags") then
 			return memo(t)
 		end
-		local props: { [type]: type } = {}
+		local props: { { key: type, ty: type, read: boolean, write: boolean } } = {}
 		local rebuilt = false
+		local nested = false
 		for key, prop in t:properties() do
 			local childType = prop.read or prop.write
 			if childType ~= nil then
 				local mapped = unwrapWrappers(childType, depth + 1)
-				props[key] = mapped
+				table.insert(props, { key = key, ty = mapped, read = prop.read ~= nil, write = prop.write ~= nil })
 				if mapped ~= childType then
 					rebuilt = true
+				elseif mapped:is("table") then
+					nested = true
 				end
 			end
 		end
@@ -345,11 +379,23 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 				rebuilt = true
 			end
 		end
-		if not rebuilt then
+		-- Rebuild nested records to share cached children. Rebuilding an indexed type
+		-- can lose its read-only indexer, so keep it unless a child changed.
+		if not rebuilt and (indexer ~= nil or not nested or not shared) then
 			return memo(t)
 		end
 		-- Preserve set and map brands.
-		return memo(ts.newtable(props, spec, t:metatable()))
+		local out = ts.newtable(nil, spec, t:metatable())
+		for _, entry in props do
+			if entry.read and entry.write then
+				out:setproperty(entry.key, entry.ty)
+			elseif entry.read then
+				out:setreadproperty(entry.key, entry.ty)
+			else
+				out:setwriteproperty(entry.key, entry.ty)
+			end
+		end
+		return memo(out)
 	end
 
 	-- A canonical key for a subtree, so two identical subtrees are built once. A template
@@ -361,11 +407,15 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 	-- because an unknown tag fails the whole type function.
 	local opaqueIds: { [type]: string } = {}
 	local opaqueCount = 0
+	local sigReach = 0
 	local signatureOf: (type, number, { [type]: boolean }) -> string?
 	signatureOf = function(t: type, depth: number, seen: { [type]: boolean }): string?
 		-- A cut-short walk or a cycle cannot be keyed.
 		if depth > MAX_DEPTH + 2 or seen[t] then
 			return nil
+		end
+		if depth > sigReach then
+			sigReach = depth
 		end
 		if t:is("singleton") then
 			local value = t:value()
@@ -381,8 +431,9 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 			end
 			local parts: { string } = {}
 			for key, prop in t:properties() do
-				-- Signed separately: a field can differ in only one.
-				local keySig, readSig, writeSig = sub(key), sub(prop.read), sub(prop.write)
+				-- Distinguish read and write types. Repeating identical signatures doubles the key at each level.
+				local keySig, readSig = sub(key), sub(prop.read)
+				local writeSig = if prop.read ~= nil and prop.read == prop.write then "=" else sub(prop.write)
 				if keySig == nil or readSig == nil or writeSig == nil then
 					seen[t] = nil
 					return nil
@@ -394,7 +445,8 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 			local indexerSig = "-"
 			local indexer = t:indexer()
 			if indexer ~= nil then
-				local i, r, w = sub(indexer.index), sub(indexer.readresult), sub(indexer.writeresult)
+				local i, r = sub(indexer.index), sub(indexer.readresult)
+				local w = if indexer.readresult == indexer.writeresult then "=" else sub(indexer.writeresult)
 				if i == nil or r == nil or w == nil then
 					seen[t] = nil
 					return nil
@@ -415,6 +467,18 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 			seen[t] = nil
 			return `t<{table.concat(parts, ",")};i:{indexerSig};m:{metaSig}>`
 		end
+		-- Rendered unions can truncate or hide a table's shape.
+		if t:is("union") then
+			local parts: { string } = {}
+			for _, member in t:components() do
+				local memberSig = signatureOf(member, depth + 1, seen)
+				if memberSig == nil then
+					return nil
+				end
+				table.insert(parts, memberSig)
+			end
+			return `u<{table.concat(parts, "|")}>`
+		end
 		-- Not a table, so its rendering is its structure and is short enough not to
 		-- truncate.
 		local rendered = tostring(t)
@@ -430,30 +494,44 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 		end
 		return id
 	end
+	signed = function(t: type): (string?, number)
+		sigReach = 0
+		local key = signatureOf(t, 0, {})
+		return key, sigReach
+	end
 
 	local buildUncached: (type, boolean, number) -> type
-	local buildCache: { [number]: { [string]: type } } = {}
+	local buildCache: { [string]: type } = {}
+	local deepCache: { [number]: { [string]: type } } = {}
 	local function build(rawType: type, isRoot: boolean, depth: number): type
 		-- Roots are never cached: isRoot changes what is emitted.
 		if isRoot then
 			return buildUncached(rawType, isRoot, depth)
 		end
-		local key = signatureOf(rawType, 0, {})
+		local key, reach = signed(rawType)
 		if key == nil then
 			return buildUncached(rawType, isRoot, depth)
 		end
-		-- Keyed by depth too, because MAX_DEPTH truncates.
-		local atDepth = buildCache[depth]
-		if atDepth == nil then
-			atDepth = {}
-			buildCache[depth] = atDepth
+		-- Timed fields have different server and client methods.
+		if string.find(key, "__scribeTimed", 1, true) ~= nil then
+			key = `{mode}@{key}`
 		end
-		local hit = atDepth[key]
+		-- Include depth only when MAX_DEPTH can truncate the subtree.
+		local cache = buildCache
+		if not fits(depth, reach) then
+			local atDepth = deepCache[depth]
+			if atDepth == nil then
+				atDepth = {}
+				deepCache[depth] = atDepth
+			end
+			cache = atDepth
+		end
+		local hit = cache[key]
 		if hit ~= nil then
 			return hit
 		end
 		local built = buildUncached(rawType, isRoot, depth)
-		atDepth[key] = built
+		cache[key] = built
 		return built
 	end
 	buildUncached = function(rawType: type, isRoot: boolean, depth: number): type
@@ -550,7 +628,14 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 		-- cannot do that: two ts.singleton("Remove") calls are distinct objects.
 		local props: { { key: type, ty: type } } = {}
 		local indexerSpec: { index: type, readresult: type, writeresult: type }? = nil
-		local childLookups: { type } = {}
+		local lookups = 0
+		local onlyLookup: type? = nil
+		local function lookup(key: type, node: type)
+			lookups += 1
+			if lookups == 1 then
+				onlyLookup = fn({ key }, { node }, "Key")
+			end
+		end
 
 		-- Strips a nested Timed / ServerOnly label, the one thing a read should not show.
 		local valueType = unwrapWrappers(t, depth)
@@ -563,37 +648,33 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 		-- with the declared key type, and two ts.singleton("Remove") calls are distinct
 		-- keys, so letting a map through here duplicates rather than overrides.
 		if t:is("table") and mapKey == nil and not isTimed and not isFlags and not isSet and not isBig then
+			-- OnChildChanged reports an existing child's value moving, once per write
+			-- and never coalesced, unlike Changed.
+			local childKeys: { type } = {}
+			local childTypes: { type } = {}
 			for key, prop in t:properties() do
 				local childType = prop.read or prop.write
 				if childType ~= nil then
 					local childNode = build(childType, false, depth + 1)
 					table.insert(props, { key = key, ty = childNode })
-					table.insert(childLookups, fn({ key }, { childNode }, "Key"))
-				end
-			end
-
-			-- OnChildChanged reports an existing child's value moving, once per write
-			-- and never coalesced, unlike Changed.
-			local childKeys: { type } = {}
-			local childValues: { type } = {}
-			for key, prop in t:properties() do
-				local childType = prop.read or prop.write
-				if childType ~= nil then
+					lookup(key, childNode)
 					table.insert(childKeys, key)
-					table.insert(childValues, unwrapWrappers(widen(childType), depth + 1))
+					table.insert(childTypes, childType)
 				end
 			end
 
 			local indexer = t:indexer()
+			local elementValue: type? = nil
 			if indexer ~= nil then
 				-- Read values exclude nested markers.
 				local elementType = unwrapWrappers(widen(indexer.readresult), depth + 1)
 				local elementIn = readOnlyDeep(elementType, depth + 1)
+				local optElement = optional(elementType)
 				if indexer.index:is("number") then
 					-- Array node: the indexer makes `arr[i]` an accessor node, which is
 					-- the only way to reach a Scribe.ArrayOf element field.
 					local elemNode = build(indexer.readresult, false, depth + 1)
-					table.insert(childLookups, fn({ indexer.index }, { elemNode }, "Key"))
+					lookup(indexer.index, elemNode)
 					indexerSpec = {
 						index = indexer.index,
 						readresult = elemNode,
@@ -602,60 +683,65 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 					if writable then
 						add("Insert", fn({ elementIn, optNumber, optBool }, {}, "Insert"))
 						-- Remove returns nil on an empty/missing array (matches RemoveValue).
-						add("Remove", fn({ optNumber, optBool }, { optional(elementType) }, "RemoveIndex"))
-						add("RemoveValue", fn({ elementIn, optBool }, { optional(elementType), optNumber }, "Set"))
+						add("Remove", fn({ optNumber, optBool }, { optElement }, "RemoveIndex"))
+						add("RemoveValue", fn({ elementIn, optBool }, { optElement, optNumber }, "Set"))
 					end
 					add("Find", fn({ elementIn }, { optNumber }, "Value"))
 					add("Has", fn({ elementIn }, { ts.boolean }, "Value"))
-					add(
-						"OnInsert",
-						fn({ fn({ elementType, ts.number }, {}, "IndexedValue") }, { disconnectType }, "Listener")
+					local onIndexed = fn(
+						{ fn({ elementType, ts.number }, {}, "IndexedValue") },
+						{ disconnectType },
+						"Listener"
 					)
-					add(
-						"OnRemove",
-						fn({ fn({ elementType, ts.number }, {}, "IndexedValue") }, { disconnectType }, "Listener")
-					)
+					add("OnInsert", onIndexed)
+					add("OnRemove", onIndexed)
 				else
 					-- Dictionary node: children are accessor nodes.
 					local childNode = build(indexer.readresult, false, depth + 1)
-					table.insert(childLookups, fn({ indexer.index }, { childNode }, "Key"))
+					lookup(indexer.index, childNode)
 					indexerSpec = {
 						index = indexer.index,
 						readresult = childNode,
 						writeresult = childNode,
 					}
 					if writable then
-						add("Remove", fn({ ts.string, optBool }, { optional(elementType) }, "RemoveKey"))
+						add("Remove", fn({ ts.string, optBool }, { optElement }, "RemoveKey"))
 					end
-					add(
-						"OnKeyAdded",
-						fn({ fn({ indexer.index, elementType }, {}, "KeyValue") }, { disconnectType }, "Listener")
+					local onKey = fn(
+						{ fn({ indexer.index, elementType }, {}, "KeyValue") },
+						{ disconnectType },
+						"Listener"
 					)
-					add(
-						"OnKeyRemoved",
-						fn({ fn({ indexer.index, elementType }, {}, "KeyValue") }, { disconnectType }, "Listener")
-					)
+					add("OnKeyAdded", onKey)
+					add("OnKeyRemoved", onKey)
 				end
 				if writable then
-					add("Clear", fn({ optBool }, {}, "Replicate"))
+					add("Clear", clearFn)
 				end
-				add("Count", fn({}, { ts.number }))
+				add("Count", countFn)
 				-- A dynamic container's children are homogeneous, so the key and value
 				-- types here are exact rather than a union over declared fields.
 				table.insert(childKeys, indexer.index)
-				table.insert(childValues, elementType)
+				elementValue = elementType
 			end
 
-			if #childKeys > 0 then
+			if #childKeys > MAX_CHILD_UNION then
+				-- Past MAX_CHILD_UNION the pair is widened; a growing union is what exceeds the budget.
+				add("OnChildChanged", wideChildChanged)
+			elseif #childKeys > 0 then
 				-- (key, new, old), matching Changed's new-first order. Both values are
 				-- optional: an added key has no old, a removed key has no new. On a
 				-- heterogeneous static table they widen to a union Luau will not narrow from
 				-- the key, which is accepted; that node kind has exact per-field listeners.
-				-- Past MAX_CHILD_UNION the pair is widened; a growing union is what exceeds the budget.
-				local childKey = if #childKeys > MAX_CHILD_UNION then ts.string else ts.unionof(table.unpack(childKeys))
-				local childValue = if #childValues > MAX_CHILD_UNION
-					then optional(anyType)
-					else optional(ts.unionof(table.unpack(childValues)))
+				local childValues: { type } = {}
+				for _, childType in childTypes do
+					table.insert(childValues, unwrapWrappers(widen(childType), depth + 1))
+				end
+				if elementValue ~= nil then
+					table.insert(childValues, elementValue)
+				end
+				local childKey = ts.unionof(table.unpack(childKeys))
+				local childValue = optional(ts.unionof(table.unpack(childValues)))
 				add(
 					"OnChildChanged",
 					fn({ fn({ childKey, childValue, childValue }, {}, "ChildChange") }, { disconnectType }, "Listener")
@@ -667,40 +753,39 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 			-- A map's children are accessor nodes keyed by the declared type; the key
 			-- events and Remove carry the element rather than the whole map.
 			local element = mapElement :: type
+			local optElement = optional(element)
 			local childNode = build(mapValue :: type, false, depth + 1)
-			table.insert(childLookups, fn({ mapKey }, { childNode }, "Key"))
+			lookup(mapKey, childNode)
 			indexerSpec = { index = mapKey, readresult = childNode, writeresult = childNode }
 			if writable then
-				add("Remove", fn({ mapKey, optBool }, { optional(element) }, "RemoveKey"))
+				add("Remove", fn({ mapKey, optBool }, { optElement }, "RemoveKey"))
 			end
-			add("OnKeyAdded", fn({ fn({ mapKey, element }, {}, "KeyValue") }, { disconnectType }, "Listener"))
-			add("OnKeyRemoved", fn({ fn({ mapKey, element }, {}, "KeyValue") }, { disconnectType }, "Listener"))
+			local onKey = fn({ fn({ mapKey, element }, {}, "KeyValue") }, { disconnectType }, "Listener")
+			add("OnKeyAdded", onKey)
+			add("OnKeyRemoved", onKey)
 			add(
 				"OnChildChanged",
-				fn(
-					{ fn({ mapKey, optional(element), optional(element) }, {}, "ChildChange") },
-					{ disconnectType },
-					"Listener"
-				)
+				fn({ fn({ mapKey, optElement, optElement }, {}, "ChildChange") }, { disconnectType }, "Listener")
 			)
 			if writable then
-				add("Clear", fn({ optBool }, {}, "Replicate"))
+				add("Clear", clearFn)
 			end
-			add("Count", fn({}, { ts.number }))
+			add("Count", countFn)
 		end
 
 		-- A homogeneous container keeps the exact child type. Static records use
 		-- an untyped lookup: overloads duplicate every recursive child node in the
 		-- callable surface and push ordinary templates past the Luau solver budget.
 		-- Direct property access remains exact; TypeScript can type this lookup too.
-		if #childLookups == 1 then
-			add("Child", childLookups[1])
-		elseif #childLookups > 1 then
-			add("Child", fn({ ts.unionof(ts.string, ts.number) }, { anyType }, "Key"))
+		if lookups == 1 then
+			add("Child", onlyLookup :: type)
+		elseif lookups > 1 then
+			add("Child", recordChild)
 		end
 
 		-- Common node methods.
-		add("Get", fn({}, { valueType }))
+		local reader = fn({}, { valueType })
+		add("Get", reader)
 		-- The root accessor cannot be Set or Updated at runtime, so those are left off the
 		-- root type. A big field declares its own wider Set and Update below; adding them
 		-- here too would duplicate rather than override, as the singletons are distinct keys.
@@ -715,8 +800,8 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 			add("Set", fn({ writeIn, optBool }, { valueType }, "Set"))
 			add("Update", fn({ fn({ valueType }, { writeIn }, "Value"), optBool }, { valueType }, "Update"))
 		end
-		add("Clone", fn({}, { valueType }))
-		add("Default", fn({}, { valueType }))
+		add("Clone", reader)
+		add("Default", reader)
 		-- (new, old) on every node. On a container it reports state, coalesced to one
 		-- fire per batch or received frame; which child moved is OnChildChanged's job.
 		add("Changed", fn({ fn({ valueType, valueType }, {}, "Change") }, { disconnectType }, "Listener"))
@@ -742,11 +827,13 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 			-- Min/Max read the declared bounds, so they stay on a derived field; the
 			-- two mutators do not.
 			if writable then
-				add("Increment", fn({ ts.number, amountOptions }, { ts.number }, "Increment"))
-				add("Decrement", fn({ ts.number, amountOptions }, { ts.number }, "Increment"))
+				local step = fn({ ts.number, amountOptions }, { ts.number }, "Increment")
+				add("Increment", step)
+				add("Decrement", step)
 			end
-			add("Min", fn({}, { optNumber }))
-			add("Max", fn({}, { optNumber }))
+			local bound = fn({}, { optNumber })
+			add("Min", bound)
+			add("Max", bound)
 		elseif scalar:is("boolean") and writable then
 			add("Toggle", fn({ optBool }, { ts.boolean }, "Replicate"))
 		end
@@ -758,16 +845,18 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 				local operand = ts.unionof(ts.number, ts.string, valueType)
 				add("Set", fn({ operand, optBool }, { valueType }, "Set"))
 				add("Update", fn({ fn({ valueType }, { operand }, "Value"), optBool }, { valueType }, "Update"))
-				add("Increment", fn({ operand, amountOptions }, { valueType }, "Increment"))
-				add("Decrement", fn({ operand, amountOptions }, { valueType }, "Increment"))
-				add("Multiply", fn({ operand, optBool }, { valueType }, "Set"))
-				add("Divide", fn({ operand, optBool }, { valueType }, "Set"))
+				local step = fn({ operand, amountOptions }, { valueType }, "Increment")
+				add("Increment", step)
+				add("Decrement", step)
+				local scale = fn({ operand, optBool }, { valueType }, "Set")
+				add("Multiply", scale)
+				add("Divide", scale)
 			end
 			-- A big bound past the double range is only expressible as a numeric string,
 			-- so these return the same union the declarator accepts.
-			local optBound = optional(ts.unionof(ts.number, ts.string))
-			add("Min", fn({}, { optBound }))
-			add("Max", fn({}, { optBound }))
+			local bound = fn({}, { optional(ts.unionof(ts.number, ts.string)) })
+			add("Min", bound)
+			add("Max", bound)
 		end
 
 		if isSet then
@@ -778,22 +867,24 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 				else anyType
 			local elementIn = readOnlyDeep(element, depth + 1)
 			if writable then
-				add("Add", fn({ elementIn, optBool }, { ts.boolean }, "Set"))
-				add("Remove", fn({ elementIn, optBool }, { ts.boolean }, "Set"))
-				add("Clear", fn({ optBool }, {}, "Replicate"))
+				local member = fn({ elementIn, optBool }, { ts.boolean }, "Set")
+				add("Add", member)
+				add("Remove", member)
+				add("Clear", clearFn)
 			end
 			add("Has", fn({ elementIn }, { ts.boolean }, "Value"))
 			add("Find", fn({ elementIn }, { optNumber }, "Value"))
-			add("Count", fn({}, { ts.number }))
+			add("Count", countFn)
 		end
 
 		if isFlags then
 			-- Named-member surface. Get/Set still take the whole { string } set.
 			if writable then
-				add("Enable", fn({ ts.string, optBool }, {}, "FlagWrite"))
-				add("Disable", fn({ ts.string, optBool }, {}, "FlagWrite"))
+				local switch = fn({ ts.string, optBool }, {}, "FlagWrite")
+				add("Enable", switch)
+				add("Disable", switch)
 				add("Toggle", fn({ ts.string, optBool }, { ts.boolean }, "FlagWrite"))
-				add("Clear", fn({ optBool }, {}, "Replicate"))
+				add("Clear", clearFn)
 			end
 			add("Has", fn({ ts.string }, { ts.boolean }, "Flag"))
 		end
@@ -817,7 +908,21 @@ type function BuildValueType(T, Names: type?, Mode: type?)
 		return out
 	end
 
+	if mode == "pair" and ClientT ~= nil then
+		local halves = ts.newtable(nil, nil, nil)
+		mode = "server"
+		halves:setproperty(ts.singleton("Server"), build(T, true, 0))
+		mode = "client"
+		halves:setproperty(ts.singleton("Client"), build(ClientT, true, 0))
+		return halves
+	end
+
 	return build(T, true, 0)
+end
+
+-- selene: allow(undefined_variable)
+type function BuildValueType(T, Names: type?, Mode: type?)
+	return BuildNodes(T, Names, Mode, nil)
 end
 
 -- Keep the original type-function arity for existing callers.
@@ -1049,6 +1154,7 @@ type ServerApiNames = {
 	TryHandleReceipt: (receiptInfo: any) -> (),
 	Owns: (player: any, key: any) -> (),
 	OwnsAsync: (player: any, key: any, timeout: any) -> (),
+	GetTrial: (player: any, key: any) -> (),
 	ObserveOwned: (player: any, key: any, callback: any) -> (),
 	GrantPerk: (player: any, key: any) -> (),
 	RevokePerk: (player: any, key: any) -> (),
@@ -1073,6 +1179,7 @@ type ClientApiNames = {
 	GetShared: (playerOrUserId: any) -> (),
 	Owns: (key: any) -> (),
 	OwnsAsync: (key: any, timeout: any) -> (),
+	GetTrial: (key: any) -> (),
 	ObserveOwned: (key: any, callback: any) -> (),
 	GetPurchases: (filter: any) -> (),
 	GetProductInfo: (name: any) -> (),
@@ -1122,7 +1229,7 @@ end
 -- rather than `ValueType<T> & { ... }`, because normalizing an intersection over a
 -- large accessor tree exceeds the solver's budget at the Scribe() call site.
 -- selene: allow(undefined_variable)
-type function BuildClientDataType(T, S, Names: type?)
+type function BuildClientApi(T, S, Names: type?, Node: type?)
 	local ts = types
 
 	local function optional(t: type): type
@@ -1167,7 +1274,7 @@ type function BuildClientDataType(T, S, Names: type?)
 	saveInfoProps[ts.singleton("Size")] = optional(ts.number)
 	local saveInfo = ts.newtable(saveInfoProps, nil, nil)
 
-	local out = ts.copy(BuildValueType(StripServerOnly(T), Names, ts.singleton("client")))
+	local out = if Node ~= nil then Node else ts.copy(BuildValueType(StripServerOnly(T), Names, ts.singleton("client")))
 	-- Read-only members avoid invariant type comparisons.
 	local function add(name: string, ty: type)
 		local prototype = if ty:is("function") then ClientApiNames:readproperty(ts.singleton(name)) else nil
@@ -1198,7 +1305,10 @@ type function BuildClientDataType(T, S, Names: type?)
 	add("OnSharedChanged", ts.any)
 	add("Owns", fn({ ts.string }, { ts.boolean }))
 	add("OwnsAsync", fn({ ts.string, optional(ts.number) }, { ts.boolean }))
-	add("ObserveOwned", fn({ ts.string, fn({ ts.boolean }, {}) }, { fn({}, {}) }))
+	local passTrialProps: { [type]: type } = {}
+	passTrialProps[ts.singleton("EndsAt")] = optional(ts.number)
+	add("GetTrial", fn({ ts.string }, { optional(ts.newtable(passTrialProps, nil, nil)) }))
+	add("ObserveOwned", fn({ ts.string, fn({ ts.boolean, ts.boolean }, {}) }, { fn({}, {}) }))
 	add("OnOwnershipChanged", ts.any)
 	add("GetSaveInfo", fn({}, { saveInfo }))
 	add("GetGiftCredits", fn({}, { stringToNumber }))
@@ -1233,18 +1343,54 @@ type function BuildClientDataType(T, S, Names: type?)
 end
 
 -- selene: allow(undefined_variable)
+type function BuildClientDataType(T, S, Names: type?)
+	return BuildClientApi(T, S, Names, nil)
+end
+
+-- selene: allow(undefined_variable)
 export type function ClientDataType(T)
 	return BuildClientDataType(T, types.any, nil)
+end
+
+-- A type alias supplies the read-only player indexer so Luau compares each node one way.
+-- Pass both halves together because separate type arguments are copied independently.
+type BundleSeed<P, Halves> = {
+	Server: { read [P]: index<Halves, "Server"> },
+	Client: index<Halves, "Client">,
+}
+
+-- selene: allow(undefined_variable)
+type function BuildBundleSeed(P: type, Halves: type): type
+	local ts = types
+	local seed = BundleSeed(P, Halves)
+	local server = seed:readproperty(ts.singleton("Server"))
+	if server ~= nil and server:indexer() ~= nil then
+		return seed
+	end
+	-- Older analyzers drop read-only indexers. Restore player lookup for them.
+	local node = Halves:readproperty(ts.singleton("Server")) :: type
+	local out = ts.newtable(nil, nil, nil)
+	out:setproperty(ts.singleton("Server"), ts.newtable(nil, { index = P, readresult = node, writeresult = node }, nil))
+	out:setproperty(ts.singleton("Client"), Halves:readproperty(ts.singleton("Client")))
+	return out
 end
 
 -- The server `Data` API. P is the Player class type, passed in as a type argument
 -- because class types are not constructible inside a type function. A type function
 -- for the same complexity-budget reason as ClientDataType.
 -- selene: allow(undefined_variable)
-type function BuildServerDataType(T, P, S, Names: type?)
+type function BuildServerApi(T, P, S, Names: type?, Indexed: type?)
 	local ts = types
 
-	local node = BuildValueType(T, Names)
+	local seeded = Indexed
+	if seeded == nil then
+		local halves = ts.newtable(nil, nil, nil)
+		halves:setproperty(ts.singleton("Server"), BuildValueType(T, Names))
+		halves:setproperty(ts.singleton("Client"), ts.any)
+		seeded = BuildBundleSeed(P, halves):readproperty(ts.singleton("Server"))
+	end
+	local api = seeded :: type
+	local node = (api:indexer() :: { readresult: type }).readresult
 
 	local function optional(t: type): type
 		return ts.unionof(t, ts.singleton(nil))
@@ -1409,7 +1555,10 @@ type function BuildServerDataType(T, P, S, Names: type?)
 	add("TryHandleReceipt", fn({ ts.any }, { optional(ts.any) }))
 	add("Owns", fn({ P, ts.string }, { ts.boolean }))
 	add("OwnsAsync", fn({ P, ts.string, optional(ts.number) }, { ts.boolean }))
-	add("ObserveOwned", fn({ P, ts.string, fn({ ts.boolean }, {}) }, { fn({}, {}) }))
+	local passTrialProps: { [type]: type } = {}
+	passTrialProps[ts.singleton("EndsAt")] = optional(ts.number)
+	add("GetTrial", fn({ P, ts.string }, { optional(ts.newtable(passTrialProps, nil, nil)) }))
+	add("ObserveOwned", fn({ P, ts.string, fn({ ts.boolean, ts.boolean }, {}) }, { fn({}, {}) }))
 	add("OnOwnershipChanged", ts.any)
 	add("GrantPerk", fn({ P, ts.string }, {}))
 	add("RevokePerk", fn({ P, ts.string }, {}))
@@ -1428,7 +1577,12 @@ type function BuildServerDataType(T, P, S, Names: type?)
 	purchaseProps[ts.singleton("Meta")] = optAnyTable
 	purchaseProps[ts.singleton("IdempotencyKey")] = optional(ts.string)
 	purchaseProps[ts.singleton("PaidRandom")] = optional(ts.boolean)
-	add("Purchase", fn({ P, ts.newtable(purchaseProps, nil, nil) }, boolAndReason))
+	-- Read-only inputs avoid an invariant comparison of Grant's accessor tree.
+	local purchaseSpec = ts.newtable(nil, nil, nil)
+	for key, ty in purchaseProps do
+		purchaseSpec:setreadproperty(key, ty)
+	end
+	add("Purchase", fn({ P, purchaseSpec }, boolAndReason))
 	add("RecordPurchase", fn({ P, anyTable }, {}))
 	-- OpenLeg and OpenExchange are rebuilt here: a type function cannot reach an alias.
 	local openLegProps: { [type]: type } = {}
@@ -1497,7 +1651,6 @@ type function BuildServerDataType(T, P, S, Names: type?)
 	add("ServerStore", StoreDataType(S, Names))
 
 	-- Read-only members avoid invariant type comparisons.
-	local api = ts.newtable(nil, { index = P, readresult = node, writeresult = node }, nil)
 	for key, ty in props do
 		api:setreadproperty(key, ty)
 	end
@@ -1505,8 +1658,26 @@ type function BuildServerDataType(T, P, S, Names: type?)
 end
 
 -- selene: allow(undefined_variable)
+type function BuildServerDataType(T, P, S, Names: type?)
+	return BuildServerApi(T, P, S, Names, nil)
+end
+
+-- selene: allow(undefined_variable)
 export type function ServerDataType(T, P)
 	return BuildServerDataType(T, P, types.any, nil)
+end
+
+-- Sharing nodes across both APIs reduces the cost of checking a Scribe() call.
+-- selene: allow(undefined_variable)
+type function BuildBundleType(T, P, S, Names: type?)
+	local ts = types
+	local seed = BuildBundleSeed(P, BuildNodes(T, Names, ts.singleton("pair"), StripServerOnly(T)))
+	local server = seed:readproperty(ts.singleton("Server"))
+	local client = seed:readproperty(ts.singleton("Client"))
+	local out = ts.newtable(nil, nil, nil)
+	out:setreadproperty(ts.singleton("Server"), BuildServerApi(T, P, S, Names, server))
+	out:setreadproperty(ts.singleton("Client"), BuildClientApi(T, S, Names, client))
+	return out
 end
 
 --------------------------------------------------------------------------------
@@ -1717,6 +1888,7 @@ export type ScribeOptions<T, S = any> = {
 
 	Migrations: { [number]: (data: { [string]: any }) -> () }?,
 	UserOwnsGamePassAsync: ((userId: number, passId: number) -> boolean)?, -- advanced/test seam
+	GetPassOwnershipAsync: ((player: Player, passId: number) -> { [string]: any })?, -- advanced/test seam
 	GetProductInfoAsync: ((assetId: number, infoType: any) -> { [string]: any }?)?, -- advanced/test seam
 	GetPolicyInfoAsync: ((player: Player) -> { [string]: any }?)?, -- advanced/test seam
 	DevMode: boolean?, -- advanced/test seam: overrides the RunService:IsStudio() default
@@ -1836,11 +2008,7 @@ export type ClientData<T, S = any> = BuildClientDataType<T, S, NodeFunctionNames
 -- cannot be called across modules: Scribe.ValueType<T> would resolve to any.
 export type PlayerData<T> = BuildValueType<T, NodeFunctionNames, "server">
 
--- Read-only halves avoid invariant comparisons that exhaust the type budget.
-export type Bundle<T, S = any> = {
-	read Server: ServerData<T, S>,
-	read Client: ClientData<T, S>,
-}
+export type Bundle<T, S = any> = BuildBundleType<T, Player, S, NodeFunctionNames>
 
 --[=[
 	@within Scribe
@@ -2058,6 +2226,15 @@ export type Bundle<T, S = any> = {
 	The optional filter you pass [Server.GetPurchases] or [Client.GetPurchases].
 	The fields combine with AND, so omitting all of them returns the whole
 	retained log, which is itself capped. See [Monetization](../monetization.md).
+]=]
+
+--[=[
+	@interface PassTrial
+	.EndsAt number? -- expected end in Unix seconds, nil if unknown
+	@tag Monetization
+	Returned by [Server.GetTrial] and [Client.GetTrial]. Display `EndsAt` as an
+	estimate. Scribe reports expiry after Roblox confirms it.
+	See [Monetization](../monetization.md#pass-free-trials).
 ]=]
 
 --[=[
@@ -2505,6 +2682,7 @@ local KNOWN_OPTION_KEYS: { [string]: boolean } = {
 	TransportChannel = true,
 	Migrations = true,
 	UserOwnsGamePassAsync = true,
+	GetPassOwnershipAsync = true,
 	GetProductInfoAsync = true,
 	GetPolicyInfoAsync = true,
 	DevMode = true,

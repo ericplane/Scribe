@@ -146,6 +146,9 @@ export type LogCode =
     | "RECEIPT_HISTORY_FULL"
     | "OWNERSHIP_CHECK_FAIL"
     | "PASS_PURCHASE_UNCONFIRMED"
+    | "PASS_TRIAL_STARTED"
+    | "PASS_TRIAL_ENDED"
+    | "PASS_TRIAL_READ_FAIL"
     | "PERK_GRANTED"
     | "PERK_REVOKED"
     | "PRODUCT_INFO_FAIL"
@@ -285,6 +288,8 @@ export interface LeaderboardStatusInfo {
 export interface LeaderboardSnapshotEntry extends LeaderboardStatusInfo { BundleId: number; Name: string; }
 export interface PassConfig { Id: number; Category?: string; }
 export interface PurchaseFilter { Kind?: "Robux" | "InGame"; Category?: string; ItemId?: string; Since?: number; Limit?: number; }
+/** Expected trial end in Unix seconds, absent if unknown. */
+export interface PassTrial { EndsAt?: number; }
 /** RecordPurchase accepts game-defined fields, so only Kind is universally present. */
 export interface PurchaseEntry extends UnknownRecord {
     Kind: "Robux" | "InGame";
@@ -371,6 +376,7 @@ export interface PeriodResetOptions { UtcOffset?: number; WeekStart?: "Monday" |
 
 export interface MockState {
     Perks?: ReadonlyArray<string>;
+    Trials?: { [pass: string]: number };
     GiftCredits?: { [product: string]: number };
     PurchaseLogs?: { Robux?: ReadonlyArray<UnknownRecord>; InGame?: ReadonlyArray<UnknownRecord> };
     Leaderboards?: { [name: string]: ReadonlyArray<LeaderboardEntry> };

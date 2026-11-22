@@ -1,5 +1,5 @@
 --!strict
--- EXPECTED_ERRORS: 30
+-- EXPECTED_ERRORS: 34
 -- Each invalid write, argument or wrapped-value use must report one type error.
 local Scribe = require(script.Parent.Parent.Scribe)
 
@@ -47,6 +47,27 @@ local _granted: Scribe.ProductConfig<typeof(template)> = {
 		local _wrong: number = player.Name -- 30: the player is a Player, not any
 	end,
 }
+local sealed = (nil :: any) :: Scribe.PlayerData<{
+	read Limits: { Cap: number },
+	Coins: number,
+	Open: { Cap: number },
+	Shut: { read Cap: number },
+}>
+local wide = (nil :: any) :: Scribe.PlayerData<{
+	A: number,
+	B: number,
+	C: number,
+	D: number,
+	E: number,
+	F: number,
+	G: number,
+	H: number,
+	I: number,
+	J: number,
+	K: number,
+	L: number,
+	M: number,
+}>
 
 return function(player: Player)
 	local data = bundle.Server[player]
@@ -79,4 +100,13 @@ return function(player: Player)
 	local _goneElement = client.Items.Get()[1].Cost -- 27: and inside a container element
 	data.Items.Insert({ Id = "a", Cost = "5" }) -- 28: the element field takes its value type
 	data.HiddenSet.Add("5") -- 29: a set's server-only element takes its value type
+
+	bundle.Server[player] = data -- 31: the player index is read-only
+	sealed.Get().Limits = { Cap = 1 } -- 32: Get preserves read-only fields
+	sealed.Open.Get().Cap = 1
+	sealed.Shut.Get().Cap = 1 -- 33: Shut.Cap remains read-only alongside Open.Cap
+
+	wide.OnChildChanged(function(key)
+		local _notAny: number = key -- 34: thirteen children widen the key to string
+	end)
 end

@@ -1,5 +1,5 @@
 import type { Accessor, PlayerData, ValueOf, InputOf, ClientSchema, SharedSchema, ReadonlyAccessor, NumericPaths, Disconnect, Datatype, BigValue, BigOperand } from "./schema";
-import type { UnknownRecord, ScribeTransport, Signal, LifecycleReason, SessionState, LoadPhase, Status, ProductState, RequestFailure, RequestFailedMarker, OperationResult, SaveInfo, SaveEvent, Anomaly, GiftReceived, VersionRecord, SchemaViolation, FlushOptions, UpdateOfflineOptions, RestoreOptions, CooldownOptions, MigrationContext, LeaderboardEntry, LeaderboardStatusInfo, PassConfig, PurchaseFilter, PurchaseEntry, PurchaseLogOptions, ProductInfo, PolicyInfo, ReceiptInfo, EconomyConfig, ExchangeableSpec, ExchangeAPI, LogLevel, StatusThresholds, PeriodResetOptions, MockState } from "./common";
+import type { UnknownRecord, ScribeTransport, Signal, LifecycleReason, SessionState, LoadPhase, Status, ProductState, RequestFailure, RequestFailedMarker, OperationResult, SaveInfo, SaveEvent, Anomaly, GiftReceived, VersionRecord, SchemaViolation, FlushOptions, UpdateOfflineOptions, RestoreOptions, CooldownOptions, MigrationContext, LeaderboardEntry, LeaderboardStatusInfo, PassConfig, PassTrial, PurchaseFilter, PurchaseEntry, PurchaseLogOptions, ProductInfo, PolicyInfo, ReceiptInfo, EconomyConfig, ExchangeableSpec, ExchangeAPI, LogLevel, StatusThresholds, PeriodResetOptions, MockState } from "./common";
 
 export interface LeaderboardConfig<T = unknown> {
     Stat: NumericPaths<T, true>;
@@ -122,8 +122,10 @@ export interface ServerAPI<T, C = {}> {
     readonly Owns: (this: void, player: Player, key: string) => boolean;
     /** Verifies uncached pass ownership with Roblox before returning. */
     readonly OwnsAsync: (this: void, player: Player, key: string, timeout?: number) => boolean;
+    /** Returns the cached trial if it alone grants access, otherwise `undefined`. */
+    readonly GetTrial: (this: void, player: Player, key: string) => PassTrial | undefined;
     /** Reports ownership now and on changes; returns a disconnect function. */
-    readonly ObserveOwned: (this: void, player: Player, key: string, callback: (this: void, owned: boolean) => void) => Disconnect;
+    readonly ObserveOwned: (this: void, player: Player, key: string, callback: (this: void, owned: boolean, trial: boolean) => void) => Disconnect;
     /** Grants a perk through Scribe's ownership state. */
     readonly GrantPerk: (this: void, player: Player, key: string) => void;
     /** Removes a granted perk from Scribe's ownership state. */
@@ -155,7 +157,7 @@ export interface ServerAPI<T, C = {}> {
     /** Fires when a player receives an unassigned gift credit. */
     readonly OnGiftCredit: Signal<[Player, string]>;
     /** Fires when effective ownership changes after load. */
-    readonly OnOwnershipChanged: Signal<[Player, string, boolean]>;
+    readonly OnOwnershipChanged: Signal<[Player, string, boolean, boolean]>;
     /** Fires when a cooldown expires during an active session. */
     readonly OnCooldownEnded: Signal<[Player, string]>;
     /** Fires when cached board contents change. */
@@ -202,10 +204,12 @@ export interface ClientAPI<T, C = {}> {
     readonly Owns: (this: void, key: string) => boolean;
     /** Waits for the server's initial ownership sync before reading the mirror. */
     readonly OwnsAsync: (this: void, key: string, timeout?: number) => boolean;
+    /** Reads trial-only access from the local mirror after load. */
+    readonly GetTrial: (this: void, key: string) => PassTrial | undefined;
     /** Returns a disconnect immediately. Reports current ownership once loaded and on changes. */
-    readonly ObserveOwned: (this: void, key: string, callback: (this: void, owned: boolean) => void) => Disconnect;
+    readonly ObserveOwned: (this: void, key: string, callback: (this: void, owned: boolean, trial: boolean) => void) => Disconnect;
     /** Fires for ownership changes after the initial baseline. */
-    readonly OnOwnershipChanged: Signal<[string, boolean]>;
+    readonly OnOwnershipChanged: Signal<[string, boolean, boolean]>;
     /** Reads cached player-specific marketplace info, fetching on demand. */
     readonly GetProductInfo: (this: void, name: string) => ProductInfo | undefined;
     /** Reads the local player's cached Robux price, or `undefined` while loading. */
@@ -254,6 +258,7 @@ export interface ScribeOptions<T, S = {}, C = {}> {
     Transport?: ScribeTransport | "Default";
     Migrations?: { [version: number]: (this: void, data: UnknownRecord) => void };
     UserOwnsGamePassAsync?: (this: void, userId: number, passId: number) => boolean;
+    GetPassOwnershipAsync?: (this: void, player: Player, passId: number) => UnknownRecord;
     GetProductInfoAsync?: (this: void, assetId: number, infoType: Enum.InfoType) => ProductInfo | undefined;
     GetPolicyInfoAsync?: (this: void, player: Player) => PolicyInfo | undefined;
     DevMode?: boolean;

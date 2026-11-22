@@ -1,8 +1,68 @@
 # Changelog
 
+## 2.8.0
+
+Released 2026-11-22.
+
+Roblox pass free trials, more room for large Luau templates, and fixes for interrupted
+profile loads and saves.
+
+### Behaviour changes
+
+- Luau now treats `Data[player]` as read-only. Assigning to it hid the player's
+  accessor. Write through the player's fields instead.
+
+- Luau shows `Scribe.Bundle<T>` expanded on hover. Helpers that read `Server` or
+  `Client` from a bundle now need a concrete template type.
+
+### Added
+
+- Roblox pass free trials. During a confirmed trial, `Owns` is true, the pass stays
+  purchasable, and Scribe skips the purchase-history entry. `Data.GetTrial` returns the
+  trial on server and client, with `EndsAt` when Roblox supplies it.
+
+- `ObserveOwned` and `OnOwnershipChanged` pass a trailing `trial` flag. They also fire
+  when a trial becomes a purchase, even though `owned` stays true. Includes Luau and
+  roblox-ts types.
+
+- `Data.Mock` accepts `Trials`. The `PassTrialsStarted` and `PassTrialsEnded` metrics
+  count detected trials and expirations. ScribeTelemetry watches `PASS_TRIAL_READ_FAIL`
+  by default.
+
+### Fixed
+
+- A player who left during loading could be kicked with `PROFILE_LOAD_FAIL` when
+  rejoining the same server. The new session now retries the cancelled load.
+
+- A late DataStore callback could invalidate a session opened by a retry. The next
+  save could then kick the player and discard unsaved changes. Scribe now ignores
+  callbacks that run after their call returns.
+
+- Deeply nested templates no longer make Luau repeat the same work at each level.
+
+### Changed
+
+- Large templates take fewer steps to type-check. The largest type comparison in the
+  large-template test dropped from about 49,200 steps to 17,100, below Luau's default
+  limit of 20,000.
+
+- Pass checks now use Roblox's detailed ownership result. Until the first successful
+  result, Scribe can fall back to the older check, which counts a trial as a purchase.
+  After that first success, a failed check keeps the last known state.
+
+- Updated Jest and JestGlobals to 3.21.0.
+
+### Documentation
+
+- The monetization, gifting and testing guides cover temporary pass access, permanent
+  rewards and testing trials with `Data.Mock`.
+
+- The templates guide shows how to measure a file with `scripts/measure-type-budget.mjs`
+  and what to change when Luau reports "Code is too complex to typecheck".
+
 ## 2.7.0
 
-Unreleased.
+Released 2026-11-12.
 
 Purchase grants now receive the player. This update also improves client ownership
 observers, edit-mode mocks and replication diagnostics.

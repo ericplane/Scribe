@@ -873,10 +873,11 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@tag Ownership
 		@client
 		@prop OnOwnershipChanged Signal
-		Fires `(key, owned)` whenever the local player's ownership of a pass or perk
-		actually changes. Ownership already held at load is the baseline and does not
-		fire. Use [Client.ObserveOwned] instead when you care about one specific key
-		and want the current value immediately.
+		Fires `(key, owned, trial)` when access changes after the load baseline.
+		Use [Client.ObserveOwned] for the current value of one key and later changes.
+
+		Trial-only access reports `(true, true)`, purchase during a trial reports
+		`(true, false)`, and expiry reports `(false, false)`.
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]
@@ -893,16 +894,23 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		end
 	end
 
-	local function ownsFromMirror(key: string): boolean
+	local function ownershipFromMirror(key: string): (boolean, boolean, number?)
 		local reserved = mirror[Template.RESERVED_ROOT]
 		if type(reserved) == "table" and type(reserved.Perks) == "table" and reserved.Perks[key] == true then
-			return true
+			return true, false, nil
 		end
 		local session = mirror[Template.SESSION_ROOT]
-		if type(session) == "table" and type(session.OwnsCache) == "table" and session.OwnsCache[key] == true then
-			return true
+		local cached = if type(session) == "table" and type(session.OwnsCache) == "table"
+			then session.OwnsCache[key]
+			else nil
+		if type(cached) == "number" then
+			return true, true, if cached > 0 then cached else nil
 		end
-		return false
+		return cached == true, false, nil
+	end
+
+	local function ownsFromMirror(key: string): boolean
+		return (ownershipFromMirror(key))
 	end
 
 	--[=[
@@ -913,6 +921,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@param key string
 		@return boolean
 		Whether the local player owns a perk or pass, from the replicated mirror.
+		Includes free trials. Use [Client.GetTrial] to identify trial access.
 		Yields until data has loaded.
 	]=]
 	-- Reads mirrored ownership after the profile loads.
@@ -922,6 +931,33 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			waitForLoaded()
 		end
 		return ownsFromMirror(key)
+	end
+
+	--[=[
+		@within Client
+		@tag Ownership
+		@client
+		@yields
+		@param key string
+		@return PassTrial?
+		Waits for data to load. Returns the trial when it alone grants access,
+		otherwise `nil`. A trial pass stays purchasable.
+
+		```lua
+		local trial = Data.GetTrial("DoubleCoins")
+		if trial then
+		    badge.Text = "Trial"
+		end
+		```
+	]=]
+	-- Reads trial-only access from the local mirror after load.
+	function Data.GetTrial(key: string): { EndsAt: number? }?
+		assertOwnsKey(key, "GetTrial")
+		if not editMode then
+			waitForLoaded()
+		end
+		local _, trial, trialEnds = ownershipFromMirror(key)
+		return if trial then { EndsAt = trialEnds } else nil
 	end
 
 	local function ownsSyncedFromMirror(): boolean
@@ -985,7 +1021,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 
 	-- Drives OnOwnershipChanged. Dedupes like ObserveOwned, but across every key the
 	-- mirror holds, so a listener does not have to know keys up front.
-	local ownsLast: { [string]: boolean } = {}
+	local ownsLast: { [string]: string? } = {}
 	local ownsWatched = false
 	local function scanOwnership(silent: boolean?)
 		local candidates: { [string]: boolean } = {}
@@ -1006,11 +1042,12 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			candidates[key] = true
 		end
 		for key in candidates do
-			local owned = ownsFromMirror(key)
-			if owned ~= (ownsLast[key] == true) then
-				ownsLast[key] = owned
+			local owned, trial = ownershipFromMirror(key)
+			local state = if trial then "trial" elseif owned then "owned" else nil
+			if state ~= ownsLast[key] then
+				ownsLast[key] = state
 				if not silent then
-					OnOwnershipChanged:Fire(key, owned)
+					OnOwnershipChanged:Fire(key, owned, trial)
 				end
 			end
 		end
@@ -1037,20 +1074,22 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@tag Ownership
 		@client
 		@param key string
-		@param callback (owned: boolean) -> ()
+		@param callback (owned: boolean, trial: boolean) -> ()
 		@return () -> ()
 		Returns a disconnect function immediately. Calls `callback` with current
-		ownership once data has loaded and whenever ownership changes.
+		ownership once data has loaded and whenever ownership changes. Buying a trial
+		pass changes `(owned, trial)` from `(true, true)` to `(true, false)`.
 	]=]
 	-- Reports current ownership and later changes; returns a disconnect.
-	function Data.ObserveOwned(key: string, callback: (owned: boolean) -> ()): () -> ()
+	function Data.ObserveOwned(key: string, callback: (owned: boolean, trial: boolean) -> ()): () -> ()
 		assertOwnsKey(key, "ObserveOwned")
-		local last: boolean? = nil
+		local lastOwned: boolean? = nil
+		local lastTrial = false
 		local function push()
-			local owned = ownsFromMirror(key)
-			if owned ~= last then
-				last = owned
-				Sched.Spawn(callback, owned)
+			local owned, trial = ownershipFromMirror(key)
+			if owned ~= lastOwned or trial ~= lastTrial then
+				lastOwned, lastTrial = owned, trial
+				Sched.Spawn(callback, owned, trial)
 			end
 		end
 		local disconnectPerk = tree.Reserved.Perks.Changed(push)
@@ -1372,8 +1411,11 @@ function Client.new(options: any, compiled: Template.Compiled): any
 			end
 		end
 		local ownedKey = if products[name] ~= nil then config.Grants else name
-		if ownedKey ~= nil and ownsFromMirror(ownedKey) then
-			return "owned"
+		if ownedKey ~= nil then
+			local owned, trial = ownershipFromMirror(ownedKey)
+			if owned and not trial then
+				return "owned"
+			end
 		end
 		return "purchasable"
 	end
@@ -1853,7 +1895,7 @@ function Client.new(options: any, compiled: Template.Compiled): any
 		@tag Edit Mode
 		@client
 		@param values { [string]: any }?
-		@param scribeState { Perks: { string }?, GiftCredits: { [string]: number }?, PurchaseLogs: { Robux: { any }?, InGame: { any }? }?, Leaderboards: { [string]: { LeaderboardEntry } }? }?
+		@param scribeState { Perks: { string }?, Trials: { [string]: number }?, GiftCredits: { [string]: number }?, PurchaseLogs: { Robux: { any }?, InGame: { any }? }?, Leaderboards: { [string]: { LeaderboardEntry } }? }?
 		Seeds mock data for a storybook / edit mode. **Errors outside edit mode.**
 		Use it to render Scribe-backed components with realistic state.
 
@@ -1882,6 +1924,12 @@ function Client.new(options: any, compiled: Template.Compiled): any
 				if scribeState.Perks then
 					for _, perk in scribeState.Perks :: { string } do
 						reservedAccessor.Perks.Child(perk).Set(true)
+					end
+				end
+				if scribeState.Trials then
+					-- Unix seconds, or 0 for an unknown end.
+					for pass, endsAt in scribeState.Trials :: { [string]: number } do
+						tree.ReservedSession.OwnsCache.Child(pass).Set(endsAt)
 					end
 				end
 				if scribeState.GiftCredits then

@@ -141,6 +141,7 @@ Pass an array, set or `Flags` list whole. A shorter list drops the old tail, and
     | Key | Client APIs it feeds |
     | --- | --- |
     | `Perks` | `Owns`, `ObserveOwned` |
+    | `Trials` | `Owns`, `GetTrial` and `ObserveOwned`. Map each pass name to its trial end in Unix seconds, or `0` if the end is unknown |
     | `GiftCredits` | `GetGiftCredits` |
     | `Leaderboards` | `GetLeaderboard` |
     | `PurchaseLogs` | `GetPurchases`; takes `Robux` and `InGame` arrays of log entries |

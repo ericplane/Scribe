@@ -59,7 +59,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		OnGiftReceived = Signal.new(), -- (player, { FromUserId, Product, GiftId })
 		OnGiftCredit = Signal.new(), -- (player, productName)
 		OnMessage = Signal.new(), -- (player, message)
-		OnOwnershipChanged = Signal.new(), -- (player, key, owned)
+		OnOwnershipChanged = Signal.new(), -- (player, key, owned, trial)
 		OnCooldownEnded = Signal.new(), -- (player, key)
 		OnLeaderboard = Signal.new(), -- (boardName, entries)
 	}
@@ -880,7 +880,7 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		**Refuses something the player already owns**, so a caller does not have to pair
 		every prompt with its own [Server.Owns] check. A pass is its own ownership key. A
 		product is checked against its `Grants` perk, and a product with no `Grants` is a
-		consumable that can be bought repeatedly.
+		consumable that can be bought repeatedly. A pass on trial stays purchasable.
 
 		Ownership is read from Scribe's cache rather than a live Marketplace call, because
 		this is a UI gate: for a product the receipt path is what actually prevents a
@@ -1019,8 +1019,9 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param player Player
 		@param key string
 		@return boolean
-		The unified ownership check: a granted perk **or** an owned game pass
-		(cached) **or** RobloxPlus. Hide "buy" buttons whenever this is true.
+		True for a granted perk, a purchased or trial pass, or RobloxPlus.
+		Use [Server.GetTrial] to identify trial access and [Server.GetProductState]
+		to decide whether to show a buy button.
 
 		Non-yielding, so it reads the gamepass cache that fills asynchronously right
 		after a player joins. For a gate that must be correct at that instant, use
@@ -1039,14 +1040,11 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@param key string
 		@param timeout number?
 		@return boolean
-		Like [Server.Owns] but **authoritative and yielding**: if the pass is not
-		already owned in the cache, it verifies live with the server-side
-		`UserOwnsGamePassAsync` on every call, so a pass bought moments ago (in
-		experience or on the Roblox website) is reflected immediately. Once owned,
-		the cached value is returned without a re-check. This is the ownership check
-		to gate grants on. The client's `Owns`/`OwnsAsync` are only mirror reads and
-		must never gate a grant. (`timeout` applies only to the client version, which
-		waits on a replicated flag.)
+		Like [Server.Owns], but checks unowned and trial passes with Roblox on each
+		call. Confirmed purchases stay cached. A failed check returns cached access.
+
+		Use the server result for grants. For permanent rewards, also check
+		[Server.GetTrial]. The client reads a mirror, and only the client uses `timeout`.
 	]=]
 	-- Verifies uncached pass ownership with Roblox before returning.
 	function Data.OwnsAsync(player: Player, key: string, timeout: number?)
@@ -1058,15 +1056,41 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@server
 		@param player Player
 		@param key string
-		@param callback (owned: boolean) -> ()
+		@return PassTrial?
+		Returns the cached trial when it alone grants access, otherwise `nil`.
+		For a permanent reward, check both ownership and trial status.
+
+		```lua
+		if Data.OwnsAsync(player, "StarterPack") and not Data.GetTrial(player, "StarterPack") then
+		    grantStarterItems(player)
+		end
+		```
+
+		[Server.OwnsAsync] refreshes the cache. If Roblox only supplies legacy
+		ownership, a trial counts as a purchase and `GetTrial` returns `nil`.
+		See [Monetization](../monetization.md#pass-free-trials).
+	]=]
+	-- Returns the cached trial if it alone grants access, otherwise nil.
+	function Data.GetTrial(player: Player, key: string)
+		return ctx.Monetization.GetTrial(player, key)
+	end
+	--[=[
+		@within Server
+		@tag Monetization
+		@server
+		@param player Player
+		@param key string
+		@param callback (owned: boolean, trial: boolean) -> ()
 		@return () -> ()
 		Calls `callback` with the player's current ownership of `key`, then again
 		whenever it changes. Returns a disconnect function. The server twin of
 		[Client.ObserveOwned]. To react to any key without subscribing per key, use
 		[Server.OnOwnershipChanged].
+
+		Buying a trial pass changes `(owned, trial)` from `(true, true)` to `(true, false)`.
 	]=]
 	-- Reports current ownership and later changes; returns a disconnect.
-	function Data.ObserveOwned(player: Player, key: string, callback: (owned: boolean) -> ())
+	function Data.ObserveOwned(player: Player, key: string, callback: (owned: boolean, trial: boolean) -> ())
 		return ctx.Monetization.ObserveOwned(player, key, callback)
 	end
 	--[=[
@@ -1287,14 +1311,12 @@ function Server.build(options: any, compiled: Template.Compiled): (any, any)
 		@tag Monetization
 		@server
 		@prop OnOwnershipChanged Signal
-		Fires `(player, key, owned)` whenever a player's effective ownership of a
-		pass, perk, or RobloxPlus actually changes, covering purchases, grants, gift
-		deliveries, and revokes. Pre-existing ownership at join is the baseline and
-		does not fire. Use this to react to any grant without subscribing per key;
-		use [Server.ObserveOwned] for one specific key.
+		Fires `(player, key, owned, trial)` when pass, perk, or RobloxPlus access
+		changes after the join baseline. Use [Server.ObserveOwned] for one key.
 
-		Ownership only ever gains within a session, so a game pass **refund** is not
-		detected until the player rejoins (a cached `true` is never re-verified).
+		Trial-only access reports `(true, true)`, conversion to permanent access
+		reports `(true, false)`, and expiry reports `(false, false)`. Only permanent
+		access qualifies for lasting rewards. Pass refunds take effect on rejoin.
 
 		The value is a [Signal](signal.md), where `Connect`, `Once` and `Wait` are documented.
 	]=]

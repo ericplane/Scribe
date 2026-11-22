@@ -220,6 +220,7 @@ These describe what Scribe is putting on the wire. Reach for them when the Ember
     | `ReceiptsPartial` | Receipts settled after a **yielding** `Grant` threw part way. The player may have received less than they paid for |
     | `PurchaseIdsEvicted`, `PurchaseClaimsEvicted` | Dedupe entries dropped by their count backstops. A retry under an evicted key would apply its purchase again |
     | `GiftPrompts`, `GiftsDelivered`, `OwnershipCheckFailures` | Gifting and pass ownership |
+    | `PassTrialsStarted`, `PassTrialsEnded` | Active pass trials first seen in a session, including at join, and trials Roblox later reports expired. Buying the pass during a trial does not increment `PassTrialsEnded` |
     | `PaidRandomRefused` | Prompts, soft-currency purchases and gift prompts refused on the paid random policy, restricted and pending alike |
     | `MessageQueueFull` | Sends refused because the recipient's message queue is at its 1,000-entry cap. Nothing already queued is lost, because the send is refused rather than evicting anything |
     | `MessageQueueFullAmbiguous` | The subset of those refusals where an earlier attempt inside the same call may already have queued the message. Non-zero means a refused send can still arrive, so a duplicate delivery is reconcilable rather than mysterious. Pair it with `Context.ProvablyClean` on the `MESSAGE_QUEUE_FULL` lines |

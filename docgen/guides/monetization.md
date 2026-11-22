@@ -11,6 +11,7 @@ Choose the task you need; you do not need every feature to build a shop:
 | Show a purchase dialog | [Prompting the sale](#prompting-the-sale) |
 | Spend coins earned in your game | [Soft-currency purchases](#soft-currency-purchases) |
 | Check a pass or saved perk | [Checking what a player owns](#checking-what-a-player-owns) |
+| Handle a pass free trial | [Pass free trials](#pass-free-trials) |
 | Display the player's price | [Showing the price](#showing-the-price) |
 | Send a purchase to another player | [Gifting](./gifting) |
 
@@ -104,7 +105,7 @@ need to know which table an item lives in. The Id stays in one place.
 
 A name declared in **both** tables is a startup error. Resolution is by name, so otherwise the order of two tables would decide what the player is charged for.
 
-**It refuses something the player already owns.** A pass is its own ownership key. A product is checked against its `Grants` perk, and one with no `Grants` is a consumable that can be bought repeatedly. So you do not have to pair every prompt with its own [`Owns`](/api/Server#Owns) check.
+**It refuses something the player already owns.** A pass is its own ownership key. A product is checked against its `Grants` perk, and one with no `Grants` is a consumable that can be bought repeatedly. So you do not have to pair every prompt with its own [`Owns`](/api/Server#Owns) check. Players on a [free trial](#pass-free-trials) can still buy the pass.
 
 An eligibility refusal returns a `Scribe.ProductState` string: `"not-loaded"`, `"owned"`,
 `"paid-random-restricted"`, or `"policy-pending"`. Unknown names and engine prompt errors
@@ -135,9 +136,7 @@ an item from this return value or from a client prompt-finished event.
 
 A game pass has no `ProcessReceipt`. The only signal is `PromptGamePassPurchaseFinished`, which reports that the purchase **dialog closed**, not that a transaction completed.
 
-Scribe re-checks ownership before crediting anything. If the check does not confirm it, nothing is credited, no purchase-history entry is written, and `PASS_PURCHASE_UNCONFIRMED` is logged. A genuine purchase the ownership API has not caught up with is credited on the player's next load, because the join scan re-resolves every declared pass.
-
-The reason this matters is not the session cache, which heals itself. It is the purchase history: that is persisted, and an unconfirmed event would have written a permanent record of Robux that may never have been spent.
+Starting a [free trial](#pass-free-trials) also fires this event. Scribe checks ownership after the dialog reports success. A confirmed purchase goes in the Robux history. A confirmed trial grants temporary access. If Roblox confirms neither, Scribe logs `PASS_PURCHASE_UNCONFIRMED` and skips the entry. The next join refreshes access for a genuine buyer without backfilling the history.
 
 The meta table on `Increment` is optional. It makes the grant show up in Roblox's economy dashboard, which is worth having for your largest source of currency. See [Economy Analytics](./economy).
 
@@ -181,7 +180,7 @@ A receipt for a flagged product from a restricted player is still granted and lo
 | `Scribe.ProductState` member | The string | When |
 | --- | --- | --- |
 | `Purchasable` | `"purchasable"` | none of the below |
-| `Owned` | `"owned"` | a pass the player holds, or a product whose `Grants` perk they hold; a consumable is never owned |
+| `Owned` | `"owned"` | the player owns the pass key or the product's `Grants` perk outright. Consumables and trial-only passes stay purchasable |
 | `PaidRandomRestricted` | `"paid-random-restricted"` | flagged, and the player's policy restricts it |
 | `PolicyPending` | `"policy-pending"` | flagged, and the policy is not known yet |
 | `NotLoaded` | `"not-loaded"` | the player's data is not loaded |
@@ -260,16 +259,16 @@ Scribe re-reads on its own the first time the local player's `HasRobloxSubscript
 
 ## Checking what a player owns
 
-Perks, passes and Roblox Premium all answer to the same key. In Emberfall, `"VIP"` is the pass name, so `Owns(player, "VIP")` is true whether the player bought the pass or was handed the perk by staff.
+Perks, passes and Roblox Plus all answer to the same key. In Emberfall, `"VIP"` is the pass name, so `Owns(player, "VIP")` is true whether the player bought the pass or was handed the perk by staff.
 
 ```lua
 -- server
 if Data.OwnsAsync(player, "VIP") then
-    giveVipKit(player)
+    openVipDoor(player)
 end
 ```
 
-[`OwnsAsync`](/api/Server#OwnsAsync) is the one to reach for by default. If the cache does not already say owned, it re-checks live with `UserOwnsGamePassAsync`, so a pass bought thirty seconds ago is reflected immediately. [`Owns`](/api/Server#Owns) is the non-yielding version for a hot path where the data is already warm, such as a button click mid-session.
+On the server, [`OwnsAsync`](/api/Server#OwnsAsync) asks Roblox about a registered pass unless the player already owns the key outright. [`Owns`](/api/Server#Owns) reads the cache without yielding. Both return true during a [free trial](#pass-free-trials), so either can open the VIP door.
 
 Gate a grant on the **server's** check, never the client's. The client's `Owns` and `OwnsAsync` read a replicated mirror, and an exploiter can make a mirror say anything.
 
@@ -287,8 +286,8 @@ Do not poll. `OnOwnershipChanged` fires for every key, which is what you want wh
 
 ```lua
 Data.OnOwnershipChanged:Connect(function(player, key, owned)
-    if key == "VIP" and owned then
-        openVipDoor(player)
+    if key == "VIP" then
+        setVipDoorAccess(player, owned)
     end
 end)
 ```
@@ -296,7 +295,7 @@ end)
 On the server, [`ObserveOwned`](/api/Server#ObserveOwned) needs a Ready profile and delivers the current value when you subscribe. Call it after [`WaitForData`](/api/Server#WaitForData). On the client, [`Data.ObserveOwned(key, callback)`](/api/Client#ObserveOwned) returns its disconnect immediately. The callback first runs when the snapshot arrives, or immediately if data has already loaded, then whenever ownership changes.
 
 ??? note "The key is the NAME you registered, and it has to be a string"
-    `Owns`, `OwnsAsync` and `ObserveOwned` take the name a pass, perk or product grant was
+    `Owns`, `OwnsAsync`, `GetTrial` and `ObserveOwned` take the name a pass, perk or product grant was
     registered under, not a game-pass id. `Owns(player, 12345)` is a mistake, and so is
     `Owns(player, config.PassName)` when that field is missing.
 
@@ -304,22 +303,52 @@ On the server, [`ObserveOwned`](/api/Server#ObserveOwned) needs a Ready profile 
     worst way: a non-string key answered `false`, so an ownership gate denied a player who
     had paid and nothing was logged anywhere.
 
-    Only owned keys are stored. The ownership cache holds a key when the player owns it and
-    holds nothing when they do not, rather than writing `false` for every declared pass, so
-    what crosses the wire is proportional to what a player actually owns. Every reader tests
-    for `true`, so an absent key and a `false` one are the same answer.
+    The ownership cache includes only keys the player currently holds. An active trial takes one entry until it ends, so the amount replicated depends on what the player can use.
 
 ??? note "Why `Owns` can say false right after a player joins"
     Perks and gift deliveries resolve the moment a profile is Ready, but real game-pass ownership is filled in by an asynchronous refresh that starts at load. `Owns` reads that cache, so a genuinely-owned pass can read `false` for a moment right after join. `OwnsAsync` closes that gap by verifying live.
 
-    Once the cache says owned it is trusted without re-checking, because pass ownership only ever gains during a session. A refund is picked up on the player's next join, not mid-session.
+    Scribe trusts a confirmed purchase for the rest of the session and picks up a refund on the next join. It re-checks [free trials](#pass-free-trials) during the session so access can end.
 
-    `"RobloxPlus"` is the exception that moves both ways. Scribe keeps it current from `Players.PlayerMembershipChanged`, so a player who subscribes or lapses mid-session fires `OnOwnershipChanged` in the matching direction.
+    `"RobloxPlus"` also moves both ways. Scribe keeps it current from `Players.PlayerMembershipChanged`, so a player who subscribes or lapses mid-session fires `OnOwnershipChanged` in the matching direction.
 
 ??? note "Which monetization calls need a Ready player"
     Four of them error if the profile is not Ready: [`GrantPerk`](/api/Server#GrantPerk), [`RevokePerk`](/api/Server#RevokePerk), [`ObserveOwned`](/api/Server#ObserveOwned), and [`RecordPurchase`](/api/Server#RecordPurchase). Wire those behind [`WaitForData`](/api/Server#WaitForData) rather than calling them straight out of `PlayerAdded`.
 
     On the server, `Owns`, `OwnsAsync`, `GetPurchases` and `GetGiftCredits` answer `false` or an empty table before Ready, and `Purchase` and `PromptGift` refuse with a reason. Gate ownership logic on readiness. On the client, `GetPurchases` and `GetGiftCredits` wait for the first snapshot.
+
+## Pass free trials
+
+Enable trials per pass in Creator Hub under **Monetization → Shop → Free Trials**. A trial start fires `PromptGamePassPurchaseFinished` with success, and `UserOwnsGamePassAsync` returns true throughout the trial. Scribe checks `MarketplaceService:GetPassOwnershipAsync` to tell a trial from a sale. See [Roblox's announcement](https://devforum.roblox.com/t/introducing-pass-free-trials/4995943).
+
+During a trial, `Owns` and `OwnsAsync` return true on both sides. The player can use the VIP door and can still buy the pass. Scribe keeps the trial in session data and skips the purchase history.
+
+`OnOwnershipChanged` and `ObserveOwned` pass two ownership flags. The table shows how they change for a player whose only access comes from the pass.
+
+| What happened | `owned` | `trial` |
+| --- | --- | --- |
+| The trial starts | `true` | `true` |
+| The player buys the pass during the trial | `true` | `false` |
+| The trial expires without a purchase | `false` | `false` |
+
+For a reward the player keeps, check both flags on the server. A saved perk named `VIP` also qualifies the player, including a [gifted perk](./gifting).
+
+```lua
+Data.OnOwnershipChanged:Connect(function(player, key, owned, trial)
+    if key == "VIP" and owned and not trial then
+        Data.GrantPerk(player, "VIPTitle")
+    end
+end)
+```
+
+Outside a callback, check `Data.OwnsAsync(player, "VIP") and not Data.GetTrial(player, "VIP")`. [`GetTrial`](/api/Server#GetTrial) returns a table only when a trial is the player's sole source of access. Its `EndsAt` field holds the reported end in Unix seconds, or `nil` if unknown. On the client, use [`Data.GetTrial("VIP")`](/api/Client#GetTrial) for a trial label or [`ObserveOwned`](/api/Client#ObserveOwned) to update the shop as access changes.
+
+Roblox sends no expiry event. Scribe re-checks near the reported end and at least every five minutes. Remove temporary benefits in the ownership callback when Roblox confirms expiry.
+
+??? note "What Scribe cannot see about a trial"
+    Before enabling trials, confirm that `GetPassOwnershipAsync` works in your game. When the method is missing or has yet to return a valid result, Scribe falls back to the older ownership call. An active trial then looks like a purchase, including to your grant code, and a trial start can enter the Robux history. See [`PASS_TRIAL_READ_FAIL`](./log-codes#monetization) for when the fallback warns.
+
+    For a gift recipient whose profile has not loaded on this server, Scribe checks ownership by user ID. That check also counts an active trial as owned. See [Gifting](./gifting).
 
 ## Granting a perk yourself
 
@@ -518,7 +547,7 @@ Show suitable UI text for the four player reasons; log the rest. Anything outsid
 
 ## Purchase history
 
-Every player carries two capped logs. The `Robux` log is written only by Scribe, from the receipt path and from completed pass purchases, so game code cannot forge an entry. The `InGame` log is yours, and `Data.Purchase` writes into it automatically.
+Every player carries two capped logs. The `Robux` log is written only by Scribe, from the receipt path and from completed pass purchases, so game code cannot forge an entry. A confirmed [free trial](#pass-free-trials) adds no entry. The `InGame` log is yours, and `Data.Purchase` writes into it automatically.
 
 Add your own entries for anything Scribe did not process, such as a quest reward or a trade:
 

@@ -22,6 +22,30 @@ type function Branded(T, Label)
 	return T
 end
 
+-- A nil-only callback argument would pass an optional annotation.
+-- selene: allow(undefined_variable)
+type function Carries(T, Label)
+	local carried = not (T:is("nil") or T:is("never"))
+	if T:is("union") then
+		carried = false
+		for _, member in T:components() do
+			carried = carried or not (member:is("nil") or member:is("never"))
+		end
+	end
+	if not carried then
+		error(`lost its value: {Label:value()}`)
+	end
+	return T
+end
+
+-- selene: allow(undefined_variable)
+type function Erased(T, Label)
+	if not T:is("any") then
+		error(`kept a type past the depth budget: {Label:value()}`)
+	end
+	return T
+end
+
 local template = {
 	Coins = Scribe.Int(0),
 	Wealth = Scribe.Big(0),
@@ -74,6 +98,52 @@ local bundle = Scribe({
 local frozen: Scribe.Bundle<typeof(template), any> = table.freeze(bundle)
 local Server = frozen.Server
 local Client = bundle.Client
+
+-- Explicit API annotations must preserve accessor types.
+local namedServer: Scribe.ServerData<typeof(template)> = bundle.Server
+local namedClient: Scribe.ClientData<typeof(template)> = bundle.Client
+
+-- OnChildChanged widens the key and value after twelve children.
+type Twelve = {
+	A: number,
+	B: number,
+	C: number,
+	D: number,
+	E: number,
+	F: number,
+	G: number,
+	H: number,
+	I: number,
+	J: number,
+	K: number,
+	L: number,
+}
+type Thirteen = {
+	A: number,
+	B: number,
+	C: number,
+	D: number,
+	E: number,
+	F: number,
+	G: number,
+	H: number,
+	I: number,
+	J: number,
+	K: number,
+	L: number,
+	M: number,
+}
+local twelve = (nil :: any) :: Scribe.PlayerData<Twelve>
+local thirteen = (nil :: any) :: Scribe.PlayerData<Thirteen>
+
+-- Near and Far reuse Leafy on opposite sides of the accessor depth limit.
+type Leafy = { A: { B: number } }
+-- stylua: ignore
+type Deep = {
+	Near: Leafy,
+	Far: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { N: { Tail: Leafy } } } } } } } } } } } } } } } } } } } } } } },
+}
+local deep = (nil :: any) :: Scribe.PlayerData<Deep>
 
 -- Addon compatibility with read-only API fields.
 ScribeLeaderstats.Start(Server, { Coins = "Coins" })
@@ -173,7 +243,24 @@ return function(player: Player)
 	end)
 	data.Items.OnChildChanged(function(_index, new)
 		local _cost: number? = if new then new.Cost else nil
+		local _kept: Carries<typeof(new), "array-child-changed"> = new
 	end)
+
+	local namedCoins: Exact<typeof(namedServer[player].Coins.Get()), "named-server"> = namedServer[player].Coins.Get()
+	local namedBag: Exact<typeof(namedClient.Bag.Get()), "named-client"> = namedClient.Bag.Get()
+
+	twelve.OnChildChanged(function(key, _new)
+		local _exact: "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L" = key
+	end)
+	thirteen.OnChildChanged(function(key, new)
+		local _wideKey: string = key
+		local _wideValue: string = new
+	end)
+
+	local nearLeaf: Exact<typeof(deep.Near.A.B.Get()), "near-leaf"> = deep.Near.A.B.Get()
+	-- stylua: ignore
+	local farNode = deep.Far.N.N.N.N.N.N.N.N.N.N.N.N.N.N.N.N.N.N.N.N.N.N.Tail.A.B
+	local farLeaf: Erased<typeof(farNode), "far-leaf"> = farNode
 
 	return doubled,
 		doubledMax,
@@ -194,5 +281,9 @@ return function(player: Player)
 		optHidden,
 		whole,
 		hint,
-		at
+		at,
+		namedCoins,
+		namedBag,
+		nearLeaf,
+		farLeaf
 end

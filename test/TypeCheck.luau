@@ -214,6 +214,11 @@ local function serverUsage(player: Player)
 	)
 	local owns: boolean = Data.Owns(player, "VIP")
 	local ownsAsync: boolean = Data.OwnsAsync(player, "VIP")
+	local passTrial: Scribe.PassTrial? = Data.GetTrial(player, "VIP")
+	local _trialEnds: number? = if passTrial then passTrial.EndsAt else nil
+	-- Existing one-argument callbacks still type-check.
+	local _stopOwned: () -> () = Data.ObserveOwned(player, "VIP", function(_owned: boolean) end)
+	local _stopOwnedTrial: () -> () = Data.ObserveOwned(player, "VIP", function(_owned: boolean, _onTrial: boolean) end)
 	local ok, err = Data.PromptGift(player, "GiftVIP", 12345)
 	-- These are on the returned Data type, not only on the runtime table.
 	local promptedOk: boolean, promptedWhy: string? = Data.PromptPurchase(player, "VIP")
@@ -683,6 +688,9 @@ local function clientUsage()
 	local rank: number? = ClientData.GetMyRank("TopCoins")
 	local owns: boolean = ClientData.Owns("VIP")
 	local ownsAsync: boolean = ClientData.OwnsAsync("VIP")
+	local _clientTrial: Scribe.PassTrial? = ClientData.GetTrial("VIP")
+	local _stopClientOwned: () -> () = ClientData.ObserveOwned("VIP", function(_owned: boolean) end)
+	local _stopClientTrial: () -> () = ClientData.ObserveOwned("VIP", function(_owned: boolean, _onTrial: boolean) end)
 	local requestOk = ClientData.Request("EquipItem", "Sword_001")
 	-- RequestOnce takes the idempotency key as a required second string, then the
 	-- command's own arguments.

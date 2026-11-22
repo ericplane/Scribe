@@ -170,6 +170,9 @@ export type LogCode =
 	| "RECEIPT_HISTORY_FULL"
 	| "OWNERSHIP_CHECK_FAIL"
 	| "PASS_PURCHASE_UNCONFIRMED"
+	| "PASS_TRIAL_STARTED"
+	| "PASS_TRIAL_ENDED"
+	| "PASS_TRIAL_READ_FAIL"
 	| "PERK_GRANTED"
 	| "PERK_REVOKED"
 	| "PRODUCT_INFO_FAIL"
@@ -445,6 +448,11 @@ export type PurchaseFilter = {
 	ItemId: string?,
 	Since: number?,
 	Limit: number?,
+}
+
+-- Expected trial end in Unix seconds, nil if unknown.
+export type PassTrial = {
+	EndsAt: number?,
 }
 
 -- Economy analytics -----------------------------------------------------------

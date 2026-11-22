@@ -132,6 +132,8 @@ jobs:
 
   analyze:
     runs-on: ubuntu-latest
+    # Deeply nested type fixtures can stall the solver.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -189,7 +191,7 @@ jobs:
       # regression the positive fixture cannot.
       - name: Type-check (negative fixture must report the expected count)
         run: |
-          for fixture in test/TypeCheckErrors.luau test/TypeCheckInteropErrors.luau test/TypeCheckServerStoreErrors.luau test/TypeCheckAddonsErrors.luau test/TypeCheckPrecisionErrors.luau; do
+          for fixture in test/TypeCheckErrors.luau test/TypeCheckInteropErrors.luau test/TypeCheckServerStoreErrors.luau test/TypeCheckAddonsErrors.luau test/TypeCheckPrecisionErrors.luau test/TypeCheckLargeErrors.luau; do
             # grep exits 1 on no match; keep the diagnostic useful under pipefail.
             expected="$(grep -oE 'EXPECTED_ERRORS: [0-9]+' "$fixture" | grep -oE '[0-9]+' || true)"
             if [ -z "$expected" ]; then
@@ -212,6 +214,8 @@ jobs:
               exit 1
             fi
           done
+      - name: Report the size gate's share of the type budget
+        run: node scripts/measure-type-budget.mjs test/TypeCheckLargeErrors.luau
 
   clock-seam:
     runs-on: ubuntu-latest

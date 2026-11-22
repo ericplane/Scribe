@@ -603,8 +603,18 @@ local function UpdateAsync(profile_store, profile_key, transform_params, is_user
 
 	local success = true
 
+	-- SCRIBE PATCH: ignore transforms that run after their call returns. A late
+	-- session-start transform can increment SessionLoadCount after a successful
+	-- retry, invalidating the new session's next save.
+	local call_answered = false
+
 	local success, error_message = pcall(function()
 		local transform_function = function(latest_data)
+
+			-- SCRIBE PATCH: returning nil cancels the write.
+			if call_answered == true then
+				return nil
+			end
 
 			local missing_profile = false
 			local overwritten = false
@@ -725,6 +735,7 @@ local function UpdateAsync(profile_store, profile_key, transform_params, is_user
 
 	end)
 
+	call_answered = true -- SCRIBE PATCH
 	next_in_queue()
 
 	if success == true and type(loaded_data) == "table" then
@@ -2124,6 +2135,11 @@ function ProfileStore:StartSessionAsync(profile_key, params)
 			if profile_load_job[1] == load_id then -- Load job hasn't been double-stolen
 				loaded_data, key_info = table.unpack(profile_load_job[2])
 				profile_load_jobs[profile_key] = nil
+				-- SCRIBE PATCH: the shared job used the first caller's cancel condition.
+				-- If it declined the lock, retry with the rejoining player's condition.
+				if profile_load_job.declined == true then
+					continue
+				end
 			else
 				ActiveProfileLoadJobs = ActiveProfileLoadJobs - 1
 				return nil
@@ -2141,6 +2157,7 @@ function ProfileStore:StartSessionAsync(profile_key, params)
 					ExistingProfileHandle = function(latest_data)
 
 						if ProfileStore.IsClosing == true or cancel_condition() == true then
+							profile_load_job.declined = true -- SCRIBE PATCH: see the steal above
 							return
 						end
 
@@ -2178,6 +2195,9 @@ function ProfileStore:StartSessionAsync(profile_key, params)
 					MissingProfileHandle = function(latest_data)
 						
 						local is_cancel = ProfileStore.IsClosing == true or cancel_condition() == true
+						if is_cancel == true then
+							profile_load_job.declined = true -- SCRIBE PATCH: see the steal above
+						end
 
 						latest_data.Data = DeepCopyTable(self.template)
 						latest_data.MetaData = {

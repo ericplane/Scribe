@@ -36,12 +36,12 @@ Two different checks are happening here, and it is worth naming them separately.
 Client-side `Set` does exist, but it touches only the local mirror for optimistic UI, and the next server diff overwrites it. Reads work the same way, which leads to the one mistake worth calling out:
 
 !!! warning "Gate grants on the server, never on the client mirror"
-    [`Owns`](/api/Client#Owns) on the client reads a replicated mirror that an exploiter can make return `true` locally. Use the server's [`OwnsAsync`](/api/Server#OwnsAsync), which verifies live, before you hand anyone the `VIP` reward.
+    [`Owns`](/api/Client#Owns) on the client reads a replicated mirror that an exploiter can make return `true` locally. Check the server's [`OwnsAsync`](/api/Server#OwnsAsync) before granting a VIP reward. For a reward the player keeps, also check [`GetTrial`](./monetization#pass-free-trials) to exclude trial access.
 
     ```lua
     -- Server. This is the one that decides.
-    if Data.OwnsAsync(player, "VIP") then
-        Data[player].Gems.Increment(100)
+    if Data.OwnsAsync(player, "VIP") and not Data.GetTrial(player, "VIP") then
+        Data.GrantPerk(player, "VIPTitle")
     end
     ```
 

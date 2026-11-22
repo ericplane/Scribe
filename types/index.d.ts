@@ -234,6 +234,7 @@ declare namespace Scribe {
     export type LeaderboardSnapshotEntry = Common.LeaderboardSnapshotEntry;
     export type PassConfig = Common.PassConfig;
     export type PurchaseFilter = Common.PurchaseFilter;
+    export type PassTrial = Common.PassTrial;
     export type PurchaseEntry = Common.PurchaseEntry;
     export type PurchaseLogOptions = Common.PurchaseLogOptions;
     export type ProductInfo = Common.ProductInfo;

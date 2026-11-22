@@ -1125,7 +1125,8 @@ local function buildInternalRoots(state: any, root: SchemaNode, config: CompileC
 	-- _ScribeSession: never persisted, replicated to the owner. Holds the pass/Plus
 	-- ownership cache, the player's own save info, and a sync flag the server flips
 	-- true once the async gamepass refresh completes, so the client can await it
-	-- before trusting OwnsCache (see Client/Server OwnsAsync).
+	-- before trusting OwnsCache (see Client/Server OwnsAsync). Cache values are true
+	-- for outright access, or trial end times in Unix seconds (0 if unknown).
 	local sessionTemplate = {
 		OwnsCache = {},
 		SaveInfo = {},

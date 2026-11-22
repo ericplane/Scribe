@@ -88,11 +88,21 @@ export function checkAPI(player: Player): void {
     client.OnOwnershipChanged.Connect((key, owned) => print(key, owned));
     const ownershipConnection = server.OnOwnershipChanged.Connect((_player, key, owned) => print(key, owned));
     ownershipConnection.Disconnect();
+    server.OnOwnershipChanged.Once((_player, _key, owned, trial) => {
+        const keeps: boolean = owned && !trial;
+        print(keeps);
+    });
+    client.ObserveOwned("VIP", (owned, trial) => print(owned, trial));
+    const serverTrial: Scribe.PassTrial | undefined = server.GetTrial(player, "VIP");
+    const trialEnds: number | undefined = client.GetTrial("VIP")?.EndsAt;
+    // @ts-expect-error GetTrial returns PassTrial | undefined.
+    const onTrial: boolean = server.GetTrial(player, "VIP");
+    print(serverTrial, trialEnds, onTrial);
     server.GetPurchases(player, { Kind: "InGame" });
     server.Purchase(player, { Cost: { Path: "Coins", Amount: 10 }, ItemId: "Sword", IdempotencyKey: "purchase-1", PaidRandom: false });
     const [updated, updateReason, violations] = server.UpdateOffline(1, raw => { raw["Coins"] = 2; }, { Validate: true });
     print(updated, updateReason, violations);
-    client.Mock({ Settings: { Music: false } }, { Perks: ["VIP"] });
+    client.Mock({ Settings: { Music: false } }, { Perks: ["VIP"], Trials: { Radar: 0 } });
     const [verdict] = server.Exchange.Attempt(player, [{ Path: ["Coins"], Kind: "Qty", Amount: 1 }], player, []);
     const result: "Committed" | "Aborted" | undefined = verdict;
     print(result);
